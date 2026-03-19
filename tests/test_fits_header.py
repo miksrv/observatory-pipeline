@@ -8,6 +8,7 @@ import math
 import os
 import tempfile
 
+import numpy as np
 import astropy.io.fits as fits
 import pytest
 
@@ -19,8 +20,16 @@ from modules.fits_header import extract_headers, sanitize_object_name
 # ---------------------------------------------------------------------------
 
 def _write_fits(headers: dict) -> str:
-    """Write a minimal FITS file with given headers to a temp file, return path."""
-    hdu = fits.PrimaryHDU()
+    """Write a minimal FITS file with given headers to a temp file, return path.
+
+    NAXIS1/NAXIS2 are pulled from the headers dict and used to create real
+    image data so astropy does not raise a VerifyError for mismatched NAXISj.
+    """
+    headers = dict(headers)  # don't mutate caller's dict
+    width  = int(headers.pop("NAXIS1", 10))
+    height = int(headers.pop("NAXIS2", 10))
+    data = np.zeros((height, width), dtype=np.float32)
+    hdu = fits.PrimaryHDU(data=data)
     for key, value in headers.items():
         hdu.header[key] = value
     tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
