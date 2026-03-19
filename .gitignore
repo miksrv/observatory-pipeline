@@ -208,3 +208,20 @@ __marimo__/
 
 # IntelliJ IDEA
 .idea
+
+# -------------------------------------------------------
+# Observatory Pipeline — project-specific
+# -------------------------------------------------------
+
+# FITS image data files (large binaries, never commit)
+*.fits
+*.fit
+*.fts
+
+# ASTAP star catalog files (gigabytes, stored on host volume)
+*.bin
+*.cat
+/astap/
+
+# WCS solution files written by astap alongside FITS files
+*.wcs

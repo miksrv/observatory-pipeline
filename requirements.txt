@@ -1,0 +1,12 @@
+astropy>=6.0
+astroquery>=0.4.7
+photutils>=1.12
+sep>=1.4
+astroscrappy>=1.1
+numpy>=1.26
+httpx>=0.27
+tenacity>=8.2
+watchdog>=4.0
+python-dotenv>=1.0
+pytest>=8.0
+pytest-asyncio>=0.23

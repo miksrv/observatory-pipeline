@@ -1,0 +1,11 @@
+services:
+  pipeline:
+    build: .
+    volumes:
+      - /data/fits/incoming:/fits/incoming
+      - /data/fits/archive:/fits/archive
+      - /data/fits/rejected:/fits/rejected
+      - /data/astap/catalogs:/astap/catalogs
+    env_file:
+      - .env
+    restart: unless-stopped
