@@ -157,6 +157,16 @@ QC_ELONGATION_MAX=2.0
 QC_SNR_MIN=5.0
 QC_STARS_MIN=10
 
+# Star detection filtering (astrometry module)
+# These filter raw SEP detections to keep only point sources (stars)
+# and reject extended objects (nebula parts, galaxies) and artifacts.
+SEP_DETECT_THRESH=10.0
+SEP_MIN_AREA=15
+STAR_FWHM_MIN_ARCSEC=2.5
+STAR_FWHM_MAX_ARCSEC=8.0
+STAR_ELONGATION_MAX=1.5
+STAR_SNR_MIN=50.0
+
 # Cross-match cone radius
 MATCH_CONE_ARCSEC=5.0
 # Cone to search for moving objects (wider)
