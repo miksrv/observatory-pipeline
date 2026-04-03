@@ -1,5 +1,7 @@
 # Observatory FITS Analysis Pipeline
 
+[![Tests](https://github.com/miksrv/observatory-pipeline/actions/workflows/tests.yml/badge.svg)](https://github.com/miksrv/observatory-pipeline/actions/workflows/tests.yml)
+
 Automated Python service for processing astronomical FITS frames from an observatory telescope. Runs on a dedicated observatory server, performs quality control, plate solving, source extraction, catalog cross-matching, anomaly detection, and reports everything to a remote REST API.
 
 ---
