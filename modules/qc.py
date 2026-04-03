@@ -196,10 +196,15 @@ async def analyze(fits_path: str) -> dict:
     # ------------------------------------------------------------------
     # 3. Source detection
     # ------------------------------------------------------------------
-    threshold: float = config.QC_SNR_MIN * bkg.globalrms
-
+    # Use the same detection parameters as astrometry.py for consistent star counts
+    # SEP_DETECT_THRESH is in units of sigma (background RMS)
     try:
-        objects = sep.extract(data_sub, threshold)
+        objects = sep.extract(
+            data_sub,
+            thresh=config.SEP_DETECT_THRESH,
+            err=bkg.globalrms,
+            minarea=config.SEP_MIN_AREA,
+        )
     except Exception as exc:
         logger.error("QC: sep.extract failed for %s: %s", fits_path, exc)
         return _result(
@@ -209,21 +214,21 @@ async def analyze(fits_path: str) -> dict:
             rejected_path=_move_rejected(fits_path, "BAD", object_name),
         )
 
-    star_count: int = len(objects)
-    logger.debug("QC: detected %d sources in %s", star_count, os.path.basename(fits_path))
+    raw_detection_count: int = len(objects)
+    logger.debug("QC: detected %d raw sources in %s", raw_detection_count, os.path.basename(fits_path))
 
     # Degenerate frame — too few sources to compute reliable statistics
-    if star_count < 3:
+    if raw_detection_count < 3:
         logger.warning(
             "QC: only %d sources detected (< 3), flagging LOW_STARS: %s",
-            star_count,
+            raw_detection_count,
             fits_path,
         )
         return _result(
             quality_flag="LOW_STARS",
             sky_background=sky_background,
             sky_sigma=sky_sigma,
-            star_count=star_count,
+            star_count=raw_detection_count,
             rejected_path=_move_rejected(fits_path, "LOW_STARS", object_name),
         )
 
@@ -264,6 +269,56 @@ async def analyze(fits_path: str) -> dict:
         elongation_median,
         os.path.basename(fits_path),
     )
+
+    # ------------------------------------------------------------------
+    # 5b. Filter to count only real stars (consistent with astrometry.py)
+    # ------------------------------------------------------------------
+    # Apply the same filtering criteria as astrometry.py uses:
+    # - Elongation < STAR_ELONGATION_MAX (round sources only)
+    # - FWHM in valid range (reject hot pixels and extended objects)
+    # - Positive flux
+    #
+    # Note: We use QC thresholds (QC_ELONGATION_MAX, QC_FWHM_MAX_ARCSEC) for
+    # the BLUR/TRAIL quality flags, but use the stricter STAR_* thresholds
+    # here to count only genuine point sources, matching what astrometry
+    # will actually extract as stars.
+    
+    # Compute per-source FWHM in arcsec (or pixels if no plate scale)
+    fwhm_per_source: np.ndarray
+    if plate_scale is not None:
+        fwhm_per_source = fwhm_pixels_arr * plate_scale
+        
+        # Apply star filters
+        mask_elongation = elongation_arr < config.STAR_ELONGATION_MAX
+        mask_fwhm_min = fwhm_per_source >= config.STAR_FWHM_MIN_ARCSEC
+        mask_fwhm_max = fwhm_per_source <= config.STAR_FWHM_MAX_ARCSEC
+        mask_flux = objects["flux"] > 0
+        
+        star_mask = mask_elongation & mask_fwhm_min & mask_fwhm_max & mask_flux
+        star_count: int = int(np.sum(star_mask))
+        
+        logger.debug(
+            "QC: star filter: %d raw → %d stars (elong<%0.1f, fwhm=[%.1f-%.1f]\")  file=%s",
+            raw_detection_count,
+            star_count,
+            config.STAR_ELONGATION_MAX,
+            config.STAR_FWHM_MIN_ARCSEC,
+            config.STAR_FWHM_MAX_ARCSEC,
+            os.path.basename(fits_path),
+        )
+    else:
+        # Without plate scale, use only elongation and flux filters
+        mask_elongation = elongation_arr < config.STAR_ELONGATION_MAX
+        mask_flux = objects["flux"] > 0
+        star_mask = mask_elongation & mask_flux
+        star_count = int(np.sum(star_mask))
+        
+        logger.debug(
+            "QC: star filter (no plate scale): %d raw → %d stars  file=%s",
+            raw_detection_count,
+            star_count,
+            os.path.basename(fits_path),
+        )
 
     # ------------------------------------------------------------------
     # 6. SNR via aperture photometry
@@ -322,6 +377,10 @@ async def analyze(fits_path: str) -> dict:
     # ------------------------------------------------------------------
     # 8. Quality flag classification
     # ------------------------------------------------------------------
+    # Note: BLUR and TRAIL explain why star_count might be low (sources are
+    # filtered out due to poor image quality). So we check BLUR and TRAIL
+    # first, and only check LOW_STARS if those are both false.
+    
     blur: bool = (
         fwhm_unit == "arcsec"
         and fwhm_median is not None
@@ -331,7 +390,10 @@ async def analyze(fits_path: str) -> dict:
         elongation_median is not None
         and elongation_median > config.QC_ELONGATION_MAX
     )
-    low_stars: bool = star_count < config.QC_STARS_MIN
+    
+    # LOW_STARS only applies when BLUR and TRAIL are false
+    # (otherwise low star count is a consequence of the BLUR/TRAIL issue)
+    low_stars: bool = (not blur and not trail) and star_count < config.QC_STARS_MIN
 
     issue_count: int = sum([blur, trail, low_stars])
 
