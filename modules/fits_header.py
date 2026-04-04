@@ -203,6 +203,8 @@ def _extract_instrument(hdr: fits.Header) -> dict:
 
 def _extract_sensor(hdr: fits.Header) -> dict:
     binning = _to_int(_get(hdr, "BINNING"))
+    # Pixel size in microns - try multiple keyword variations
+    pixel_size_um = _to_float(_get(hdr, "XPIXSZ", "PIXSIZE", "PIXSCALE1", "PIXELSZ"))
     return {
         "temp_celsius":         _to_float(_get(hdr, "CCD-TEMP", "CCDTEMP")),
         "temp_setpoint_celsius": _to_float(_get(hdr, "SET-TEMP")),
@@ -212,6 +214,7 @@ def _extract_sensor(hdr: fits.Header) -> dict:
         "offset":               _to_float(_get(hdr, "OFFSET")),
         "width_px":             _to_int(_get(hdr, "NAXIS1")),
         "height_px":            _to_int(_get(hdr, "NAXIS2")),
+        "pixel_size_um":        pixel_size_um,
     }
 
 
@@ -251,6 +254,7 @@ def _empty_dict() -> dict:
             "binning_x": None, "binning_y": None,
             "gain": None, "offset": None,
             "width_px": None, "height_px": None,
+            "pixel_size_um": None,
         },
         "observer": {
             "name": None, "site_name": None,
