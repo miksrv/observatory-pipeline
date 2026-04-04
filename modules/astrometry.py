@@ -30,7 +30,7 @@ import config
 logger = logging.getLogger(__name__)
 
 
-async def solve(fits_path: str) -> dict[str, Any]:
+async def solve(fits_path: str, psf_fwhm_arcsec: float | None = None) -> dict[str, Any]:
     """
     Plate-solve a FITS frame and extract calibrated source positions.
 
@@ -43,6 +43,11 @@ async def solve(fits_path: str) -> dict[str, Any]:
     ----------
     fits_path:
         Absolute path to the FITS file on disk.
+    psf_fwhm_arcsec:
+        Median PSF FWHM in arcseconds from QC analysis. When provided, the
+        star filter upper FWHM bound is tightened to ``psf_fwhm_arcsec * 1.5``
+        (capped at ``STAR_FWHM_MAX_ARCSEC``) to better reject compact galaxies
+        and other extended sources whose FWHM significantly exceeds stellar PSF.
 
     Returns
     -------
@@ -50,6 +55,8 @@ async def solve(fits_path: str) -> dict[str, Any]:
         ra_center   float   – frame centre RA in decimal degrees
         dec_center  float   – frame centre Dec in decimal degrees
         fov_deg     float   – field of view (larger image dimension) in degrees
+        naxis1      int     – image width in pixels
+        naxis2      int     – image height in pixels
         sources     list    – list of source dicts; each has:
                               ra, dec, flux, fwhm (arcsec), elongation (a/b)
         wcs         WCS     – astropy WCS object for downstream coordinate work
@@ -122,6 +129,17 @@ async def solve(fits_path: str) -> dict[str, Any]:
         )
         return {}
 
+    # Check astap stdout for "Solution found" or similar success indicator
+    # astap outputs "Solution found:" when plate solve succeeds
+    astap_output = result.stdout + result.stderr
+    if "Solution found" not in astap_output and "solution found" not in astap_output.lower():
+        logger.warning(
+            "astap returned rc=0 but no solution found in output for %s. Output: %s",
+            fits_path,
+            astap_output[:500],
+        )
+        return {}
+
     logger.debug("astap succeeded for %s", fits_filename)
 
     # ------------------------------------------------------------------
@@ -129,15 +147,67 @@ async def solve(fits_path: str) -> dict[str, Any]:
     # ------------------------------------------------------------------
     try:
         # Step 2 — Read WCS from the solved FITS file
+        # astap with -wcs flag should write WCS keywords into the FITS header.
+        # As a fallback, check for a separate .wcs file created by astap.
+        
+        wcs = None
+        hdr = None
+        naxis1: int = 0
+        naxis2: int = 0
+        
         with fits.open(fits_path) as hdul:
-            hdr = hdul[0].header
+            hdr = hdul[0].header.copy()
+            naxis1 = int(hdr.get("NAXIS1", 0))
+            naxis2 = int(hdr.get("NAXIS2", 0))
             wcs = WCS(hdr)
-            naxis1: int = int(hdr.get("NAXIS1", 0))
-            naxis2: int = int(hdr.get("NAXIS2", 0))
+        
+        # Check if WCS from FITS has celestial coordinates
+        if not wcs.has_celestial:
+            # Try to read from .wcs file that astap creates
+            wcs_file_path = os.path.splitext(fits_path)[0] + ".wcs"
+            if os.path.exists(wcs_file_path):
+                logger.info(
+                    "FITS has no celestial WCS, trying .wcs file: %s",
+                    wcs_file_path,
+                )
+                try:
+                    with fits.open(wcs_file_path) as wcs_hdul:
+                        wcs_hdr = wcs_hdul[0].header
+                        wcs = WCS(wcs_hdr)
+                        # Merge WCS keywords into main header for downstream use
+                        for key in ["CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", 
+                                    "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", 
+                                    "CD2_1", "CD2_2", "CDELT1", "CDELT2"]:
+                            if key in wcs_hdr:
+                                hdr[key] = wcs_hdr[key]
+                except Exception as wcs_exc:
+                    logger.warning(
+                        "Failed to read .wcs file %s: %s",
+                        wcs_file_path,
+                        wcs_exc,
+                    )
 
         if not wcs.has_celestial:
+            # Log detailed WCS info for debugging
             logger.error(
                 "WCS has no celestial axes after plate solve for %s", fits_path
+            )
+            # Check for common WCS keywords to diagnose the issue
+            wcs_keys = ["CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2",
+                        "CD1_1", "CD1_2", "CD2_1", "CD2_2", "CDELT1", "CDELT2"]
+            found_keys = {k: hdr.get(k) for k in wcs_keys if k in hdr}
+            logger.error(
+                "WCS keywords found: %s  file=%s", 
+                found_keys if found_keys else "NONE",
+                fits_filename,
+            )
+            # Also check if astap wrote solution info
+            astap_keys = ["PLTSOLVD", "CRVAL1", "CRVAL2"]
+            astap_found = {k: hdr.get(k) for k in astap_keys if k in hdr}
+            logger.error(
+                "ASTAP solution keywords: %s  file=%s",
+                astap_found if astap_found else "NONE",
+                fits_filename,
             )
             return {}
 
@@ -242,12 +312,21 @@ async def solve(fits_path: str) -> dict[str, Any]:
             # 2. FWHM in reasonable range (reject hot pixels and extended objects)
             # 3. SNR > min (reject faint noise detections)
             # 4. Positive flux (reject artifacts)
+            #
+            # When psf_fwhm_arcsec is provided from QC, the upper FWHM bound is
+            # tightened to psf_fwhm_arcsec * 1.5 to reject compact galaxies that
+            # are slightly broader than the stellar PSF but still pass the
+            # static STAR_FWHM_MAX_ARCSEC threshold.
             # ---------------------------------------------------------
-            
+
+            fwhm_max_arcsec = config.STAR_FWHM_MAX_ARCSEC
+            if psf_fwhm_arcsec is not None and psf_fwhm_arcsec > 0:
+                fwhm_max_arcsec = min(config.STAR_FWHM_MAX_ARCSEC, psf_fwhm_arcsec * 1.5)
+
             # Count rejections per criterion for debugging
             mask_elongation = elongations < config.STAR_ELONGATION_MAX
             mask_fwhm_min = fwhm_arcsec >= config.STAR_FWHM_MIN_ARCSEC
-            mask_fwhm_max = fwhm_arcsec <= config.STAR_FWHM_MAX_ARCSEC
+            mask_fwhm_max = fwhm_arcsec <= fwhm_max_arcsec
             mask_snr = snr >= config.STAR_SNR_MIN
             mask_flux = objects["flux"] > 0
             
@@ -281,8 +360,9 @@ async def solve(fits_path: str) -> dict[str, Any]:
             
             # Log filter thresholds for reference
             logger.info(
-                "Filter thresholds: FWHM=[%.1f-%.1f]\", elong<%.1f, SNR>%.1f  file=%s",
-                config.STAR_FWHM_MIN_ARCSEC, config.STAR_FWHM_MAX_ARCSEC,
+                "Filter thresholds: FWHM=[%.1f-%.1f]\"%s, elong<%.1f, SNR>%.1f  file=%s",
+                config.STAR_FWHM_MIN_ARCSEC, fwhm_max_arcsec,
+                " (PSF-based)" if psf_fwhm_arcsec is not None else "",
                 config.STAR_ELONGATION_MAX, config.STAR_SNR_MIN, fits_filename,
             )
 
@@ -310,6 +390,8 @@ async def solve(fits_path: str) -> dict[str, Any]:
             "ra_center":  ra_center,
             "dec_center": dec_center,
             "fov_deg":    fov_deg,
+            "naxis1":     naxis1,
+            "naxis2":     naxis2,
             "sources":    sources,
             "wcs":        wcs,
         }
