@@ -401,12 +401,22 @@ When normalization is enabled, the API receives only normalized values (no dupli
 Cross-matches the source list against external catalogs using
 `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC`.
 
-Catalogs queried (via `astroquery`):
-- **Gaia DR3** — for all stellar sources, provides reference magnitudes
-- **Simbad / Vizier** — for named objects, variable stars, double stars, galaxies
-- **MPC (Minor Planet Center)** — for asteroids and comets at the frame's epoch
+Catalogs queried **in this order** (sequential exclusive matching — once matched, source skips remaining):
+1. **Simbad** — named objects first: variable stars, binaries, galaxies, nebulae — provides rich `object_type`
+2. **Gaia DR3** — dense stellar catalog with G-band magnitudes; also performs WCS offset correction on all sources
+3. **2MASS** (VizieR catalog `II/246`) — fallback for red/cool stars (late M/K dwarfs, reddened) absent in Gaia; J-band magnitude
+4. **MPC / SkyBot** — solar system objects (asteroids, comets) at the observation epoch; wider cone (`MOVING_CONE_ARCSEC`)
+
+Rationale: Simbad first gives correct `object_type` for known named objects (instead of generic "STAR").
+Gaia handles the bulk of stars. 2MASS catches the remainder that are faint in the optical but bright in NIR.
+
+Rate limits (all free, no auth):
+- Simbad & 2MASS/VizieR: CDS infrastructure, ~5–6 req/sec recommended; 1-hr in-process cache is sufficient
+- Gaia DR3: ESA TAP+, no hard limit, queries take 1–5 s; 1-hr cache is sufficient
+- MPC/SkyBot: IMCCE, no hard limit; epoch-dependent
 
 Returns for each source: `{source_ra, source_dec, catalog_name, catalog_id, catalog_mag, object_type}`
+`catalog_mag` is G-band for Gaia, J-band for 2MASS, None for Simbad/MPC.
 Unmatched sources get `catalog_name = None`.
 
 ### `modules/anomaly_detector.py`
@@ -603,29 +613,40 @@ distance, angular velocity.
 
 ## External Catalogs & APIs
 
+Catalog matching order: **Simbad → Gaia DR3 → 2MASS → MPC**
+
+### Simbad
+- Source: CDS Strasbourg (Centre de Données astronomiques de Strasbourg)
+- Content: named astronomical objects — variable stars, double stars, galaxies, nebulae, quasars, etc.
+- Access: `astroquery.simbad.Simbad.query_region()`
+- Use: **first** — identifies object type (`V*`, `EB*`, `G`, `QSO`, etc.) for named objects
+- Rate limit: ~5–6 req/sec (shared CDS infrastructure); 1-hr cache is sufficient
+
 ### Gaia DR3
 - Source: ESA Gaia mission, Data Release 3
-- Content: ~1.8 billion stars with precise positions, proper motions, magnitudes
-- Access: `astroquery.gaia.Gaia.query_object_async()`
-- Use: primary stellar reference for source matching and differential photometry
+- Content: ~1.8 billion stars with precise positions, proper motions, G-band magnitudes
+- Access: `astroquery.gaia.Gaia.cone_search()`
+- Use: **second** — primary stellar reference for matching and differential photometry; also performs WCS offset correction
+- Rate limit: no hard limit; queries take 1–5 s; 1-hr cache is sufficient
 
-### Simbad / Vizier
-- Source: CDS Strasbourg
-- Content: named astronomical objects (variable stars, double stars, galaxies, nebulae, etc.)
-- Access: `astroquery.simbad.Simbad.query_region()`
-- Use: identifying object types, finding known variable/binary stars
+### 2MASS (Two Micron All Sky Survey)
+- Source: IPAC / NASA; catalog hosted on VizieR (CDS)
+- Content: ~470 million point sources to K≈14.3 / J≈15.8
+- Access: `astroquery.vizier.Vizier.query_region(catalog="II/246")`
+- Use: **third** — fallback for red/cool stars (late M/K dwarfs, reddened sources) faint or absent in Gaia; stores J-band magnitude
+- Rate limit: same CDS infrastructure as Simbad; 1-hr cache is sufficient
 
 ### MPC (Minor Planet Center)
-- Source: IAU Minor Planet Center
+- Source: IAU Minor Planet Center / IMCCE SkyBot
 - Content: all known asteroids and comets with orbital elements
-- Access: `astroquery.mpc.MPC.query_objects()` and ephemeris queries
-- Use: identifying moving objects in frames
+- Access: `astroquery.imcce.Skybot.cone_search()` at observation epoch
+- Use: **fourth** — identifying moving solar system objects; wider cone (`MOVING_CONE_ARCSEC`)
 
 ### JPL Horizons
 - Source: NASA Jet Propulsion Laboratory
 - Content: high-precision ephemerides for solar system bodies
 - Access: `astroquery.jplhorizons.Horizons`
-- Use: computing predicted position of a known asteroid/comet at observation time
+- Use: computing predicted position of a known asteroid/comet at observation time (called from `ephemeris.py`)
 
 ---
 
@@ -912,26 +933,14 @@ normal faint stars missing from the catalog.
 
 ---
 
-### 2. Simbad enrichment for Gaia-matched stars
+### 2. Catalog depth summary
 
-**Problem:** Simbad currently only matches sources NOT found in Gaia. This means variable stars,
-binary stars, pulsars etc. matched by Gaia get `object_type="STAR"` instead of their specific
-Simbad type (`V*`, `EB*`, `RR*`, `Cep`, etc.).
-
-**Solution:** After Gaia matching, query Simbad for ALL Gaia-matched sources and update
-`object_type` if Simbad returns a more specific classification.
-
-**Location:** `modules/catalog_matcher.py` line ~269
-
----
-
-### 3. Catalog depth summary
-
-| Catalog | Depth (mag) | Coverage | Used for |
-|---------|-------------|----------|----------|
-| Gaia DR3 | ~21 (complete to ~20) | All-sky | Primary stellar matching, photometry calibration |
-| Simbad | Variable | All-sky | Object type classification |
-| Pan-STARRS DR2 | ~23.3 | δ > −30° | NOT YET USED — could help with faint sources |
-| SDSS DR17 | ~22 | ~35% sky | NOT YET USED — could help with faint sources |
-| MPC/SkyBot | — | All-sky | Asteroids and comets |
+| Catalog | Depth (mag) | Coverage | Used for | Order |
+|---------|-------------|----------|----------|-------|
+| Simbad | Variable | All-sky | Named objects (V*, G, EB*, etc.) — rich object types | 1st |
+| Gaia DR3 | ~21 (complete to ~20) | All-sky | Primary stellar matching, photometry calibration (G-band) | 2nd |
+| 2MASS | K≈14.3, J≈15.8 | All-sky | Fallback for red/cool stars absent in Gaia (J-band mag) | 3rd |
+| MPC/SkyBot | — | All-sky | Asteroids and comets at observation epoch | 4th |
+| Pan-STARRS DR2 | ~23.3 | δ > −30° | NOT YET USED — could help with faint sources (issue #1) | — |
+| SDSS DR17 | ~22 | ~35% sky | NOT YET USED — could help with faint sources (issue #1) | — |
 
