@@ -422,7 +422,7 @@ class TestOutputStructure:
     EXPECTED_INSTRUMENT_KEYS = {"telescope", "camera", "focal_length_mm", "aperture_mm"}
     EXPECTED_SENSOR_KEYS = {
         "temp_celsius", "temp_setpoint_celsius", "binning_x", "binning_y",
-        "gain", "offset", "width_px", "height_px",
+        "gain", "offset", "width_px", "height_px", "pixel_size_um",
     }
     EXPECTED_OBSERVER_KEYS = {"name", "site_name", "site_lat", "site_lon", "site_elev_m"}
     EXPECTED_SOFTWARE_KEYS = {"capture"}

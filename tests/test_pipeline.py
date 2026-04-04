@@ -132,7 +132,20 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
     anom_mock.detect = AsyncMock(return_value=[])
     monkeypatch.setattr("pipeline.anomaly_detector", anom_mock)
 
+    # Enable normalization in config
+    monkeypatch.setattr(config, "NORMALIZE_ENABLED", True)
+
+    # normalizer — mock to return predictable normalized filename
+    norm_mock = MagicMock()
+    norm_mock.normalize_headers = lambda h: h  # Pass through
+    norm_mock.generate_normalized_filename = lambda **kwargs: "M51_L_V_120_2024-03-15T22-01-34.fits"
+    monkeypatch.setattr("pipeline.normalizer", norm_mock)
+
     return fits_file
+
+
+# Expected normalized filename from mock
+_NORMALIZED_FILENAME = "M51_L_V_120_2024-03-15T22-01-34.fits"
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +159,7 @@ async def test_qc_ok_all_steps_called(mock_modules, tmp_path):
     fits_path = str(mock_modules)
     await pipeline.run(fits_path)
 
-    pipeline.astrometry.solve.assert_called_once_with(fits_path)
+    pipeline.astrometry.solve.assert_called_once_with(fits_path, psf_fwhm_arcsec=3.2)
     pipeline.photometry.measure.assert_called_once()
     pipeline.api_client.post_frame.assert_called_once()
     pipeline.api_client.post_sources.assert_called_once()
@@ -154,11 +167,11 @@ async def test_qc_ok_all_steps_called(mock_modules, tmp_path):
     pipeline.anomaly_detector.detect.assert_called_once()
     pipeline.api_client.post_anomalies.assert_called_once()
 
-    # File must have been archived
+    # File must have been archived with normalized filename
     archive_path = os.path.join(
-        config.FITS_ARCHIVE, "M51", os.path.basename(fits_path)
+        config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME
     )
-    assert os.path.exists(archive_path)
+    assert os.path.exists(archive_path), f"Expected archived file at {archive_path}"
 
 
 @pytest.mark.asyncio
@@ -209,13 +222,13 @@ async def test_frame_id_propagated(mock_modules):
 
 @pytest.mark.asyncio
 async def test_archive_move_correct_path(mock_modules, tmp_path):
-    """The archived file must land at {FITS_ARCHIVE}/{object_name}/{filename}."""
+    """The archived file must land at {FITS_ARCHIVE}/{object_name}/{normalized_filename}."""
     fits_path = str(mock_modules)
-    filename = os.path.basename(fits_path)
 
     await pipeline.run(fits_path)
 
-    expected = os.path.join(config.FITS_ARCHIVE, "M51", filename)
+    # File is archived with normalized filename, not original
+    expected = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
     assert os.path.exists(expected), f"Expected archived file at {expected}"
 
 
@@ -265,11 +278,12 @@ async def test_optional_modules_absent(monkeypatch, fits_file, tmp_path):
     api_mock.post_anomalies = AsyncMock(return_value=None)
     monkeypatch.setattr("pipeline.api_client", api_mock)
 
-    # Disable all optional modules
+    # Disable all optional modules (including normalizer)
     monkeypatch.setattr("pipeline.astrometry", None)
     monkeypatch.setattr("pipeline.photometry", None)
     monkeypatch.setattr("pipeline.catalog_matcher", None)
     monkeypatch.setattr("pipeline.anomaly_detector", None)
+    monkeypatch.setattr("pipeline.normalizer", None)
 
     await pipeline.run(str(fits_file))
 
@@ -277,6 +291,7 @@ async def test_optional_modules_absent(monkeypatch, fits_file, tmp_path):
     api_mock.post_sources.assert_called_once()
     api_mock.post_anomalies.assert_called_once()
 
+    # When normalizer is None, file is archived with original name
     archive_path = os.path.join(
         config.FITS_ARCHIVE, "M51", fits_file.name
     )
@@ -355,9 +370,9 @@ async def test_post_anomalies_exception_continues(mock_modules):
     fits_path = str(mock_modules)
     await pipeline.run(fits_path)
 
-    # Archive move must still have happened
+    # Archive move must still have happened (with normalized filename)
     archive_path = os.path.join(
-        config.FITS_ARCHIVE, "M51", os.path.basename(fits_path)
+        config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME
     )
     assert os.path.exists(archive_path)
 

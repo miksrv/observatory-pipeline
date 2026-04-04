@@ -137,9 +137,18 @@ class _FakeHeader:
 
     def __getitem__(self, key: str) -> Any:
         return self._data[key]
+    
+    def __setitem__(self, key: str, value: Any) -> None:
+        self._data[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)
+
+    def copy(self) -> "_FakeHeader":
+        return _FakeHeader(self._data.copy())
 
 
 class _FakeHDU:
@@ -228,7 +237,12 @@ def _patch_astrometry(
             if subprocess_raises is subprocess.TimeoutExpired:
                 raise subprocess.TimeoutExpired(cmd="astap", timeout=60)
             raise subprocess_raises()
-        return MagicMock(returncode=subprocess_rc, stdout="", stderr="")
+        # Return success with "Solution found" in output (required by astrometry.py)
+        return MagicMock(
+            returncode=subprocess_rc, 
+            stdout="Solution found: RA=12h34m, Dec=+45d" if subprocess_rc == 0 else "",
+            stderr=""
+        )
 
     def _sep_background(data):
         if sep_background_raises:
