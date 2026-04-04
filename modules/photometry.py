@@ -230,9 +230,31 @@ async def measure(fits_path: str, sources: list[dict]) -> list[dict]:
 
     data: np.ndarray = np.ascontiguousarray(raw_data.astype(np.float64))
 
+    # Try to get WCS from FITS header first, then fallback to .wcs file
+    wcs = None
     try:
         wcs = WCS(hdr)
         if not wcs.has_celestial:
+            # Try to read from .wcs file that astap creates
+            wcs_file_path = os.path.splitext(fits_path)[0] + ".wcs"
+            if os.path.exists(wcs_file_path):
+                logger.info(
+                    "photometry: FITS has no celestial WCS, trying .wcs file: %s",
+                    wcs_file_path,
+                )
+                try:
+                    with fits.open(wcs_file_path) as wcs_hdul:
+                        wcs_hdr = wcs_hdul[0].header
+                        wcs = WCS(wcs_hdr)
+                except Exception as wcs_exc:
+                    logger.warning(
+                        "photometry: failed to read .wcs file %s: %s",
+                        wcs_file_path,
+                        wcs_exc,
+                    )
+                    wcs = None
+            
+        if wcs is None or not wcs.has_celestial:
             raise ValueError("WCS has no celestial axes")
     except Exception as exc:
         logger.error(
