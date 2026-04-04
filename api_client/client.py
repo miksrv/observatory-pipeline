@@ -2,11 +2,13 @@
 api_client/client.py — HTTP client for the observatory REST API.
 
 Public functions:
-  post_frame(frame_data)                               → str (frame_id)
-  post_sources(frame_id, filename, sources)            → None
-  post_anomalies(frame_id, filename, anomalies)        → None
-  get_sources_near(ra, dec, radius_arcsec, before_time) → list
-  get_frames_covering(ra, dec, before_time)            → list
+  post_frame(frame_data)                                    → str (frame_id)
+  post_sources(frame_id, filename, sources)                 → None
+  post_anomalies(frame_id, filename, anomalies)             → None
+  get_sources_near(ra, dec, radius_arcsec, before_time)     → list
+  get_frames_covering(ra, dec, before_time)                 → list
+  get_sources_near_batch(positions, radius_arcsec, before_time)  → dict
+  get_frames_covering_batch(positions, before_time)         → dict
 """
 
 from __future__ import annotations
@@ -413,3 +415,151 @@ async def get_frames_covering(
             extra={"frame_id": None, "log_filename": None},
         )
         return []
+
+
+# ---------------------------------------------------------------------------
+# ML-7-5: get_sources_near_batch (BATCH)
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _get_sources_near_batch_with_retry(
+    positions: list[dict],
+    radius_arcsec: float,
+    before_time: str,
+) -> dict:
+    """Inner retryable core for get_sources_near_batch."""
+    payload = {
+        "positions": positions,
+        "radius_arcsec": radius_arcsec,
+        "before_time": before_time,
+    }
+
+    async with _make_client() as client:
+        response = await client.post("/sources/near/batch", json=payload)
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    # Expected format: {"results": {"0": [...], "1": [...], ...}}
+    # where keys are string indices matching input positions array
+    data = resp_json.get("results", resp_json) if isinstance(resp_json, dict) else {}
+    return data if isinstance(data, dict) else {}
+
+
+async def get_sources_near_batch(
+    positions: list[dict],
+    radius_arcsec: float,
+    before_time: str,
+) -> dict:
+    """
+    Retrieve historical sources near multiple sky positions from the API
+    in a single batch request.
+
+    Parameters
+    ----------
+    positions:
+        List of position dicts, each with "ra" and "dec" keys in decimal degrees.
+        Example: [{"ra": 123.45, "dec": 67.89}, {"ra": 124.00, "dec": 68.00}]
+    radius_arcsec:
+        Cone radius in arcseconds (same for all positions).
+    before_time:
+        ISO 8601 timestamp — only return sources from frames before this time.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping position index (as string) to list of source dicts.
+        Example: {"0": [source1, source2], "1": [], "2": [source3]}
+        Returns {} on any failure.
+    """
+    if not positions:
+        return {}
+
+    logger.debug(
+        "POST /sources/near/batch positions=%d radius=%.1f",
+        len(positions),
+        radius_arcsec,
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _get_sources_near_batch_with_retry(positions, radius_arcsec, before_time)
+    except Exception as exc:
+        logger.error(
+            "Error querying /sources/near/batch: %s",
+            exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# ML-7-6: get_frames_covering_batch (BATCH)
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _get_frames_covering_batch_with_retry(
+    positions: list[dict],
+    before_time: str,
+) -> dict:
+    """Inner retryable core for get_frames_covering_batch."""
+    payload = {
+        "positions": positions,
+        "before_time": before_time,
+    }
+
+    async with _make_client() as client:
+        response = await client.post("/frames/covering/batch", json=payload)
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    # Expected format: {"results": {"0": [...], "1": [...], ...}}
+    data = resp_json.get("results", resp_json) if isinstance(resp_json, dict) else {}
+    return data if isinstance(data, dict) else {}
+
+
+async def get_frames_covering_batch(
+    positions: list[dict],
+    before_time: str,
+) -> dict:
+    """
+    Retrieve frames covering multiple sky positions from the API
+    in a single batch request.
+
+    Parameters
+    ----------
+    positions:
+        List of position dicts, each with "ra" and "dec" keys in decimal degrees.
+        Example: [{"ra": 123.45, "dec": 67.89}, {"ra": 124.00, "dec": 68.00}]
+    before_time:
+        ISO 8601 timestamp — only return frames observed before this time.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping position index (as string) to list of frame dicts.
+        Example: {"0": [frame1, frame2], "1": [], "2": [frame3]}
+        Returns {} on any failure.
+    """
+    if not positions:
+        return {}
+
+    logger.debug(
+        "POST /frames/covering/batch positions=%d",
+        len(positions),
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _get_frames_covering_batch_with_retry(positions, before_time)
+    except Exception as exc:
+        logger.error(
+            "Error querying /frames/covering/batch: %s",
+            exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+        return {}
+

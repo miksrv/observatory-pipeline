@@ -45,6 +45,11 @@ except ImportError:
     anomaly_detector = None  # type: ignore[assignment]
 
 try:
+    from modules import normalizer
+except ImportError:
+    normalizer = None  # type: ignore[assignment]
+
+try:
     from api_client import client as api_client
 except ImportError:
     api_client = None  # type: ignore[assignment]
@@ -85,15 +90,36 @@ async def run(fits_path: str) -> None:
     extra = {"fits_filename": basename}
 
     # ------------------------------------------------------------------
-    # Step 1 — Header extraction
+    # Step 1 — Header extraction and normalization
     # ------------------------------------------------------------------
     header: dict = fits_header.extract_headers(fits_path)
+    
+    # Apply normalization if enabled in config
+    if config.NORMALIZE_ENABLED and normalizer is not None:
+        header = normalizer.normalize_headers(header)
+    
+    # Get object name for directory organization
     object_name: str = header.get("object_name", "_UNKNOWN") or "_UNKNOWN"
+    
+    # Generate filename (normalized if enabled)
+    original_filename = basename
+    if config.NORMALIZE_ENABLED and normalizer is not None:
+        observation = header.get("observation", {})
+        normalized_filename = normalizer.generate_normalized_filename(
+            object_name=object_name,
+            frame_type=observation.get("frame_type"),
+            filter_name=observation.get("filter"),
+            exptime=observation.get("exptime"),
+            obs_time=header.get("obs_time"),
+        )
+    else:
+        normalized_filename = basename
 
     logger.info(
-        "Starting pipeline for filename=%s object=%s",
-        basename,
+        "Starting pipeline for filename=%s object=%s%s",
+        original_filename,
         object_name,
+        f" → {normalized_filename}" if normalized_filename != original_filename else "",
         extra=extra,
     )
 
@@ -126,7 +152,10 @@ async def run(fits_path: str) -> None:
     astro_result: dict = {}
     if astrometry is not None:
         try:
-            astro_result = await astrometry.solve(fits_path)
+            astro_result = await astrometry.solve(
+                fits_path,
+                psf_fwhm_arcsec=qc_result.get("fwhm_median"),
+            )
             logger.debug(
                 "Astrometry complete: ra=%.4f dec=%.4f sources=%d",
                 astro_result.get("ra_center") or 0.0,
@@ -157,6 +186,8 @@ async def run(fits_path: str) -> None:
                 "ra_center": astro_result.get("ra_center") or header.get("ra"),
                 "dec_center": astro_result.get("dec_center") or header.get("dec"),
                 "fov_deg": astro_result.get("fov_deg") or 1.0,
+                "naxis1": astro_result.get("naxis1"),
+                "naxis2": astro_result.get("naxis2"),
                 "obs_time": header.get("obs_time"),
             }
             sources = await catalog_matcher.match(sources, frame_meta)
@@ -211,7 +242,10 @@ async def run(fits_path: str) -> None:
         )
         return
 
-    frame_data: dict = _build_frame_payload(fits_path, header, qc_result, astro_result)
+    frame_data: dict = _build_frame_payload(
+        fits_path, header, qc_result, astro_result,
+        filename=normalized_filename,
+    )
 
 
     try:
@@ -219,7 +253,7 @@ async def run(fits_path: str) -> None:
         logger.info(
             "Frame registered: frame_id=%s filename=%s",
             frame_id,
-            basename,
+            normalized_filename,
             extra=extra,
         )
     except Exception as exc:
@@ -307,17 +341,31 @@ async def run(fits_path: str) -> None:
     # Step 10 — Archive move and cleanup
     # ------------------------------------------------------------------
     try:
+        # Use object name for directory structure (normalized if normalization enabled)
         dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
         os.makedirs(dest_dir, exist_ok=True)
-        dest_path = os.path.join(dest_dir, basename)
+        
+        # Rename file to normalized filename (if normalization enabled)
+        dest_path = os.path.join(dest_dir, normalized_filename)
         shutil.move(fits_path, dest_path)
-        logger.info(
-            "Pipeline complete: filename=%s archived_to=%s frame_id=%s",
-            basename,
-            dest_path,
-            frame_id,
-            extra=extra,
-        )
+        
+        if normalized_filename != original_filename:
+            logger.info(
+                "Pipeline complete: %s → %s archived_to=%s frame_id=%s",
+                original_filename,
+                normalized_filename,
+                dest_path,
+                frame_id,
+                extra=extra,
+            )
+        else:
+            logger.info(
+                "Pipeline complete: filename=%s archived_to=%s frame_id=%s",
+                normalized_filename,
+                dest_path,
+                frame_id,
+                extra=extra,
+            )
 
         # Clean up astap temporary files (.ini, .wcs) left in incoming directory
         _cleanup_astap_files(fits_path)
@@ -361,20 +409,29 @@ def _build_frame_payload(
     header: dict,
     qc_result: dict,
     astro_result: dict,
+    *,
+    filename: str,
 ) -> dict:
     """
     Assemble the POST /frames request body from module outputs.
 
     The structure matches the POST /frames API payload defined in CLAUDE.md,
     with nested sub-dicts for observation, instrument, sensor, observer, software, and qc.
+    
+    If normalization is enabled, all values in header are already normalized.
     """
+    # Get fov_deg from astrometry, or calculate from FITS headers as fallback
+    fov_deg = astro_result.get("fov_deg")
+    if fov_deg is None:
+        fov_deg = _calculate_fov_from_headers(header)
+
     return {
-        "filename": os.path.basename(fits_path),
+        "filename": filename,
         "original_filepath": fits_path,
         "obs_time": header.get("obs_time"),
         "ra_center": astro_result.get("ra_center") or header.get("ra"),
         "dec_center": astro_result.get("dec_center") or header.get("dec"),
-        "fov_deg": astro_result.get("fov_deg"),
+        "fov_deg": fov_deg,
         "quality_flag": qc_result.get("quality_flag"),
         "observation": header.get("observation", {}),
         "instrument": header.get("instrument", {}),
@@ -389,3 +446,70 @@ def _build_frame_payload(
             "star_count":     qc_result.get("star_count"),
         },
     }
+
+
+def _calculate_fov_from_headers(header: dict) -> float | None:
+    """
+    Calculate field of view (in degrees) from FITS header information.
+
+    Uses pixel size from headers if available (XPIXSZ keyword), otherwise
+    falls back to a reasonable default for modern CMOS cameras (3.76µm).
+
+    Returns the FOV of the longer axis in degrees, or None if calculation fails.
+    """
+    sensor = header.get("sensor", {})
+    instrument = header.get("instrument", {})
+
+    width_px = sensor.get("width_px")
+    height_px = sensor.get("height_px")
+
+    if width_px is None or height_px is None:
+        logger.debug("Cannot calculate FOV: missing image dimensions")
+        return None
+
+    focal_length_mm = instrument.get("focal_length_mm")
+
+    if focal_length_mm is None or focal_length_mm <= 0:
+        logger.debug("Cannot calculate FOV: missing or invalid focal_length_mm")
+        return None
+
+    # Get pixel size from header, or use default
+    pixel_size_um = sensor.get("pixel_size_um")
+    if pixel_size_um is None or pixel_size_um <= 0:
+        # Use a reasonable default for modern CMOS cameras
+        # Common values: 3.76µm (ASI294/IMX294), 2.9µm (ASI533)
+        pixel_size_um = 3.76
+        logger.debug("Using default pixel size: %.2f µm", pixel_size_um)
+
+    # Account for binning if present
+    binning_x = sensor.get("binning_x") or 1
+    binning_y = sensor.get("binning_y") or 1
+    effective_pixel_size_um = pixel_size_um * max(binning_x, binning_y)
+
+    # Calculate plate scale in arcsec/pixel
+    # plate_scale = 206.265 * pixel_size_mm / focal_length_mm
+    # 206.265 is the conversion factor from radians to arcseconds
+    pixel_size_mm = effective_pixel_size_um / 1000.0
+    plate_scale_arcsec = 206.265 * pixel_size_mm / focal_length_mm
+
+    # Calculate FOV for both axes
+    fov_x_arcsec = width_px * plate_scale_arcsec
+    fov_y_arcsec = height_px * plate_scale_arcsec
+
+    # Return the larger FOV (longest axis) in degrees
+    fov_max_arcsec = max(fov_x_arcsec, fov_y_arcsec)
+    fov_deg = fov_max_arcsec / 3600.0
+
+    logger.debug(
+        "Calculated FOV from headers: %.3f deg (plate_scale=%.2f arcsec/px, "
+        "pixel=%.2fµm, binning=%dx%d, focal=%dmm)",
+        fov_deg,
+        plate_scale_arcsec,
+        pixel_size_um,
+        binning_x,
+        binning_y,
+        focal_length_mm,
+    )
+
+    return fov_deg
+

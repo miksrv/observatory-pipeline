@@ -79,3 +79,11 @@ DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
 SITE_LAT: float = float(_get("SITE_LAT", "0.0"))   # degrees, positive = North
 SITE_LON: float = float(_get("SITE_LON", "0.0"))   # degrees, positive = East
 SITE_ELEV: int  = int(_get("SITE_ELEV", "0"))      # metres above sea level
+
+# ---------------------------------------------------------------------------
+# Normalization settings
+# ---------------------------------------------------------------------------
+# When enabled, normalizes object names (M 51 → M51), filter names (Blue → B),
+# frame types (Light Frame → Light), and renames files to standard format.
+NORMALIZE_ENABLED: bool = _get("NORMALIZE_ENABLED", "true").lower() in ("true", "1", "yes")
+

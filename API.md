@@ -91,6 +91,18 @@ The pipeline retries on HTTP 5xx and transport errors (3 attempts, exponential b
 
 ---
 
+### 6. Get Historical Sources Near Multiple Positions (Batch)
+
+**[POST /sources/near/batch](#6-get-historical-sources-near-multiple-positions-batch)**
+
+---
+
+### 7. Get Frames Covering Multiple Positions (Batch)
+
+**[POST /frames/covering/batch](#7-get-frames-covering-multiple-positions-batch)**
+
+---
+
 ---
 
 ## 1. Register a Frame
@@ -651,3 +663,184 @@ Returns `{"data": []}` (empty array) when no prior coverage exists — this is h
 |--------|------|
 | `400` | Missing or non-numeric `ra` or `dec` |
 | `401` | Invalid or missing `X-API-Key` |
+
+---
+
+## 6. Get Historical Sources Near Multiple Positions (Batch)
+
+Returns historical sources near multiple sky positions in a single batch request.
+This endpoint reduces API calls from O(N) to O(1) when processing frames with many sources.
+
+### Request
+
+```
+POST /sources/near/batch
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Content-Type: application/json
+Accept: application/json
+```
+
+**Body:**
+
+```json
+{
+  "positions": [
+    {"ra": 202.461, "dec": 47.182},
+    {"ra": 202.478, "dec": 47.201},
+    {"ra": 202.490, "dec": 47.195}
+  ],
+  "radius_arcsec": 430.0,
+  "before_time": "2024-03-15T22:01:34Z"
+}
+```
+
+**Field descriptions:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `positions` | array | yes | List of position objects, each with `ra` and `dec` in decimal degrees |
+| `positions[].ra` | float | yes | Right ascension in decimal degrees |
+| `positions[].dec` | float | yes | Declination in decimal degrees |
+| `radius_arcsec` | float | yes | Cone search radius in arcseconds (same for all positions) |
+| `before_time` | string (ISO 8601) | yes | Only return sources from frames observed strictly before this timestamp |
+
+### Response
+
+**Status: `200 OK`**
+
+```json
+{
+  "results": {
+    "0": [
+      {
+        "ra": 202.4612,
+        "dec": 47.1819,
+        "mag": 14.21,
+        "flux": 44850.0,
+        "frame_id": "38",
+        "obs_time": "2024-03-14T21:55:12Z"
+      }
+    ],
+    "1": [],
+    "2": [
+      {
+        "ra": 202.4901,
+        "dec": 47.1948,
+        "mag": 16.50,
+        "flux": 12000.0,
+        "frame_id": "35",
+        "obs_time": "2024-03-13T20:30:00Z"
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `results` | object | Dictionary mapping position index (as string "0", "1", ...) to list of source dicts |
+| `results["N"]` | array | List of historical sources near position N. Empty array if none found |
+
+Each source in the results has the same fields as the single-position endpoint (see section 4).
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `400` | Missing required fields or invalid position format |
+| `401` | Invalid or missing `X-API-Key` |
+
+---
+
+## 7. Get Frames Covering Multiple Positions (Batch)
+
+Returns frames covering multiple sky positions in a single batch request.
+This endpoint reduces API calls from O(N) to O(1) when processing frames with many sources.
+
+### Request
+
+```
+POST /frames/covering/batch
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Content-Type: application/json
+Accept: application/json
+```
+
+**Body:**
+
+```json
+{
+  "positions": [
+    {"ra": 202.461, "dec": 47.182},
+    {"ra": 202.478, "dec": 47.201},
+    {"ra": 202.490, "dec": 47.195}
+  ],
+  "before_time": "2024-03-15T22:01:34Z"
+}
+```
+
+**Field descriptions:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `positions` | array | yes | List of position objects, each with `ra` and `dec` in decimal degrees |
+| `positions[].ra` | float | yes | Right ascension in decimal degrees |
+| `positions[].dec` | float | yes | Declination in decimal degrees |
+| `before_time` | string (ISO 8601) | yes | Only return frames observed strictly before this timestamp |
+
+### Response
+
+**Status: `200 OK`**
+
+```json
+{
+  "results": {
+    "0": [
+      {
+        "id": "38",
+        "filename": "frame_20240314_215512.fits",
+        "obs_time": "2024-03-14T21:55:12Z",
+        "ra_center": 202.470,
+        "dec_center": 47.195,
+        "fov_deg": 1.25
+      }
+    ],
+    "1": [
+      {
+        "id": "38",
+        "filename": "frame_20240314_215512.fits",
+        "obs_time": "2024-03-14T21:55:12Z",
+        "ra_center": 202.470,
+        "dec_center": 47.195,
+        "fov_deg": 1.25
+      }
+    ],
+    "2": []
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `results` | object | Dictionary mapping position index (as string "0", "1", ...) to list of frame dicts |
+| `results["N"]` | array | List of frames covering position N. Empty array if none found |
+
+Each frame in the results has the same fields as the single-position endpoint (see section 5).
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `400` | Missing required fields or invalid position format |
+| `401` | Invalid or missing `X-API-Key` |
+

@@ -173,11 +173,17 @@ MATCH_CONE_ARCSEC=5.0
 MOVING_CONE_ARCSEC=30.0
 # Magnitude delta to trigger variability alert
 DELTA_MAG_ALERT=0.5
+
+# Normalization (enabled by default)
+# When true, normalizes object names (M 51 → M51), filter names (Blue → B),
+# frame types (Light Frame → Light), and renames files to standard format.
+NORMALIZE_ENABLED=true
 ```
 
 ---
 
 ## Project Structure
+
 
 ```
 observatory-pipeline/
@@ -194,6 +200,7 @@ observatory-pipeline/
 │   ├── __init__.py
 │   ├── qc.py                  ← quality control, bad frame detection & moving to rejected
 │   ├── fits_header.py         ← extract all relevant FITS headers into structured dict
+│   ├── normalizer.py          ← normalize object names, filter names, filenames
 │   ├── astrometry.py          ← plate solving (astap) + source extraction (sep)
 │   ├── photometry.py          ← aperture photometry (photutils)
 │   ├── catalog_matcher.py     ← cross-match: Gaia DR3, Simbad/Vizier, MPC
@@ -207,6 +214,7 @@ observatory-pipeline/
 └── tests/
     ├── test_qc.py
     ├── test_fits_header.py
+    ├── test_normalizer.py
     ├── test_astrometry.py
     └── test_anomaly_detector.py
 ```
@@ -285,16 +293,25 @@ No hardcoded paths, thresholds, or credentials anywhere else.
 ### `pipeline.py`
 Orchestrates processing of a single FITS file in order:
 1. `fits_header.extract_headers(fits_path)` → returns all FITS metadata
-2. `qc.analyze(fits_path)` → returns metrics + quality flag
-3. If `quality_flag != OK` → move file to `/fits/rejected/{object_name}/` → **STOP** (no API call)
-4. `astrometry.solve(fits_path)` → returns WCS + source list `[(ra, dec, flux, fwhm, elongation), ...]`
-5. `photometry.measure(fits_path, sources)` → returns calibrated magnitudes
-6. `api_client.post_frame(frame_data)` → registers the frame, gets back `frame_id`
-7. `api_client.post_sources(frame_id, filename, sources)` → saves all detected sources
-8. `catalog_matcher.match(sources, frame_meta)` → identifies known objects
-9. `anomaly_detector.detect(frame_id, sources, catalog_matches)` → finds anomalies
-10. `api_client.post_anomalies(frame_id, filename, anomalies)` → saves anomalies
-11. Move file to `/fits/archive/{object_name}/` directory
+2. `normalizer.normalize_headers()` → normalize object name, filter, frame type (if enabled)
+3. **Check frame type** (`IMAGETYP` header):
+   - If `Dark`, `Flat`, or `Bias` → rename file (if normalization enabled) → move to `/fits/archive/{object}/` → **STOP** (no analysis needed)
+   - If `Light` → continue processing
+4. `qc.analyze(fits_path)` → returns metrics + quality flag
+5. If `quality_flag != OK` → move file to `/fits/rejected/{object_name}/` → **STOP** (no API call)
+6. `astrometry.solve(fits_path)` → returns WCS + source list `[(ra, dec, flux, fwhm, elongation), ...]`
+7. `photometry.measure(fits_path, sources)` → returns calibrated magnitudes
+8. `api_client.post_frame(frame_data)` → registers the frame, gets back `frame_id`
+9. `api_client.post_sources(frame_id, filename, sources)` → saves all detected sources
+10. `catalog_matcher.match(sources, frame_meta)` → identifies known objects
+11. `anomaly_detector.detect(frame_id, sources, catalog_matches)` → finds anomalies
+12. `api_client.post_anomalies(frame_id, filename, anomalies)` → saves anomalies
+13. Move file to `/fits/archive/{object_name}/` directory
+
+**Calibration frames (Dark, Flat, Bias):** These frames are used for image calibration but
+contain no astronomical data to analyze. The pipeline simply normalizes the filename
+(if `NORMALIZE_ENABLED=true`) and moves them to the archive. No QC, astrometry, photometry,
+or API calls are performed.
 
 ### `modules/qc.py`
 Computes quality metrics from a FITS file without plate solving:
@@ -323,6 +340,50 @@ database clean from unusable data.
 - Normalizes keyword aliases (e.g., `CCD-TEMP` vs `CCDTEMP`)
 - Returns structured dict ready for API payload
 - Extracts `OBJECT` field for directory organization
+
+### `modules/normalizer.py`
+Normalizes FITS header values and filenames for consistency across different capture software:
+
+**Object Name Normalization:**
+| Input | Normalized |
+|---|---|
+| `M 51`, `M_51`, `m51` | `M51` |
+| `NGC 1234`, `NGC_1234`, `ngc1234` | `NGC1234` |
+| `IC 5070`, `IC_5070` | `IC5070` |
+| `Andromeda Galaxy` | `Andromeda_Galaxy` |
+
+**Filter Name Normalization:**
+| Input | Normalized |
+|---|---|
+| `Luminance`, `Lum`, `L`, `Clear` | `L` |
+| `Red`, `RED`, `r` | `R` |
+| `Blue`, `BLUE`, `b` | `B` |
+| `H-Alpha`, `Halpha`, `Ha` | `Ha` |
+| `OIII`, `O3`, `[OIII]` | `OIII` |
+| `SII`, `S2`, `[SII]` | `SII` |
+
+**Frame Type Normalization:**
+| Input | Normalized |
+|---|---|
+| `Light Frame`, `light`, `LIGHT`, `Object` | `Light` |
+| `Dark Frame`, `dark` | `Dark` |
+| `Flat Field`, `flat`, `skyflat` | `Flat` |
+| `Bias`, `zero`, `offset` | `Bias` |
+
+**Filename Generation:**
+Files are renamed to a standardized format (enabled by `NORMALIZE_ENABLED=true`):
+```
+{Object}_{FrameType}_{Filter}_{Exptime}_{DateTime}.fits
+```
+Frame type uses short codes: L=Light, D=Dark, F=Flat, B=Bias
+
+Examples:
+- `M45_L_B_60_2020-10-15T01-24-51.fits` (M45, Light, Blue filter, 60s)
+- `M51_L_Ha_300_2024-03-15T22-01-34.fits` (M51, Light, Ha filter, 300s)
+- `NGC1234_L_L_120_2024-03-15T22-01-34.fits` (NGC1234, Light, Luminance, 120s)
+- `M42_D_300_2024-03-15T22-01-34.fits` (Dark frame, no filter)
+
+When normalization is enabled, the API receives only normalized values (no duplicates).
 
 ### `modules/astrometry.py`
 - Calls `astap` binary as subprocess for plate solving
@@ -452,10 +513,19 @@ New file detected by watchdog
         │
         ▼
 fits_header.extract_headers()
-  extract OBJECT, OBSERVER, CCD-TEMP, etc.
+  extract OBJECT, OBSERVER, CCD-TEMP, IMAGETYP, etc.
         │
         ▼
-qc.analyze()
+normalizer.normalize_headers()
+  normalize object name, filter, frame type
+  generate normalized filename
+        │
+        ▼
+Check frame_type (IMAGETYP header)
+  ├─ Dark/Flat/Bias → rename + move to /fits/archive/{object}/ → STOP (no analysis)
+  └─ Light ─────────────────────────────────────────────────────────┐
+                                                                     ▼
+                                                            qc.analyze()
   ├─ BAD/BLUR/TRAIL/LOW_STARS → move to /fits/rejected/{object}/ → STOP (no API call)
   └─ OK ──────────────────────────────────────────────────────────────┐
                                                                        ▼
@@ -490,7 +560,8 @@ qc.analyze()
                                                      (includes filename for correlation)
                                                                        │
                                                                        ▼
-                                                  move file to /fits/archive/{object}/
+                                        rename to normalized filename
+                                        move to /fits/archive/{object_normalized}/
 ```
 
 ---
@@ -563,8 +634,8 @@ distance, angular velocity.
 ### POST /frames
 ```json
 {
-  "filename": "frame_20240315_220134.fits",
-  "original_filepath": "/fits/archive/M51/frame_20240315_220134.fits",
+  "filename": "M51_L_V_120_2024-03-15T22-01-34.fits",
+  "original_filepath": "/fits/archive/M51/M51_L_V_120_2024-03-15T22-01-34.fits",
   "obs_time": "2024-03-15T22:01:34Z",
   "ra_center": 123.456,
   "dec_center": 45.678,
@@ -620,6 +691,12 @@ distance, angular velocity.
 }
 ```
 
+**Note:** When `NORMALIZE_ENABLED=true` (default), all values are normalized before sending:
+- `filename` — normalized filename (e.g., `M51_L_Ha_300_2024-03-15T22-01-34.fits`)
+- `observation.object` — normalized object name (e.g., "M51")
+- `observation.filter` — normalized filter name (e.g., "Ha")
+- `observation.frame_type` — normalized frame type (e.g., "Light")
+
 ### POST /frames/{id}/sources
 
 The `{id}` in URL is the `frame_id` returned from POST /frames. Additionally, `filename`
@@ -627,7 +704,7 @@ is included in the request body for logging and correlation purposes.
 
 ```json
 {
-  "filename": "frame_20240315_220134.fits",
+  "filename": "M51_L_V_120_2024-03-15T22-01-34.fits",
   "sources": [
     {
       "ra": 123.461,
@@ -650,7 +727,7 @@ is included in the request body for logging and correlation purposes.
 
 ```json
 {
-  "filename": "frame_20240315_220134.fits",
+  "filename": "M51_L_V_120_2024-03-15T22-01-34.fits",
   "anomalies": [
     {
       "anomaly_type": "ASTEROID",
@@ -815,3 +892,46 @@ SITEELEV    = 150                     / Site elevation (meters)
 # Software
 SWCREATE    = 'N.I.N.A. 2.1'          / Capture software
 ```
+
+---
+
+## Known Issues & Future Improvements
+
+### 1. Faint UNKNOWN sources (mag > 20)
+
+**Problem:** Sources fainter than ~20 mag are often marked as `UNKNOWN` anomalies because they
+fall below the completeness limit of Gaia DR3 (~21 mag). These are NOT new discoveries — just
+normal faint stars missing from the catalog.
+
+**Possible solutions:**
+- Add magnitude threshold to skip UNKNOWN alert for sources with mag > 20
+- Query deeper catalogs (Pan-STARRS DR2 ~23.3 mag, SDSS DR17 ~22 mag) for faint sources
+- Add new classification `FAINT_UNCATALOGUED` distinct from true `UNKNOWN`
+
+**Location:** `modules/anomaly_detector.py` line ~481
+
+---
+
+### 2. Simbad enrichment for Gaia-matched stars
+
+**Problem:** Simbad currently only matches sources NOT found in Gaia. This means variable stars,
+binary stars, pulsars etc. matched by Gaia get `object_type="STAR"` instead of their specific
+Simbad type (`V*`, `EB*`, `RR*`, `Cep`, etc.).
+
+**Solution:** After Gaia matching, query Simbad for ALL Gaia-matched sources and update
+`object_type` if Simbad returns a more specific classification.
+
+**Location:** `modules/catalog_matcher.py` line ~269
+
+---
+
+### 3. Catalog depth summary
+
+| Catalog | Depth (mag) | Coverage | Used for |
+|---------|-------------|----------|----------|
+| Gaia DR3 | ~21 (complete to ~20) | All-sky | Primary stellar matching, photometry calibration |
+| Simbad | Variable | All-sky | Object type classification |
+| Pan-STARRS DR2 | ~23.3 | δ > −30° | NOT YET USED — could help with faint sources |
+| SDSS DR17 | ~22 | ~35% sky | NOT YET USED — could help with faint sources |
+| MPC/SkyBot | — | All-sky | Asteroids and comets |
+
