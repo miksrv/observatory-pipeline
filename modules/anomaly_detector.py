@@ -7,16 +7,15 @@ The single public entry point is:
 
 For each source in the frame the module:
 
-1. Checks whether the sky position was ever observed before (GET /frames/covering).
-2. Retrieves prior detections at the same position (GET /sources/near).
-3. Probes a wider cone for shifted historical detections that indicate a moving object.
-4. Classifies each source into one of the ten anomaly types defined in CLAUDE.md.
-5. Calls ephemeris.query() concurrently for all ASTEROID / COMET sources.
-6. Returns only actionable anomaly dicts (FIRST_OBSERVATION and KNOWN_CATALOG_NEW
+1. Collects all unique sky tiles from sources that need history queries.
+2. Makes TWO batch API requests: one for source history, one for frame coverage.
+3. Classifies each source using the pre-fetched data (no per-source API calls).
+4. Calls ephemeris.query() concurrently for all ASTEROID / COMET sources.
+5. Returns only actionable anomaly dicts (FIRST_OBSERVATION and KNOWN_CATALOG_NEW
    are never elevated to anomaly records; they are logged but not returned).
 
-API queries are cached per detect() call using a tile-based key to avoid redundant
-network round-trips for sources that share the same sky region.
+This batch approach reduces API calls from O(N) to O(1) where N is the number of sources,
+preventing server overload when processing frames with hundreds of detected sources.
 """
 
 from __future__ import annotations
@@ -133,52 +132,16 @@ def _is_galaxy(object_type: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Cache helpers
+# Tile helpers for batch queries
 # ---------------------------------------------------------------------------
 
-def _tile_key(ra: float, dec: float) -> tuple[float, float]:
+def _tile_key(ra: float, dec: float, tile_size: float = 0.1) -> tuple[float, float]:
     """
-    Round RA/Dec to 0.1-degree tiles for cache keying.
+    Round RA/Dec to tiles of given size (in degrees) for batch query optimization.
 
-    Two sources within ~6 arcminutes of each other map to the same tile and
-    reuse the same API query result.
+    Default tile_size=0.1 degrees (~6 arcmin) groups nearby sources together.
     """
-    return round(ra / 0.1) * 0.1, round(dec / 0.1) * 0.1
-
-
-async def _cached_get_sources_near(
-    ra: float,
-    dec: float,
-    radius_arcsec: float,
-    before_time: str,
-    cache: dict[str, Any],
-) -> list[dict]:
-    """
-    Return historical sources near (ra, dec) within radius_arcsec, using
-    a per-run in-memory cache keyed by tile + radius.
-    """
-    tile = _tile_key(ra, dec)
-    key = f"sources:{tile[0]:.2f}:{tile[1]:.2f}:{radius_arcsec:.1f}"
-    if key not in cache:
-        cache[key] = await api_client.get_sources_near(ra, dec, radius_arcsec, before_time)
-    return cache[key]  # type: ignore[return-value]
-
-
-async def _cached_get_frames_covering(
-    ra: float,
-    dec: float,
-    before_time: str,
-    cache: dict[str, Any],
-) -> list[dict]:
-    """
-    Return prior frames that covered (ra, dec), using a per-run cache keyed
-    by tile.
-    """
-    tile = _tile_key(ra, dec)
-    key = f"covering:{tile[0]:.2f}:{tile[1]:.2f}"
-    if key not in cache:
-        cache[key] = await api_client.get_frames_covering(ra, dec, before_time)
-    return cache[key]  # type: ignore[return-value]
+    return round(ra / tile_size) * tile_size, round(dec / tile_size) * tile_size
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +173,33 @@ def _history_median_mag(history: list[dict]) -> float | None:
     if not mags:
         return None
     return statistics.median(mags)
+
+
+def _find_sources_within_radius(
+    ra: float,
+    dec: float,
+    radius_arcsec: float,
+    all_sources: list[dict],
+) -> list[dict]:
+    """
+    Filter sources that fall within radius_arcsec from (ra, dec).
+
+    This is used to find sources near a specific position from the batch
+    query results which cover a larger tile area.
+    """
+    result = []
+    for src in all_sources:
+        src_ra = src.get("ra")
+        src_dec = src.get("dec")
+        if src_ra is None or src_dec is None:
+            continue
+        try:
+            sep = _haversine_arcsec(ra, dec, float(src_ra), float(src_dec))
+            if sep <= radius_arcsec:
+                result.append(src)
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -244,24 +234,125 @@ def _is_position_shifted(
 
 
 # ---------------------------------------------------------------------------
-# Per-source classification
+# Batch data prefetch
 # ---------------------------------------------------------------------------
 
-async def _classify_source(
+async def _prefetch_history_data(
+    sources: list[dict],
+    obs_time: str,
+    frame_id: str,
+    log_filename: str,
+) -> tuple[dict[tuple, list], dict[tuple, list]]:
+    """
+    Prefetch all historical data needed for anomaly classification in TWO batch requests.
+
+    Returns:
+        - narrow_history_by_tile: dict mapping tile -> list of historical sources (MATCH_CONE_ARCSEC)
+        - coverage_by_tile: dict mapping tile -> list of covering frames
+
+    For moving object detection (wide cone), we use the same batch data but filter
+    with a larger radius client-side.
+    """
+    extra = {"frame_id": frame_id, "log_filename": log_filename}
+
+    # Collect unique tiles that need queries
+    # Only unmatched sources (catalog_name=None) need history queries
+    tiles_needing_sources: set[tuple[float, float]] = set()
+    tiles_needing_coverage: set[tuple[float, float]] = set()
+
+    for source in sources:
+        ra = float(source.get("ra", 0))
+        dec = float(source.get("dec", 0))
+        catalog_name = source.get("catalog_name")
+
+        tile = _tile_key(ra, dec)
+
+        # All sources need coverage check (unless already matched in a known catalog that implies stationarity)
+        tiles_needing_coverage.add(tile)
+
+        # Only unmatched and MPC sources need source history queries
+        if catalog_name is None or catalog_name == "MPC":
+            tiles_needing_sources.add(tile)
+
+    logger.info(
+        "Prefetching history data: %d tiles for sources, %d tiles for coverage",
+        len(tiles_needing_sources),
+        len(tiles_needing_coverage),
+        extra=extra,
+    )
+
+    # Build position lists for batch API calls
+    # Use wider radius for the batch query to ensure we capture all needed sources
+    # The tile size is 0.1 deg = 360 arcsec, plus we need MOVING_CONE_ARCSEC margin
+    batch_radius = max(config.MOVING_CONE_ARCSEC, config.MATCH_CONE_ARCSEC) + 400  # arcsec
+
+    source_positions = [{"ra": t[0], "dec": t[1]} for t in tiles_needing_sources]
+    coverage_positions = [{"ra": t[0], "dec": t[1]} for t in tiles_needing_coverage]
+
+    # Execute batch requests concurrently
+    narrow_history_by_tile: dict[tuple, list] = {}
+    coverage_by_tile: dict[tuple, list] = {}
+
+    try:
+        # Make both batch requests in parallel
+        if source_positions and coverage_positions:
+            sources_result, coverage_result = await asyncio.gather(
+                api_client.get_sources_near_batch(source_positions, batch_radius, obs_time),
+                api_client.get_frames_covering_batch(coverage_positions, obs_time),
+            )
+        elif source_positions:
+            sources_result = await api_client.get_sources_near_batch(source_positions, batch_radius, obs_time)
+            coverage_result = {}
+        elif coverage_positions:
+            sources_result = {}
+            coverage_result = await api_client.get_frames_covering_batch(coverage_positions, obs_time)
+        else:
+            sources_result = {}
+            coverage_result = {}
+
+        # Map results back to tiles
+        tiles_sources_list = list(tiles_needing_sources)
+        for i, tile in enumerate(tiles_sources_list):
+            narrow_history_by_tile[tile] = sources_result.get(str(i), [])
+
+        tiles_coverage_list = list(tiles_needing_coverage)
+        for i, tile in enumerate(tiles_coverage_list):
+            coverage_by_tile[tile] = coverage_result.get(str(i), [])
+
+        logger.info(
+            "Batch prefetch complete: %d source history results, %d coverage results",
+            sum(len(v) for v in narrow_history_by_tile.values()),
+            sum(len(v) for v in coverage_by_tile.values()),
+            extra=extra,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Batch prefetch failed: %s — will classify without history data",
+            exc,
+            extra=extra,
+        )
+
+    return narrow_history_by_tile, coverage_by_tile
+
+
+# ---------------------------------------------------------------------------
+# Per-source classification (using prefetched data)
+# ---------------------------------------------------------------------------
+
+def _classify_source_sync(
     source: dict,
     frame_id: str,
-    obs_time: str,
     log_filename: str,
-    cache: dict[str, Any],
+    history_by_tile: dict[tuple, list],
+    coverage_by_tile: dict[tuple, list],
 ) -> dict | None:
     """
-    Classify a single source and return an anomaly dict, or None if no
-    reportable anomaly is found (FIRST_OBSERVATION, KNOWN_CATALOG_NEW).
+    Classify a single source using PREFETCHED batch data (synchronous).
 
-    Classification priority:
-        1. MPC-matched moving objects (ASTEROID / COMET)
-        2. Unmatched position-shifted moving objects (MOVING_UNKNOWN / SPACE_DEBRIS)
-        3. Stationary source classification
+    No API calls are made here - all data comes from the batch prefetch.
+
+    Returns an anomaly dict, or None if no reportable anomaly is found.
     """
     ra  = float(source["ra"])
     dec = float(source["dec"])
@@ -273,6 +364,7 @@ async def _classify_source(
     elongation:   float       = float(source.get("elongation", 0.0))
 
     extra = {"frame_id": frame_id, "log_filename": log_filename}
+    tile = _tile_key(ra, dec)
 
     # ------------------------------------------------------------------
     # Priority 1 — MPC-matched moving objects
@@ -287,8 +379,6 @@ async def _classify_source(
             extra=extra,
         )
 
-        # Ephemeris is resolved later via asyncio.gather; return a sentinel
-        # dict with _needs_ephemeris so the outer loop can batch-resolve them.
         return {
             "anomaly_type":    anomaly_type,
             "ra":              ra,
@@ -305,77 +395,58 @@ async def _classify_source(
     # Priority 2 — Position-shifted unmatched moving objects
     # ------------------------------------------------------------------
 
-    try:
-        wide_history = await _cached_get_sources_near(
-            ra, dec, config.MOVING_CONE_ARCSEC, obs_time, cache
-        )
-    except Exception as exc:
-        logger.error(
-            "Wide-cone history query failed ra=%.4f dec=%.4f: %s",
-            ra, dec, exc,
-            extra=extra,
-        )
-        wide_history = []
+    if catalog_name is None:
+        # Get wide-cone history from prefetched data
+        tile_sources = history_by_tile.get(tile, [])
+        wide_history = _find_sources_within_radius(ra, dec, config.MOVING_CONE_ARCSEC, tile_sources)
 
-    if catalog_name is None and _is_position_shifted(ra, dec, wide_history):
-        if elongation > 3.0:
-            anomaly_type = _TYPE_SPACE_DEBRIS
-        else:
-            anomaly_type = _TYPE_MOVING_UNKNOWN
+        if _is_position_shifted(ra, dec, wide_history):
+            if elongation > 3.0:
+                anomaly_type = _TYPE_SPACE_DEBRIS
+            else:
+                anomaly_type = _TYPE_MOVING_UNKNOWN
 
-        logger.warning(
-            "ALERT — %s: unmatched position-shifted source ra=%.4f dec=%.4f elongation=%.2f",
-            anomaly_type, ra, dec, elongation,
-            extra=extra,
-        )
+            logger.warning(
+                "ALERT — %s: unmatched position-shifted source ra=%.4f dec=%.4f elongation=%.2f",
+                anomaly_type, ra, dec, elongation,
+                extra=extra,
+            )
 
-        return {
-            "anomaly_type":    anomaly_type,
-            "ra":              ra,
-            "dec":             dec,
-            "magnitude":       mag,
-            "delta_mag":       None,
-            "mpc_designation": None,
-            "ephemeris":       None,
-            "notes": (
-                f"Position shifted >{config.MATCH_CONE_ARCSEC:.1f} arcsec from prior detection; "
-                f"not matched in MPC. Elongation={elongation:.2f}."
-            ),
-        }
+            return {
+                "anomaly_type":    anomaly_type,
+                "ra":              ra,
+                "dec":             dec,
+                "magnitude":       mag,
+                "delta_mag":       None,
+                "mpc_designation": None,
+                "ephemeris":       None,
+                "notes": (
+                    f"Position shifted >{config.MATCH_CONE_ARCSEC:.1f} arcsec from prior detection; "
+                    f"not matched in MPC. Elongation={elongation:.2f}."
+                ),
+            }
 
     # ------------------------------------------------------------------
     # Priority 3 — Stationary source classification
     # ------------------------------------------------------------------
 
-    try:
-        coverage = await _cached_get_frames_covering(ra, dec, obs_time, cache)
-    except Exception as exc:
-        logger.error(
-            "Coverage query failed ra=%.4f dec=%.4f: %s",
-            ra, dec, exc,
-            extra=extra,
-        )
-        coverage = []
+    # Get coverage from prefetched data
+    coverage = coverage_by_tile.get(tile, [])
+    n_coverage = len(coverage)
 
-    # Narrow-cone history: prior detections at essentially this same position
-    try:
-        history = await _cached_get_sources_near(
-            ra, dec, config.MATCH_CONE_ARCSEC, obs_time, cache
-        )
-    except Exception as exc:
-        logger.error(
-            "Narrow-cone history query failed ra=%.4f dec=%.4f: %s",
-            ra, dec, exc,
-            extra=extra,
-        )
+    # Get narrow-cone history from prefetched data
+    if catalog_name is None:
+        tile_sources = history_by_tile.get(tile, [])
+        history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
+    else:
+        # Catalog-matched sources don't need history lookup for UNKNOWN classification
         history = []
 
-    n_coverage = len(coverage)
-    n_history  = len(history)
+    n_history = len(history)
 
     # --- FIRST_OBSERVATION: sky area never imaged before ---
     if n_coverage == 0:
-        logger.info(
+        logger.debug(
             "FIRST_OBSERVATION: ra=%.4f dec=%.4f — sky area has no prior coverage",
             ra, dec,
             extra=extra,
@@ -385,8 +456,6 @@ async def _classify_source(
     # --- Area has prior coverage from here on ---
 
     # --- SUPERNOVA_CANDIDATE: new source in/near a galaxy ---
-    # Condition: covered before, no history at this position, source is
-    # associated with a galaxy (Simbad match) or unmatched in a known galaxy field.
     if n_history == 0 and _is_galaxy(object_type):
         logger.warning(
             "ALERT — SUPERNOVA_CANDIDATE: new source near galaxy object_type=%s "
@@ -410,6 +479,12 @@ async def _classify_source(
         }
 
     # --- UNKNOWN: covered, no history, no catalog match ---
+    # TODO: Many UNKNOWN sources with mag > 20 are simply faint stars beyond Gaia DR3
+    # completeness limit (~21 mag). Consider:
+    #   1. Adding magnitude threshold (e.g., skip UNKNOWN alert if mag > 20)
+    #   2. Querying deeper catalogs (Pan-STARRS DR2, SDSS) for faint sources
+    #   3. Adding "FAINT_UNCATALOGUED" classification distinct from true UNKNOWN
+    # See: https://github.com/users/miksrv/projects/10 for tracking
     if n_history == 0 and catalog_name is None:
         logger.warning(
             "ALERT — UNKNOWN: new uncatalogued source ra=%.4f dec=%.4f mag=%s "
@@ -434,7 +509,7 @@ async def _classify_source(
 
     # --- KNOWN_CATALOG_NEW: covered, no history, but matched in catalog ---
     if n_history == 0 and catalog_name is not None:
-        logger.info(
+        logger.debug(
             "KNOWN_CATALOG_NEW: ra=%.4f dec=%.4f catalog=%s id=%s — "
             "below prior detection threshold",
             ra, dec, catalog_name, catalog_id,
@@ -460,7 +535,7 @@ async def _classify_source(
         if _is_binary_star(object_type):
             logger.info(
                 "BINARY_STAR: ra=%.4f dec=%.4f delta_mag=%.3f object_type=%s",
-                ra, dec, delta_mag, object_type,  # type: ignore[arg-type]
+                ra, dec, delta_mag, object_type,
                 extra=extra,
             )
             return {
@@ -483,7 +558,7 @@ async def _classify_source(
         if _is_variable_star(object_type):
             logger.info(
                 "VARIABLE_STAR: ra=%.4f dec=%.4f delta_mag=%.3f object_type=%s",
-                ra, dec, delta_mag, object_type,  # type: ignore[arg-type]
+                ra, dec, delta_mag, object_type,
                 extra=extra,
             )
             return {
@@ -580,9 +655,11 @@ async def detect(
     """
     Detect and classify anomalies for all sources in a processed frame.
 
-    Queries the observatory API for historical data, classifies each source
-    according to the anomaly taxonomy in CLAUDE.md, and concurrently resolves
-    JPL Horizons ephemerides for any matched solar-system objects.
+    Uses BATCH API queries to minimize network round-trips:
+    - One POST /sources/near/batch for all source history
+    - One POST /frames/covering/batch for all coverage checks
+
+    This reduces API calls from O(N) to O(1) where N is the number of sources.
 
     Parameters
     ----------
@@ -593,7 +670,7 @@ async def detect(
         Each dict must have at minimum: ra, dec, mag, catalog_name, catalog_id,
         object_type, elongation.
     catalog_matches:
-        Same list as sources (catalog_matcher enriches in-place).  The
+        Same list as sources (catalog_matcher enriches in-place). The
         parameter exists for API compatibility with the pipeline orchestrator.
     frame_meta:
         Dict with keys: frame_id, obs_time (ISO 8601), filename,
@@ -621,34 +698,35 @@ async def detect(
         logger.info("No sources to classify frame_id=%s", frame_id, extra=extra)
         return []
 
-    # Per-run API response cache — rebuilt fresh each call, no TTL needed.
-    _api_cache: dict[str, Any] = {}
+    # ------------------------------------------------------------------
+    # BATCH PREFETCH: Get all historical data in TWO API calls
+    # ------------------------------------------------------------------
+    history_by_tile, coverage_by_tile = await _prefetch_history_data(
+        sources, obs_time, frame_id, log_filename
+    )
 
-    # Classify each source sequentially.  API queries are cached so repeated
-    # tile lookups across nearby sources incur only one network round-trip.
+    # ------------------------------------------------------------------
+    # Classify all sources using prefetched data (no additional API calls)
+    # ------------------------------------------------------------------
     anomalies: list[dict] = []
 
     for source in sources:
         try:
-            result = await _classify_source(
+            result = _classify_source_sync(
                 source,
                 frame_id=frame_id,
-                obs_time=obs_time,
                 log_filename=log_filename,
-                cache=_api_cache,
+                history_by_tile=history_by_tile,
+                coverage_by_tile=coverage_by_tile,
             )
+            if result is not None:
+                anomalies.append(result)
         except Exception as exc:
-            ra  = source.get("ra", "?")
-            dec = source.get("dec", "?")
             logger.error(
                 "Unexpected error classifying source ra=%s dec=%s: %s",
-                ra, dec, exc,
+                source.get("ra", "?"), source.get("dec", "?"), exc,
                 extra=extra,
             )
-            continue
-
-        if result is not None:
-            anomalies.append(result)
 
     # Resolve ephemerides concurrently for all MPC-matched objects
     await _resolve_ephemerides(anomalies, obs_time, frame_id, log_filename)
