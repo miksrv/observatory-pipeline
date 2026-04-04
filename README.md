@@ -17,6 +17,7 @@ Automated Python service for processing astronomical FITS frames from an observa
   - [2. Prepare directories on the host](#2-prepare-directories-on-the-host)
   - [3. Download ASTAP star catalogs](#3-download-astap-star-catalogs)
   - [4. Configure environment variables](#4-configure-environment-variables)
+  - [Configuration Reference](#configuration-reference)
   - [5. Build and start the container](#5-build-and-start-the-container)
   - [External volumes reference](#external-volumes-reference)
   - [What installs automatically](#what-installs-automatically)
@@ -328,6 +329,7 @@ FITS_REJECTED=/fits/rejected
 # ── ASTAP plate solver ────────────────────────────────────────────────────────
 ASTAP_BINARY=/usr/local/bin/astap
 ASTAP_CATALOGS=/astap/catalogs
+ASTAP_FOV_HINT=0              # FOV hint in degrees (0 = auto-detect from FITS)
 
 # ── Observatory site (used for JPL Horizons topocentric ephemerides) ──────────
 SITE_LAT=55.7558
@@ -344,9 +346,52 @@ QC_STARS_MIN=10
 MATCH_CONE_ARCSEC=5.0
 MOVING_CONE_ARCSEC=30.0
 DELTA_MAG_ALERT=0.5
+
+# ── Normalization ─────────────────────────────────────────────────────────────
+NORMALIZE_ENABLED=true        # Normalize object/filter names and filenames
 ```
 
 > `API_KEY` must never be committed to git. It is listed in `.gitignore`.
+
+#### Configuration Reference
+
+All settings are loaded from environment variables via `config.py`. Here is the complete list:
+
+| Variable | Default | Required | Description |
+|----------|---------|----------|-------------|
+| **API** |
+| `API_BASE_URL` | — | Yes | Base URL of the observatory-api (e.g., `https://your-cloud-host.com/api/v1`) |
+| `API_KEY` | — | Yes | Secret API key for authentication |
+| **FITS Directories** |
+| `FITS_INCOMING` | `/fits/incoming` | No | Directory to watch for new FITS files |
+| `FITS_ARCHIVE` | `/fits/archive` | No | Directory for successfully processed frames |
+| `FITS_REJECTED` | `/fits/rejected` | No | Directory for frames that fail QC |
+| **ASTAP Plate Solver** |
+| `ASTAP_BINARY` | `/usr/local/bin/astap` | No | Path to the astap executable |
+| `ASTAP_CATALOGS` | `/astap/catalogs` | No | Path to ASTAP star catalog directory |
+| `ASTAP_FOV_HINT` | `0` | No | Field-of-view hint in degrees for faster plate solving. Set to 0 for auto-detection from FITS headers. Providing your telescope's approximate FOV (e.g., `1.5`) significantly speeds up plate solving. |
+| **Quality Control** |
+| `QC_FWHM_MAX_ARCSEC` | `8.0` | No | Maximum acceptable median FWHM in arcseconds. Frames exceeding this are rejected as `BLUR`. |
+| `QC_ELONGATION_MAX` | `2.0` | No | Maximum acceptable PSF elongation ratio (major/minor axis). Values >2.0 indicate star trailing due to tracking issues. |
+| `QC_SNR_MIN` | `5.0` | No | Minimum acceptable median SNR of detected sources. |
+| `QC_STARS_MIN` | `10` | No | Minimum number of detected stars. Frames with fewer stars are rejected as `LOW_STARS`. |
+| **Star Detection Filtering** |
+| `SEP_DETECT_THRESH` | `10.0` | No | Detection threshold in sigma above background for SEP source extraction. Higher = fewer, more reliable detections. |
+| `SEP_MIN_AREA` | `15` | No | Minimum connected pixels for a valid source detection. Filters out hot pixels and noise. |
+| `STAR_FWHM_MIN_ARCSEC` | `2.5` | No | Minimum FWHM in arcseconds. Sources below this are likely hot pixels or cosmic rays. |
+| `STAR_FWHM_MAX_ARCSEC` | `8.0` | No | Maximum FWHM in arcseconds. Sources above this are extended objects (nebulae, galaxies) or badly defocused. |
+| `STAR_ELONGATION_MAX` | `1.5` | No | Maximum elongation for valid star detections. Filters out trails and extended objects. |
+| `STAR_SNR_MIN` | `50.0` | No | Minimum SNR (peak/rms) for valid star detections. Higher = fewer but more reliable. |
+| **Cross-Matching** |
+| `MATCH_CONE_ARCSEC` | `5.0` | No | Cone search radius in arcseconds for point-source catalog matching (Gaia, Simbad). |
+| `MOVING_CONE_ARCSEC` | `30.0` | No | Wider cone radius in arcseconds for moving-object detection (asteroids, comets). |
+| `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
+| **Observatory Site** |
+| `SITE_LAT` | `0.0` | No | Observatory latitude in decimal degrees (positive = North). Used for topocentric ephemeris queries to JPL Horizons. |
+| `SITE_LON` | `0.0` | No | Observatory longitude in decimal degrees (positive = East). |
+| `SITE_ELEV` | `0` | No | Observatory elevation in metres above sea level. |
+| **Normalization** |
+| `NORMALIZE_ENABLED` | `true` | No | Enable automatic normalization of FITS header values and filenames. Normalizes object names (`M 51` → `M51`), filter names (`Blue` → `B`, `Luminance` → `L`, `H-Alpha` → `Ha`), frame types (`Light Frame` → `Light`), and renames files to standard format `{Object}_{Type}_{Filter}_{Exp}_{DateTime}.fits`. Ensures consistency across different capture software. |
 
 ---
 
