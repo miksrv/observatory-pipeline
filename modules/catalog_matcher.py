@@ -82,7 +82,10 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
 
     try:
         coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
-        radius = (fov_deg / 2.0) * u.deg
+        # Use sqrt(2)/2 × fov_deg to cover the full field diagonal.
+        # fov_deg is the larger dimension; for any aspect ratio the half-diagonal
+        # is at most fov_deg × sqrt(2)/2, so this radius covers all corners.
+        radius = (fov_deg * math.sqrt(2) / 2.0) * u.deg
         job = Gaia.cone_search(coord, radius=radius)
         table = job.get_results()
 
@@ -139,176 +142,120 @@ def _match_gaia(sources: list[dict], gaia_stars: list[dict]) -> None:
         dec=[g["dec"] for g in gaia_stars] * u.deg,
     )
 
-    # First pass: match with wider tolerance to detect systematic offset
+    # First pass: match each source to its nearest Gaia star
     idx, sep2d, _ = source_coords.match_to_catalog_sky(gaia_coords)
     sep_arcsec = sep2d.to(u.arcsec).value
-    
+
     # Log initial match statistics
-    within_5 = sum(1 for s in sep_arcsec if s <= 5.0)
-    within_10 = sum(1 for s in sep_arcsec if s <= 10.0)
-    within_30 = sum(1 for s in sep_arcsec if s <= 30.0)
-    within_60 = sum(1 for s in sep_arcsec if s <= 60.0)
-    min_sep = min(sep_arcsec) if len(sep_arcsec) > 0 else 0
-    max_sep = max(sep_arcsec) if len(sep_arcsec) > 0 else 0
-    median_sep = float(np.median(sep_arcsec)) if len(sep_arcsec) > 0 else 0
-    
+    within_5  = int(np.sum(sep_arcsec <= 5.0))
+    within_10 = int(np.sum(sep_arcsec <= 10.0))
+    within_30 = int(np.sum(sep_arcsec <= 30.0))
+    within_60 = int(np.sum(sep_arcsec <= 60.0))
+    min_sep    = float(np.min(sep_arcsec))  if len(sep_arcsec) > 0 else 0.0
+    max_sep    = float(np.max(sep_arcsec))  if len(sep_arcsec) > 0 else 0.0
+    median_sep = float(np.median(sep_arcsec)) if len(sep_arcsec) > 0 else 0.0
+
     logger.info(
         "Gaia match (initial): min=%.2f\" median=%.2f\" max=%.2f\"  "
         "within 5\"=%d, 10\"=%d, 30\"=%d, 60\"=%d (threshold=%.1f\")",
-        min_sep, median_sep, max_sep, within_5, within_10, within_30, within_60, config.MATCH_CONE_ARCSEC,
+        min_sep, median_sep, max_sep, within_5, within_10, within_30, within_60,
+        config.MATCH_CONE_ARCSEC,
     )
 
-    # Check if we need WCS offset correction
-    # Only attempt if median is large but we have some reasonably close matches
-    if median_sep > 10.0 and within_60 >= 3:
-        logger.info(
-            "Gaia match: detected potential WCS offset (median=%.2f\"), attempting correction...",
-            median_sep,
+    # ------------------------------------------------------------------
+    # WCS offset correction via 2D vote accumulator
+    #
+    # For each source we have a (delta_RA, delta_Dec) vector pointing from
+    # the source to its nearest Gaia star.  If a systematic WCS error
+    # exists, all true source→star pairs vote for the same offset bin and
+    # produce a sharp peak in the 2D histogram.  Random/false matches
+    # (e.g. galaxies matched to unrelated Gaia stars) are scattered
+    # uniformly and produce only low-level background noise.
+    #
+    # This is robust regardless of the source/catalog density ratio — unlike
+    # mutual nearest-neighbour matching, which breaks down when the catalog
+    # is much denser than the source list (10k Gaia vs 421 sources = 24:1
+    # ratio would make almost every source appear "mutual" by default).
+    # ------------------------------------------------------------------
+    if median_sep > 10.0 and within_60 >= 10:
+        mean_dec = float(np.mean([sources[i]["dec"] for i in range(len(sources))
+                                  if sep_arcsec[i] <= 60.0]))
+        cos_dec = math.cos(math.radians(mean_dec))
+
+        dra_arcsec  = np.array([(gaia_stars[idx[i]]["ra"]  - sources[i]["ra"])  * cos_dec * 3600.0
+                                 for i in range(len(sources)) if sep_arcsec[i] <= 60.0])
+        ddec_arcsec = np.array([(gaia_stars[idx[i]]["dec"] - sources[i]["dec"]) * 3600.0
+                                 for i in range(len(sources)) if sep_arcsec[i] <= 60.0])
+
+        # 2" bins over ±62" — enough to capture any plausible WCS offset
+        BIN_SIZE = 2.0
+        RANGE    = 62.0
+        n_bins   = int(2 * RANGE / BIN_SIZE)  # 62 bins per axis
+
+        H, ra_edges, dec_edges = np.histogram2d(
+            dra_arcsec, ddec_arcsec,
+            bins=n_bins,
+            range=[[-RANGE, RANGE], [-RANGE, RANGE]],
         )
-        
-        # Strategy: use MUTUAL matching to find reliable pairs
-        # A pair is valid only if:
-        # 1. Source A's nearest Gaia star is B
-        # 2. Gaia star B's nearest source is A
-        # This eliminates false pairings in crowded fields
-        
-        # Forward match: source → Gaia (already done)
-        # Backward match: Gaia → source
-        idx_reverse, sep2d_reverse, _ = gaia_coords.match_to_catalog_sky(source_coords)
-        
-        # Find mutual matches within tolerance
-        offset_threshold = 60.0  # arcsec
-        mutual_matches = []
-        
-        for i in range(len(sources)):
-            if sep_arcsec[i] < offset_threshold:
-                gaia_idx = idx[i]
-                # Check if this Gaia star's nearest source is this source
-                if idx_reverse[gaia_idx] == i:
-                    mutual_matches.append((i, gaia_idx, sep_arcsec[i]))
-        
+        peak_i, peak_j = np.unravel_index(np.argmax(H), H.shape)
+        peak_count      = int(H[peak_i, peak_j])
+        expected_bg     = len(dra_arcsec) / float(n_bins ** 2)
+        # Require peak to hold at least 5 % of matches and be ≥ 15 counts
+        sig_threshold   = max(15, len(dra_arcsec) * 0.05)
+
+        peak_dra_arcsec  = float((ra_edges[peak_i]  + ra_edges[peak_i + 1])  / 2.0)
+        peak_ddec_arcsec = float((dec_edges[peak_j] + dec_edges[peak_j + 1]) / 2.0)
+        total_offset     = math.sqrt(peak_dra_arcsec ** 2 + peak_ddec_arcsec ** 2)
+
         logger.info(
-            "Gaia match: found %d mutual matches within %.0f\" (forward matches: %d)",
-            len(mutual_matches), offset_threshold, within_60,
+            "Gaia offset accumulator: %d pairs within 60\" — peak=%d (bg≈%.2f, threshold=%.0f) "
+            "at dRA=%.1f\" dDec=%.1f\" (total=%.1f\")",
+            len(dra_arcsec), peak_count, expected_bg, sig_threshold,
+            peak_dra_arcsec, peak_ddec_arcsec, total_offset,
         )
-        
-        if len(mutual_matches) >= 3:
-            # Compute offset in RA and Dec
-            delta_ra_list = []
-            delta_dec_list = []
-            
-            for src_i, gaia_i, _ in mutual_matches:
-                gaia_match = gaia_stars[gaia_i]
-                source = sources[src_i]
-                # Offset = Gaia - Source (we need to add this to source coords)
-                # Note: RA offset needs cos(dec) correction for proper arcsec conversion
-                delta_ra = gaia_match["ra"] - source["ra"]
-                delta_dec = gaia_match["dec"] - source["dec"]
-                delta_ra_list.append(delta_ra)
-                delta_dec_list.append(delta_dec)
-            
-            # Median offset (robust to outliers)
-            offset_ra = float(np.median(delta_ra_list))
-            offset_dec = float(np.median(delta_dec_list))
-            
-            # Convert to arcsec for logging (with cos(dec) correction for RA)
-            mean_dec = float(np.mean([sources[m[0]]["dec"] for m in mutual_matches]))
-            cos_dec = np.cos(np.radians(mean_dec))
-            offset_ra_arcsec = offset_ra * 3600.0 * cos_dec
-            offset_dec_arcsec = offset_dec * 3600.0
-            total_offset_arcsec = np.sqrt(offset_ra_arcsec**2 + offset_dec_arcsec**2)
-            
-            logger.info(
-                "Gaia match: computed WCS offset: dRA=%.2f\" dDec=%.2f\" (total=%.2f\", from %d mutual matches)",
-                offset_ra_arcsec, offset_dec_arcsec, total_offset_arcsec, len(mutual_matches),
+
+        if peak_count >= sig_threshold and total_offset > 2.0:
+            # Refine offset: median of all matches within 2 bins of the peak
+            near_mask = (
+                (np.abs(dra_arcsec  - peak_dra_arcsec)  <= BIN_SIZE * 2) &
+                (np.abs(ddec_arcsec - peak_ddec_arcsec) <= BIN_SIZE * 2)
             )
-            
-            # Only apply correction if offset is significant (> 2 arcsec)
-            if total_offset_arcsec > 2.0:
-                # Apply correction and re-match
-                corrected_coords = SkyCoord(
-                    ra=[(s["ra"] + offset_ra) for s in sources] * u.deg,
-                    dec=[(s["dec"] + offset_dec) for s in sources] * u.deg,
-                )
-                
-                idx, sep2d, _ = corrected_coords.match_to_catalog_sky(gaia_coords)
-                sep_arcsec = sep2d.to(u.arcsec).value
-                
-                # Log corrected statistics
-                within_5_new = sum(1 for s in sep_arcsec if s <= 5.0)
-                within_10_new = sum(1 for s in sep_arcsec if s <= 10.0)
-                min_sep_new = min(sep_arcsec) if len(sep_arcsec) > 0 else 0
-                median_sep_new = float(np.median(sep_arcsec)) if len(sep_arcsec) > 0 else 0
-                
-                logger.info(
-                    "Gaia match (after offset): min=%.2f\" median=%.2f\"  within 5\"=%d, 10\"=%d",
-                    min_sep_new, median_sep_new, within_5_new, within_10_new,
-                )
-                
-                # Check if correction helped
-                if median_sep_new < median_sep * 0.5:
-                    logger.info("WCS offset correction successful (median reduced by >50%%)")
-                    # Store offset in sources for downstream use
-                    for source in sources:
-                        source["_wcs_offset_ra"] = offset_ra
-                        source["_wcs_offset_dec"] = offset_dec
-                else:
-                    # Offset correction didn't help - investigate plate scale issue
-                    # Compare distances from center for matched pairs
-                    logger.warning(
-                        "WCS offset correction did NOT help significantly (median %.2f\" → %.2f\"). "
-                        "Investigating plate scale...",
-                        median_sep, median_sep_new,
-                    )
-                    
-                    # Check plate scale by comparing angular distances
-                    # Take pairs that are far from frame center and compare their separations
-                    if len(mutual_matches) >= 10:
-                        src_ras = np.array([sources[m[0]]["ra"] for m in mutual_matches])
-                        src_decs = np.array([sources[m[0]]["dec"] for m in mutual_matches])
-                        gaia_ras = np.array([gaia_stars[m[1]]["ra"] for m in mutual_matches])
-                        gaia_decs = np.array([gaia_stars[m[1]]["dec"] for m in mutual_matches])
-                        
-                        # Compute center
-                        src_center_ra = np.median(src_ras)
-                        src_center_dec = np.median(src_decs)
-                        
-                        # Compute distances from center
-                        cos_dec = np.cos(np.radians(src_center_dec))
-                        src_dist = np.sqrt(((src_ras - src_center_ra) * cos_dec)**2 + 
-                                          (src_decs - src_center_dec)**2) * 3600  # arcsec
-                        gaia_dist = np.sqrt(((gaia_ras - src_center_ra) * cos_dec)**2 + 
-                                           (gaia_decs - src_center_dec)**2) * 3600  # arcsec
-                        
-                        # Compute scale ratio for stars not at center
-                        far_mask = src_dist > 100  # at least 100 arcsec from center
-                        if np.sum(far_mask) >= 5:
-                            scale_ratios = gaia_dist[far_mask] / src_dist[far_mask]
-                            scale_ratio = float(np.median(scale_ratios))
-                            scale_ratio_std = float(np.std(scale_ratios))
-                            
-                            if abs(scale_ratio - 1.0) > 0.01:  # more than 1% scale error
-                                logger.warning(
-                                    "Plate scale error detected: Gaia/Source distance ratio = %.4f "
-                                    "(std=%.4f). WCS scale is off by %.2f%%",
-                                    scale_ratio, scale_ratio_std, (scale_ratio - 1.0) * 100,
-                                )
-                            else:
-                                logger.warning(
-                                    "Plate scale appears OK (ratio=%.4f), "
-                                    "issue may be rotation or non-linear distortion",
-                                    scale_ratio,
-                                )
-                    
-                    # Revert to original matching
-                    idx, sep2d, _ = source_coords.match_to_catalog_sky(gaia_coords)
-                    sep_arcsec = sep2d.to(u.arcsec).value
-            else:
-                logger.debug("WCS offset too small (%.2f\"), skipping correction", total_offset_arcsec)
+            refined_dra  = float(np.median(dra_arcsec[near_mask]))  if near_mask.any() else peak_dra_arcsec
+            refined_ddec = float(np.median(ddec_arcsec[near_mask])) if near_mask.any() else peak_ddec_arcsec
+
+            offset_ra_deg  = refined_dra  / (cos_dec * 3600.0)
+            offset_dec_deg = refined_ddec / 3600.0
+
+            corrected_coords = SkyCoord(
+                ra= [(s["ra"]  + offset_ra_deg)  for s in sources] * u.deg,
+                dec=[(s["dec"] + offset_dec_deg) for s in sources] * u.deg,
+            )
+            idx, sep2d, _ = corrected_coords.match_to_catalog_sky(gaia_coords)
+            sep_arcsec = sep2d.to(u.arcsec).value
+
+            within_5_new  = int(np.sum(sep_arcsec <= 5.0))
+            within_10_new = int(np.sum(sep_arcsec <= 10.0))
+            median_new    = float(np.median(sep_arcsec))
+
+            logger.info(
+                "Gaia match (after WCS correction dRA=%.1f\" dDec=%.1f\"): "
+                "median=%.2f\" within 5\"=%d, 10\"=%d",
+                refined_dra, refined_ddec, median_new, within_5_new, within_10_new,
+            )
+
+            for source in sources:
+                source["_wcs_offset_ra"]  = offset_ra_deg
+                source["_wcs_offset_dec"] = offset_dec_deg
+        else:
+            logger.debug(
+                "No significant WCS offset detected (peak=%d < threshold=%.0f, offset=%.1f\"). "
+                "High median separation may indicate a galaxy-rich field where most detections "
+                "are extended sources not present in Gaia.",
+                peak_count, sig_threshold, total_offset,
+            )
 
     # Final matching with configured threshold
     threshold = config.MATCH_CONE_ARCSEC * u.arcsec
-    matched_count = 0
     for i, source in enumerate(sources):
         if sep2d[i] < threshold:
             matched = gaia_stars[idx[i]]
@@ -316,12 +263,19 @@ def _match_gaia(sources: list[dict], gaia_stars: list[dict]) -> None:
             source["catalog_id"]   = matched["source_id"]
             source["catalog_mag"]  = matched["phot_g_mean_mag"]
             source["object_type"]  = "STAR"
-            matched_count += 1
 
 
 # ---------------------------------------------------------------------------
 # Simbad
 # ---------------------------------------------------------------------------
+
+# TODO: Currently Simbad only matches sources NOT found in Gaia. This means:
+#   - Variable stars matched by Gaia get object_type="STAR" instead of "V*"
+#   - Binary stars, pulsars, etc. also lose their specific types
+# Solution: After Gaia matching, query Simbad for ALL Gaia-matched sources
+# and update object_type if Simbad returns a more specific classification.
+# This would give proper types: V*, EB*, RR*, Cep, G (galaxy), etc.
+# See: https://github.com/users/miksrv/projects/10 for tracking
 
 def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[dict]:
     """
@@ -585,7 +539,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         gaia_stars = _query_gaia(ra_center, dec_center, fov_deg)
         logger.info(
             "Gaia query: ra=%.4f dec=%.4f fov=%.4f° radius=%.4f° → %d catalog stars  fits_filename=%s",
-            ra_center, dec_center, fov_deg, fov_deg / 2.0, len(gaia_stars), fits_filename,
+            ra_center, dec_center, fov_deg, fov_deg * math.sqrt(2) / 2.0, len(gaia_stars), fits_filename,
         )
         _match_gaia(sources, gaia_stars)
     except Exception as exc:
@@ -616,5 +570,21 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         "Catalog matching: %d sources — Gaia: %d, Simbad: %d, MPC: %d, unmatched: %d  fits_filename=%s",
         len(sources), n_gaia, n_simbad, n_mpc, n_unmatched, fits_filename,
     )
+
+    # Warn when very few sources match Gaia — this is normal for fields at high
+    # galactic latitude (galaxy clusters, galaxy groups) where most detections
+    # are compact galaxies rather than stars.  If you expect more matches, check:
+    #   1. Galactic latitude of the target (|b| > 60° → few stars, many galaxies)
+    #   2. STAR_SNR_MIN threshold — lowering it detects fainter stars
+    #   3. Run on a Milky Way field to verify the pipeline works for star-rich frames
+    if len(sources) > 0:
+        match_rate = (n_gaia + n_simbad) / len(sources)
+        if match_rate < 0.05 and len(sources) >= 20:
+            logger.warning(
+                "Low catalog match rate: %.1f%% (%d/%d sources matched Gaia/Simbad). "
+                "This is expected for high-galactic-latitude fields where most detections "
+                "are compact galaxies not present in Gaia DR3.  fits_filename=%s",
+                match_rate * 100, n_gaia + n_simbad, len(sources), fits_filename,
+            )
 
     return sources
