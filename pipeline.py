@@ -176,8 +176,21 @@ async def run(fits_path: str) -> None:
     # ------------------------------------------------------------------
     # Step 4 — Catalog matching (run BEFORE photometry so Gaia DR3 stars
     #          can be used as reference for zero-point calibration)
+    #
+    # Use "sources_all" (loose filter) which includes bright saturated
+    # objects (asteroids, comets) and faint stars rejected by the strict
+    # star filter. This gives more sources for WCS offset correction and
+    # ensures moving/transient objects reach the anomaly detector.
+    # Falls back to "sources" (strict stars) if sources_all is unavailable.
     # ------------------------------------------------------------------
-    sources: list = astro_result.get("sources") or []
+    sources: list = astro_result.get("sources_all") or astro_result.get("sources") or []
+    sources_stars: list = astro_result.get("sources") or []
+    if len(sources) != len(sources_stars):
+        logger.info(
+            "Using sources_all for catalog matching: %d detections (%d strict stars)  fits_filename=%s",
+            len(sources), len(sources_stars), basename,
+            extra=extra,
+        )
     if catalog_matcher is not None and sources:
         try:
             # Build frame_meta with all fields required by catalog_matcher
@@ -210,7 +223,12 @@ async def run(fits_path: str) -> None:
 
     # ------------------------------------------------------------------
     # Step 5 — Photometry (runs AFTER catalog matching to use Gaia DR3
-    #          reference stars for magnitude calibration)
+    #          reference stars for magnitude calibration).
+    #
+    # Photometry is run on `sources` (the full list including sources_all)
+    # so that Gaia-matched stars in the list serve as calibration reference.
+    # Non-stellar sources (asteroids, galaxies) also get instrumental
+    # magnitudes, which is useful for anomaly detection.
     # ------------------------------------------------------------------
     if photometry is not None and sources:
         try:
