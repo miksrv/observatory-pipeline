@@ -45,7 +45,7 @@ from typing import Any
 
 import astropy.units as u
 import numpy as np
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import SkyCoord, search_around_sky
 from astroquery.gaia import Gaia
 from astroquery.simbad import Simbad
 from astroquery.vizier import Vizier
@@ -165,16 +165,19 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
         dec=[g["dec"] for g in gaia_stars] * u.deg,
     )
 
-    idx, sep2d, _ = source_coords.match_to_catalog_sky(gaia_coords)
-    sep_arcsec = sep2d.to(u.arcsec).value
+    # ------------------------------------------------------------------
+    # Quick nearest-neighbour pass — logging and early-exit only.
+    # ------------------------------------------------------------------
+    idx_nn, sep2d_nn, _ = source_coords.match_to_catalog_sky(gaia_coords)
+    sep_nn = sep2d_nn.to(u.arcsec).value
 
-    within_5  = int(np.sum(sep_arcsec <= 5.0))
-    within_10 = int(np.sum(sep_arcsec <= 10.0))
-    within_30 = int(np.sum(sep_arcsec <= 30.0))
-    within_60 = int(np.sum(sep_arcsec <= 60.0))
-    min_sep    = float(np.min(sep_arcsec))   if len(sep_arcsec) > 0 else 0.0
-    max_sep    = float(np.max(sep_arcsec))   if len(sep_arcsec) > 0 else 0.0
-    median_sep = float(np.median(sep_arcsec)) if len(sep_arcsec) > 0 else 0.0
+    within_5  = int(np.sum(sep_nn <= 5.0))
+    within_10 = int(np.sum(sep_nn <= 10.0))
+    within_30 = int(np.sum(sep_nn <= 30.0))
+    within_60 = int(np.sum(sep_nn <= 60.0))
+    min_sep    = float(np.min(sep_nn))    if len(sep_nn) > 0 else 0.0
+    max_sep    = float(np.max(sep_nn))    if len(sep_nn) > 0 else 0.0
+    median_sep = float(np.median(sep_nn)) if len(sep_nn) > 0 else 0.0
 
     logger.info(
         "Gaia match (raw): min=%.2f\" median=%.2f\" max=%.2f\"  "
@@ -183,34 +186,61 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
         config.MATCH_CONE_ARCSEC,
     )
 
-    if median_sep <= 10.0 or within_60 < 10:
-        # Separation already acceptable or too few pairs — no correction needed
+    if median_sep <= 10.0:
+        # WCS is already accurate — no correction needed
         return 0.0, 0.0
 
     # ------------------------------------------------------------------
-    # 2D vote accumulator on (dRA, dDec) vectors
+    # All-pairs vote accumulator
     #
-    # For each source we have a (dRA, dDec) vector pointing from the source
-    # to its nearest Gaia star. If a systematic WCS error exists, all true
-    # source→star pairs vote for the same offset bin and produce a sharp peak.
-    # Random/false matches are scattered uniformly and produce only background.
+    # The nearest-neighbour approach fails for sparse fields with large
+    # WCS offsets: with only ~10 sources and an offset of 30-60", each
+    # source's nearest Gaia star is typically a WRONG star at ~10" away,
+    # so every source votes for a different random offset → peak = 1.
     #
-    # This is robust regardless of the source/catalog density ratio — unlike
-    # mutual nearest-neighbour matching, which breaks down when the catalog is
-    # much denser than the source list (10k Gaia vs 421 sources = 24:1 ratio).
+    # The fix: use search_around_sky to collect ALL (source, Gaia-star)
+    # pairs within MAX_SEARCH_RADIUS. True pairs (correct star at the
+    # systematic offset distance) all vote for the same histogram bin and
+    # produce a sharp peak. False pairs (nearby wrong stars) are scattered
+    # uniformly and create only background noise.
+    #
+    # Example — Vesta field (12 sources, offset ≈ 37"):
+    #   Nearest-neighbour: 12 pairs → peak = 1  (fails, threshold = 15)
+    #   All-pairs within 90": ~120 pairs → peak = 12 (easily significant)
     # ------------------------------------------------------------------
-    mean_dec = float(np.mean([sources[i]["dec"] for i in range(len(sources))
-                              if sep_arcsec[i] <= 60.0]))
-    cos_dec = math.cos(math.radians(mean_dec))
+    MAX_SEARCH_ARCSEC = 90.0
+    idx_src, idx_cat, _, _ = search_around_sky(
+        source_coords, gaia_coords, MAX_SEARCH_ARCSEC * u.arcsec
+    )
+    n_pairs = len(idx_src)
 
-    dra_arcsec  = np.array([(gaia_stars[idx[i]]["ra"]  - sources[i]["ra"])  * cos_dec * 3600.0
-                             for i in range(len(sources)) if sep_arcsec[i] <= 60.0])
-    ddec_arcsec = np.array([(gaia_stars[idx[i]]["dec"] - sources[i]["dec"]) * 3600.0
-                             for i in range(len(sources)) if sep_arcsec[i] <= 60.0])
+    if n_pairs < 3:
+        logger.debug(
+            "Too few source-Gaia pairs (%d) within %.0f\" — cannot compute WCS offset",
+            n_pairs, MAX_SEARCH_ARCSEC,
+        )
+        return 0.0, 0.0
+
+    logger.info(
+        "WCS offset search: %d source-Gaia pairs within %.0f\" (%d sources, %d Gaia stars)",
+        n_pairs, MAX_SEARCH_ARCSEC, len(sources), len(gaia_stars),
+    )
+
+    mean_dec = float(np.mean([s["dec"] for s in sources]))
+    cos_dec  = math.cos(math.radians(mean_dec))
+
+    dra_arcsec  = np.array([
+        (gaia_stars[idx_cat[k]]["ra"]  - sources[idx_src[k]]["ra"])  * cos_dec * 3600.0
+        for k in range(n_pairs)
+    ])
+    ddec_arcsec = np.array([
+        (gaia_stars[idx_cat[k]]["dec"] - sources[idx_src[k]]["dec"]) * 3600.0
+        for k in range(n_pairs)
+    ])
 
     BIN_SIZE = 2.0
-    RANGE    = 62.0
-    n_bins   = int(2 * RANGE / BIN_SIZE)  # 62 bins per axis
+    RANGE    = MAX_SEARCH_ARCSEC
+    n_bins   = int(2 * RANGE / BIN_SIZE)  # 90 bins per axis
 
     H, ra_edges, dec_edges = np.histogram2d(
         dra_arcsec, ddec_arcsec,
@@ -218,38 +248,39 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
         range=[[-RANGE, RANGE], [-RANGE, RANGE]],
     )
     peak_i, peak_j = np.unravel_index(np.argmax(H), H.shape)
-    peak_count     = int(H[peak_i, peak_j])
-    # Require peak to hold at least 5% of matches and be ≥ 15 counts
-    sig_threshold  = max(15, len(dra_arcsec) * 0.05)
+    peak_count  = int(H[peak_i, peak_j])
+    expected_bg = n_pairs / float(n_bins ** 2)
+    # Threshold: peak must be > 20× background AND at least 3 votes.
+    # 20× background gives ~4σ significance for Poisson noise.
+    sig_threshold = max(3.0, expected_bg * 20.0)
 
-    peak_dra_arcsec  = float((ra_edges[peak_i]  + ra_edges[peak_i + 1])  / 2.0)
-    peak_ddec_arcsec = float((dec_edges[peak_j] + dec_edges[peak_j + 1]) / 2.0)
-    total_offset     = math.sqrt(peak_dra_arcsec ** 2 + peak_ddec_arcsec ** 2)
+    peak_dra  = float((ra_edges[peak_i]  + ra_edges[peak_i + 1])  / 2.0)
+    peak_ddec = float((dec_edges[peak_j] + dec_edges[peak_j + 1]) / 2.0)
+    total_offset = math.sqrt(peak_dra ** 2 + peak_ddec ** 2)
 
-    expected_bg = len(dra_arcsec) / float(n_bins ** 2)
     logger.info(
-        "Gaia offset accumulator: %d pairs within 60\" — peak=%d (bg≈%.2f, threshold=%.0f) "
+        "WCS offset accumulator: %d pairs → peak=%d (bg≈%.3f, threshold=%.1f) "
         "at dRA=%.1f\" dDec=%.1f\" (total=%.1f\")",
-        len(dra_arcsec), peak_count, expected_bg, sig_threshold,
-        peak_dra_arcsec, peak_ddec_arcsec, total_offset,
+        n_pairs, peak_count, expected_bg, sig_threshold,
+        peak_dra, peak_ddec, total_offset,
     )
 
     if peak_count < sig_threshold or total_offset <= 2.0:
         logger.debug(
-            "No significant WCS offset detected (peak=%d < threshold=%.0f, offset=%.1f\"). "
-            "High median separation may indicate a galaxy-rich field where most detections "
-            "are extended sources not present in Gaia.",
+            "No significant WCS offset detected (peak=%d < threshold=%.1f, offset=%.1f\"). "
+            "This is expected for galaxy-rich fields where most detections are extended "
+            "sources not present in Gaia.",
             peak_count, sig_threshold, total_offset,
         )
         return 0.0, 0.0
 
-    # Refine: median of all matches within 2 bins of the peak
+    # Refine: median of all pairs within 2 bins of the peak
     near_mask = (
-        (np.abs(dra_arcsec  - peak_dra_arcsec)  <= BIN_SIZE * 2) &
-        (np.abs(ddec_arcsec - peak_ddec_arcsec) <= BIN_SIZE * 2)
+        (np.abs(dra_arcsec  - peak_dra)  <= BIN_SIZE * 2) &
+        (np.abs(ddec_arcsec - peak_ddec) <= BIN_SIZE * 2)
     )
-    refined_dra  = float(np.median(dra_arcsec[near_mask]))  if near_mask.any() else peak_dra_arcsec
-    refined_ddec = float(np.median(ddec_arcsec[near_mask])) if near_mask.any() else peak_ddec_arcsec
+    refined_dra  = float(np.median(dra_arcsec[near_mask]))  if near_mask.any() else peak_dra
+    refined_ddec = float(np.median(ddec_arcsec[near_mask])) if near_mask.any() else peak_ddec
 
     offset_ra_deg  = refined_dra  / (cos_dec * 3600.0)
     offset_dec_deg = refined_ddec / 3600.0
