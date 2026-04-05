@@ -377,23 +377,58 @@ async def solve(fits_path: str, psf_fwhm_arcsec: float | None = None) -> dict[st
                 for i in range(len(objects))
                 if star_mask[i]
             ]
+
+            # ----------------------------------------------------------
+            # "sources_all" — loose filter for anomaly detection.
+            #
+            # The strict star_mask above intentionally rejects:
+            #   - Bright saturated objects (large FWHM, e.g. asteroids)
+            #   - Faint stars below STAR_SNR_MIN (useful for WCS correction)
+            #   - Compact galaxies above the PSF-based FWHM limit
+            #
+            # sources_all keeps everything with:
+            #   - FWHM >= STAR_FWHM_MIN_ARCSEC (rejects single-pixel hot pixels)
+            #   - elongation < 5.0  (rejects strongly trailed cosmic rays)
+            #   - positive flux
+            #
+            # Used by: catalog_matcher (more sources → better WCS correction),
+            #          anomaly_detector (detects moving/transient objects),
+            #          API post_sources (complete detection record).
+            # Photometry calibration still uses `sources` (strict stars only).
+            # ----------------------------------------------------------
+            mask_all = mask_fwhm_min & (elongations < 5.0) & mask_flux
+            n_all = int(np.sum(mask_all))
+
+            sources_all = [
+                {
+                    "ra":         float(coords[i, 0]),
+                    "dec":        float(coords[i, 1]),
+                    "flux":       float(objects["flux"][i]),
+                    "fwhm":       float(fwhm_arcsec[i]),
+                    "elongation": float(elongations[i]),
+                }
+                for i in range(len(objects))
+                if mask_all[i]
+            ]
+
+            logger.info(
+                "Astrometry complete: %d strict stars + %d total detections (sources_all)  file=%s",
+                len(sources), n_all, fits_filename,
+            )
         else:
             sources = []
-
-        logger.info(
-            "Astrometry complete: %d sources extracted  file=%s",
-            len(sources),
-            fits_filename,
-        )
+            sources_all = []
+            logger.info("Astrometry complete: 0 sources extracted  file=%s", fits_filename)
 
         return {
-            "ra_center":  ra_center,
-            "dec_center": dec_center,
-            "fov_deg":    fov_deg,
-            "naxis1":     naxis1,
-            "naxis2":     naxis2,
-            "sources":    sources,
-            "wcs":        wcs,
+            "ra_center":   ra_center,
+            "dec_center":  dec_center,
+            "fov_deg":     fov_deg,
+            "naxis1":      naxis1,
+            "naxis2":      naxis2,
+            "sources":     sources,      # strict stars: for photometry calibration only
+            "sources_all": sources_all,  # all detections: for catalog matching + anomaly detection
+            "wcs":         wcs,
         }
 
     except Exception as exc:
