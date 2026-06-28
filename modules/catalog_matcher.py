@@ -11,11 +11,11 @@ Each source dict is enriched in-place with four catalog fields:
     catalog_mag   — magnitude (float): G-band for Gaia, J-band for 2MASS, None otherwise
     object_type   — "STAR", Simbad OTYPE string, "ASTEROID", "COMET", or None
 
-Catalogs are queried in order: Simbad → Gaia DR3 → 2MASS → MPC. Once a source is
-matched, subsequent catalogs skip it. This order prioritises rich object-type
-information from Simbad (variable stars, galaxies, named objects) over generic
-Gaia stellar matching, and uses 2MASS as a fallback for red/cool stars that are
-faint or absent in Gaia DR3.
+Catalogs are queried in order: Simbad → Gaia DR3 → 2MASS → Pan-STARRS → MPC.
+Once a source is matched, subsequent catalogs skip it. This order prioritises rich
+object-type information from Simbad over generic Gaia stellar matching, uses 2MASS
+for red/cool stars absent in Gaia, Pan-STARRS for faint optical sources below Gaia's
+completeness limit, and MPC last for solar system objects.
 
 Rationale for 2MASS as third catalog:
     - 2MASS (Two Micron All Sky Survey) covers ~470 million point sources to K≈14.3
@@ -23,11 +23,18 @@ Rationale for 2MASS as third catalog:
       in the Gaia G band, and for heavily reddened regions near the Galactic plane
     - Accessed via VizieR catalog II/246; magnitudes stored as J-band (Jmag)
 
+Rationale for Pan-STARRS DR1 as fourth catalog:
+    - Covers ~1 billion sources to r~23.3 mag (Gaia DR3 complete only to ~21 mag)
+    - Reduces false UNKNOWN anomaly alerts for faint sources simply below Gaia depth
+    - Coverage limited to declination > -30° (optical survey from Haleakala, Hawaii)
+    - Accessed via VizieR catalog II/349/ps1; magnitudes stored as r-band (rmag)
+
 Rate limits of the online services (all free, no auth required):
-    Simbad:    CDS infrastructure, ~5–6 req/sec recommended; 1-hr cache is sufficient
-    Gaia DR3:  ESA TAP+, no hard limit; queries take 1–5 s; 1-hr cache is sufficient
-    2MASS:     CDS/VizieR infrastructure, same limits as Simbad; cache is sufficient
-    MPC/SkyBot: IMCCE, no hard limit; epoch-dependent so shorter natural TTL
+    Simbad:      CDS infrastructure, ~5–6 req/sec recommended; 1-hr cache is sufficient
+    Gaia DR3:    ESA TAP+, no hard limit; queries take 1–5 s; 1-hr cache is sufficient
+    2MASS:       CDS/VizieR infrastructure, same limits as Simbad; cache is sufficient
+    Pan-STARRS:  CDS/VizieR infrastructure, same limits as Simbad; cache is sufficient
+    MPC/SkyBot:  IMCCE, no hard limit; epoch-dependent so shorter natural TTL
 
 Catalog query results are cached in-process for 1 hour to avoid redundant network
 calls across sources that share the same field.
@@ -571,6 +578,112 @@ def _match_2mass(sources: list[dict], twomass_stars: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pan-STARRS DR1 (VizieR catalog II/349/ps1)
+# ---------------------------------------------------------------------------
+
+def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> list[dict]:
+    """
+    Query Pan-STARRS DR1 (VizieR II/349/ps1) within fov_deg/2 of the frame centre.
+
+    Pan-STARRS reaches r~23.3 mag, significantly deeper than Gaia DR3 (~21 mag),
+    and reduces false UNKNOWN alerts for faint sources that are simply below Gaia's
+    completeness limit. Coverage is restricted to declination > -30°.
+
+    Returns a list of dicts with keys: ra, dec, obj_id, rmag.
+    Returns [] outside coverage or on any error.
+    """
+    if dec_center < -30.0:
+        logger.debug(
+            "Pan-STARRS skipped: dec=%.3f is outside coverage (dec > -30° required)",
+            dec_center,
+        )
+        return []
+
+    cache_key = f"panstarrs:{ra_center:.3f}:{dec_center:.3f}:{fov_deg:.3f}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+
+    try:
+        coord  = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
+        radius = (fov_deg * math.sqrt(2) / 2.0) * u.deg
+
+        viz = Vizier(
+            columns=["RAJ2000", "DEJ2000", "objID", "rmag"],
+            row_limit=-1,
+        )
+        result = viz.query_region(coord, radius=radius, catalog="II/349/ps1")
+
+        if result is None or len(result) == 0:
+            _cache_set(cache_key, [])
+            return []
+
+        table = result[0]
+
+        sources: list[dict] = []
+        for row in table:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    rmag = float(row["rmag"])
+                if not math.isfinite(rmag):
+                    continue
+                sources.append({
+                    "ra":     float(row["RAJ2000"]),
+                    "dec":    float(row["DEJ2000"]),
+                    "obj_id": str(row["objID"]),
+                    "rmag":   rmag,
+                })
+            except (TypeError, ValueError):
+                continue
+
+        _cache_set(cache_key, sources)
+        logger.debug(
+            "Pan-STARRS query returned %d sources for ra=%.3f dec=%.3f",
+            len(sources), ra_center, dec_center,
+        )
+        return sources
+
+    except Exception as exc:
+        logger.warning("Pan-STARRS query failed for ra=%.3f dec=%.3f: %s", ra_center, dec_center, exc)
+        return []
+
+
+def _match_panstarrs(sources: list[dict], ps_sources: list[dict]) -> None:
+    """
+    Mutate sources in-place: set catalog fields for unmatched sources within
+    MATCH_CONE_ARCSEC of a Pan-STARRS DR1 source.
+
+    Runs after Simbad, Gaia DR3, and 2MASS — catches faint sources (r < 23.3)
+    that fall below Gaia's completeness limit (~21 mag), reducing false UNKNOWN
+    alerts. catalog_mag is set to r-band magnitude.
+    """
+    unmatched = [s for s in sources if s["catalog_name"] is None]
+    if not unmatched or not ps_sources:
+        return
+
+    unmatched_coords = SkyCoord(
+        ra=[s["ra"] for s in unmatched] * u.deg,
+        dec=[s["dec"] for s in unmatched] * u.deg,
+    )
+    ps_coords = SkyCoord(
+        ra=[o["ra"] for o in ps_sources] * u.deg,
+        dec=[o["dec"] for o in ps_sources] * u.deg,
+    )
+
+    idx, sep2d, _ = unmatched_coords.match_to_catalog_sky(ps_coords)
+    threshold = config.MATCH_CONE_ARCSEC * u.arcsec
+
+    for i, source in enumerate(unmatched):
+        if sep2d[i] < threshold:
+            matched = ps_sources[idx[i]]
+            source["catalog_name"] = "Pan-STARRS"
+            source["catalog_id"]   = f"PS1 {matched['obj_id']}"
+            source["catalog_mag"]  = matched["rmag"]
+            source["object_type"]  = "STAR"
+
+
+# ---------------------------------------------------------------------------
 # MPC / SkyBot (Minor Planet Center / IMCCE)
 # ---------------------------------------------------------------------------
 
@@ -592,38 +705,70 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
         from astroquery.imcce import Skybot
         from astropy.time import Time
 
-        # Parse observation time
         if not obs_time:
-            logger.debug("No obs_time provided for MPC/SkyBot query, skipping")
+            logger.warning("SkyBot skipped: obs_time is empty (check DATE-OBS header in FITS)")
             _cache_set(cache_key, [])
             return []
 
         coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
         epoch = Time(obs_time)
-        # SkyBot uses FOV in arcmin
         fov_arcmin = fov_deg * 60.0
+
+        logger.info(
+            "SkyBot query: ra=%.4f dec=%.4f radius=%.1f' epoch=%s (UTC)",
+            ra_center, dec_center, fov_arcmin, epoch.utc.iso,
+        )
 
         result = Skybot.cone_search(coord, rad=fov_arcmin * u.arcmin, epoch=epoch)
 
         if result is None or len(result) == 0:
+            logger.info(
+                "SkyBot: no solar system objects found at ra=%.4f dec=%.4f epoch=%s",
+                ra_center, dec_center, epoch.utc.iso,
+            )
+            _cache_set(cache_key, [])
+            return []
+
+        # Log available columns once to help diagnose column name variations
+        # across astroquery versions (Name/name, RA/ra, Class/Type etc.)
+        logger.info(
+            "SkyBot returned %d row(s), columns: %s",
+            len(result), list(result.colnames),
+        )
+
+        # Normalise column names to uppercase for version-independent access
+        col_map = {c.upper(): c for c in result.colnames}
+
+        ra_col    = col_map.get("RA")
+        dec_col   = col_map.get("DEC")
+        name_col  = col_map.get("NAME") or col_map.get("OBJECT") or col_map.get("DESIGNATION")
+        class_col = col_map.get("CLASS") or col_map.get("TYPE") or col_map.get("OBJECTTYPE")
+
+        if not ra_col or not dec_col or not name_col:
+            logger.warning(
+                "SkyBot result missing expected columns. Available: %s", list(result.colnames)
+            )
             _cache_set(cache_key, [])
             return []
 
         objects: list[dict] = []
         for row in result:
             try:
-                # SkyBot returns RA/Dec in degrees
-                ra_val = float(row["RA"])
-                dec_val = float(row["DEC"])
-                name = str(row["Name"])
-                obj_class = str(row.get("Class", "Asteroid"))
+                # SkyBot returns RA/DEC as astropy Quantities (with angular units).
+                # .value extracts the numeric value in the column's native unit (degrees).
+                raw_ra  = row[ra_col]
+                raw_dec = row[dec_col]
+                ra_val  = float(raw_ra.value)  if hasattr(raw_ra,  "value") else float(raw_ra)
+                dec_val = float(raw_dec.value) if hasattr(raw_dec, "value") else float(raw_dec)
+                name    = str(row[name_col]).strip()
+                obj_class = str(row[class_col]).strip() if class_col else "Asteroid"
 
-                # Determine object type based on class
-                if "comet" in obj_class.lower():
-                    obj_type = "COMET"
-                else:
-                    obj_type = "ASTEROID"
+                obj_type = "COMET" if "comet" in obj_class.lower() else "ASTEROID"
 
+                logger.info(
+                    "SkyBot object: %s  type=%s  ra=%.4f dec=%.4f",
+                    name, obj_type, ra_val, dec_val,
+                )
                 objects.append({
                     "ra":          ra_val,
                     "dec":         dec_val,
@@ -631,14 +776,10 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
                     "object_type": obj_type,
                 })
             except Exception as row_exc:
-                logger.debug("Skipping malformed SkyBot row: %s", row_exc)
+                logger.warning("SkyBot: skipping malformed row: %s", row_exc)
                 continue
 
         _cache_set(cache_key, objects)
-        logger.debug(
-            "SkyBot query returned %d objects for ra=%.3f dec=%.3f at %s",
-            len(objects), ra_center, dec_center, obs_time,
-        )
         return objects
 
     except ImportError:
@@ -646,7 +787,10 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
         _cache_set(cache_key, [])
         return []
     except Exception as exc:
-        logger.warning("SkyBot query failed for ra=%.3f dec=%.3f: %s", ra_center, dec_center, exc)
+        logger.warning(
+            "SkyBot query failed: ra=%.4f dec=%.4f obs_time=%r — %s",
+            ra_center, dec_center, obs_time, exc,
+        )
         return []
 
 
@@ -813,7 +957,21 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     except Exception as exc:
         logger.warning("2MASS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
-    # --- 4. MPC / SkyBot (solar system objects; wider cone) ---
+    # --- 4. Pan-STARRS DR1 (deep optical catalog, dec > -30°; catches faint sources
+    #        below Gaia completeness limit ~21 mag, reduces false UNKNOWN alerts) ---
+    ps_sources: list[dict] = []
+    try:
+        ps_sources = _query_panstarrs(ra_center, dec_center, fov_deg)
+        if ps_sources:
+            logger.info(
+                "Pan-STARRS query: ra=%.4f dec=%.4f fov=%.4f° → %d sources  fits_filename=%s",
+                ra_center, dec_center, fov_deg, len(ps_sources), fits_filename,
+            )
+        _match_panstarrs(sources, ps_sources)
+    except Exception as exc:
+        logger.warning("Pan-STARRS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
+
+    # --- 5. MPC / SkyBot (solar system objects; wider cone) ---
     mpc_objects: list[dict] = []
     try:
         mpc_objects = _query_mpc(ra_center, dec_center, obs_time, fov_deg)
@@ -821,15 +979,16 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     except Exception as exc:
         logger.warning("MPC/SkyBot matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
-    n_simbad    = sum(1 for s in sources if s["catalog_name"] == "Simbad")
-    n_gaia      = sum(1 for s in sources if s["catalog_name"] == "Gaia DR3")
-    n_2mass     = sum(1 for s in sources if s["catalog_name"] == "2MASS")
-    n_mpc       = sum(1 for s in sources if s["catalog_name"] == "MPC")
-    n_unmatched = sum(1 for s in sources if s["catalog_name"] is None)
+    n_simbad     = sum(1 for s in sources if s["catalog_name"] == "Simbad")
+    n_gaia       = sum(1 for s in sources if s["catalog_name"] == "Gaia DR3")
+    n_2mass      = sum(1 for s in sources if s["catalog_name"] == "2MASS")
+    n_panstarrs  = sum(1 for s in sources if s["catalog_name"] == "Pan-STARRS")
+    n_mpc        = sum(1 for s in sources if s["catalog_name"] == "MPC")
+    n_unmatched  = sum(1 for s in sources if s["catalog_name"] is None)
 
     logger.info(
-        "Catalog matching: %d sources — Simbad: %d, Gaia: %d, 2MASS: %d, MPC: %d, unmatched: %d  fits_filename=%s",
-        len(sources), n_simbad, n_gaia, n_2mass, n_mpc, n_unmatched, fits_filename,
+        "Catalog matching: %d sources — Simbad: %d, Gaia: %d, 2MASS: %d, Pan-STARRS: %d, MPC: %d, unmatched: %d  fits_filename=%s",
+        len(sources), n_simbad, n_gaia, n_2mass, n_panstarrs, n_mpc, n_unmatched, fits_filename,
     )
 
     # Warn when very few sources match any stellar catalog — expected for fields at
@@ -839,7 +998,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     #   2. STAR_SNR_MIN threshold — lowering it detects fainter stars
     #   3. Run on a Milky Way field to verify the pipeline works for star-rich frames
     if len(sources) > 0:
-        n_stellar = n_simbad + n_gaia + n_2mass
+        n_stellar = n_simbad + n_gaia + n_2mass + n_panstarrs
         match_rate = n_stellar / len(sources)
         if match_rate < 0.05 and len(sources) >= 20:
             logger.warning(

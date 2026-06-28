@@ -319,12 +319,22 @@ async def _prefetch_history_data(
         for i, tile in enumerate(tiles_coverage_list):
             coverage_by_tile[tile] = coverage_result.get(str(i), [])
 
+        n_history  = sum(len(v) for v in narrow_history_by_tile.values())
+        n_coverage = sum(len(v) for v in coverage_by_tile.values())
         logger.info(
             "Batch prefetch complete: %d source history results, %d coverage results",
-            sum(len(v) for v in narrow_history_by_tile.values()),
-            sum(len(v) for v in coverage_by_tile.values()),
+            n_history, n_coverage,
             extra=extra,
         )
+        if n_history == 0 and n_coverage == 0:
+            logger.warning(
+                "API returned empty history AND empty coverage — "
+                "either this is the first frame of this field, or the API batch "
+                "endpoints (/sources/near/batch, /frames/covering/batch) are not "
+                "returning saved data. All sources will be classified as "
+                "FIRST_OBSERVATION and no anomalies will be reported.",
+                extra=extra,
+            )
 
     except Exception as exc:
         logger.error(
@@ -358,10 +368,11 @@ def _classify_source_sync(
     dec = float(source["dec"])
     mag: float | None = source.get("mag")
 
-    catalog_name: str | None  = source.get("catalog_name")
-    catalog_id:   str | None  = source.get("catalog_id")
-    object_type:  str | None  = source.get("object_type")
-    elongation:   float       = float(source.get("elongation", 0.0))
+    catalog_name:     str | None = source.get("catalog_name")
+    catalog_id:       str | None = source.get("catalog_id")
+    object_type:      str | None = source.get("object_type")
+    elongation:       float      = float(source.get("elongation", 0.0))
+    from_subtraction: bool       = bool(source.get("_from_subtraction", False))
 
     extra = {"frame_id": frame_id, "log_filename": log_filename}
     tile = _tile_key(ra, dec)
@@ -446,12 +457,33 @@ def _classify_source_sync(
 
     # --- FIRST_OBSERVATION: sky area never imaged before ---
     if n_coverage == 0:
-        logger.debug(
-            "FIRST_OBSERVATION: ra=%.4f dec=%.4f — sky area has no prior coverage",
-            ra, dec,
+        if not from_subtraction:
+            logger.debug(
+                "FIRST_OBSERVATION: ra=%.4f dec=%.4f — sky area has no prior coverage",
+                ra, dec,
+                extra=extra,
+            )
+            return None  # Not an anomaly — do not report to API
+        # Subtraction already confirmed this source is new relative to the
+        # reference stack, even though the API has no prior coverage record.
+        logger.info(
+            "UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f mag=%s",
+            ra, dec, mag,
             extra=extra,
         )
-        return None  # Not an anomaly — do not report to API
+        return {
+            "anomaly_type":    _TYPE_UNKNOWN,
+            "ra":              ra,
+            "dec":             dec,
+            "magnitude":       mag,
+            "delta_mag":       None,
+            "mpc_designation": None,
+            "ephemeris":       None,
+            "notes": (
+                "Detected via image subtraction in a sky area with no prior "
+                "coverage in the API history."
+            ),
+        }
 
     # --- Area has prior coverage from here on ---
 
