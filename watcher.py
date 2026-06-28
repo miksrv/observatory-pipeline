@@ -86,16 +86,17 @@ def process_existing_files(directory: str) -> int:
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+        format="%(asctime)s %(levelname)-5s %(module)s — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    logger.info("Starting observatory-pipeline watcher on %s", config.FITS_INCOMING)
+    logger.info("Starting watcher on %s (log level: %s)", config.FITS_INCOMING, config.LOG_LEVEL)
 
     # Process any FITS files that already exist in the incoming directory
     existing_count = process_existing_files(config.FITS_INCOMING)
     if existing_count > 0:
-        logger.info("Processed %d existing FITS file(s)", existing_count)
+        logger.info("Processed %d existing file(s)", existing_count)
 
     # Now start watching for new files
     event_handler = FitsEventHandler()
@@ -103,14 +104,14 @@ if __name__ == "__main__":
     observer.schedule(event_handler, config.FITS_INCOMING, recursive=False)
     observer.start()
 
-    logger.info("Watching for new FITS files...")
+    logger.info("Watching for new FITS files in %s", config.FITS_INCOMING)
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Shutdown requested — stopping observer")
+        logger.info("Shutdown requested — stopping")
         observer.stop()
 
     observer.join()
-    logger.info("Observatory-pipeline watcher stopped")
+    logger.info("Watcher stopped")

@@ -3,6 +3,7 @@ astroquery>=0.4.7
 photutils>=1.12
 sep>=1.4
 astroscrappy>=1.1
+astroalign>=2.4
 numpy>=1.26
 httpx>=0.27
 tenacity>=8.2

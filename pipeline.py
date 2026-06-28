@@ -50,6 +50,11 @@ except ImportError:
     normalizer = None  # type: ignore[assignment]
 
 try:
+    from modules import subtraction
+except ImportError:
+    subtraction = None  # type: ignore[assignment]
+
+try:
     from api_client import client as api_client
 except ImportError:
     api_client = None  # type: ignore[assignment]
@@ -100,7 +105,21 @@ async def run(fits_path: str) -> None:
     
     # Get object name for directory organization
     object_name: str = header.get("object_name", "_UNKNOWN") or "_UNKNOWN"
-    
+
+    # Fallback: extract object name from filename when OBJECT header is empty
+    if (object_name == "_UNKNOWN" or not object_name) and normalizer is not None:
+        extracted = normalizer.extract_object_from_filename(basename)
+        if extracted != "_UNKNOWN":
+            object_name = extracted
+            header["object_name"] = object_name
+            observation = header.get("observation", {})
+            if isinstance(observation, dict):
+                observation["object"] = object_name
+
+    # Write normalized object name back to FITS file
+    if config.NORMALIZE_ENABLED and normalizer is not None:
+        normalizer.update_fits_object_header(fits_path, object_name)
+
     # Generate filename (normalized if enabled)
     original_filename = basename
     if config.NORMALIZE_ENABLED and normalizer is not None:
@@ -115,13 +134,23 @@ async def run(fits_path: str) -> None:
     else:
         normalized_filename = basename
 
-    logger.info(
-        "Starting pipeline for filename=%s object=%s%s",
-        original_filename,
-        object_name,
-        f" → {normalized_filename}" if normalized_filename != original_filename else "",
-        extra=extra,
-    )
+    if normalized_filename != original_filename:
+        logger.info('Processing "%s" (%s) → %s', original_filename, object_name, normalized_filename, extra=extra)
+    else:
+        logger.info('Processing "%s" (%s)', original_filename, object_name, extra=extra)
+
+    # ------------------------------------------------------------------
+    # Step 1.5 — Early exit for calibration frames (Dark, Flat, Bias)
+    # ------------------------------------------------------------------
+    frame_type: str | None = header.get("observation", {}).get("frame_type")
+    if frame_type in ("Dark", "Flat", "Bias"):
+        dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
+        dest_path = os.path.join(dest_dir, normalized_filename)
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.move(fits_path, dest_path)
+        _cleanup_astap_files(fits_path)
+        logger.info("Archived %s frame: %s → %s", frame_type, basename, dest_path, extra=extra)
+        return
 
     # ------------------------------------------------------------------
     # Step 2 — Quality control
@@ -130,7 +159,7 @@ async def run(fits_path: str) -> None:
     quality_flag: str = qc_result.get("quality_flag", "BAD")
 
     logger.info(
-        "QC result: flag=%s fwhm=%.2f stars=%d",
+        "QC: flag=%s fwhm=%.2f stars=%d",
         quality_flag,
         qc_result.get("fwhm_median") or 0.0,
         qc_result.get("star_count") or 0,
@@ -138,12 +167,7 @@ async def run(fits_path: str) -> None:
     )
 
     if quality_flag != "OK":
-        logger.warning(
-            "Frame rejected by QC: flag=%s filename=%s",
-            quality_flag,
-            basename,
-            extra=extra,
-        )
+        logger.warning("QC rejected %s: %s", basename, quality_flag, extra=extra)
         return
 
     # ------------------------------------------------------------------
@@ -156,8 +180,8 @@ async def run(fits_path: str) -> None:
                 fits_path,
                 psf_fwhm_arcsec=qc_result.get("fwhm_median"),
             )
-            logger.debug(
-                "Astrometry complete: ra=%.4f dec=%.4f sources=%d",
+            logger.info(
+                "Astrometry: ra=%.4f dec=%.4f sources=%d",
                 astro_result.get("ra_center") or 0.0,
                 astro_result.get("dec_center") or 0.0,
                 len(astro_result.get("sources") or []),
@@ -172,6 +196,52 @@ async def run(fits_path: str) -> None:
             astro_result = {}
     else:
         logger.debug("Astrometry module not available — skipping", extra=extra)
+
+    # ------------------------------------------------------------------
+    # Step 3.5 — Image subtraction (transient / moving object detection)
+    # Runs against archived frames of the same object + filter.
+    # Produces subtraction_candidates: sources confirmed new by pixel diff.
+    # These are merged into `sources` and flagged _from_subtraction=True
+    # so the anomaly detector can treat them with higher confidence.
+    # ------------------------------------------------------------------
+    subtraction_info: dict = {"performed": False, "reference_frame_count": 0, "candidates_count": 0}
+    if subtraction is not None and astro_result:
+        try:
+            filter_name = header.get("observation", {}).get("filter")
+            archive_object_dir = os.path.join(config.FITS_ARCHIVE, object_name)
+            sub_result = await subtraction.run(
+                fits_path=fits_path,
+                archive_dir=archive_object_dir,
+                filter_name=filter_name,
+            )
+            sub_candidates = sub_result.get("candidates", [])
+            subtraction_info = {
+                "performed": sub_result.get("performed", False),
+                "reference_frame_count": sub_result.get("reference_frame_count", 0),
+                "candidates_count": len(sub_candidates),
+            }
+            if sub_candidates:
+                # Initialise catalog fields so catalog_matcher can process them
+                for cand in sub_candidates:
+                    cand.setdefault("catalog_name", None)
+                    cand.setdefault("catalog_id",   None)
+                    cand.setdefault("catalog_mag",  None)
+                    cand.setdefault("object_type",  None)
+                sources = sources + sub_candidates
+                logger.info(
+                    "Subtraction found %d candidate(s); total sources for matching: %d  fits_filename=%s",
+                    len(sub_candidates), len(sources), basename,
+                    extra=extra,
+                )
+        except Exception as exc:
+            logger.error(
+                "Image subtraction failed: %s — continuing without subtraction",
+                exc,
+                extra=extra,
+            )
+    else:
+        if subtraction is None:
+            logger.debug("Subtraction module not available — skipping", extra=extra)
 
     # ------------------------------------------------------------------
     # Step 4 — Catalog matching (run BEFORE photometry so Gaia DR3 stars
@@ -268,19 +338,9 @@ async def run(fits_path: str) -> None:
 
     try:
         frame_id: str = await api_client.post_frame(frame_data)
-        logger.info(
-            "Frame registered: frame_id=%s filename=%s",
-            frame_id,
-            normalized_filename,
-            extra=extra,
-        )
+        logger.info("Frame registered: frame_id=%s", frame_id, extra=extra)
     except Exception as exc:
-        logger.error(
-            "Failed to post frame to API: %s — aborting pipeline for filename=%s",
-            exc,
-            basename,
-            extra=extra,
-        )
+        logger.error("Failed to register frame %s: %s", basename, exc, extra=extra)
         # Clean up astap temp files even on failure
         _cleanup_astap_files(fits_path)
         return
@@ -319,6 +379,7 @@ async def run(fits_path: str) -> None:
                 "ra_center": astro_result.get("ra_center") or header.get("ra"),
                 "dec_center": astro_result.get("dec_center") or header.get("dec"),
                 "fov_deg": astro_result.get("fov_deg") or 1.0,
+                "subtraction_performed": subtraction_info.get("performed", False),
             }
             # sources already have catalog_name/catalog_id from step 4
             anomalies = await anomaly_detector.detect(frame_id, sources, sources, anomaly_frame_meta)
@@ -340,7 +401,7 @@ async def run(fits_path: str) -> None:
     # Step 9 — Post anomalies
     # ------------------------------------------------------------------
     try:
-        await api_client.post_anomalies(frame_id, fits_path, anomalies)
+        await api_client.post_anomalies(frame_id, normalized_filename, anomalies)
         logger.debug(
             "Anomalies posted: frame_id=%s count=%d",
             frame_id,
@@ -367,23 +428,7 @@ async def run(fits_path: str) -> None:
         dest_path = os.path.join(dest_dir, normalized_filename)
         shutil.move(fits_path, dest_path)
         
-        if normalized_filename != original_filename:
-            logger.info(
-                "Pipeline complete: %s → %s archived_to=%s frame_id=%s",
-                original_filename,
-                normalized_filename,
-                dest_path,
-                frame_id,
-                extra=extra,
-            )
-        else:
-            logger.info(
-                "Pipeline complete: filename=%s archived_to=%s frame_id=%s",
-                normalized_filename,
-                dest_path,
-                frame_id,
-                extra=extra,
-            )
+        logger.info("Done: %s → %s", original_filename, dest_path, extra=extra)
 
         # Clean up astap temporary files (.ini, .wcs) left in incoming directory
         _cleanup_astap_files(fits_path)
