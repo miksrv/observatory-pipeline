@@ -70,8 +70,18 @@ SEP_MIN_AREA: int = int(_get("SEP_MIN_AREA", "15"))  # minimum connected pixels
 # Cross-matching
 # ---------------------------------------------------------------------------
 MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
-MOVING_CONE_ARCSEC: float = float(_get("MOVING_CONE_ARCSEC", "30.0"))
+# Default widened from 30" to 120": fast-moving objects like Vesta travel ~60"/hr,
+# so 30" was too tight to detect cross-frame position shifts reliably.
+MOVING_CONE_ARCSEC: float = float(_get("MOVING_CONE_ARCSEC", "120.0"))
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
+
+# ---------------------------------------------------------------------------
+# Image subtraction
+# ---------------------------------------------------------------------------
+# Minimum number of archived reference frames required to attempt subtraction.
+SUBTRACTION_MIN_FRAMES: int = int(_get("SUBTRACTION_MIN_FRAMES", "3"))
+# Detection threshold on the difference image (multiples of background RMS).
+SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 
 # ---------------------------------------------------------------------------
 # Observatory site coordinates (used for topocentric Horizons queries)
@@ -86,4 +96,11 @@ SITE_ELEV: int  = int(_get("SITE_ELEV", "0"))      # metres above sea level
 # When enabled, normalizes object names (M 51 → M51), filter names (Blue → B),
 # frame types (Light Frame → Light), and renames files to standard format.
 NORMALIZE_ENABLED: bool = _get("NORMALIZE_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+# Log verbosity level. Valid values: DEBUG, INFO, WARNING, ERROR.
+# Use INFO for normal operation; DEBUG for troubleshooting.
+LOG_LEVEL: str = _get("LOG_LEVEL", "INFO").upper()
 
