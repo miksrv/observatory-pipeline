@@ -3,7 +3,7 @@ api_client/client.py — HTTP client for the observatory REST API.
 
 Public functions:
   post_frame(frame_data)                                    → str (frame_id)
-  post_sources(frame_id, filename, sources)                 → None
+  post_sources(frame_id, filename, sources)                 → list[str | None] | None
   post_anomalies(frame_id, filename, anomalies)             → None
   get_sources_near(ra, dec, radius_arcsec, before_time)     → list
   get_frames_covering(ra, dec, before_time)                 → list
@@ -46,6 +46,35 @@ _retry = tenacity.retry(
 
 # Types that tenacity will retry — used in outer-wrapper catches.
 _RETRYABLE = (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError)
+
+
+def _normalize_batch_results(resp_json: object) -> dict:
+    """
+    Normalize the "results" field of a batch-endpoint response to a
+    dict mapping position index (as string) -> list of result dicts.
+
+    API.md documents "results" as a JSON *object* keyed by string index
+    (e.g. {"0": [...], "1": [...]}), but the observatory-api's actual
+    responses have been observed to serialize it as a plain JSON *array*
+    instead (e.g. [[...], [...]] — PHP's json_encode() does this for any
+    array with sequential integer keys, which is exactly what a
+    foreach-built results array normally has). Silently coercing a
+    non-dict "results" to {} — the previous behaviour — discarded every
+    batch result on every call, making anomaly_detector.py permanently
+    blind to history/coverage regardless of how much data the API
+    actually holds. Accept both shapes here so a fix on either side of
+    the API contract keeps working.
+    """
+    if not isinstance(resp_json, dict):
+        return {}
+
+    data = resp_json.get("results", resp_json)
+
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {str(i): v for i, v in enumerate(data)}
+    return {}
 
 
 def _make_client() -> httpx.AsyncClient:
@@ -140,7 +169,7 @@ async def _post_sources_with_retry(
     frame_id: str,
     filename: str,
     sources: list,
-) -> None:
+) -> list | None:
     """Inner retryable core for post_sources."""
     url = f"{config.API_BASE_URL}/frames/{frame_id}/sources"
     logger.info(
@@ -169,10 +198,17 @@ async def _post_sources_with_retry(
         if response.status_code >= 500:
             response.raise_for_status()  # triggers retry
 
-    return None
+        resp_json = response.json()
+
+    # API.md documents "source_ids" as positionally parallel to the request's
+    # "sources" array — see FramesController::saveSources. Missing/malformed
+    # is treated as "the API didn't tell us" rather than an error: callers
+    # must already tolerate None (e.g. an old API version predating this field).
+    source_ids = resp_json.get("source_ids") if isinstance(resp_json, dict) else None
+    return source_ids if isinstance(source_ids, list) else None
 
 
-async def post_sources(frame_id: str, filename: str, sources: list) -> None:
+async def post_sources(frame_id: str, filename: str, sources: list) -> list | None:
     """
     POST detected sources for a processed frame.
 
@@ -184,6 +220,15 @@ async def post_sources(frame_id: str, filename: str, sources: list) -> None:
         Original FITS filename — included in the request body for log correlation.
     sources:
         List of source dicts as defined in CLAUDE.md.  An empty list is valid.
+
+    Returns
+    -------
+    list | None
+        The API's `source_ids` array — positionally parallel to `sources`
+        (same length/order), each entry the resolved `sources.id` or `None`
+        for a skipped entry. Returns `None` (not a list of Nones) if the API
+        call failed entirely or didn't return the field, so callers can tell
+        "we don't know any source ids" apart from "every source was skipped".
     """
     logger.info(
         "Posting %d sources for frame_id=%s",
@@ -192,7 +237,7 @@ async def post_sources(frame_id: str, filename: str, sources: list) -> None:
         extra={"frame_id": frame_id, "log_filename": filename},
     )
     try:
-        await _post_sources_with_retry(frame_id, filename, sources)
+        return await _post_sources_with_retry(frame_id, filename, sources)
     except _RETRYABLE as exc:
         logger.error(
             "All retries exhausted posting sources for frame_id=%s: %s",
@@ -442,10 +487,9 @@ async def _get_sources_near_batch_with_retry(
 
         resp_json = response.json()
 
-    # Expected format: {"results": {"0": [...], "1": [...], ...}}
-    # where keys are string indices matching input positions array
-    data = resp_json.get("results", resp_json) if isinstance(resp_json, dict) else {}
-    return data if isinstance(data, dict) else {}
+    # Documented format: {"results": {"0": [...], "1": [...], ...}}
+    # Also accepted: {"results": [[...], [...], ...]} — see _normalize_batch_results.
+    return _normalize_batch_results(resp_json)
 
 
 async def get_sources_near_batch(

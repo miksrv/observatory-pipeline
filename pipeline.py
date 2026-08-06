@@ -198,6 +198,31 @@ async def run(fits_path: str) -> None:
         logger.debug("Astrometry module not available — skipping", extra=extra)
 
     # ------------------------------------------------------------------
+    # Sources for subtraction / catalog matching / photometry.
+    #
+    # Use "sources_all" (loose filter) which includes bright saturated
+    # objects (asteroids, comets) and faint stars rejected by the strict
+    # star filter. This gives more sources for WCS offset correction and
+    # ensures moving/transient objects reach the anomaly detector.
+    # Falls back to "sources" (strict stars) if sources_all is unavailable.
+    #
+    # NOTE: this must be assigned BEFORE Step 3.5 (image subtraction) below,
+    # which merges its candidates into `sources`. Assigning it later (as an
+    # earlier revision of this file did, in what is now Step 4) made
+    # `sources` a local variable whose first assignment happened after the
+    # read in Step 3.5, raising UnboundLocalError on every frame where
+    # subtraction actually found candidates.
+    # ------------------------------------------------------------------
+    sources: list = astro_result.get("sources_all") or astro_result.get("sources") or []
+    sources_stars: list = astro_result.get("sources") or []
+    if len(sources) != len(sources_stars):
+        logger.info(
+            "Using sources_all for catalog matching: %d detections (%d strict stars)  fits_filename=%s",
+            len(sources), len(sources_stars), basename,
+            extra=extra,
+        )
+
+    # ------------------------------------------------------------------
     # Step 3.5 — Image subtraction (transient / moving object detection)
     # Runs against archived frames of the same object + filter.
     # Produces subtraction_candidates: sources confirmed new by pixel diff.
@@ -246,21 +271,7 @@ async def run(fits_path: str) -> None:
     # ------------------------------------------------------------------
     # Step 4 — Catalog matching (run BEFORE photometry so Gaia DR3 stars
     #          can be used as reference for zero-point calibration)
-    #
-    # Use "sources_all" (loose filter) which includes bright saturated
-    # objects (asteroids, comets) and faint stars rejected by the strict
-    # star filter. This gives more sources for WCS offset correction and
-    # ensures moving/transient objects reach the anomaly detector.
-    # Falls back to "sources" (strict stars) if sources_all is unavailable.
     # ------------------------------------------------------------------
-    sources: list = astro_result.get("sources_all") or astro_result.get("sources") or []
-    sources_stars: list = astro_result.get("sources") or []
-    if len(sources) != len(sources_stars):
-        logger.info(
-            "Using sources_all for catalog matching: %d detections (%d strict stars)  fits_filename=%s",
-            len(sources), len(sources_stars), basename,
-            extra=extra,
-        )
     if catalog_matcher is not None and sources:
         try:
             # Build frame_meta with all fields required by catalog_matcher
@@ -292,6 +303,24 @@ async def run(fits_path: str) -> None:
             logger.debug("Catalog matcher not available — skipping", extra=extra)
 
     # ------------------------------------------------------------------
+    # Step 4.5 — Deduplicate sources sharing a catalog identity.
+    #
+    # A single physical object can appear more than once in `sources` for
+    # this one frame: e.g. a moving MPC-matched asteroid is often detected
+    # both by the normal source extractor AND as one or more nearby
+    # image-subtraction candidates (MOVING_CONE_ARCSEC is wide — 120" by
+    # default — so several nearby diff-image blobs can all independently
+    # match the same MPC object). Each such duplicate would otherwise be
+    # posted as a separate row to POST /frames/{id}/sources, inflating
+    # sources.observation_count for one real observation, and separately
+    # classified by anomaly_detector.py — duplicate ASTEROID/COMET rows in
+    # `anomalies` for what is physically one object seen once in this frame.
+    # Sources with no catalog match are never merged; only entries sharing
+    # the same (catalog_name, catalog_id) collapse into one.
+    # ------------------------------------------------------------------
+    sources = _dedupe_by_catalog_identity(sources, extra)
+
+    # ------------------------------------------------------------------
     # Step 5 — Photometry (runs AFTER catalog matching to use Gaia DR3
     #          reference stars for magnitude calibration).
     #
@@ -321,6 +350,23 @@ async def run(fits_path: str) -> None:
             logger.debug("Photometry module not available — skipping", extra=extra)
 
     # ------------------------------------------------------------------
+    # Step 5.5 — Populate the unified "mag" field.
+    #
+    # This is the field the API payload documents (POST /frames/{id}/sources)
+    # and the one anomaly_detector.py reads for magnitude-change comparisons
+    # (VARIABLE_STAR / BINARY_STAR / SUPERNOVA_CANDIDATE). photometry.measure()
+    # only ever sets mag_instrumental/mag_calibrated — never "mag" itself —
+    # so without this step every source's "mag" stayed at whatever
+    # placeholder it had before (None for catalog/subtraction candidates),
+    # delta_mag in anomaly_detector.py was always None, and no
+    # magnitude-change anomaly could ever fire. Prefer the Gaia-calibrated
+    # magnitude; fall back to the uncalibrated instrumental one so sources
+    # without enough Gaia reference stars in the field still get a value.
+    # ------------------------------------------------------------------
+    for _src in sources:
+        _src["mag"] = _src.get("mag_calibrated") if _src.get("calibrated") else _src.get("mag_instrumental")
+
+    # ------------------------------------------------------------------
     # Step 6 — Post frame to API
     # ------------------------------------------------------------------
     if api_client is None:
@@ -347,16 +393,33 @@ async def run(fits_path: str) -> None:
 
     # ------------------------------------------------------------------
     # Step 7 — Post sources (includes catalog match info from step 4)
+    #
+    # The API returns `source_ids`, positionally parallel to `sources`, so
+    # each source dict can be tagged with its resolved `sources.id` here.
+    # anomaly_detector.py reads this back (as "_source_id") to populate
+    # `anomalies[].source_id` — otherwise the API has no way to know which
+    # catalog source an anomaly refers to (see CLAUDE.md Known Issues).
     # ------------------------------------------------------------------
 
     try:
-        await api_client.post_sources(frame_id, basename, sources)
+        source_ids = await api_client.post_sources(frame_id, basename, sources)
         logger.debug(
             "Sources posted: frame_id=%s count=%d",
             frame_id,
             len(sources),
             extra=extra,
         )
+        if source_ids is not None and len(source_ids) == len(sources):
+            for src, source_id in zip(sources, source_ids):
+                src["_source_id"] = source_id
+        elif source_ids is not None:
+            logger.warning(
+                "post_sources returned %d source_ids for %d sources — "
+                "length mismatch, not attaching source_id to anomalies",
+                len(source_ids),
+                len(sources),
+                extra=extra,
+            )
     except Exception as exc:
         logger.error(
             "Failed to post sources: frame_id=%s error=%s — continuing",
@@ -440,6 +503,65 @@ async def run(fits_path: str) -> None:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _dedupe_by_catalog_identity(sources: list, extra: dict) -> list:
+    """
+    Collapse multiple detections in this frame's source list that resolved
+    to the very same catalog identity (catalog_name, catalog_id) into a
+    single representative source. See Step 4.5's comment in run() above for
+    the rationale.
+
+    Sources with no catalog match (catalog_name is None, or catalog_id is
+    None) are never merged — every uncatalogued detection is kept as a
+    distinct source, since it has no stable identity to deduplicate on.
+
+    When two detections share an identity, prefer the one NOT tagged
+    `_from_subtraction` (normal source-extractor detections are typically
+    more astrometrically/photometrically precise than a diff-image blob);
+    among two of the same kind, prefer the brighter one (higher flux).
+    """
+    kept_index_by_key: dict[tuple, int] = {}
+    deduped: list = []
+    n_merged = 0
+
+    for src in sources:
+        catalog_name = src.get("catalog_name")
+        catalog_id = src.get("catalog_id")
+        if catalog_name is None or catalog_id is None:
+            deduped.append(src)
+            continue
+
+        key = (catalog_name, catalog_id)
+        idx = kept_index_by_key.get(key)
+        if idx is None:
+            kept_index_by_key[key] = len(deduped)
+            deduped.append(src)
+            continue
+
+        n_merged += 1
+        if _prefer_candidate(src, deduped[idx]):
+            deduped[idx] = src
+
+    if n_merged:
+        logger.info(
+            "Deduplicated %d source(s) sharing a catalog identity with "
+            "another detection in this frame (%d unique sources remain)",
+            n_merged,
+            len(deduped),
+            extra=extra,
+        )
+
+    return deduped
+
+
+def _prefer_candidate(candidate: dict, existing: dict) -> bool:
+    """Return True if `candidate` should replace `existing` as the kept detection."""
+    existing_is_sub = bool(existing.get("_from_subtraction"))
+    candidate_is_sub = bool(candidate.get("_from_subtraction"))
+    if candidate_is_sub != existing_is_sub:
+        return existing_is_sub  # prefer the non-subtraction detection
+    return (candidate.get("flux") or 0.0) > (existing.get("flux") or 0.0)
 
 
 def _cleanup_astap_files(fits_path: str) -> None:

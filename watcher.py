@@ -8,6 +8,7 @@ new FITS file to the pipeline for processing.
 import asyncio
 import logging
 import os
+import threading
 import time
 
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
@@ -20,6 +21,25 @@ logger = logging.getLogger(__name__)
 
 
 FITS_EXTENSIONS: frozenset[str] = frozenset({".fits", ".fit"})
+
+# ---------------------------------------------------------------------------
+# Duplicate-dispatch guard.
+#
+# Regression: the same FITS file was seen registered as TWO separate frames
+# a few seconds apart (same filename, same obs_time, same photometry —
+# `Vesta_A807_FA_Light_L_60_2021-03-14T17-05-27.fits` got two distinct
+# frame_ids in the API, inflating object_stats.frame_count and
+# sources.observation_count for every source in it). watchdog is known to
+# occasionally deliver two FileCreatedEvent for one path — e.g. on the
+# polling-based emitter used for Docker Desktop bind mounts on macOS, or
+# when a capture program writes-then-renames the file. `_paths_in_flight`
+# rejects a second dispatch for a path that's still being processed; the
+# `os.path.exists` check in `process_fits_file` catches the remaining case
+# where the duplicate event arrives strictly after the first dispatch
+# already finished and moved the file out of FITS_INCOMING.
+# ---------------------------------------------------------------------------
+_paths_in_flight: set[str] = set()
+_paths_in_flight_lock = threading.Lock()
 
 
 class FitsEventHandler(FileSystemEventHandler):
@@ -43,9 +63,40 @@ class FitsEventHandler(FileSystemEventHandler):
 
 
 def process_fits_file(fits_path: str) -> None:
-    """Process a single FITS file through the pipeline."""
-    logger.info("Dispatching to pipeline: %s", fits_path)
-    asyncio.run(pipeline.run(fits_path))
+    """
+    Process a single FITS file through the pipeline.
+
+    Guards against processing the same file twice from a duplicate
+    filesystem event (see the `_paths_in_flight` module comment above):
+    skips dispatch if this exact path is already being processed, or if it
+    no longer exists (already processed and moved out of FITS_INCOMING by
+    an earlier, still-in-flight or already-finished call).
+    """
+    if not os.path.exists(fits_path):
+        logger.warning(
+            "Skipping %s — file no longer exists (likely a duplicate "
+            "filesystem event for an already-processed file)",
+            fits_path,
+        )
+        return
+
+    real_path = os.path.realpath(fits_path)
+    with _paths_in_flight_lock:
+        if real_path in _paths_in_flight:
+            logger.warning(
+                "Skipping %s — already being processed by another event "
+                "(duplicate on_created event for the same file)",
+                fits_path,
+            )
+            return
+        _paths_in_flight.add(real_path)
+
+    try:
+        logger.info("Dispatching to pipeline: %s", fits_path)
+        asyncio.run(pipeline.run(fits_path))
+    finally:
+        with _paths_in_flight_lock:
+            _paths_in_flight.discard(real_path)
 
 
 def process_existing_files(directory: str) -> int:
