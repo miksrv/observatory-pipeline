@@ -64,6 +64,7 @@ def _make_source(
     catalog_mag: float | None = None,
     object_type: str | None = None,
     source_id: str | None = None,
+    saturated: bool = False,
 ) -> dict:
     return {
         "ra":           ra,
@@ -76,6 +77,7 @@ def _make_source(
         "catalog_id":   catalog_id,
         "catalog_mag":  catalog_mag,
         "object_type":  object_type,
+        "saturated":    saturated,
         # Resolved sources.id, as attached by pipeline.py's Step 7 after
         # POST /frames/{id}/sources. None by default, matching a source
         # the pipeline couldn't resolve an id for.
@@ -573,6 +575,74 @@ class TestDetectUnmatchedMovingObjects:
 
         assert len(result) == 1
         assert result[0]["anomaly_type"] == "SPACE_DEBRIS"
+
+
+class TestDetectSaturatedArtifacts:
+    """
+    Regression coverage for docs/ISSUES.md #1/#2: a saturated, uncatalogued
+    detection is treated as a bright-star/subtraction artifact and never
+    reported as MOVING_UNKNOWN/SPACE_DEBRIS/UNKNOWN. A saturated but
+    catalog-matched (MPC) source is unaffected — it's a legitimate bright
+    object, just without a usable magnitude (see photometry.py).
+    """
+
+    def _far_hist_source(self) -> dict:
+        offset_arcsec = 15.0  # within MOVING_CONE_ARCSEC, beyond MATCH_CONE_ARCSEC
+        offset_deg = offset_arcsec / 3600.0
+        return _make_hist_source(ra=_RA, dec=_DEC + offset_deg)
+
+    async def test_saturated_unmatched_shifted_source_suppressed(self):
+        """Would otherwise be MOVING_UNKNOWN — must be suppressed instead."""
+        source = _make_source(catalog_name=None, elongation=1.2, saturated=True)
+        far = self._far_hist_source()
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [far]}
+            mock_cov.return_value = {"0": []}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_saturated_unmatched_covered_source_suppressed(self):
+        """Would otherwise be UNKNOWN — must be suppressed instead."""
+        source = _make_source(catalog_name=None, saturated=True)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_saturated_mpc_matched_source_still_classified(self):
+        """A saturated but MPC-matched source is a legitimate bright asteroid — must still fire."""
+        source = _make_source(
+            catalog_name="MPC",
+            catalog_id="2019 XY3",
+            object_type="ASTEROID",
+            saturated=True,
+        )
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+            patch("modules.anomaly_detector.ephemeris.query", new_callable=AsyncMock, return_value=_EPH_DICT),
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": []}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "ASTEROID"
 
 
 class TestDetectResilienceAndMixedSources:

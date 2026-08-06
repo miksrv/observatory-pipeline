@@ -27,6 +27,7 @@ import pytest
 from astropy.io import fits
 from astropy.wcs import WCS as AstropyWCS
 
+import config
 from modules import subtraction
 
 
@@ -172,6 +173,124 @@ class TestDetectDiffSources:
 
         assert subtraction._detect_diff_sources(diff) == []
 
+    def test_masked_blob_is_not_detected(self):
+        """A candidate whose pixels fall entirely inside the mask must be suppressed."""
+        rng = np.random.default_rng(42)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 60) ** 2 + (yy - 40) ** 2) / (2 * 3.0 ** 2)))
+        diff = diff + blob
+
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[20:60, 40:80] = True  # covers the blob at (x=60, y=40)
+
+        assert subtraction._detect_diff_sources(diff, mask=mask) == []
+
+    def test_mask_elsewhere_does_not_suppress_blob(self):
+        """A mask that doesn't overlap the blob must not affect detection."""
+        rng = np.random.default_rng(42)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 60) ** 2 + (yy - 40) ** 2) / (2 * 3.0 ** 2)))
+        diff = diff + blob
+
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[0:10, 0:10] = True  # nowhere near the blob
+
+        candidates = subtraction._detect_diff_sources(diff, mask=mask)
+
+        assert len(candidates) >= 1
+
+    def test_mismatched_mask_shape_is_ignored(self):
+        """A mask whose shape doesn't match diff must be silently ignored, not raise."""
+        rng = np.random.default_rng(42)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 60) ** 2 + (yy - 40) ** 2) / (2 * 3.0 ** 2)))
+        diff = diff + blob
+
+        wrong_shape_mask = np.zeros((10, 10), dtype=bool)
+
+        candidates = subtraction._detect_diff_sources(diff, mask=wrong_shape_mask)
+
+        assert len(candidates) >= 1
+
+
+# ---------------------------------------------------------------------------
+# _build_saturation_mask (docs/ISSUES.md #1, #2)
+# ---------------------------------------------------------------------------
+
+class TestBuildSaturationMask:
+
+    def test_no_saturation_returns_none(self):
+        new_data = np.full((20, 20), 100.0, dtype=np.float32)
+        refs = [np.full((20, 20), 100.0, dtype=np.float32)]
+
+        assert subtraction._build_saturation_mask(new_data, refs, radius_px=2) is None
+
+    def test_saturated_pixel_in_new_frame_is_flagged(self):
+        new_data = np.full((20, 20), 100.0, dtype=np.float32)
+        new_data[10, 10] = config.SATURATION_ADU + 1000.0
+
+        mask = subtraction._build_saturation_mask(new_data, [], radius_px=0)
+
+        assert mask is not None
+        assert bool(mask[10, 10]) is True
+        assert int(mask.sum()) == 1  # no dilation requested
+
+    def test_saturated_pixel_in_reference_frame_is_flagged(self):
+        new_data = np.full((20, 20), 100.0, dtype=np.float32)
+        ref = np.full((20, 20), 100.0, dtype=np.float32)
+        ref[5, 5] = config.SATURATION_ADU + 1000.0
+
+        mask = subtraction._build_saturation_mask(new_data, [ref], radius_px=0)
+
+        assert mask is not None
+        assert bool(mask[5, 5]) is True
+
+    def test_dilation_grows_mask_around_saturated_pixel(self):
+        new_data = np.full((20, 20), 100.0, dtype=np.float32)
+        new_data[10, 10] = config.SATURATION_ADU + 1000.0
+
+        mask = subtraction._build_saturation_mask(new_data, [], radius_px=2)
+
+        assert mask is not None
+        assert bool(mask[10, 12]) is True    # within the dilation radius
+        assert bool(mask[10, 17]) is False   # well outside it
+
+    def test_mismatched_reference_shape_is_skipped(self):
+        new_data = np.full((20, 20), 100.0, dtype=np.float32)
+        wrong_shape_ref = np.full((5, 5), config.SATURATION_ADU + 1000.0, dtype=np.float32)
+
+        # Must not raise despite the shape mismatch; the mismatched ref is
+        # skipped and new_data itself has no saturation.
+        assert subtraction._build_saturation_mask(new_data, [wrong_shape_ref], radius_px=0) is None
+
+
+# ---------------------------------------------------------------------------
+# _pixel_scale_arcsec
+# ---------------------------------------------------------------------------
+
+class TestPixelScaleArcsec:
+
+    def test_returns_scale_matching_wcs(self, tmp_path):
+        path = TestPixelToSky._make_wcs_fits(tmp_path, scale_deg=0.000278)
+
+        scale = subtraction._pixel_scale_arcsec(path)
+
+        assert scale is not None
+        assert scale == pytest.approx(0.000278 * 3600.0, rel=1e-3)
+
+    def test_no_wcs_returns_none(self, tmp_path):
+        data = np.zeros((10, 10), dtype=np.float32)
+        path = tmp_path / "no_wcs.fits"
+        fits.PrimaryHDU(data=data).writeto(path)
+
+        assert subtraction._pixel_scale_arcsec(str(path)) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert subtraction._pixel_scale_arcsec(str(tmp_path / "missing.fits")) is None
+
 
 # ---------------------------------------------------------------------------
 # _pixel_to_sky
@@ -277,7 +396,7 @@ class TestRun:
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
-        monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff: [])
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff, mask=None: [])
         monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path: [])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
@@ -309,7 +428,7 @@ class TestRun:
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
-            lambda diff: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+            lambda diff, mask=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
         )
         monkeypatch.setattr(
             subtraction, "_pixel_to_sky",
@@ -327,3 +446,66 @@ class TestRun:
         assert cand["mag"] is None
         assert cand["ra"] == 10.0
         assert cand["dec"] == 20.0
+
+    async def test_saturation_mask_is_built_and_passed_to_detect_diff_sources(
+        self, monkeypatch, tmp_path,
+    ):
+        """
+        Regression test for docs/ISSUES.md #1/#2: a saturated pixel in the new
+        frame must produce a non-None mask that reaches _detect_diff_sources(),
+        so astroalign residual artifacts around it get excluded from detection.
+        """
+        shape = (20, 20)
+        new_data = np.full(shape, 100.0, dtype=np.float32)
+        new_data[5, 5] = config.SATURATION_ADU + 5000.0  # saturated pixel
+
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+        )
+        monkeypatch.setattr(
+            subtraction, "_load_frame_data",
+            lambda p: new_data if p.endswith("new.fits") else np.full(shape, 100.0, dtype=np.float32),
+        )
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.full(shape, 100.0, dtype=np.float32))
+        # Force the fixed-pixel dilation fallback (no WCS lookup in this test).
+        monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path: None)
+
+        captured: dict = {}
+
+        def fake_detect(diff, mask=None):
+            captured["mask"] = mask
+            return []
+
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", fake_detect)
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path: [])
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result["performed"] is True
+        assert captured["mask"] is not None
+        assert bool(captured["mask"][5, 5]) is True
+
+    async def test_no_saturation_passes_none_mask(self, monkeypatch, tmp_path):
+        """The common case (nothing saturated) must not pass a mask at all."""
+        shape = (10, 10)
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.full(shape, 100.0, dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.full(shape, 100.0, dtype=np.float32))
+
+        captured: dict = {}
+
+        def fake_detect(diff, mask=None):
+            captured["mask"] = mask
+            return []
+
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", fake_detect)
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path: [])
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result["performed"] is True
+        assert captured["mask"] is None

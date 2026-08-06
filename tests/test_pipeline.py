@@ -255,6 +255,51 @@ async def test_archive_move_correct_path(mock_modules, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
+    """
+    Regression test for Known Issues #11: the archive move (step 14.5) must
+    happen BEFORE the finder-chart step (step 15), not after — otherwise
+    finder_chart.update_charts_for_sources() looks for this frame's own
+    epoch at FITS_ARCHIVE/{object}/{filename} before it has actually been
+    moved there, and the chart for any single-epoch (first-time) anomaly
+    can never be rendered.
+    """
+    fits_path = str(mock_modules)
+
+    # Give this frame one anomaly with a resolved source_id, so the
+    # finder_chart step actually has something to act on.
+    pipeline.anomaly_detector.detect = AsyncMock(
+        return_value=[{"anomaly_type": "UNKNOWN", "source_id": "src-1"}]
+    )
+
+    expected_archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_existed_at_chart_time = {}
+
+    async def fake_update_charts_for_sources(anomaly_type_by_source_id):
+        archive_existed_at_chart_time["exists"] = os.path.exists(expected_archive_path)
+        return {sid: True for sid in anomaly_type_by_source_id}
+
+    finder_chart_mock = MagicMock()
+    finder_chart_mock.update_charts_for_sources = AsyncMock(
+        side_effect=fake_update_charts_for_sources
+    )
+    monkeypatch.setattr("pipeline.finder_chart", finder_chart_mock)
+    monkeypatch.setattr(config, "CHART_ENABLED", True)
+
+    await pipeline.run(fits_path)
+
+    finder_chart_mock.update_charts_for_sources.assert_called_once_with(
+        {"src-1": "UNKNOWN"}
+    )
+    assert archive_existed_at_chart_time.get("exists") is True, (
+        "finder_chart.update_charts_for_sources() ran before the archive move — "
+        "this frame's own epoch would never be found on disk"
+    )
+    # And the archive move must still have actually happened.
+    assert os.path.exists(expected_archive_path)
+
+
+@pytest.mark.asyncio
 async def test_astrometry_failure_continues(mock_modules):
     """A crash in astrometry.solve must not abort the pipeline."""
     pipeline.astrometry.solve.side_effect = RuntimeError("astap binary missing")
@@ -527,9 +572,15 @@ async def test_source_id_absent_when_post_sources_returns_none(mock_modules):
 
 
 @pytest.mark.asyncio
-async def test_mag_field_falls_back_to_instrumental_when_uncalibrated(mock_modules):
-    """When photometry could not calibrate a source, "mag" falls back to
-    the uncalibrated instrumental magnitude instead of staying None."""
+async def test_mag_field_is_none_when_uncalibrated(mock_modules):
+    """
+    Regression test for docs/ISSUES.md #2: when photometry could not
+    calibrate a source (fewer than 3 Gaia DR3 references in the frame),
+    "mag" must be None — it must NEVER fall back to the raw uncalibrated
+    mag_instrumental. mag_instrumental has no absolute zero-point; falling
+    back to it was exactly what produced extreme (e.g. -15) "magnitude"
+    values for entire uncalibrated frames in production.
+    """
 
     async def mock_measure_uncalibrated(fits_path, sources):
         for s in sources:
@@ -545,7 +596,28 @@ async def test_mag_field_falls_back_to_instrumental_when_uncalibrated(mock_modul
 
     posted_sources = pipeline.api_client.post_sources.call_args.args[2]
     for s in posted_sources:
-        assert s["mag"] == pytest.approx(-5.0)
+        assert s["mag"] is None
+
+
+@pytest.mark.asyncio
+async def test_mag_field_uses_calibrated_value_when_available(mock_modules):
+    """When photometry did calibrate a source, "mag" must be mag_calibrated."""
+
+    async def mock_measure_calibrated(fits_path, sources):
+        for s in sources:
+            s["flux_aperture"]   = 100.0
+            s["mag_instrumental"] = -5.0
+            s["mag_calibrated"]   = 17.3
+            s["calibrated"]       = True
+        return sources
+
+    pipeline.photometry.measure.side_effect = mock_measure_calibrated
+
+    await pipeline.run(str(mock_modules))
+
+    posted_sources = pipeline.api_client.post_sources.call_args.args[2]
+    for s in posted_sources:
+        assert s["mag"] == pytest.approx(17.3)
 
 
 # ---------------------------------------------------------------------------

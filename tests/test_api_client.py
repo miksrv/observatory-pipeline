@@ -21,10 +21,12 @@ import pytest
 from api_client import client as api_client_module
 from api_client.client import (
     get_frames_covering,
+    get_source_tracks_batch,
     get_sources_near,
     post_anomalies,
     post_frame,
     post_sources,
+    upload_source_charts_batch,
 )
 
 
@@ -450,3 +452,127 @@ class TestGetFramesCovering:
             result = await get_frames_covering(1.0, 2.0, "2024-01-01T00:00:00Z")
 
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Test 6: get_source_tracks_batch
+# ---------------------------------------------------------------------------
+
+class TestGetSourceTracksBatch:
+    async def test_returns_results_dict(self):
+        payload = {"results": {"src1": [{"ra": 1.0}], "src2": []}}
+        resp = _mock_response(status_code=200, json_data=payload)
+        with _patch_client(post_response=resp):
+            result = await get_source_tracks_batch(["src1", "src2"])
+
+        assert result == {"src1": [{"ra": 1.0}], "src2": []}
+
+    async def test_empty_source_ids_short_circuits_without_a_call(self):
+        with _patch_client() as mock_client:
+            result = await get_source_tracks_batch([])
+
+        assert result == {}
+        mock_client.post.assert_not_called()
+
+    async def test_sends_source_ids_in_body(self):
+        resp = _mock_response(status_code=200, json_data={"results": {}})
+        with _patch_client(post_response=resp) as mock_client:
+            await get_source_tracks_batch(["a", "b"])
+
+        _, call_kwargs = mock_client.post.call_args
+        assert call_kwargs["json"] == {"source_ids": ["a", "b"]}
+
+    async def test_uses_correct_endpoint(self):
+        resp = _mock_response(status_code=200, json_data={"results": {}})
+        with _patch_client(post_response=resp) as mock_client:
+            await get_source_tracks_batch(["a"])
+
+        call_args = mock_client.post.call_args
+        assert call_args[0][0] == "/sources/tracks/batch"
+
+    async def test_returns_empty_dict_on_transport_error(self):
+        exc = httpx.ConnectError("connection refused")
+        with patch.object(
+            api_client_module,
+            "_get_source_tracks_batch_with_retry",
+            AsyncMock(side_effect=exc),
+        ):
+            result = await get_source_tracks_batch(["a"])
+
+        assert result == {}
+
+    async def test_returns_empty_dict_when_results_not_a_dict(self):
+        resp = _mock_response(status_code=200, json_data={"results": ["not", "a", "dict"]})
+        with _patch_client(post_response=resp):
+            result = await get_source_tracks_batch(["a"])
+
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Test 7: upload_source_charts_batch
+# ---------------------------------------------------------------------------
+
+class TestUploadSourceChartsBatch:
+    _CHARTS = [
+        {"source_id": "src1", "png_bytes": b"\x89PNGfake1", "style": "track", "frame_count": 2},
+        {"source_id": "src2", "png_bytes": b"\x89PNGfake2", "style": "stamp_strip", "frame_count": 1},
+    ]
+
+    async def test_returns_outcomes_keyed_by_source_id(self):
+        payload = {"results": [
+            {"source_id": "src1", "status": "ok"},
+            {"source_id": "src2", "status": "error", "error": "Invalid style"},
+        ]}
+        resp = _mock_response(status_code=200, json_data=payload)
+        with _patch_client(post_response=resp):
+            result = await upload_source_charts_batch(self._CHARTS)
+
+        assert result == {"src1": True, "src2": False}
+
+    async def test_empty_charts_short_circuits_without_a_call(self):
+        with _patch_client() as mock_client:
+            result = await upload_source_charts_batch([])
+
+        assert result == {}
+        mock_client.post.assert_not_called()
+
+    async def test_sends_base64_encoded_png_in_body(self):
+        import base64
+
+        resp = _mock_response(status_code=200, json_data={"results": []})
+        with _patch_client(post_response=resp) as mock_client:
+            await upload_source_charts_batch(self._CHARTS)
+
+        _, call_kwargs = mock_client.post.call_args
+        sent_charts = call_kwargs["json"]["charts"]
+        assert sent_charts[0]["source_id"] == "src1"
+        assert sent_charts[0]["png_base64"] == base64.b64encode(b"\x89PNGfake1").decode("ascii")
+        assert sent_charts[0]["style"] == "track"
+        assert sent_charts[0]["frame_count"] == 2
+
+    async def test_uses_correct_endpoint(self):
+        resp = _mock_response(status_code=200, json_data={"results": []})
+        with _patch_client(post_response=resp) as mock_client:
+            await upload_source_charts_batch(self._CHARTS)
+
+        call_args = mock_client.post.call_args
+        assert call_args[0][0] == "/sources/charts/batch"
+
+    async def test_returns_empty_dict_on_transport_error_after_retries(self):
+        exc = httpx.ConnectError("connection refused")
+        with patch.object(
+            api_client_module,
+            "_upload_source_charts_batch_with_retry",
+            AsyncMock(side_effect=exc),
+        ):
+            result = await upload_source_charts_batch(self._CHARTS)
+
+        assert result == {}
+
+    async def test_returns_empty_dict_when_results_not_a_list(self):
+        resp = _mock_response(status_code=200, json_data={"results": {"not": "a list"}})
+        with _patch_client(post_response=resp):
+            result = await upload_source_charts_batch(self._CHARTS)
+
+        assert result == {}

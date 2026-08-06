@@ -81,6 +81,12 @@ def _make_sources(
 
     Only the fields consumed by astrometry.solve() are populated:
     x, y (pixel position), a, b (semi-axes), flux, peak.
+
+    ``peak`` defaults to 1000.0, well below the default
+    ``config.SATURATION_ADU`` (60000) once the fake background (globalback=800.0,
+    see _FakeBackground below) is added back — so sources built with the
+    default ``peak`` are never flagged ``saturated`` unless the test raises
+    ``peak`` explicitly past that threshold.
     """
     dtype = np.dtype([
         ("x",    np.float64),
@@ -312,11 +318,11 @@ class TestSuccessfulSolve:
 
 class TestSourceFormat:
     async def test_sources_have_correct_keys(self):
-        """Every source dict must carry exactly: ra, dec, flux, fwhm, elongation."""
+        """Every source dict must carry exactly: ra, dec, flux, fwhm, elongation, saturated."""
         with _patch_astrometry():
             result = await astrometry.solve(_FITS_PATH)
 
-        required = {"ra", "dec", "flux", "fwhm", "elongation"}
+        required = {"ra", "dec", "flux", "fwhm", "elongation", "saturated"}
         for src in result["sources"]:
             assert set(src.keys()) == required
 
@@ -329,11 +335,15 @@ class TestSourceFormat:
             assert isinstance(src["dec"], float), "dec must be a Python float"
 
     async def test_sources_all_fields_are_floats(self):
+        """Every field except the boolean ``saturated`` flag must be a Python float."""
         with _patch_astrometry():
             result = await astrometry.solve(_FITS_PATH)
 
         for src in result["sources"]:
             for key, val in src.items():
+                if key == "saturated":
+                    assert isinstance(val, bool), "saturated must be a Python bool"
+                    continue
                 assert isinstance(val, float), f"{key} must be a Python float, got {type(val)}"
 
     async def test_source_count_matches_sep_output(self):
@@ -358,6 +368,41 @@ class TestSourceFormat:
 
         for src in result["sources"]:
             assert src["fwhm"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Test 2.5 — Saturation flag (docs/ISSUES.md #2)
+# ---------------------------------------------------------------------------
+
+class TestSaturationFlag:
+    """
+    sep's "peak" field is background-subtracted; astrometry.solve() adds
+    bkg.globalback (800.0 in _FakeBackground) back to approximate the raw
+    ADU value and compares it against config.SATURATION_ADU (60000 default).
+    """
+
+    async def test_bright_peak_is_flagged_saturated(self):
+        bright = _make_sources(n=3, peak=70000.0)  # 70000 + 800 >= 60000
+        with _patch_astrometry(sources=bright):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert len(result["sources"]) == 3
+        assert all(src["saturated"] is True for src in result["sources"])
+
+    async def test_faint_peak_is_not_flagged_saturated(self):
+        with _patch_astrometry():  # default peak=1000.0, well below threshold
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"]
+        assert all(src["saturated"] is False for src in result["sources"])
+
+    async def test_saturated_flag_present_in_sources_all_too(self):
+        bright = _make_sources(n=3, peak=70000.0)
+        with _patch_astrometry(sources=bright):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources_all"]
+        assert all(src["saturated"] is True for src in result["sources_all"])
 
 
 # ---------------------------------------------------------------------------

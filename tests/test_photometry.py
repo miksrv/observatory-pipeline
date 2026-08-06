@@ -131,6 +131,7 @@ def _make_source(
     elongation: float = 1.1,
     catalog_name: str | None = None,
     catalog_mag: float | None = None,
+    saturated: bool = False,
 ) -> dict:
     src: dict[str, Any] = {
         "ra":         ra,
@@ -138,6 +139,7 @@ def _make_source(
         "flux":       flux,
         "fwhm":       fwhm,
         "elongation": elongation,
+        "saturated":  saturated,
     }
     if catalog_name is not None:
         src["catalog_name"] = catalog_name
@@ -535,6 +537,62 @@ class TestZeroPoint:
     async def test_no_catalog_fields_means_uncalibrated(self):
         """Sources without catalog_name / catalog_mag must not be calibrated."""
         srcs = _make_sources(n=5)  # no catalog fields
+        with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert all(src["calibrated"] is False for src in result)
+        assert all(src["zero_point"] is None for src in result)
+
+
+# ---------------------------------------------------------------------------
+# Test 6.5 — Saturated sources (docs/ISSUES.md #2)
+# ---------------------------------------------------------------------------
+
+class TestSaturatedSources:
+    async def test_saturated_source_gets_null_photometry(self):
+        """
+        A source flagged saturated=True must never be measured — aperture
+        flux on a clipped PSF core is not physically meaningful and was the
+        root cause of extreme (e.g. -14) magnitudes reaching the API.
+        """
+        srcs = [_make_source(saturated=True)]
+        with _patch_photometry(aperture_sum=1_000_000.0, annulus_sky_per_px=0.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert result[0]["flux_aperture"]    is None
+        assert result[0]["mag_instrumental"] is None
+        assert result[0]["mag_calibrated"]   is None
+        assert result[0]["calibrated"]       is False
+
+    async def test_saturated_flag_preserved_in_output(self):
+        srcs = [_make_source(saturated=True)]
+        with _patch_photometry():
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert result[0]["saturated"] is True
+
+    async def test_non_saturated_source_unaffected(self):
+        """A mix of saturated and normal sources: only the normal one gets measured."""
+        srcs = [
+            _make_source(saturated=True),
+            _make_source(saturated=False),
+        ]
+        with _patch_photometry(aperture_sum=60000.0, annulus_sky_per_px=50.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert result[0]["flux_aperture"] is None
+        assert result[1]["flux_aperture"] is not None
+
+    async def test_saturated_gaia_star_excluded_from_zero_point(self):
+        """
+        A saturated source must never be used as a Gaia DR3 zero-point
+        reference, even if catalog-matched — its aperture flux is garbage.
+        With one saturated + two normal Gaia stars, fewer than 3 valid
+        references remain, so calibration must fail.
+        """
+        srcs = _make_gaia_sources(n=2, catalog_mag=14.0)
+        srcs.append(_make_source(catalog_name="Gaia DR3", catalog_mag=14.0, saturated=True))
+
         with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
             result = await photometry.measure(_FITS_PATH, srcs)
 
