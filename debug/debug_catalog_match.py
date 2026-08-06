@@ -61,14 +61,26 @@ async def main(fits_path: str, out_png: str) -> None:
         obs_time = header.get("DATE-OBS", "")
 
     print(f"=== QC: {filename}  (object={object_name}) ===")
-    qc_result = await qc.analyze(fits_path)
+    # move_on_reject=False: this tool must never touch the input frame (see
+    # module docstring above) — qc.analyze() otherwise moves a non-OK frame
+    # to FITS_REJECTED itself, on its own, before returning (found the hard
+    # way: 2026-08-06, see debug/README.md "Background").
+    qc_result = await qc.analyze(fits_path, move_on_reject=False)
     print(f"  quality_flag={qc_result.get('quality_flag')}  "
           f"fwhm={qc_result.get('fwhm_median')}  elongation={qc_result.get('elongation_median')}  "
           f"stars={qc_result.get('star_count')}  snr_median={qc_result.get('snr_median')}  "
           f"sky_background={qc_result.get('sky_background')}")
 
     print("=== Astrometry ===")
-    astro = await astrometry.solve(fits_path, psf_fwhm_arcsec=qc_result.get("fwhm_median"))
+    # output_base: keep astap's .ini/.wcs/.log side files out of the debug
+    # frame's own directory — they'd otherwise pile up there on every rerun.
+    # Doesn't touch fits_path itself (see astrometry.solve()'s docstring).
+    output_dir = os.path.dirname(out_png) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    output_base = os.path.join(output_dir, os.path.splitext(filename)[0])
+    astro = await astrometry.solve(
+        fits_path, psf_fwhm_arcsec=qc_result.get("fwhm_median"), output_base=output_base,
+    )
     if not astro:
         print("  astrometry FAILED — aborting")
         return

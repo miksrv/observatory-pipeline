@@ -18,6 +18,7 @@ services:
       - ~/Developer/data/fits/incoming:/fits/incoming
       - ~/Developer/data/fits/archive:/fits/archive
       - ~/Developer/data/fits/rejected:/fits/rejected
+      - ~/Developer/data/fits/debug:/fits/debug
       - ~/Developer/data/astap/catalogs:/astap/catalogs
     env_file:
       - .env

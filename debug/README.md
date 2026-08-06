@@ -63,3 +63,15 @@ a real bug in `catalog_matcher._compute_wcs_offset()`'s significance test
 (see git history / CLAUDE.md for the fix itself). Kept around as a
 general-purpose tool for testing catalog-matching behaviour on any FITS
 frame going forward, not just that one incident.
+
+Also on 2026-08-06: this script's own "no file moves" promise turned out to
+be false for any frame that fails QC. `qc.analyze()` moves a rejected frame
+to `FITS_REJECTED` *itself*, internally, before ever returning to its
+caller — this script called it exactly like `pipeline.py` does and so
+inherited that side effect, silently relocating two `HIGH_BACKGROUND` test
+frames out of `debug/` and into `/fits/rejected/{object}/` (not deleted,
+just moved — but still a real violation of what this tool is for). Fixed by
+adding `qc.analyze(fits_path, move_on_reject=False)`; this script now always
+passes that. If you add a new stage here that calls another module
+function shared with `pipeline.py`, check whether it has a similar hidden
+side effect before assuming "read-only" from the docstring alone.
