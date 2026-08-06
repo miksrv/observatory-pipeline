@@ -19,10 +19,15 @@ Called from `pipeline.py` after `photometry.measure()`, and after
 `api_client.post_sources()` has returned `source_ids` for each source (see Steps 12–13
 in `CLAUDE.md`). The input source list has already been through:
 
-- plate solving and source extraction (`astrometry.py`),
-- optional image subtraction (`subtraction.py`, candidates flagged `_from_subtraction=True`),
+- plate solving and source extraction (`astrometry.py`, sources flagged `saturated=True`
+  when their peak ADU reaches `SATURATION_ADU`),
+- optional image subtraction (`subtraction.py`, candidates flagged `_from_subtraction=True`;
+  the vicinity of any saturated pixel is masked out of diff-image detection before
+  candidates are even produced — see docs/ISSUES.md #1, #2),
 - catalog cross-matching (`catalog_matcher.py`: Simbad, Gaia DR3, 2MASS, Pan-STARRS DR1, MPC),
-- photometry (`photometry.py`, `mag` field, merged by `pipeline.py` from `mag_calibrated`/`mag_instrumental`).
+- photometry (`photometry.py`, `mag` field, set by `pipeline.py` to `mag_calibrated` when the
+  source was calibrated, `None` otherwise — never the raw `mag_instrumental`, which has no
+  absolute zero-point; see docs/ISSUES.md #2).
 
 The output is a list of anomaly dicts ready to be sent to `POST /frames/{id}/anomalies`.
 `FIRST_OBSERVATION` and `KNOWN_CATALOG_NEW` are **never included** in this list — they
@@ -44,10 +49,10 @@ queries. Both requests run concurrently via `asyncio.gather`.
 
 Important: **history is fetched for every source without exception**, including
 already catalog-matched ones — it's needed not only to detect position shifts (movers)
-but also to compute `delta_mag` for already-known variable/binary stars and galaxies
-(see resolved Known Issue #6 in `CLAUDE.md` — an earlier revision forced history to
-empty for catalog-matched sources, which made `VARIABLE_STAR`/`BINARY_STAR`/the
-"brightening" branch of `SUPERNOVA_CANDIDATE` permanently unreachable).
+but also to compute `delta_mag` for already-known variable/binary stars and galaxies.
+(An earlier revision skipped this for catalog-matched sources, which made
+`VARIABLE_STAR`/`BINARY_STAR`/the "brightening" branch of `SUPERNOVA_CANDIDATE`
+permanently unreachable — fixed; see git history if you need the details.)
 
 If both batch requests come back empty, it's either the very first frame of this sky
 area, or an API failure; a warning is logged.
@@ -67,7 +72,9 @@ flowchart TD
     Loop --> P1{"catalog_name\n== 'MPC'?"}
     P1 -- yes --> Asteroid["ASTEROID / COMET\n(by object_type)\n⚑ _needs_ephemeris=True"]
 
-    P1 -- no --> P2{"catalog_name is None\nAND a historical source exists\nin the wide cone (MOVING_CONE_ARCSEC)\nfarther than MATCH_CONE_ARCSEC?"}
+    P1 -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
+    Sat -- yes --> Suppressed(["suppressed — return None\n(bright-star/subtraction artifact,\nnot a real transient)"])
+    Sat -- no --> P2{"catalog_name is None\nAND a historical source exists\nin the wide cone (MOVING_CONE_ARCSEC)\nfarther than MATCH_CONE_ARCSEC?"}
     P2 -- yes --> Elong{"elongation > 3.0?"}
     Elong -- yes --> SpaceDebris["🔔 SPACE_DEBRIS"]
     Elong -- no --> MovingUnknown["🔔 MOVING_UNKNOWN"]
@@ -112,6 +119,7 @@ flowchart TD
     FirstObs -.-> LogOnly(["logged only, not\nin the output list"])
     KnownNew -.-> LogOnly
     NoAnomaly -.-> LogOnly2(["None — excluded\nfrom the output list"])
+    Suppressed -.-> LogOnly2
 ```
 
 🔔 — the type is a member of `_ALERT_TYPES` and is logged with `logger.warning`
@@ -126,11 +134,22 @@ one condition matches, the function returns and no further checks run:
 
 1. **MPC match** — `catalog_name == "MPC"` → `ASTEROID`/`COMET`, regardless of history
    or coverage.
-2. **Unmatched position-shifted source** — `catalog_name is None` and the wide cone
+2. **Saturated, unmatched source** — `catalog_name is None` and `saturated == True` →
+   suppressed outright (`return None`, no anomaly record). A saturated star leaves
+   large `astroalign` residual artifacts around it even under near-perfect
+   registration (see `modules/subtraction.py`'s saturation masking), and an
+   uncatalogued detection sitting on top of one is overwhelmingly that artifact, not
+   a real transient or mover — see docs/ISSUES.md #1, #2. This check runs *before*
+   the position-shift check below, so a saturated artifact can never become
+   `MOVING_UNKNOWN`/`SPACE_DEBRIS` either. Scoped to `catalog_name is None` only: a
+   saturated source that *is* MPC- or Simbad-matched (bullet 1, or the history-based
+   branches below) is a legitimate detection and is unaffected — it just never gets a
+   usable `magnitude`, since `photometry.py` never measures a saturated source.
+3. **Unmatched position-shifted source** — `catalog_name is None` and the wide cone
    (`MOVING_CONE_ARCSEC`, default 120″) found a historical position farther than
    `MATCH_CONE_ARCSEC` (5″) → `MOVING_UNKNOWN` (elongation ≤ 3.0) or `SPACE_DEBRIS`
    (elongation > 3.0, fast trail).
-3. **Stationary sources** — decided next by coverage (`coverage`) and local history
+4. **Stationary sources** — decided next by coverage (`coverage`) and local history
    (`history`, `MATCH_CONE_ARCSEC` cone):
    - no coverage at all → `FIRST_OBSERVATION` (not an anomaly), except when
      `_from_subtraction=True` → then `UNKNOWN` (subtraction already proved novelty at
@@ -176,7 +195,7 @@ Table of Simbad OTYPE substrings used by the classifiers:
 
 The list is fixed as `AnomalyType(str, Enum)` and must match
 `AnomalyModel::ALLOWED_TYPES`/the `ENUM` constraint on the `observatory-api` side — the
-two lists are kept in sync by hand (see `CLAUDE.md`, "Anomaly Types Reference" section).
+two lists are kept in sync by hand (see `CLAUDE.md`, `modules/anomaly_detector.py` section).
 
 ---
 
@@ -226,7 +245,15 @@ dicts before they're returned.
   [../CLAUDE.md](../CLAUDE.md)).
 - Both "galaxy" branches (`SUPERNOVA_CANDIDATE`) use the same `MATCH_CONE_ARCSEC`
   radius (5″ by default) — there is no separate, wider radius for extended galaxy disks.
+- The saturated-artifact suppression (priority 2 above) only ever returns `None` for a
+  matching source — it does not by itself confirm how much of the historically observed
+  `UNKNOWN`/`MOVING_UNKNOWN` volume was actually caused by saturation artifacts, since
+  that requires comparing anomaly counts before/after the fix against the deployed
+  database (see docs/ISSUES.md #1's remaining checklist). If a large volume of
+  `UNKNOWN`/`MOVING_UNKNOWN` persists after deploying this fix, the more likely
+  remaining causes are the width of `MOVING_CONE_ARCSEC` and the missing magnitude
+  threshold discussed above.
 
-The full history of resolved issues in this module (history not queried for
-catalog-matched sources, `source_id` not propagated to anomalies, etc.) is in the
-"Known Issues & Future Improvements" section of [../CLAUDE.md](../CLAUDE.md).
+Resolved issues in this module (history not queried for catalog-matched sources,
+`source_id` not propagated to anomalies, etc.) are no longer tracked in the docs — see
+`git log -- modules/anomaly_detector.py` for that history.

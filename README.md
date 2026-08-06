@@ -72,13 +72,18 @@ qc.analyze()                    ← check quality
                          api_client.post_anomalies()
                                          │
                                          ▼
+                         finder_chart.update_charts_for_sources()  ← per-source discovery chart (optional)
+                                         │
+                                         ▼
                          /fits/archive/{object}/    ← archive frame
 ```
 
 > **Note:** catalog matching and photometry run *before* the frame/sources are posted to the
 > API (not after, as older diagrams of this pipeline showed) — this lets matched Gaia DR3 stars
 > serve as the photometric zero-point reference. Image subtraction is a newer step, inserted
-> between astrometry and catalog matching.
+> between astrometry and catalog matching. Finder-chart generation is the newest step, running
+> after anomalies are posted — for every anomaly with a resolved `source_id` it (re)builds a
+> small PNG from that source's full detection history and uploads it to the API.
 
 ---
 
@@ -138,7 +143,8 @@ observatory-pipeline/
 │   ├── subtraction.py         ← image subtraction: align + diff archived frames (transients/movers)
 │   ├── catalog_matcher.py     ← cross-match: Simbad, Gaia DR3, 2MASS, Pan-STARRS DR1, MPC
 │   ├── anomaly_detector.py    ← comparison with history + anomaly classification
-│   └── ephemeris.py           ← JPL Horizons queries for solar system objects
+│   ├── ephemeris.py           ← JPL Horizons queries for solar system objects
+│   └── finder_chart.py        ← per-source discovery-chart PNG (track / stamp-strip) generation + upload
 │
 ├── api_client/
 │   └── client.py              ← all HTTP calls to observatory-api
@@ -154,6 +160,7 @@ observatory-pipeline/
     ├── test_ephemeris.py
     ├── test_anomaly_detector.py
     ├── test_subtraction.py
+    ├── test_finder_chart.py
     └── test_pipeline.py
 ```
 
@@ -202,13 +209,13 @@ Bad frames are never sent to the API — this keeps the remote database clean.
 ### `modules/astrometry.py`
 Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
 
-Returns a dict with `ra_center`, `dec_center`, `fov_deg`, `naxis1`/`naxis2`, the `wcs` object itself, and two source lists: `sources` (strict star filter) and `sources_all` (a looser filter that also keeps bright/saturated and faint detections, used for catalog matching and WCS offset correction so moving/transient objects aren't lost).
+Returns a dict with `ra_center`, `dec_center`, `fov_deg`, `naxis1`/`naxis2`, the `wcs` object itself, and two source lists: `sources` (strict star filter) and `sources_all` (a looser filter that also keeps bright/saturated and faint detections, used for catalog matching and WCS offset correction so moving/transient objects aren't lost). Every source also carries a `saturated` bool (peak ADU ≥ `SATURATION_ADU`).
 
 ### `modules/photometry.py`
-Aperture photometry via `photutils`. Performs differential photometry against Gaia DR3 reference stars in the field (requires ≥3 Gaia matches for a zero-point) — this makes brightness measurements immune to atmospheric transparency variations. Adds `flux_aperture`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `calibrated`, `zero_point` (and a few more) to each source.
+Aperture photometry via `photutils`. Performs differential photometry against Gaia DR3 reference stars in the field (requires ≥3 Gaia matches for a zero-point) — this makes brightness measurements immune to atmospheric transparency variations. Adds `flux_aperture`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `calibrated`, `zero_point` (and a few more) to each source. A source flagged `saturated=True` is never measured (its aperture flux is not physically meaningful) and is excluded from the Gaia zero-point reference set.
 
 ### `modules/subtraction.py`
-Image subtraction (difference imaging) — a second detection path for transients and moving objects that catalog matching alone would miss. If ≥`SUBTRACTION_MIN_FRAMES` frames of the same object are already archived, aligns them with `astroalign`, builds a median reference image, subtracts it from the new frame, and runs `sep` on the difference image (threshold `SUBTRACTION_DETECT_SIGMA`). Candidates are merged into the source list, flagged `_from_subtraction=True` so `anomaly_detector.py` can treat them with different coverage rules. Skipped gracefully when too few reference frames exist yet — e.g. for a brand-new target.
+Image subtraction (difference imaging) — a second detection path for transients and moving objects that catalog matching alone would miss. If ≥`SUBTRACTION_MIN_FRAMES` frames of the same object are already archived, aligns them with `astroalign`, builds a median reference image, subtracts it from the new frame, masks out the vicinity of any saturated pixel (`SATURATION_MASK_RADIUS_ARCSEC`, to suppress astroalign residual artifacts around bright stars), and runs `sep` on the (masked) difference image (threshold `SUBTRACTION_DETECT_SIGMA`). Candidates are merged into the source list, flagged `_from_subtraction=True` so `anomaly_detector.py` can treat them with different coverage rules. Skipped gracefully when too few reference frames exist yet — e.g. for a brand-new target.
 
 ### `modules/catalog_matcher.py`
 Cross-matches the source list against external catalogs using `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC` (`MOVING_CONE_ARCSEC` for MPC). Also computes a Gaia-based WCS offset correction applied in-place to every source's coordinates before the remaining catalogs are queried.
@@ -245,8 +252,24 @@ Core science logic. Queries the API in a single batched call per frame (`POST /s
 ### `modules/ephemeris.py`
 Queries JPL Horizons via `astroquery.jplhorizons`. Given an MPC designation and observation time, returns predicted (RA, Dec, magnitude, distance in AU, angular velocity in arcsec/hour).
 
+### `modules/finder_chart.py`
+For every anomaly with a resolved `source_id`, (re)generates and uploads a small PNG showing every
+frame that source has ever been detected on, with its position circled on each — fully
+regenerated from the source's complete track on every new epoch, never patched in place. Two
+styles, chosen by `anomaly_type`: a **track** chart (`ASTEROID`/`COMET`/`MOVING_UNKNOWN`/
+`SPACE_DEBRIS`) — one background frame with a numbered circle + motion line per epoch, via a
+per-epoch `WCS.world_to_pixel()` transform (no pixel-level alignment needed); or a **stamp strip**
+(everything else) — one small crop per epoch centred on that epoch's own detected position, each
+circled and labelled with timestamp/magnitude, for a classic before/after "blink" comparison.
+`update_charts_for_sources()` handles every source_id for one frame in a single call — one
+`POST /sources/tracks/batch` to fetch all their tracks, one `POST /sources/charts/batch` to
+upload all their rendered charts — instead of one GET+POST pair per source_id. Gated by
+`CHART_ENABLED`; best-effort — a missing local archive file, API error, or rendering failure for
+one source_id is logged and only downgrades that source_id's own result, never affecting any
+other source_id in the same call or frame processing overall.
+
 ### `api_client/client.py`
-All HTTP communication with the remote API. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `anomaly_detector.py` actually calls.
+All HTTP communication with the remote API. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `anomaly_detector.py` actually calls, plus `get_source_tracks_batch`/`upload_source_charts_batch` for `modules/finder_chart.py` (the single-item `get_source_track`/`upload_source_chart` are still implemented/exported, just no longer called by that module).
 
 ---
 
@@ -386,6 +409,10 @@ QC_ELONGATION_MAX=2.0
 QC_SNR_MIN=5.0
 QC_STARS_MIN=10
 
+# ── Saturation detection (astrometry + subtraction modules) ───────────────────
+SATURATION_ADU=60000
+SATURATION_MASK_RADIUS_ARCSEC=10.0
+
 # ── Cross-matching ────────────────────────────────────────────────────────────
 MATCH_CONE_ARCSEC=5.0
 MOVING_CONE_ARCSEC=120.0       # code default; see note below
@@ -394,6 +421,11 @@ DELTA_MAG_ALERT=0.5
 # ── Image subtraction (modules/subtraction.py) ────────────────────────────────
 SUBTRACTION_MIN_FRAMES=3
 SUBTRACTION_DETECT_SIGMA=5.0
+
+# ── Finder charts (modules/finder_chart.py) ────────────────────────────────────
+CHART_ENABLED=true
+CHART_STAMP_SIZE_ARCSEC=60.0
+CHART_MAX_EPOCHS=12
 
 # ── Normalization ─────────────────────────────────────────────────────────────
 NORMALIZE_ENABLED=true        # Normalize object/filter names and filenames
@@ -406,7 +438,8 @@ LOG_LEVEL=INFO                 # DEBUG, INFO, WARNING, or ERROR
 >
 > `.env.example` is kept in sync with `config.py`'s real defaults: `MOVING_CONE_ARCSEC=120.0`
 > (widened because fast movers like Vesta travel ~60"/hr and 30" was too tight to reliably catch
-> cross-frame shifts), `SUBTRACTION_MIN_FRAMES=3`, `SUBTRACTION_DETECT_SIGMA=5.0`.
+> cross-frame shifts), `SUBTRACTION_MIN_FRAMES=3`, `SUBTRACTION_DETECT_SIGMA=5.0`,
+> `CHART_ENABLED=true`, `CHART_STAMP_SIZE_ARCSEC=60.0`, `CHART_MAX_EPOCHS=12`.
 
 #### Configuration Reference
 
@@ -437,13 +470,20 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `STAR_FWHM_MAX_ARCSEC` | `8.0` | No | Maximum FWHM in arcseconds. Sources above this are extended objects (nebulae, galaxies) or badly defocused. |
 | `STAR_ELONGATION_MAX` | `1.5` | No | Maximum elongation for valid star detections. Filters out trails and extended objects. |
 | `STAR_SNR_MIN` | `50.0` | No | Minimum SNR (peak/rms) for valid star detections. Higher = fewer but more reliable. |
+| **Saturation Detection** |
+| `SATURATION_ADU` | `60000` | No | Sensor pixel value (ADU) at/above which a pixel is considered saturated. `modules/astrometry.py` flags any source whose peak reaches this as `saturated`; `modules/subtraction.py` masks its vicinity out of difference-image detection. Tune per camera's full-well/bit depth. |
+| `SATURATION_MASK_RADIUS_ARCSEC` | `10.0` | No | Radius in arcseconds around a saturated pixel that `modules/subtraction.py` excludes from diff-image source detection, to suppress astroalign residual artifacts near bright/saturated stars. |
 | **Cross-Matching** |
 | `MATCH_CONE_ARCSEC` | `5.0` | No | Cone search radius in arcseconds for point-source catalog matching (Simbad, Gaia, 2MASS, Pan-STARRS). |
-| `MOVING_CONE_ARCSEC` | `120.0` | No | Wider cone radius in arcseconds for moving-object (MPC) detection. Widened from an earlier default of `30.0` because fast movers like Vesta travel ~60"/hr. The committed `.env.example` file still shows the old `30.0` value — see the note above. |
+| `MOVING_CONE_ARCSEC` | `120.0` | No | Wider cone radius in arcseconds for moving-object (MPC) detection. Widened from an earlier default of `30.0` because fast movers like Vesta travel ~60"/hr. `.env.example` is up to date with this value — see the note above. |
 | `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
 | **Image Subtraction** |
 | `SUBTRACTION_MIN_FRAMES` | `3` | No | Minimum number of archived reference frames of the same object required before `modules/subtraction.py` will attempt image subtraction. |
 | `SUBTRACTION_DETECT_SIGMA` | `5.0` | No | Detection threshold on the difference image, in multiples of background RMS. |
+| **Finder Charts** |
+| `CHART_ENABLED` | `true` | No | Enable/disable per-source finder-chart generation (`modules/finder_chart.py`). |
+| `CHART_STAMP_SIZE_ARCSEC` | `60.0` | No | Half-width of the per-epoch crop for the `stamp_strip` style (stationary anomalies), in arcseconds. |
+| `CHART_MAX_EPOCHS` | `12` | No | Cap on the number of epochs drawn on one chart (oldest dropped first). |
 | **Observatory Site** |
 | `SITE_LAT` | `0.0` | No | Observatory latitude in decimal degrees (positive = North). Used for topocentric ephemeris queries to JPL Horizons. |
 | `SITE_LON` | `0.0` | No | Observatory longitude in decimal degrees (positive = East). |
@@ -656,8 +696,8 @@ pytest tests/test_anomaly_detector.py
 ```
 
 As of the last manual check, coverage was around **95%** overall, with all critical modules
-above 80% — `modules/subtraction.py` now has its own `tests/test_subtraction.py` as well,
-matching every other module. Coverage is not tracked in CI: the GitHub Actions workflow runs
+above 80% — every module under `modules/`, including `subtraction.py` and `finder_chart.py`,
+has its own dedicated test file. Coverage is not tracked in CI: the GitHub Actions workflow runs
 plain `pytest tests/ -v --tb=short`, not `pytest --cov`. Run the `--cov` command above locally
 if you need an up-to-date number.
 
@@ -676,10 +716,17 @@ Full request/response documentation for every endpoint is in **[docs/API.md](doc
 | `GET` | `/frames/covering` | Get frames that covered a single sky point — same caveat as above | [→ docs/API.md](docs/API.md#5-get-frames-covering-a-sky-position) |
 | `POST` | `/sources/near/batch` | Get historical sources near **multiple** positions in one call — what `anomaly_detector.py` actually uses | [→ docs/API.md](docs/API.md#6-get-historical-sources-near-multiple-positions-batch) |
 | `POST` | `/frames/covering/batch` | Coverage check for **multiple** sky positions in one call — what `anomaly_detector.py` actually uses | [→ docs/API.md](docs/API.md#7-get-frames-covering-multiple-positions-batch) |
+| `GET` | `/sources/{id}/track` | Per-epoch position track for a source — implemented, but no longer called by `modules/finder_chart.py` | [→ docs/API.md](docs/API.md#8-get-a-sources-position-track) |
+| `POST` | `/sources/{id}/chart` | Upload/replace a source's finder-chart PNG — same caveat as above | [→ docs/API.md](docs/API.md#9-upload-a-sources-finder-chart) |
+| `GET` | `/sources/{id}/chart.png` | Fetch a source's stored finder-chart PNG — not called by the pipeline itself | [→ docs/API.md](docs/API.md#10-get-a-sources-finder-chart) |
+| `POST` | `/sources/tracks/batch` | Get position tracks for **multiple** sources in one call — what `modules/finder_chart.py` actually uses | [→ docs/API.md](docs/API.md#11-get-position-tracks-for-multiple-sources-batch) |
+| `POST` | `/sources/charts/batch` | Upload/replace finder-chart PNGs for **multiple** sources in one call — what `modules/finder_chart.py` actually uses | [→ docs/API.md](docs/API.md#12-upload-finder-charts-for-multiple-sources-batch) |
 
 **Authentication:** every request sends `X-API-Key: <value>` and `Content-Type: application/json`. The key is read from `API_KEY` in `.env`.
 
-**Retry policy:** HTTP 5xx and transport errors are retried up to 3 attempts total (i.e. 2 retries) via `tenacity.wait_exponential(multiplier=1, min=2, max=10)`. With these exact settings the actual wait between attempts is **2s, then 2s** — not "2s → 4s → 8s": `min=2` clamps the first two exponential terms up, and the attempt that would produce 4s/8s never happens because the retry loop stops after 3 attempts. HTTP 4xx errors are logged immediately and not retried.
+**Retry policy:** HTTP 5xx and transport errors are retried (3 attempts total, ~2s between
+each) via `tenacity`; HTTP 4xx errors are logged immediately and not retried. Exact parameters
+and the reasoning behind the ~2s spacing are in [docs/API.md](docs/API.md#error-responses).
 
 ---
 
@@ -693,7 +740,9 @@ Full request/response documentation for every endpoint is in **[docs/API.md](doc
 | `sep` | >=1.4 | Fast source extraction (SourceExtractor wrapper) |
 | `astroscrappy` | >=1.1 | Cosmic ray detection and removal |
 | `astroalign` | >=2.4 | Frame alignment for `modules/subtraction.py` (image subtraction) |
+| `matplotlib` | >=3.8 | PNG rendering for `modules/finder_chart.py` (finder/discovery charts) |
 | `numpy` | >=1.26 | Numerical operations |
+| `scipy` | >=1.11 | Binary dilation of the saturation mask in `modules/subtraction.py` |
 | `httpx` | >=0.27 | Async HTTP client for API calls |
 | `tenacity` | >=8.2 | Retry logic with exponential backoff |
 | `watchdog` | >=4.0 | Filesystem monitoring |

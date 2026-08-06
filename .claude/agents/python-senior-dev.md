@@ -74,7 +74,7 @@ Before delivering any code, verify:
 - [ ] Async functions used for all I/O (API calls, file operations in async context)
 - [ ] Logging uses `logging.getLogger(__name__)` with contextual fields
 - [ ] External failures are caught with specific exception types, logged, and handled gracefully
-- [ ] Output data structures match the API payload schemas defined in CLAUDE.md
+- [ ] Output data structures match the API payload schemas defined in docs/API.md
 - [ ] Tests exist or are outlined for the new/modified code
 
 ## Communication Style

@@ -55,7 +55,13 @@ Error response body:
 }
 ```
 
-The pipeline retries on HTTP 5xx and transport errors (3 attempts, exponential backoff: 2s, 4s, 8s). HTTP 4xx errors are logged and not retried.
+The pipeline retries on HTTP 5xx and transport/timeout errors, via
+`tenacity.retry(stop_after_attempt(3), wait_exponential(multiplier=1, min=2, max=10))` — 3
+attempts total (2 retries). With these exact parameters the actual wait between attempts is
+**2s, then 2s**, not "2s → 4s → 8s" as a superficial reading of `wait_exponential` might
+suggest: `min=2` clamps the first two exponential terms (which would be 1s and 2s) up to 2s
+each, and the attempt that would produce 4s/8s never happens because `stop_after_attempt(3)`
+stops the retry loop first. HTTP 4xx errors are logged immediately and never retried.
 
 ---
 
@@ -100,6 +106,36 @@ The pipeline retries on HTTP 5xx and transport errors (3 attempts, exponential b
 ### 7. Get Frames Covering Multiple Positions (Batch)
 
 **[POST /frames/covering/batch](#7-get-frames-covering-multiple-positions-batch)**
+
+---
+
+### 8. Get a Source's Position Track
+
+**[GET /sources/{id}/track](#8-get-a-sources-position-track)**
+
+---
+
+### 9. Upload a Source's Finder Chart
+
+**[POST /sources/{id}/chart](#9-upload-a-sources-finder-chart)**
+
+---
+
+### 10. Get a Source's Finder Chart
+
+**[GET /sources/{id}/chart.png](#10-get-a-sources-finder-chart)**
+
+---
+
+### 11. Get Position Tracks for Multiple Sources (Batch)
+
+**[POST /sources/tracks/batch](#11-get-position-tracks-for-multiple-sources-batch)**
+
+---
+
+### 12. Upload Finder Charts for Multiple Sources (Batch)
+
+**[POST /sources/charts/batch](#12-upload-finder-charts-for-multiple-sources-batch)**
 
 ---
 
@@ -326,7 +362,7 @@ Accept: application/json
 | `sources` | array | yes | List of detected source objects. An empty array `[]` is valid |
 | `sources[].ra` | float | yes | Source right ascension in decimal degrees |
 | `sources[].dec` | float | yes | Source declination in decimal degrees |
-| `sources[].mag` | float | no | Calibrated (or instrumental) magnitude |
+| `sources[].mag` | float\|null | no | Gaia-calibrated magnitude, or `null` when the frame couldn't be photometrically calibrated (fewer than 3 Gaia DR3 references) — the pipeline never sends the raw uncalibrated instrumental magnitude here, since it has no absolute zero-point (see observatory-pipeline's docs/ISSUES.md #2) |
 | `sources[].flux` | float | no | Raw aperture flux in ADU |
 | `sources[].fwhm` | float | no | FWHM of the source PSF in arcseconds |
 | `sources[].catalog_name` | string\|null | no | Matched catalog: `"Gaia DR3"`, `"Simbad"`, `"MPC"`, or `null` if unmatched |
@@ -850,5 +886,332 @@ Each frame in the results has the same fields as the single-position endpoint (s
 | Status | When |
 |--------|------|
 | `400` | Missing required fields or invalid position format |
+| `401` | Invalid or missing `X-API-Key` |
+
+---
+
+## 8. Get a Source's Position Track
+
+Full chronological position track for a source — one entry per frame it was detected on, each
+with the (RA, Dec) it was *actually* detected at on that specific frame (a moving object's
+position differs epoch to epoch, so this is not the same as a single fixed source position).
+Used by `modules/finder_chart.py` to build a source's finder/discovery chart.
+
+For a frame with several anomalies, `modules/finder_chart.py` fetches every one of their tracks
+in a single call via the batch variant instead (section 11) — this single-source endpoint
+remains available for any other consumer that only needs one source's track.
+
+### Request
+
+```
+GET /sources/{id}/track
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Accept: application/json
+```
+
+### Response
+
+**Status: `200 OK`**
+
+```json
+{
+  "source_id": "6612f8a5e3b9c9.12345678",
+  "epochs": [
+    {
+      "frame_id": "6612f7b2a1234.87654321",
+      "filename": "Vesta_A807_FA_Light_L_60_2021-03-14T16-54-55.fits",
+      "object": "Vesta_A807_FA",
+      "obs_time": "2021-03-14T16:54:55Z",
+      "ra": 123.461,
+      "dec": 45.682,
+      "mag": 8.1
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source_id` | string | The queried source's id |
+| `epochs` | array | Chronologically ordered (oldest first). `[]` if the source has no observations |
+| `epochs[].frame_id` | string | The frame this epoch was detected on |
+| `epochs[].filename` | string | Frame's stored filename — combine with `object` to locate the FITS file in the local archive (`FITS_ARCHIVE/{object}/{filename}`) |
+| `epochs[].object` | string | Frame's normalized object/archive-directory name |
+| `epochs[].obs_time` | string (ISO 8601) | Observation timestamp |
+| `epochs[].ra`, `epochs[].dec` | float | Position the source was detected at on this specific frame |
+| `epochs[].mag` | float or null | Magnitude on this frame, if measured |
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `401` | Invalid or missing `X-API-Key` |
+| `404` | Source not found |
+
+---
+
+## 9. Upload a Source's Finder Chart
+
+Store the finder-chart PNG for a source, fully replacing any previous one —
+`modules/finder_chart.py` always regenerates the whole image from the source's current track
+(section 8) rather than patching an existing file. The request body is the **raw PNG bytes** —
+not JSON, not multipart — since the body is entirely consumed by the image; `style` and
+`frame_count` travel as query parameters instead.
+
+For a frame with several anomalies, `modules/finder_chart.py` uploads every one of their charts
+in a single call via the batch variant instead (section 12), since the raw-PNG-body shape used
+here can't carry more than one image per request. This single-source endpoint remains available
+for any other consumer that only needs to upload one chart.
+
+### Request
+
+```
+POST /sources/{id}/chart?style=track&frame_count=5
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Content-Type: image/png
+```
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `style` | string | yes | `track` or `stamp_strip` |
+| `frame_count` | int | yes | Number of epochs included in the image (positive integer) |
+
+**Body:** raw PNG bytes. Validated by the 8-byte PNG signature (`\x89PNG\r\n\x1a\n`) rather than
+fully decoded — the API does not otherwise inspect the image.
+
+### Response
+
+**Status: `200 OK`**
+
+```json
+{
+  "source_id": "6612f8a5e3b9c9.12345678",
+  "style": "track",
+  "frame_count": 5,
+  "updated_at": "2024-03-15T22:05:00Z"
+}
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `400` | Missing/invalid `style` or `frame_count`, missing body, or body is not a valid PNG |
+| `401` | Invalid or missing `X-API-Key` |
+| `404` | Source not found |
+
+---
+
+## 10. Get a Source's Finder Chart
+
+Serve the stored finder-chart PNG for a source as raw image bytes. Not called by the pipeline
+itself — served for a future consumer such as the observatory website.
+
+### Request
+
+```
+GET /sources/{id}/chart.png
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+```
+
+### Response
+
+**Status: `200 OK`**
+
+Raw PNG bytes, `Content-Type: image/png`.
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `400` | Malformed `{id}` segment |
+| `401` | Invalid or missing `X-API-Key` |
+| `404` | No chart has been uploaded yet for this source |
+
+---
+
+## 11. Get Position Tracks for Multiple Sources (Batch)
+
+Batch variant of section 8 — returns the position track for **multiple** sources in a single
+request. `modules/finder_chart.py` uses this so that a frame with several anomalies fetches
+every one of their tracks in one round trip instead of one `GET /sources/{id}/track` per
+source_id.
+
+### Request
+
+```
+POST /sources/tracks/batch
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Content-Type: application/json
+Accept: application/json
+```
+
+**Body:**
+
+```json
+{
+  "source_ids": ["6612f8a5e3b9c9.12345678", "6612f8a5e40021.87654321"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `source_ids` | array of strings | yes | List of `sources.id` values. `[]` is valid |
+
+### Response
+
+**Status: `200 OK`**
+
+```json
+{
+  "results": {
+    "6612f8a5e3b9c9.12345678": [
+      {
+        "frame_id": "6612f7b2a1234.87654321",
+        "filename": "Vesta_A807_FA_Light_L_60_2021-03-14T16-54-55.fits",
+        "object": "Vesta_A807_FA",
+        "obs_time": "2021-03-14T16:54:55Z",
+        "ra": 123.461,
+        "dec": 45.682,
+        "mag": 8.1
+      }
+    ],
+    "6612f8a5e40021.87654321": []
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `results` | object | Dictionary mapping each requested `source_id` to its list of epochs |
+| `results["<source_id>"]` | array | Same shape as section 8's `epochs` array. `[]` for a source with no observations, an unknown source_id, or a malformed source_id — a batch entry never fails the rest of the call |
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `400` | Missing or non-array `source_ids` |
+| `401` | Invalid or missing `X-API-Key` |
+
+---
+
+## 12. Upload Finder Charts for Multiple Sources (Batch)
+
+Batch variant of section 9 — uploads finder-chart PNGs for **multiple** sources in a single
+request. `modules/finder_chart.py` uses this so that a frame with several anomalies uploads
+every one of their charts in one round trip instead of one `POST /sources/{id}/chart` per
+source_id.
+
+Unlike section 9, the request body here is a JSON envelope rather than raw PNG bytes — one
+request can only ever have one raw body, so each PNG travels **base64-encoded** inside the
+`charts` array instead.
+
+### Request
+
+```
+POST /sources/charts/batch
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Content-Type: application/json
+Accept: application/json
+```
+
+**Body:**
+
+```json
+{
+  "charts": [
+    {
+      "source_id": "6612f8a5e3b9c9.12345678",
+      "style": "track",
+      "frame_count": 5,
+      "png_base64": "iVBORw0KGgoAAAANSUhEUgAA..."
+    },
+    {
+      "source_id": "6612f8a5e40021.87654321",
+      "style": "stamp_strip",
+      "frame_count": 2,
+      "png_base64": "iVBORw0KGgoAAAANSUhEUgAA..."
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `charts` | array | yes | List of chart objects. `[]` is valid |
+| `charts[].source_id` | string | yes | The source this chart is for |
+| `charts[].style` | string | yes | `track` or `stamp_strip` |
+| `charts[].frame_count` | int | yes | Number of epochs included in the image (positive integer) |
+| `charts[].png_base64` | string | yes | Base64-encoded PNG bytes (validated by the 8-byte PNG signature after decoding, same as section 9) |
+
+### Response
+
+**Status: `200 OK`**
+
+Positionally parallel to the request's `charts` array (same length/order) — one result object
+per chart:
+
+```json
+{
+  "results": [
+    {
+      "source_id": "6612f8a5e3b9c9.12345678",
+      "status": "ok",
+      "style": "track",
+      "frame_count": 5,
+      "updated_at": "2024-03-15T22:05:00Z"
+    },
+    {
+      "source_id": "6612f8a5e40021.87654321",
+      "status": "error",
+      "error": "Source not found"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `results` | array | One entry per request `charts[]` entry, same order |
+| `results[].source_id` | string or null | Echoes the request entry's `source_id` (`null` if the entry itself was malformed) |
+| `results[].status` | string | `"ok"` or `"error"` |
+| `results[].style`, `.frame_count`, `.updated_at` | — | Present only when `status` is `"ok"` — same meaning as section 9's response |
+| `results[].error` | string | Present only when `status` is `"error"` — human-readable reason |
+
+A bad entry (invalid or unknown `source_id`, bad `style`/`frame_count`, bad PNG) only fails that
+one entry — every other entry in the same batch is still processed and stored.
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `400` | Missing or non-array `charts` (the whole request body is malformed — distinct from a per-entry `status: "error"` above) |
 | `401` | Invalid or missing `X-API-Key` |
 

@@ -4,6 +4,15 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
+      # Bind-mount the source tree itself so code edits on the host are picked
+      # up by a container restart (`docker compose restart pipeline`) instead
+      # of a full rebuild. Safe alongside the image's own `COPY . .` — this
+      # just overlays /app with the live host copy at container start; the
+      # apt packages, astap binary, and pip-installed dependencies baked into
+      # the image at build time live outside /app and are unaffected. A
+      # rebuild is still required after changing requirements.txt or the
+      # Dockerfile itself.
+      - .:/app
       # macOS local dev: paths under ~/Developer/data (Docker has access by default)
       # Linux production: change to /data/fits/... paths
       - ~/Developer/data/fits/incoming:/fits/incoming
