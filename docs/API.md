@@ -341,7 +341,10 @@ Accept: application/json
 ```json
 {
   "message": "Sources saved successfully",
-  "count": 3
+  "count": 3,
+  "new_sources": 2,
+  "matched_sources": 1,
+  "source_ids": ["6a7415c324e514.28790200", "6a7415c3211cd4.36871892", null]
 }
 ```
 
@@ -349,6 +352,9 @@ Accept: application/json
 |-------|------|-------------|
 | `message` | string | Human-readable confirmation |
 | `count` | integer | Number of sources persisted |
+| `new_sources` | integer | Number of sources that created a new `sources` catalog row |
+| `matched_sources` | integer | Number of sources that matched an existing `sources` catalog row |
+| `source_ids` | array | Positionally parallel to the request's `sources[]` (same length, same order) — each entry is the resolved `sources.id` for that source, or `null` if the entry was skipped (invalid `ra`/`dec`, or an insert failure). The pipeline uses this to attach `source_id` to the corresponding anomaly before calling `POST /frames/{id}/anomalies` (see below). |
 
 **Error responses:**
 
@@ -392,6 +398,7 @@ Accept: application/json
   "anomalies": [
     {
       "anomaly_type": "ASTEROID",
+      "source_id": "6a7415c324e514.28790200",
       "ra": 202.489,
       "dec": 47.201,
       "magnitude": 17.8,
@@ -446,7 +453,8 @@ Accept: application/json
 |-------|------|----------|-------------|
 | `filename` | string | yes | FITS filename — included for logging and correlation |
 | `anomalies` | array | yes | List of anomaly objects. An empty array `[]` is valid |
-| `anomalies[].anomaly_type` | string | yes | Classification type — see table below |
+| `anomalies[].anomaly_type` | string (enum) | yes | Classification type — one of the 10 fixed values in the table below. The API validates this against `AnomalyModel::ALLOWED_TYPES` and rejects the whole batch with `400` if any entry doesn't match |
+| `anomalies[].source_id` | string\|null | no | The `sources.id` this anomaly is linked to, taken from the `source_ids` array returned by the preceding `POST /frames/{id}/sources` call for the same frame. `null`/omitted when no source could be resolved (persisted as `NULL`; FK `ON DELETE SET NULL`). |
 | `anomalies[].ra` | float | yes | Source right ascension in decimal degrees |
 | `anomalies[].dec` | float | yes | Source declination in decimal degrees |
 | `anomalies[].magnitude` | float\|null | no | Observed magnitude |
