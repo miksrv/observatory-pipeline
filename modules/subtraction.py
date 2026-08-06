@@ -7,9 +7,13 @@ Algorithm:
   3. Align each reference frame to the new frame using astroalign triangle matching.
   4. Median-stack aligned frames -> clean reference (removes cosmic rays, hot pixels).
   5. diff = new_frame - reference.
-  6. Run SEP detection on positive residuals in diff.
-  7. Convert pixel coords to RA/Dec via WCS.
-  8. Return candidates list.
+  6. Mask the vicinity of any saturated pixel (new frame or a reference) —
+     astroalign resampling leaves large non-Gaussian residuals there even
+     under near-perfect registration, which sep would otherwise report as
+     spurious bright "transients" (see docs/ISSUES.md #1, #2).
+  7. Run SEP detection on positive residuals in the (masked) diff.
+  8. Convert pixel coords to RA/Dec via WCS.
+  9. Return candidates list.
 
 Returns candidates with _from_subtraction=True flag for pipeline routing.
 These bypass the history-check in anomaly_detector (subtraction already confirms
@@ -127,7 +131,7 @@ def _align_frame(source: np.ndarray, target: np.ndarray) -> Optional[np.ndarray]
 # Difference-image source detection
 # ---------------------------------------------------------------------------
 
-def _detect_diff_sources(diff: np.ndarray) -> list[dict]:
+def _detect_diff_sources(diff: np.ndarray, mask: Optional[np.ndarray] = None) -> list[dict]:
     """
     Detect positive residuals in the difference image using SEP.
 
@@ -139,6 +143,14 @@ def _detect_diff_sources(diff: np.ndarray) -> list[dict]:
     ----------
     diff:
         2-D float array: new_frame - reference_stack.
+    mask:
+        Optional boolean array, same shape as *diff*, marking pixels to
+        exclude from detection — used by run() to suppress astroalign
+        residual artifacts in the vicinity of saturated stars (see
+        docs/ISSUES.md #1, #2). Masked pixels are excluded from the
+        background model and zeroed in the background-subtracted image
+        before extraction, so no candidate can be detected there. Ignored
+        (treated as no mask) if its shape doesn't match *diff*.
 
     Returns
     -------
@@ -148,8 +160,11 @@ def _detect_diff_sources(diff: np.ndarray) -> list[dict]:
     """
     try:
         arr = np.ascontiguousarray(diff, dtype=np.float64)
-        bkg = sep.Background(arr)
+        use_mask = mask if (mask is not None and mask.shape == arr.shape) else None
+        bkg = sep.Background(arr, mask=use_mask) if use_mask is not None else sep.Background(arr)
         sub = arr - bkg.back()
+        if use_mask is not None:
+            sub[use_mask] = 0.0
         rms = float(bkg.globalrms)
         if rms <= 0:
             return []
@@ -195,6 +210,46 @@ def _detect_diff_sources(diff: np.ndarray) -> list[dict]:
 # WCS coordinate conversion
 # ---------------------------------------------------------------------------
 
+def _open_wcs(fits_path: str) -> Optional[WCS]:
+    """
+    Return the first valid celestial WCS found across *fits_path*'s HDUs, or
+    None on any failure / if none is found. Shared by _pixel_to_sky() and
+    _pixel_scale_arcsec() below.
+    """
+    try:
+        with fits.open(fits_path) as hdul:
+            for hdu in hdul:
+                if hdu.header.get("CTYPE1"):
+                    try:
+                        w = WCS(hdu.header)
+                        if w.has_celestial:
+                            return w
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return None
+
+
+def _pixel_scale_arcsec(fits_path: str) -> Optional[float]:
+    """
+    Best-effort pixel scale (arcsec/px) derived from *fits_path*'s WCS.
+
+    Used to convert config.SATURATION_MASK_RADIUS_ARCSEC into a pixel radius
+    for _build_saturation_mask() below. Returns None when no valid celestial
+    WCS is found — the caller falls back to a fixed-pixel dilation radius.
+    """
+    wcs = _open_wcs(fits_path)
+    if wcs is None:
+        return None
+    try:
+        ps_matrix = wcs.pixel_scale_matrix  # (2, 2), units deg/px
+        deg = math.sqrt(ps_matrix[0, 0] ** 2 + ps_matrix[1, 0] ** 2)
+        return deg * 3600.0
+    except Exception:
+        return None
+
+
 def _pixel_to_sky(pixel_candidates: list[dict], fits_path: str) -> list[dict]:
     """
     Convert pixel (x, y) detections to sky coordinates (ra, dec) using the
@@ -218,17 +273,7 @@ def _pixel_to_sky(pixel_candidates: list[dict], fits_path: str) -> list[dict]:
         Candidates for which the conversion fails are silently dropped.
     """
     try:
-        wcs: Optional[WCS] = None
-        with fits.open(fits_path) as hdul:
-            for hdu in hdul:
-                if hdu.header.get("CTYPE1"):
-                    try:
-                        w = WCS(hdu.header)
-                        if w.has_celestial:
-                            wcs = w
-                            break
-                    except Exception:
-                        continue
+        wcs = _open_wcs(fits_path)
 
         if wcs is None:
             logger.debug(
@@ -251,6 +296,69 @@ def _pixel_to_sky(pixel_candidates: list[dict], fits_path: str) -> list[dict]:
     except Exception as exc:
         logger.warning("WCS coordinate conversion failed: %s", exc)
         return []
+
+
+# ---------------------------------------------------------------------------
+# Saturation masking — see docs/ISSUES.md #1, #2
+# ---------------------------------------------------------------------------
+
+def _build_saturation_mask(
+    new_data: np.ndarray,
+    aligned_refs: list[np.ndarray],
+    radius_px: int,
+) -> Optional[np.ndarray]:
+    """
+    Flag pixels near saturation in the new frame or any aligned reference
+    frame, dilated by radius_px, for exclusion from diff-image detection.
+
+    Saturated stars leave large, non-Gaussian residuals after astroalign
+    resampling even under near-perfect registration (interpolation ringing,
+    sub-pixel misalignment amplified by huge pixel values). Left unmasked,
+    sep.extract() on the diff image happily reports these as bright
+    "transient" candidates — uncatalogued (no star sits exactly there in any
+    catalog) and, if ever photometered, at an extreme magnitude — which is
+    exactly the bright-star artifact pattern suspected in docs/ISSUES.md #1
+    and observed as extreme magnitudes in #2.
+
+    Parameters
+    ----------
+    new_data:
+        The new frame's pixel data.
+    aligned_refs:
+        Reference frames already resampled onto new_data's pixel grid.
+        Entries whose shape doesn't match new_data (shouldn't happen post
+        alignment, but checked defensively) are skipped.
+    radius_px:
+        Dilation radius in pixels. 0 (or a failed dilation, e.g. missing
+        scipy) falls back to the un-dilated saturation mask itself.
+
+    Returns
+    -------
+    np.ndarray | None
+        Boolean mask, same shape as new_data, or None when nothing in the
+        new frame or any reference frame is saturated (the common case) —
+        callers can skip masking work entirely in that case.
+    """
+    saturated = new_data >= config.SATURATION_ADU
+    for ref in aligned_refs:
+        if ref.shape == new_data.shape:
+            saturated |= (ref >= config.SATURATION_ADU)
+
+    if not saturated.any():
+        return None
+
+    if radius_px <= 0:
+        return saturated
+
+    try:
+        from scipy.ndimage import binary_dilation
+        structure = np.ones((2 * radius_px + 1, 2 * radius_px + 1), dtype=bool)
+        return binary_dilation(saturated, structure=structure)
+    except Exception as exc:
+        logger.debug(
+            "Saturation mask dilation failed (%s) — using un-dilated mask", exc
+        )
+        return saturated
 
 
 # ---------------------------------------------------------------------------
@@ -355,9 +463,27 @@ async def run(
     diff = new_data - reference
 
     # ------------------------------------------------------------------
+    # Mask the vicinity of saturated pixels (new frame or any reference)
+    # before detection — see docs/ISSUES.md #1, #2 and _build_saturation_mask().
+    # ------------------------------------------------------------------
+    pixel_scale_arcsec = _pixel_scale_arcsec(fits_path)
+    radius_px = 0
+    if pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        radius_px = max(1, int(round(config.SATURATION_MASK_RADIUS_ARCSEC / pixel_scale_arcsec)))
+
+    sat_mask = _build_saturation_mask(new_data, aligned, radius_px)
+    if sat_mask is not None:
+        logger.info(
+            "Subtraction: masking %d saturated-vicinity pixel(s) (radius=%dpx) "
+            "before diff detection",
+            int(sat_mask.sum()),
+            radius_px,
+        )
+
+    # ------------------------------------------------------------------
     # Detect and project candidates
     # ------------------------------------------------------------------
-    pixel_cands = _detect_diff_sources(diff)
+    pixel_cands = _detect_diff_sources(diff, mask=sat_mask)
     sky_cands   = _pixel_to_sky(pixel_cands, fits_path)
 
     for cand in sky_cands:

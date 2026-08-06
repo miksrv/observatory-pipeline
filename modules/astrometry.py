@@ -58,7 +58,9 @@ async def solve(fits_path: str, psf_fwhm_arcsec: float | None = None) -> dict[st
         naxis1      int     – image width in pixels
         naxis2      int     – image height in pixels
         sources     list    – list of source dicts; each has:
-                              ra, dec, flux, fwhm (arcsec), elongation (a/b)
+                              ra, dec, flux, fwhm (arcsec), elongation (a/b),
+                              saturated (bool — peak ADU >= config.SATURATION_ADU;
+                              see docs/ISSUES.md #2)
         wcs         WCS     – astropy WCS object for downstream coordinate work
 
     Returns ``{}`` on any failure (astap error, WCS invalid, sep failure).
@@ -307,6 +309,28 @@ async def solve(fits_path: str, psf_fwhm_arcsec: float | None = None) -> dict[st
             snr: np.ndarray = objects["peak"] / bkg.globalrms
 
             # ---------------------------------------------------------
+            # Saturation flag — see docs/ISSUES.md #2.
+            #
+            # sep's "peak" field is background-SUBTRACTED, so add the global
+            # background level back to approximate the true raw ADU value at
+            # the object's brightest pixel. This is a coarse per-object check
+            # (not pixel-exact), but sufficient to flag the saturated cores
+            # that were otherwise silently producing extreme (e.g. -14 mag)
+            # magnitudes downstream in photometry.py, since aperture flux on
+            # a clipped PSF core is not a physically meaningful measurement.
+            # ---------------------------------------------------------
+            raw_peak: np.ndarray = objects["peak"] + bkg.globalback
+            saturated_mask: np.ndarray = raw_peak >= config.SATURATION_ADU
+            n_saturated = int(np.sum(saturated_mask))
+            if n_saturated:
+                logger.info(
+                    "Saturation check: %d/%d raw detection(s) at/above "
+                    "SATURATION_ADU=%.0f  file=%s",
+                    n_saturated, len(objects), config.SATURATION_ADU,
+                    fits_filename,
+                )
+
+            # ---------------------------------------------------------
             # Star filtering criteria:
             # 1. Elongation < max (stars are round, trails/galaxies are elongated)
             # 2. FWHM in reasonable range (reject hot pixels and extended objects)
@@ -373,6 +397,7 @@ async def solve(fits_path: str, psf_fwhm_arcsec: float | None = None) -> dict[st
                     "flux":       float(objects["flux"][i]),
                     "fwhm":       float(fwhm_arcsec[i]),
                     "elongation": float(elongations[i]),
+                    "saturated":  bool(saturated_mask[i]),
                 }
                 for i in range(len(objects))
                 if star_mask[i]
@@ -406,6 +431,7 @@ async def solve(fits_path: str, psf_fwhm_arcsec: float | None = None) -> dict[st
                     "flux":       float(objects["flux"][i]),
                     "fwhm":       float(fwhm_arcsec[i]),
                     "elongation": float(elongations[i]),
+                    "saturated":  bool(saturated_mask[i]),
                 }
                 for i in range(len(objects))
                 if mask_all[i]

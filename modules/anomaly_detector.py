@@ -430,6 +430,24 @@ def _classify_source_sync(
     # ------------------------------------------------------------------
 
     if catalog_name is None:
+        # A saturated, uncatalogued detection is almost certainly a
+        # bright-star / astroalign residual artifact, not a real transient
+        # or moving object — see docs/ISSUES.md #1 and #2. This check is
+        # deliberately scoped to catalog_name is None: an MPC- or
+        # Simbad-matched source (e.g. a genuinely bright asteroid or a known
+        # star flaring) is a legitimate detection and must still be
+        # classified normally, just without a computed magnitude (see
+        # photometry.py, which never measures a saturated source).
+        if bool(source.get("saturated")):
+            logger.debug(
+                "Suppressed: saturated + uncatalogued detection ra=%.4f dec=%.4f "
+                "— treated as bright-star/subtraction artifact, not a real "
+                "transient (see docs/ISSUES.md #1, #2)",
+                ra, dec,
+                extra=extra,
+            )
+            return None
+
         # Get wide-cone history from prefetched data
         tile_sources = history_by_tile.get(tile, [])
         wide_history = _find_sources_within_radius(ra, dec, config.MOVING_CONE_ARCSEC, tile_sources)

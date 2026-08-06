@@ -127,6 +127,13 @@ def _compute_zero_point(
     for src in sources:
         if src.get("catalog_name") != "Gaia DR3":
             continue
+        # A saturated star's aperture flux is not a physically meaningful
+        # measurement (its PSF core is clipped), so it must never be used as
+        # a zero-point reference even if it happens to be Gaia-matched —
+        # otherwise it would corrupt the zero-point for every other source
+        # in the frame. See docs/ISSUES.md #2.
+        if src.get("saturated"):
+            continue
         cat_mag = src.get("catalog_mag")
         inst_mag = src.get("mag_instrumental")
         if cat_mag is None or inst_mag is None:
@@ -192,6 +199,13 @@ async def measure(fits_path: str, sources: list[dict]) -> list[dict]:
         edge_flag           bool           True when centroid is within 10 px of edge
         zero_point          float | None   frame-level ZP (same for all sources)
         zero_point_err      float | None   MAD of reference-star ZP offsets
+
+    A source carrying ``saturated=True`` (set by ``astrometry.solve()``; see
+    docs/ISSUES.md #2) is never measured — its photometry keys stay None
+    just like an out-of-bounds source, since aperture flux on a saturated
+    PSF core is not a physically meaningful measurement and was the root
+    cause of extreme (e.g. -14) magnitudes reaching the API. Saturated
+    sources are also excluded from the Gaia DR3 zero-point reference set.
 
     On any frame-level failure the input sources are returned with all
     photometry keys set to None.
@@ -350,6 +364,17 @@ async def measure(fits_path: str, sources: list[dict]) -> list[dict]:
             or x_px > naxis1 - 10.0
             or y_px > naxis2 - 10.0
         )
+
+        # Saturated sources (flagged upstream by astrometry.py / carried
+        # through by subtraction.py) never get a magnitude measurement:
+        # aperture photometry on a clipped PSF core returns a hugely
+        # inflated net_flux, which -2.5*log10() legitimately turns into an
+        # extreme (e.g. -14) magnitude that is not physically meaningful.
+        # See docs/ISSUES.md #2. flux_aperture/mag_* stay None, "saturated"
+        # itself is already carried over from `src` via dict(src) above.
+        if bool(src.get("saturated")):
+            output.append(out)
+            continue
 
         try:
             # Aperture sizes in pixels, derived from FWHM

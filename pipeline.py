@@ -55,6 +55,11 @@ except ImportError:
     subtraction = None  # type: ignore[assignment]
 
 try:
+    from modules import finder_chart
+except ImportError:
+    finder_chart = None  # type: ignore[assignment]
+
+try:
     from api_client import client as api_client
 except ImportError:
     api_client = None  # type: ignore[assignment]
@@ -81,7 +86,8 @@ async def run(fits_path: str) -> None:
         7. POST sources to API
         8. Anomaly detection (optional)
         9. POST anomalies to API
-        10. Move file to archive
+        9.5. Move file to archive
+        10. Finder chart update (optional) — per-source discovery chart
 
     Parameters
     ----------
@@ -359,12 +365,25 @@ async def run(fits_path: str) -> None:
     # so without this step every source's "mag" stayed at whatever
     # placeholder it had before (None for catalog/subtraction candidates),
     # delta_mag in anomaly_detector.py was always None, and no
-    # magnitude-change anomaly could ever fire. Prefer the Gaia-calibrated
-    # magnitude; fall back to the uncalibrated instrumental one so sources
-    # without enough Gaia reference stars in the field still get a value.
+    # magnitude-change anomaly could ever fire.
+    #
+    # "mag" is ONLY ever the Gaia-calibrated magnitude — never a fallback to
+    # the uncalibrated instrumental one. mag_instrumental = -2.5*log10(flux_ADU)
+    # has no absolute zero-point and is not a real magnitude on its own; when
+    # a frame has fewer than 3 Gaia DR3 references (e.g. a narrow/crowded
+    # field), photometry.py sets calibrated=False for every source in it, and
+    # an earlier revision of this step fell back to mag_instrumental in that
+    # case — which is exactly what produced the extreme (e.g. -15) "magnitude"
+    # values investigated in docs/ISSUES.md #2: two whole real frames with
+    # zero_point=None had every single source's "mag" come out negative and
+    # implausible, while frames that did calibrate looked completely normal
+    # (+11 to +19). See that doc for the live reproduction. Sources without a
+    # calibrated magnitude simply get mag=None — delta_mag-based
+    # classifications correctly don't fire for them rather than firing on a
+    # meaningless number.
     # ------------------------------------------------------------------
     for _src in sources:
-        _src["mag"] = _src.get("mag_calibrated") if _src.get("calibrated") else _src.get("mag_instrumental")
+        _src["mag"] = _src.get("mag_calibrated") if _src.get("calibrated") else None
 
     # ------------------------------------------------------------------
     # Step 6 — Post frame to API
@@ -480,17 +499,27 @@ async def run(fits_path: str) -> None:
         )
 
     # ------------------------------------------------------------------
-    # Step 10 — Archive move and cleanup
+    # Step 9.5 — Archive move and cleanup
+    #
+    # This runs BEFORE the finder chart step (10) below on purpose: chart
+    # rendering loads each epoch's FITS file from
+    # FITS_ARCHIVE/{object}/{filename} (see modules/finder_chart.py's
+    # _local_fits_path()), and that includes *this* frame's own epoch. If
+    # the archive move happened after chart generation, this frame's file
+    # would still be sitting at its pre-archive location and every chart
+    # attempt for a source whose track consists only of this one frame
+    # (i.e. any first-time alert) would find 0 of its epochs loadable and
+    # silently skip the chart entirely — see CLAUDE.md Known Issues.
     # ------------------------------------------------------------------
     try:
         # Use object name for directory structure (normalized if normalization enabled)
         dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
         os.makedirs(dest_dir, exist_ok=True)
-        
+
         # Rename file to normalized filename (if normalization enabled)
         dest_path = os.path.join(dest_dir, normalized_filename)
         shutil.move(fits_path, dest_path)
-        
+
         logger.info("Done: %s → %s", original_filename, dest_path, extra=extra)
 
         # Clean up astap temporary files (.ini, .wcs) left in incoming directory
@@ -498,6 +527,59 @@ async def run(fits_path: str) -> None:
 
     except Exception as exc:
         logger.error("Failed to archive file: %s", exc, extra=extra)
+
+    # ------------------------------------------------------------------
+    # Step 10 — Finder charts (optional)
+    #
+    # For every anomaly with a resolved source_id, (re)generate and upload
+    # its finder/discovery chart — a small PNG showing every frame that
+    # source has ever been detected on, with its position circled on each
+    # (see modules/finder_chart.py). Best-effort: failures here (missing
+    # local archive file, API hiccup, rendering error) are logged and never
+    # affect frame processing. Deduped by source_id — in practice Step 4.5
+    # already collapses multiple detections of the same catalog identity
+    # within one frame down to a single source, so seeing more than one
+    # anomaly per source_id here would be unusual; this dict-based dedup is
+    # defensive rather than the expected common case.
+    #
+    # Runs AFTER the archive move (step 9.5 above) so that this frame's own
+    # FITS file is already present at FITS_ARCHIVE/{object}/{filename} by
+    # the time chart rendering looks for it there.
+    #
+    # All source_ids for this frame are handled in one call to
+    # finder_chart.update_charts_for_sources() — it fetches every track via
+    # one GET /sources/tracks/batch and uploads every chart via one
+    # POST /sources/charts/batch, instead of one GET+POST round trip per
+    # source_id.
+    # ------------------------------------------------------------------
+    if finder_chart is not None and config.CHART_ENABLED:
+        anomaly_type_by_source: dict = {}
+        for anomaly in anomalies:
+            source_id = anomaly.get("source_id")
+            if source_id and source_id not in anomaly_type_by_source:
+                anomaly_type_by_source[source_id] = anomaly.get("anomaly_type")
+
+        if anomaly_type_by_source:
+            try:
+                chart_results = await finder_chart.update_charts_for_sources(anomaly_type_by_source)
+                for source_id, anomaly_type in anomaly_type_by_source.items():
+                    logger.debug(
+                        "Finder chart %s for source_id=%s (%s)",
+                        "updated" if chart_results.get(source_id) else "skipped",
+                        source_id,
+                        anomaly_type,
+                        extra=extra,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Finder chart batch update failed for %d source(s): %s — continuing",
+                    len(anomaly_type_by_source),
+                    exc,
+                    extra=extra,
+                )
+    else:
+        if finder_chart is None:
+            logger.debug("Finder chart module not available — skipping", extra=extra)
 
 
 # ---------------------------------------------------------------------------

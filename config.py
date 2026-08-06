@@ -67,6 +67,18 @@ SEP_DETECT_THRESH: float = float(_get("SEP_DETECT_THRESH", "10.0"))  # sigma abo
 SEP_MIN_AREA: int = int(_get("SEP_MIN_AREA", "15"))  # minimum connected pixels
 
 # ---------------------------------------------------------------------------
+# Saturation detection (astrometry + subtraction modules)
+# ---------------------------------------------------------------------------
+# Sensor pixel value (ADU) at/above which a pixel is considered saturated.
+# Default assumes a 16-bit sensor with some headroom below the hard 65535
+# ceiling for non-linearity near full well — tune per camera.
+SATURATION_ADU: float = float(_get("SATURATION_ADU", "60000"))
+# Radius (arcsec) around a saturated pixel that modules/subtraction.py
+# excludes from difference-image source detection, to suppress astroalign
+# residual artifacts around bright/saturated stars (see docs/ISSUES.md #1, #2).
+SATURATION_MASK_RADIUS_ARCSEC: float = float(_get("SATURATION_MASK_RADIUS_ARCSEC", "10.0"))
+
+# ---------------------------------------------------------------------------
 # Cross-matching
 # ---------------------------------------------------------------------------
 MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
@@ -89,6 +101,22 @@ SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 SITE_LAT: float = float(_get("SITE_LAT", "0.0"))   # degrees, positive = North
 SITE_LON: float = float(_get("SITE_LON", "0.0"))   # degrees, positive = East
 SITE_ELEV: int  = int(_get("SITE_ELEV", "0"))      # metres above sea level
+
+# ---------------------------------------------------------------------------
+# Finder charts (modules/finder_chart.py)
+# ---------------------------------------------------------------------------
+# Set false to skip chart generation entirely (it adds a local render step
+# plus two extra API round-trips per alerting-anomaly source).
+CHART_ENABLED: bool = _get("CHART_ENABLED", "true").lower() in ("true", "1", "yes")
+# Half-width of the per-epoch crop used by the "stamp_strip" style
+# (stationary anomalies), in arcseconds. Converted to pixels per-frame using
+# that frame's own WCS plate scale.
+CHART_STAMP_SIZE_ARCSEC: float = float(_get("CHART_STAMP_SIZE_ARCSEC", "60.0"))
+# Cap on the number of epochs drawn on one chart (oldest dropped first if a
+# source's track is longer than this) — keeps the rendered image size, and
+# the number of local archive FITS files opened per chart, bounded for
+# sources with a very long observation history.
+CHART_MAX_EPOCHS: int = int(_get("CHART_MAX_EPOCHS", "12"))
 
 # ---------------------------------------------------------------------------
 # Normalization settings
