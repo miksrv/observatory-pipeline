@@ -39,7 +39,6 @@ import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
-from astropy.wcs import WCS
 
 import config
 from modules import astrometry, catalog_matcher, qc, subtraction
@@ -128,9 +127,19 @@ async def main(fits_path: str, out_png: str) -> None:
     # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------
+    # Must reuse astro["wcs"] — the WCS astrometry.solve() actually used to
+    # derive every source's ra/dec (astap's own fresh .wcs sidecar,
+    # preferred over the file's own header since the 2026-08-06 UGC_6930
+    # fix). Re-reading WCS(hdul[0].header) here instead would re-derive it
+    # from fits_path's own (never rewritten — this script must never touch
+    # its input) header, which can now disagree with astro["wcs"] by the
+    # same offset that fix was about — sources would still MATCH correctly
+    # (matching happens in sky coordinates), but every circle would be
+    # plotted off the actual star, since world_to_pixel() would be going
+    # through a different WCS than the one that produced _plot_ra/_plot_dec.
     with fits.open(fits_path) as hdul:
         data = hdul[0].data.astype(np.float32)
-        wcs = WCS(hdul[0].header)
+    wcs = astro["wcs"]
 
     fig, ax = plt.subplots(figsize=(14, 11), dpi=130)
     ax.imshow(_stretch(data), cmap="gray", origin="lower")

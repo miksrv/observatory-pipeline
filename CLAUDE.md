@@ -163,7 +163,7 @@ Orchestrates processing of a single FITS file in order:
 4. `qc.analyze(fits_path)` → returns metrics + quality flag
 5. If `quality_flag != OK` → move file to `/fits/rejected/{object_name}/` → **STOP** (no API call)
 6. `astrometry.solve(fits_path)` → returns WCS + two source lists: `sources` (strict star filter) and `sources_all` (loose filter — also keeps bright/saturated and faint detections, used for matching). This selection is made *before* step 7's merge below — `sources`/`sources_all` must already exist as names before anything tries to extend them.
-7. `subtraction.run(fits_path, archive_dir, filter_name)` → if ≥`SUBTRACTION_MIN_FRAMES` archived frames of the same object exist, aligns them (via `astroalign`), builds a median reference, subtracts, and returns candidate sources found only in the difference image. These are merged into the source list and flagged `_from_subtraction=True`. Skipped gracefully otherwise.
+7. `subtraction.run(fits_path, archive_dir, filter_name, wcs=astro_result["wcs"])` → if ≥`SUBTRACTION_MIN_FRAMES` archived frames of the same object exist, aligns them (via `astroalign`), builds a median reference, subtracts, and returns candidate sources found only in the difference image. These are merged into the source list and flagged `_from_subtraction=True`. Skipped gracefully otherwise. The `wcs` passed here is step 6's already-solved WCS, not re-derived from `fits_path`'s own header — that header isn't corrected until step 14.5 archives the frame (see `modules/astrometry.py`'s section below), so re-deriving it here would give subtraction's candidates a different systematic sky-position offset than every other source in the frame.
 8. `catalog_matcher.match(sources, frame_meta)` → identifies known objects. **Runs before photometry** so matched Gaia DR3 stars can serve as the photometric zero-point reference.
 8.5. `_dedupe_by_catalog_identity(sources, extra)` → collapses sources that share the same
      `(catalog_name, catalog_id)` within this one frame into a single representative source —
@@ -353,7 +353,12 @@ entry at all, at any position).
    are zeroed in the background-subtracted diff image before extraction, so no candidate can be
    detected there. See docs/ISSUES.md #1, #2.
 5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry.py`), since `sep.extract()` doesn't return a native `fwhm` field.
-6. Converts detected pixel positions back to (RA, Dec) using the frame's WCS.
+6. Converts detected pixel positions back to (RA, Dec) using the frame's WCS — preferring the
+   already-solved `wcs` passed in from `astrometry.solve()` (see `pipeline.py` step 7 above) over
+   re-deriving one from the new frame's own header, which can still carry a stale/mount-pointing
+   WCS at this point (`pipeline.py` only corrects the header at archive time, step 14.5 — see
+   `modules/astrometry.py`'s section below). `wcs=None` (e.g. a caller that never ran astrometry
+   itself) falls back to reading whatever WCS the file's own header has.
 7. Returns `{"performed": bool, "reference_frame_count": int, "candidates": [...]}`. Every
    candidate is tagged `_from_subtraction=True` so `anomaly_detector.py` can apply looser
    coverage rules to it (see below).

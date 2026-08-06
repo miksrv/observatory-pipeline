@@ -231,15 +231,17 @@ def _open_wcs(fits_path: str) -> Optional[WCS]:
     return None
 
 
-def _pixel_scale_arcsec(fits_path: str) -> Optional[float]:
+def _pixel_scale_arcsec(fits_path: str, wcs: Optional[WCS] = None) -> Optional[float]:
     """
-    Best-effort pixel scale (arcsec/px) derived from *fits_path*'s WCS.
+    Best-effort pixel scale (arcsec/px) from *wcs*, or derived from
+    *fits_path*'s own header WCS when *wcs* is not given.
 
     Used to convert config.SATURATION_MASK_RADIUS_ARCSEC into a pixel radius
     for _build_saturation_mask() below. Returns None when no valid celestial
-    WCS is found — the caller falls back to a fixed-pixel dilation radius.
+    WCS is available — the caller falls back to a fixed-pixel dilation radius.
     """
-    wcs = _open_wcs(fits_path)
+    if wcs is None:
+        wcs = _open_wcs(fits_path)
     if wcs is None:
         return None
     try:
@@ -250,10 +252,12 @@ def _pixel_scale_arcsec(fits_path: str) -> Optional[float]:
         return None
 
 
-def _pixel_to_sky(pixel_candidates: list[dict], fits_path: str) -> list[dict]:
+def _pixel_to_sky(
+    pixel_candidates: list[dict], fits_path: str, wcs: Optional[WCS] = None
+) -> list[dict]:
     """
-    Convert pixel (x, y) detections to sky coordinates (ra, dec) using the
-    WCS stored in *fits_path*.
+    Convert pixel (x, y) detections to sky coordinates (ra, dec) using *wcs*,
+    or a WCS read from *fits_path*'s own header when *wcs* is not given.
 
     astropy WCS.pixel_to_world() uses 0-indexed pixel coordinates internally
     (it handles the FITS CRPIX 1-indexed convention transparently), so passing
@@ -264,7 +268,22 @@ def _pixel_to_sky(pixel_candidates: list[dict], fits_path: str) -> list[dict]:
     pixel_candidates:
         List of dicts with at least ``x`` and ``y`` keys.
     fits_path:
-        Absolute path to the science FITS file (must contain a valid WCS).
+        Absolute path to the science FITS file. Only actually read when
+        *wcs* is not given — see *wcs* below.
+    wcs:
+        The already-solved WCS for fits_path — normally astro_result["wcs"]
+        from astrometry.solve(), passed down through run() below. Preferred
+        over re-deriving WCS from fits_path's own header: at the point
+        run() is called, that header can still carry a stale WCS (e.g. a
+        capture program's mount-pointing estimate — see the 2026-08-06
+        UGC_6930 incident in CLAUDE.md); pipeline.py only corrects it later,
+        right before archiving. Falling back to fits_path's header here
+        would give these candidates a different systematic offset than
+        every other source in the same frame, which is exactly what
+        catalog_matcher's WCS-offset accumulator assumes can't happen.
+        Pass None (or omit) to fall back to the old file-read behavior —
+        used by callers that never ran astrometry.solve() themselves, e.g.
+        tests or standalone invocations.
 
     Returns
     -------
@@ -273,7 +292,8 @@ def _pixel_to_sky(pixel_candidates: list[dict], fits_path: str) -> list[dict]:
         Candidates for which the conversion fails are silently dropped.
     """
     try:
-        wcs = _open_wcs(fits_path)
+        if wcs is None:
+            wcs = _open_wcs(fits_path)
 
         if wcs is None:
             logger.debug(
@@ -369,6 +389,7 @@ async def run(
     fits_path: str,
     archive_dir: str,
     filter_name: Optional[str],
+    wcs: Optional[WCS] = None,
 ) -> dict:
     """
     Run image subtraction to detect transient / moving sources.
@@ -389,6 +410,14 @@ async def run(
     filter_name:
         Normalized filter name used to prefer same-filter reference frames
         (e.g. "Ha", "R").  Pass None to use all archived frames.
+    wcs:
+        The already-solved WCS for fits_path (astro_result["wcs"] from
+        astrometry.solve()), forwarded to _pixel_scale_arcsec() and
+        _pixel_to_sky() below so subtraction candidates get the exact same
+        sky coordinates every other source in this frame does. Pass None to
+        fall back to reading WCS straight from fits_path's own header (see
+        _pixel_to_sky()'s docstring for why that's a fallback, not the
+        default, in the real pipeline).
 
     Returns
     -------
@@ -466,7 +495,7 @@ async def run(
     # Mask the vicinity of saturated pixels (new frame or any reference)
     # before detection — see docs/ISSUES.md #1, #2 and _build_saturation_mask().
     # ------------------------------------------------------------------
-    pixel_scale_arcsec = _pixel_scale_arcsec(fits_path)
+    pixel_scale_arcsec = _pixel_scale_arcsec(fits_path, wcs=wcs)
     radius_px = 0
     if pixel_scale_arcsec and pixel_scale_arcsec > 0:
         radius_px = max(1, int(round(config.SATURATION_MASK_RADIUS_ARCSEC / pixel_scale_arcsec)))
@@ -484,7 +513,7 @@ async def run(
     # Detect and project candidates
     # ------------------------------------------------------------------
     pixel_cands = _detect_diff_sources(diff, mask=sat_mask)
-    sky_cands   = _pixel_to_sky(pixel_cands, fits_path)
+    sky_cands   = _pixel_to_sky(pixel_cands, fits_path, wcs=wcs)
 
     for cand in sky_cands:
         cand["mag"]               = None

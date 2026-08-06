@@ -244,6 +244,7 @@ async def run(fits_path: str) -> None:
                 fits_path=fits_path,
                 archive_dir=archive_object_dir,
                 filter_name=filter_name,
+                wcs=astro_result.get("wcs"),
             )
             sub_candidates = sub_result.get("candidates", [])
             subtraction_info = {

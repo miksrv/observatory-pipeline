@@ -291,6 +291,28 @@ class TestPixelScaleArcsec:
     def test_missing_file_returns_none(self, tmp_path):
         assert subtraction._pixel_scale_arcsec(str(tmp_path / "missing.fits")) is None
 
+    def test_explicit_wcs_overrides_file_header(self, tmp_path):
+        """
+        A passed-in wcs must win over fits_path's own header WCS entirely —
+        _open_wcs(fits_path) must not even be consulted. Regression test:
+        subtraction.run() forwards astrometry.solve()'s already-solved WCS
+        specifically so this candidate's pixel scale doesn't come from
+        fits_path's own (possibly still-stale, not yet corrected) header —
+        see run()'s docstring and modules/astrometry.py's fix history.
+        """
+        path = TestPixelToSky._make_wcs_fits(tmp_path, scale_deg=0.000278)
+
+        different_wcs = AstropyWCS(naxis=2)
+        different_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        different_wcs.wcs.crpix = [50.0, 50.0]
+        different_wcs.wcs.crval = [10.0, 10.0]
+        different_wcs.wcs.cdelt = [-0.001, 0.001]  # a very different scale
+        different_wcs.wcs.set()
+
+        scale = subtraction._pixel_scale_arcsec(path, wcs=different_wcs)
+
+        assert scale == pytest.approx(0.001 * 3600.0, rel=1e-3)
+
 
 # ---------------------------------------------------------------------------
 # _pixel_to_sky
@@ -340,6 +362,33 @@ class TestPixelToSky:
     def test_missing_file_returns_empty(self, tmp_path):
         result = subtraction._pixel_to_sky([{"x": 5.0, "y": 5.0}], str(tmp_path / "missing.fits"))
         assert result == []
+
+    def test_explicit_wcs_overrides_file_header(self, tmp_path):
+        """
+        A passed-in wcs must win over fits_path's own header WCS entirely.
+        Regression test for the class of bug fixed alongside the 2026-08-06
+        UGC_6930 incident (modules/astrometry.py): without this, subtraction
+        candidates would get a different systematic sky-position offset
+        than every other source in the same frame, since fits_path's own
+        header isn't corrected until pipeline.py archives the frame — well
+        after subtraction.run() has already been called.
+        """
+        # The file's OWN header WCS says (202.47, 47.20)...
+        path = self._make_wcs_fits(tmp_path, ra=202.47, dec=47.20)
+
+        # ...but we pass a WCS centred somewhere completely different.
+        different_wcs = AstropyWCS(naxis=2)
+        different_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        different_wcs.wcs.crpix = [50.0, 50.0]
+        different_wcs.wcs.crval = [10.0, -30.0]
+        different_wcs.wcs.cdelt = [-0.000278, 0.000278]
+        different_wcs.wcs.set()
+
+        result = subtraction._pixel_to_sky([{"x": 49.0, "y": 49.0}], path, wcs=different_wcs)
+
+        assert len(result) == 1
+        assert result[0]["ra"] == pytest.approx(10.0, abs=1e-6)
+        assert result[0]["dec"] == pytest.approx(-30.0, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +446,7 @@ class TestRun:
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
         monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff, mask=None: [])
-        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path: [])
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
 
@@ -432,7 +481,7 @@ class TestRun:
         )
         monkeypatch.setattr(
             subtraction, "_pixel_to_sky",
-            lambda cands, path: [{"ra": 10.0, "dec": 20.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+            lambda cands, path, wcs=None: [{"ra": 10.0, "dec": 20.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
         )
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
@@ -469,7 +518,7 @@ class TestRun:
         )
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.full(shape, 100.0, dtype=np.float32))
         # Force the fixed-pixel dilation fallback (no WCS lookup in this test).
-        monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path: None)
+        monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path, wcs=None: None)
 
         captured: dict = {}
 
@@ -478,7 +527,7 @@ class TestRun:
             return []
 
         monkeypatch.setattr(subtraction, "_detect_diff_sources", fake_detect)
-        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path: [])
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
 
@@ -503,9 +552,49 @@ class TestRun:
             return []
 
         monkeypatch.setattr(subtraction, "_detect_diff_sources", fake_detect)
-        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path: [])
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
 
         assert result["performed"] is True
         assert captured["mask"] is None
+
+    async def test_wcs_param_is_forwarded_to_pixel_conversion(self, monkeypatch, tmp_path):
+        """
+        run()'s own wcs parameter must reach both _pixel_scale_arcsec() and
+        _pixel_to_sky() — this is the actual fix: pipeline.py passes
+        astro_result["wcs"] here specifically so subtraction candidates
+        share the same sky-coordinate solution as every other source in the
+        frame, instead of each call independently re-deriving WCS from
+        fits_path's own (possibly stale) header.
+        """
+        shape = (10, 10)
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
+        monkeypatch.setattr(
+            subtraction, "_detect_diff_sources",
+            lambda diff, mask=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+        )
+
+        sentinel_wcs = AstropyWCS(naxis=2)
+        captured: dict = {}
+
+        def fake_pixel_scale(path, wcs=None):
+            captured["pixel_scale_wcs"] = wcs
+            return None
+
+        def fake_pixel_to_sky(cands, path, wcs=None):
+            captured["pixel_to_sky_wcs"] = wcs
+            return []
+
+        monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", fake_pixel_scale)
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", fake_pixel_to_sky)
+
+        await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None, wcs=sentinel_wcs)
+
+        assert captured["pixel_scale_wcs"] is sentinel_wcs
+        assert captured["pixel_to_sky_wcs"] is sentinel_wcs
