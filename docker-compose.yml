@@ -4,12 +4,12 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # macOS: use paths under home directory (Docker has access by default)
+      # macOS local dev: paths under ~/Developer/data (Docker has access by default)
       # Linux production: change to /data/fits/... paths
-      - ~/observatory-data/fits/incoming:/fits/incoming
-      - ~/observatory-data/fits/archive:/fits/archive
-      - ~/observatory-data/fits/rejected:/fits/rejected
-      - ~/observatory-data/astap/catalogs:/astap/catalogs
+      - ~/Developer/data/fits/incoming:/fits/incoming
+      - ~/Developer/data/fits/archive:/fits/archive
+      - ~/Developer/data/fits/rejected:/fits/rejected
+      - ~/Developer/data/astap/catalogs:/astap/catalogs
     env_file:
       - .env
     restart: unless-stopped
