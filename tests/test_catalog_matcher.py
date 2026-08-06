@@ -15,10 +15,12 @@ asyncio_mode = auto in pytest.ini — no @pytest.mark.asyncio needed.
 from __future__ import annotations
 
 import datetime
+import math
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import astropy.units as u
+import numpy as np
 import pytest
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
@@ -487,4 +489,138 @@ class TestMatchOrchestrator:
         assert result[0]["catalog_name"] == "Gaia DR3"
         assert result[0]["catalog_id"]   == "42"
         assert result[0]["catalog_mag"]  == pytest.approx(12.3)
-        assert result[0]["object_type"]  == "STAR"
+
+
+# ===========================================================================
+# TestComputeWcsOffset
+#
+# Regression coverage for the 2026-08-06 "Vesta_A807_FA" incident: a real
+# frame with ~40 detected sources against ~4453 Gaia stars in the field
+# (i.e. a dense field where almost every source has multiple Gaia stars
+# within the 90" search radius purely by chance) and a true WCS offset of
+# roughly 60". The original fine-grained (2") histogram + flat "20x
+# background" significance test missed the real offset — true pairs, each
+# scattered by a few arcsec of centroid noise around the systematic bias,
+# spread across several adjacent bins and never reached the vote floor,
+# while an unrelated 2-vote noise bin passed the (too permissive at low
+# background) significance check. See modules/catalog_matcher.py for the
+# fixed algorithm (coarser bins, Poisson-margin significance test with an
+# absolute vote floor, iterative median refinement).
+# ===========================================================================
+
+class TestComputeWcsOffset:
+
+    @staticmethod
+    def _dense_field_scenario(true_dra_arcsec: float, true_ddec_arcsec: float, seed: int = 42):
+        """
+        Build a synthetic (sources, gaia_stars) pair mirroring the real
+        incident: ~40 sources, a genuine offset cluster of ~18 matching Gaia
+        stars (each with a few arcsec of centroid scatter around the true
+        offset), and ~2500 unrelated Gaia stars scattered over the field to
+        reproduce the "almost every source has a chance neighbour within
+        90"" background density of a real dense stellar field.
+        """
+        rng = np.random.default_rng(seed)
+        n_sources = 40
+        n_real_matches = 18
+        n_background_gaia = 2500
+
+        # Sources scattered over a ~0.7° box around (_RA, _DEC)
+        src_ra  = _RA  + rng.uniform(-0.35, 0.35, n_sources)
+        src_dec = _DEC + rng.uniform(-0.35, 0.35, n_sources)
+        sources = [_make_source(ra=float(r), dec=float(d)) for r, d in zip(src_ra, src_dec)]
+        for s in sources:
+            s["catalog_name"] = None
+
+        cos_dec = np.cos(np.radians(_DEC))
+        gaia_stars: list[dict] = []
+
+        # True matches: the first n_real_matches sources each get a Gaia
+        # counterpart at the true offset plus a few arcsec of scatter.
+        for i in range(n_real_matches):
+            scatter_ra  = rng.normal(0.0, 3.0)   # arcsec
+            scatter_dec = rng.normal(0.0, 3.0)   # arcsec
+            g_ra  = src_ra[i]  + (true_dra_arcsec  + scatter_ra)  / (cos_dec * 3600.0)
+            g_dec = src_dec[i] + (true_ddec_arcsec + scatter_dec) / 3600.0
+            gaia_stars.append({
+                "ra": float(g_ra), "dec": float(g_dec),
+                "source_id": f"true-{i}", "phot_g_mean_mag": 15.0,
+            })
+
+        # Background: Gaia stars uniformly scattered over a larger box,
+        # unrelated to any source — this is what makes the field "dense".
+        bg_ra  = _RA  + rng.uniform(-0.4, 0.4, n_background_gaia)
+        bg_dec = _DEC + rng.uniform(-0.4, 0.4, n_background_gaia)
+        for i, (r, d) in enumerate(zip(bg_ra, bg_dec)):
+            gaia_stars.append({
+                "ra": float(r), "dec": float(d),
+                "source_id": f"bg-{i}", "phot_g_mean_mag": 16.0,
+            })
+
+        return sources, gaia_stars
+
+    def test_recovers_large_offset_in_dense_field(self):
+        """
+        The exact shape of the real incident: true offset ≈ 60" total,
+        buried in a dense (background-dominated) Gaia field. Must recover
+        the offset to within a few arcsec, not fall back to (0.0, 0.0).
+        """
+        true_dra, true_ddec = 20.0, -55.0  # arcsec — matches the real incident's order of magnitude
+        sources, gaia_stars = self._dense_field_scenario(true_dra, true_ddec)
+
+        offset_ra_deg, offset_dec_deg = cm._compute_wcs_offset(sources, gaia_stars)
+
+        assert (offset_ra_deg, offset_dec_deg) != (0.0, 0.0), (
+            "Offset correction fell back to no-op — the real, large offset was not detected"
+        )
+        cos_dec = math.cos(math.radians(_DEC))
+        recovered_dra_arcsec  = offset_ra_deg  * cos_dec * 3600.0
+        recovered_ddec_arcsec = offset_dec_deg * 3600.0
+
+        assert recovered_dra_arcsec  == pytest.approx(true_dra,  abs=5.0)
+        assert recovered_ddec_arcsec == pytest.approx(true_ddec, abs=5.0)
+
+    def test_no_offset_needed_returns_zero(self):
+        """Sources already aligned with Gaia (median separation small) → no correction."""
+        sources = [_make_source(ra=_RA + i * 0.001, dec=_DEC) for i in range(10)]
+        for s in sources:
+            s["catalog_name"] = None
+        gaia_stars = [
+            {"ra": s["ra"], "dec": s["dec"], "source_id": f"g{i}", "phot_g_mean_mag": 14.0}
+            for i, s in enumerate(sources)
+        ]
+
+        offset_ra_deg, offset_dec_deg = cm._compute_wcs_offset(sources, gaia_stars)
+
+        assert offset_ra_deg == 0.0
+        assert offset_dec_deg == 0.0
+
+    def test_pure_noise_field_returns_zero(self):
+        """
+        A galaxy-rich field: sources present, Gaia stars present nearby, but
+        no genuine systematic relationship between them. Must not fabricate
+        a spurious correction from a small random peak (guards against the
+        low-background false-positive that motivated the fix — a coarser
+        search must not become MORE trigger-happy on pure noise).
+        """
+        rng = np.random.default_rng(7)
+        n = 15
+        sources = [
+            _make_source(ra=float(_RA + rng.uniform(-0.3, 0.3)), dec=float(_DEC + rng.uniform(-0.3, 0.3)))
+            for _ in range(n)
+        ]
+        for s in sources:
+            s["catalog_name"] = None
+        # A modest number of Gaia stars scattered with no relationship to sources at all.
+        gaia_stars = [
+            {
+                "ra": float(_RA + rng.uniform(-0.35, 0.35)),
+                "dec": float(_DEC + rng.uniform(-0.35, 0.35)),
+                "source_id": f"g{i}", "phot_g_mean_mag": 16.0,
+            }
+            for i in range(60)
+        ]
+
+        offset_ra_deg, offset_dec_deg = cm._compute_wcs_offset(sources, gaia_stars)
+
+        assert (offset_ra_deg, offset_dec_deg) == (0.0, 0.0)

@@ -225,3 +225,6 @@ __marimo__/
 
 # WCS solution files written by astap alongside FITS files
 *.wcs
+
+# debug/ tool output — scratch PNGs from testing pipeline stages, never commit
+/debug/output/

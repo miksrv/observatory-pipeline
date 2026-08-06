@@ -215,7 +215,11 @@ Computes quality metrics from a FITS file without plate solving:
 - **SNR** (signal-to-noise ratio of detected sources) — computed and reported as `snr_median`,
   but **not currently compared** against `QC_SNR_MIN` in the accept/reject decision (see
   Known Issues #2 below — the threshold is effectively dead)
-- **Sky background** (median + sigma after sigma-clipping)
+- **Sky background** (median + sigma after sigma-clipping) — compared against
+  `QC_SKY_BACKGROUND_MAX` (see flag table below). Twilight, moonlight, cloud, or stray light
+  raise this without necessarily blurring FWHM or trailing stars — a frame can look perfectly
+  sharp and untracked-blurred while still being unusable because faint stars are drowned in an
+  elevated background, which is exactly why this check is independent of BLUR/TRAIL.
 - **Star count** (minimum threshold check against `QC_STARS_MIN`; a hard-coded floor of 3 raw
   detections is also enforced independently, before `QC_STARS_MIN` is even applied)
 - **Cosmic ray fraction** (via astroscrappy)
@@ -225,9 +229,17 @@ Quality flags and handling:
 |---|---|---|
 | FWHM > QC_FWHM_MAX_ARCSEC | `BLUR` | Move to `/fits/rejected/{object}/BLUR_filename.fits` |
 | Elongation > QC_ELONGATION_MAX | `TRAIL` | Move to `/fits/rejected/{object}/TRAIL_filename.fits` |
+| Sky background > QC_SKY_BACKGROUND_MAX | `HIGH_BACKGROUND` | Move to `/fits/rejected/{object}/HIGH_BACKGROUND_filename.fits` |
 | Star count < QC_STARS_MIN (or < 3 raw detections) | `LOW_STARS` | Move to `/fits/rejected/{object}/LOW_STARS_filename.fits` |
 | Multiple issues, or a FITS read / background-estimation / extraction failure | `BAD` | Move to `/fits/rejected/{object}/BAD_filename.fits` |
 | All good | `OK` | Continue processing |
+
+`LOW_STARS` only fires when `BLUR`, `TRAIL`, and `HIGH_BACKGROUND` are all false — a low star
+count is treated as a *consequence* of one of those three (sources filtered out, or too faint
+to detect), not a separate root cause, so it isn't double-counted alongside whichever of them
+actually explains it. `QC_SKY_BACKGROUND_MAX` has no universal default that fits every
+site/instrument (same as `QC_FWHM_MAX_ARCSEC`) — tune it to your own site's typical dark-sky
+`sky_background` reading on good frames.
 
 **Important:** Bad frames are NOT sent to the API. They are moved to the `rejected` folder
 with a prefix indicating the rejection reason. This saves bandwidth, storage, and keeps the

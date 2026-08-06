@@ -118,7 +118,7 @@ async def analyze(fits_path: str) -> dict:
     Returns
     -------
     dict with keys:
-        quality_flag        "OK" | "BLUR" | "TRAIL" | "LOW_STARS" | "BAD"
+        quality_flag        "OK" | "BLUR" | "TRAIL" | "LOW_STARS" | "HIGH_BACKGROUND" | "BAD"
         fwhm_median         float | None
         fwhm_unit           "arcsec" | "pixels"
         elongation_median   float | None
@@ -377,10 +377,11 @@ async def analyze(fits_path: str) -> dict:
     # ------------------------------------------------------------------
     # 8. Quality flag classification
     # ------------------------------------------------------------------
-    # Note: BLUR and TRAIL explain why star_count might be low (sources are
-    # filtered out due to poor image quality). So we check BLUR and TRAIL
-    # first, and only check LOW_STARS if those are both false.
-    
+    # Note: BLUR, TRAIL, and HIGH_BACKGROUND explain why star_count might be
+    # low (sources are filtered out, or too faint to detect, due to poor
+    # image quality). So we check those first, and only check LOW_STARS if
+    # all three are false.
+
     blur: bool = (
         fwhm_unit == "arcsec"
         and fwhm_median is not None
@@ -390,12 +391,23 @@ async def analyze(fits_path: str) -> dict:
         elongation_median is not None
         and elongation_median > config.QC_ELONGATION_MAX
     )
-    
-    # LOW_STARS only applies when BLUR and TRAIL are false
-    # (otherwise low star count is a consequence of the BLUR/TRAIL issue)
-    low_stars: bool = (not blur and not trail) and star_count < config.QC_STARS_MIN
+    # A raised sky background (twilight, moonlight, cloud, stray light) can
+    # leave FWHM and elongation looking perfectly normal — it degrades depth
+    # (fainter stars are lost in the noise), not sharpness or tracking — so
+    # BLUR/TRAIL alone can miss a genuinely bad frame.
+    high_background: bool = (
+        sky_background is not None
+        and sky_background > config.QC_SKY_BACKGROUND_MAX
+    )
 
-    issue_count: int = sum([blur, trail, low_stars])
+    # LOW_STARS only applies when BLUR, TRAIL, and HIGH_BACKGROUND are all
+    # false (otherwise a low star count is a consequence of one of those).
+    low_stars: bool = (
+        not blur and not trail and not high_background
+        and star_count < config.QC_STARS_MIN
+    )
+
+    issue_count: int = sum([blur, trail, high_background, low_stars])
 
     if issue_count >= 2:
         quality_flag = "BAD"
@@ -403,18 +415,21 @@ async def analyze(fits_path: str) -> dict:
         quality_flag = "BLUR"
     elif trail:
         quality_flag = "TRAIL"
+    elif high_background:
+        quality_flag = "HIGH_BACKGROUND"
     elif low_stars:
         quality_flag = "LOW_STARS"
     else:
         quality_flag = "OK"
 
     logger.info(
-        "QC: quality_flag=%s  fwhm=%.3f %s  elongation=%.3f  stars=%d  file=%s",
+        "QC: quality_flag=%s  fwhm=%.3f %s  elongation=%.3f  stars=%d  sky_background=%.1f  file=%s",
         quality_flag,
         fwhm_median if fwhm_median is not None else 0.0,
         fwhm_unit,
         elongation_median if elongation_median is not None else 0.0,
         star_count,
+        sky_background if sky_background is not None else 0.0,
         os.path.basename(fits_path),
     )
 

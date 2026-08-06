@@ -333,6 +333,58 @@ class TestLowStarsFlag:
 
 
 # ---------------------------------------------------------------------------
+# Test 4b — HIGH_BACKGROUND flag
+# ---------------------------------------------------------------------------
+
+class TestHighBackgroundFlag:
+    @pytest.mark.asyncio
+    async def test_high_background_flag(self, monkeypatch):
+        """Sky background above QC_SKY_BACKGROUND_MAX -> HIGH_BACKGROUND, even with normal FWHM/elongation/star count."""
+        import config
+        monkeypatch.setattr(config, "QC_SKY_BACKGROUND_MAX", _SKY_BACK - 1.0)
+        sources = _make_sources(_N_SOURCES, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH)
+
+        assert result["quality_flag"] == "HIGH_BACKGROUND"
+        assert result["sky_background"] == _SKY_BACK
+
+    @pytest.mark.asyncio
+    async def test_background_under_threshold_stays_ok(self):
+        """Default QC_SKY_BACKGROUND_MAX (20000) is comfortably above the fixture's 800 ADU -> OK."""
+        sources = _make_sources(_N_SOURCES, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH)
+
+        assert result["quality_flag"] == "OK"
+
+    @pytest.mark.asyncio
+    async def test_high_background_with_low_stars_is_high_background(self, monkeypatch):
+        """
+        HIGH_BACKGROUND explains a low star count (fainter stars lost in the
+        noise) -> HIGH_BACKGROUND, not BAD. Mirrors test_blur_with_low_stars_is_blur.
+        """
+        import config
+        monkeypatch.setattr(config, "QC_SKY_BACKGROUND_MAX", _SKY_BACK - 1.0)
+        sources = _make_sources(5, _A_NORMAL, _B_NORMAL)  # below QC_STARS_MIN
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH)
+
+        assert result["quality_flag"] == "HIGH_BACKGROUND"
+
+    @pytest.mark.asyncio
+    async def test_high_background_and_blur_is_bad(self, monkeypatch):
+        """Two independent issues (HIGH_BACKGROUND + BLUR) -> BAD."""
+        import config
+        monkeypatch.setattr(config, "QC_SKY_BACKGROUND_MAX", _SKY_BACK - 1.0)
+        sources = _make_sources(_N_SOURCES, _A_BLUR, _B_BLUR)
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH)
+
+        assert result["quality_flag"] == "BAD"
+
+
+# ---------------------------------------------------------------------------
 # Test 5 — BAD flag (multiple issues)
 # ---------------------------------------------------------------------------
 

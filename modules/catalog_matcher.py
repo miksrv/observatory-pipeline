@@ -210,10 +210,6 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
     # systematic offset distance) all vote for the same histogram bin and
     # produce a sharp peak. False pairs (nearby wrong stars) are scattered
     # uniformly and create only background noise.
-    #
-    # Example — Vesta field (12 sources, offset ≈ 37"):
-    #   Nearest-neighbour: 12 pairs → peak = 1  (fails, threshold = 15)
-    #   All-pairs within 90": ~120 pairs → peak = 12 (easily significant)
     # ------------------------------------------------------------------
     MAX_SEARCH_ARCSEC = 90.0
     idx_src, idx_cat, _, _ = search_around_sky(
@@ -245,9 +241,36 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
         for k in range(n_pairs)
     ])
 
-    BIN_SIZE = 2.0
+    # ------------------------------------------------------------------
+    # Bin size and significance test.
+    #
+    # Real incident (2026-08-06, "Vesta_A807_FA" field, 40 sources vs 4453
+    # Gaia stars in a ~1° frame — i.e. ~10000 stars/deg², so almost EVERY
+    # source has several Gaia stars within 90" by pure chance):
+    #   - True offset (confirmed independently against ASTAP's own solve
+    #     log): dRA≈+18" dDec≈-60" (total≈63").
+    #   - With the old BIN_SIZE=2" bins, the ~15-20 true pairs spread out
+    #     over several adjacent 2"-bins (real seeing/centroid scatter on
+    #     top of the systematic offset), so no single bin held more than
+    #     2 votes — below even the old "≥3 votes" floor. Meanwhile a
+    #     random noise bin elsewhere reached 2 votes just from the sheer
+    #     number of background pairs (245 pairs over 8100 bins), and the
+    #     old `expected_bg * 20` threshold is a flat multiplicative rule
+    #     that — at this bin size — was *more* permissive for that noise
+    #     bin than for the real, larger, but more spread-out peak.
+    #
+    # Fix: use a coarser bin (COARSE_BIN_ARCSEC) so real pairs sharing the
+    # same systematic offset land in one bin despite a few arcsec of
+    # individual scatter, and replace the flat "20x background" rule with
+    # a proper Poisson excess test (peak must clear background by several
+    # σ) *plus* an absolute floor on the vote count — the σ-only test is
+    # unreliable at very low background (sqrt(tiny number) is tiny, so
+    # even a 2-vote noise bin can look "many σ" above almost-zero
+    # background, which is exactly the false peak seen above).
+    # ------------------------------------------------------------------
+    COARSE_BIN_ARCSEC = 15.0
     RANGE    = MAX_SEARCH_ARCSEC
-    n_bins   = int(2 * RANGE / BIN_SIZE)  # 90 bins per axis
+    n_bins   = int(2 * RANGE / COARSE_BIN_ARCSEC)
 
     H, ra_edges, dec_edges = np.histogram2d(
         dra_arcsec, ddec_arcsec,
@@ -257,37 +280,57 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
     peak_i, peak_j = np.unravel_index(np.argmax(H), H.shape)
     peak_count  = int(H[peak_i, peak_j])
     expected_bg = n_pairs / float(n_bins ** 2)
-    # Threshold: peak must be > 20× background AND at least 3 votes.
-    # 20× background gives ~4σ significance for Poisson noise.
-    sig_threshold = max(3.0, expected_bg * 20.0)
+
+    MIN_PEAK_VOTES = 5     # absolute floor — never trust a 2-3 vote "peak"
+    SIGMA_MARGIN   = 5.0   # peak must exceed background by this many Poisson σ
+    sig_threshold = expected_bg + SIGMA_MARGIN * math.sqrt(max(expected_bg, 0.5))
 
     peak_dra  = float((ra_edges[peak_i]  + ra_edges[peak_i + 1])  / 2.0)
     peak_ddec = float((dec_edges[peak_j] + dec_edges[peak_j + 1]) / 2.0)
     total_offset = math.sqrt(peak_dra ** 2 + peak_ddec ** 2)
 
     logger.info(
-        "WCS offset accumulator: %d pairs → peak=%d (bg≈%.3f, threshold=%.1f) "
-        "at dRA=%.1f\" dDec=%.1f\" (total=%.1f\")",
-        n_pairs, peak_count, expected_bg, sig_threshold,
+        "WCS offset accumulator: %d pairs → peak=%d (bg≈%.3f, threshold=%.1f, "
+        "min_votes=%d) at dRA=%.1f\" dDec=%.1f\" (total=%.1f\")",
+        n_pairs, peak_count, expected_bg, sig_threshold, MIN_PEAK_VOTES,
         peak_dra, peak_ddec, total_offset,
     )
 
-    if peak_count < sig_threshold or total_offset <= 2.0:
+    if peak_count < MIN_PEAK_VOTES or peak_count < sig_threshold or total_offset <= 2.0:
         logger.debug(
-            "No significant WCS offset detected (peak=%d < threshold=%.1f, offset=%.1f\"). "
-            "This is expected for galaxy-rich fields where most detections are extended "
-            "sources not present in Gaia.",
+            "No significant WCS offset detected (peak=%d < threshold=%.1f or votes, "
+            "offset=%.1f\"). This is expected for galaxy-rich fields where most "
+            "detections are extended sources not present in Gaia.",
             peak_count, sig_threshold, total_offset,
         )
         return 0.0, 0.0
 
-    # Refine: median of all pairs within 2 bins of the peak
-    near_mask = (
-        (np.abs(dra_arcsec  - peak_dra)  <= BIN_SIZE * 2) &
-        (np.abs(ddec_arcsec - peak_ddec) <= BIN_SIZE * 2)
-    )
-    refined_dra  = float(np.median(dra_arcsec[near_mask]))  if near_mask.any() else peak_dra
-    refined_ddec = float(np.median(ddec_arcsec[near_mask])) if near_mask.any() else peak_ddec
+    # Refine: iterative sigma-clip-style median around the coarse peak.
+    #
+    # A single median over the ±COARSE_BIN_ARCSEC window (the old behaviour)
+    # is still contaminated by background pairs caught in that same wide
+    # window — in the real incident above, that pulled the one-shot estimate
+    # to (12.6", -57.3") vs. a true offset around (21", -57"). Re-centering
+    # the window on each new estimate and re-taking the median sheds most of
+    # that contamination within a few passes, since true pairs stay inside
+    # a tight window around the true offset while background pairs fall out
+    # once the window re-centers. REFINE_RADIUS_ARCSEC is deliberately
+    # tighter than COARSE_BIN_ARCSEC for this reason.
+    REFINE_RADIUS_ARCSEC = 10.0
+    refined_dra, refined_ddec = peak_dra, peak_ddec
+    for _ in range(15):
+        near_mask = (
+            (np.abs(dra_arcsec  - refined_dra)  <= REFINE_RADIUS_ARCSEC) &
+            (np.abs(ddec_arcsec - refined_ddec) <= REFINE_RADIUS_ARCSEC)
+        )
+        if not near_mask.any():
+            break
+        new_dra  = float(np.median(dra_arcsec[near_mask]))
+        new_ddec = float(np.median(ddec_arcsec[near_mask]))
+        if math.isclose(new_dra, refined_dra, abs_tol=0.05) and math.isclose(new_ddec, refined_ddec, abs_tol=0.05):
+            refined_dra, refined_ddec = new_dra, new_ddec
+            break
+        refined_dra, refined_ddec = new_dra, new_ddec
 
     offset_ra_deg  = refined_dra  / (cos_dec * 3600.0)
     offset_dec_deg = refined_ddec / 3600.0

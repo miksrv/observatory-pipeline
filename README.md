@@ -408,6 +408,7 @@ QC_FWHM_MAX_ARCSEC=8.0
 QC_ELONGATION_MAX=2.0
 QC_SNR_MIN=5.0
 QC_STARS_MIN=10
+QC_SKY_BACKGROUND_MAX=20000.0
 
 # ── Saturation detection (astrometry + subtraction modules) ───────────────────
 SATURATION_ADU=60000
@@ -463,6 +464,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `QC_ELONGATION_MAX` | `2.0` | No | Maximum acceptable PSF elongation ratio (major/minor axis). Values >2.0 indicate star trailing due to tracking issues. |
 | `QC_SNR_MIN` | `5.0` | No | Minimum acceptable median SNR of detected sources. |
 | `QC_STARS_MIN` | `10` | No | Minimum number of detected stars. Frames with fewer stars are rejected as `LOW_STARS`. |
+| `QC_SKY_BACKGROUND_MAX` | `20000.0` | No | Maximum acceptable median sky background in ADU. Frames exceeding this are rejected as `HIGH_BACKGROUND` (twilight, moonlight, cloud, stray light). Tune to your own site's typical dark-sky background. |
 | **Star Detection Filtering** |
 | `SEP_DETECT_THRESH` | `10.0` | No | Detection threshold in sigma above background for SEP source extraction. Higher = fewer, more reliable detections. |
 | `SEP_MIN_AREA` | `15` | No | Minimum connected pixels for a valid source detection. Filters out hot pixels and noise. |

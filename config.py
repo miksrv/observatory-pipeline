@@ -51,6 +51,15 @@ QC_FWHM_MAX_ARCSEC: float = float(_get("QC_FWHM_MAX_ARCSEC", "8.0"))
 QC_ELONGATION_MAX: float = float(_get("QC_ELONGATION_MAX", "2.0"))
 QC_SNR_MIN: float = float(_get("QC_SNR_MIN", "5.0"))
 QC_STARS_MIN: int = int(_get("QC_STARS_MIN", "10"))
+# Maximum acceptable median sky background (ADU). Frames exceeding this are
+# rejected as HIGH_BACKGROUND — twilight, moonlight, cloud, or stray light
+# raise the background without necessarily blurring FWHM or trailing stars,
+# so BLUR/TRAIL/LOW_STARS alone can miss it (see docs/ISSUES.md). Default is
+# a generic, generous ballpark relative to SATURATION_ADU — tune to your own
+# site's typical dark-sky background (log the actual qc_sky_background
+# values your setup reports on good frames, then set this a comfortable
+# margin above them).
+QC_SKY_BACKGROUND_MAX: float = float(_get("QC_SKY_BACKGROUND_MAX", "20000.0"))
 
 # ---------------------------------------------------------------------------
 # Star detection filtering (astrometry module)
