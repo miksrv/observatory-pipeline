@@ -24,6 +24,7 @@ import asyncio
 import logging
 import math
 import statistics
+from enum import Enum
 from typing import Any
 
 import config
@@ -33,26 +34,35 @@ from modules import ephemeris
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Anomaly type constants
+# Anomaly type enum
 # ---------------------------------------------------------------------------
+# `str` mixin keeps every member usable as a plain string — json.dumps(),
+# dict equality against literal strings (e.g. in tests), and API payload
+# serialization all work exactly as they did with the old bare string
+# constants. Must stay in sync with the ENUM column definition in
+# observatory-api's 2026-04-03-000005_CreateAnomaliesTable.php and with the
+# "Anomaly Types Reference" table in CLAUDE.md.
 
-_TYPE_FIRST_OBS        = "FIRST_OBSERVATION"
-_TYPE_KNOWN_NEW        = "KNOWN_CATALOG_NEW"
-_TYPE_VARIABLE_STAR    = "VARIABLE_STAR"
-_TYPE_BINARY_STAR      = "BINARY_STAR"
-_TYPE_SUPERNOVA        = "SUPERNOVA_CANDIDATE"
-_TYPE_UNKNOWN          = "UNKNOWN"
-_TYPE_ASTEROID         = "ASTEROID"
-_TYPE_COMET            = "COMET"
-_TYPE_MOVING_UNKNOWN   = "MOVING_UNKNOWN"
-_TYPE_SPACE_DEBRIS     = "SPACE_DEBRIS"
+
+class AnomalyType(str, Enum):
+    FIRST_OBSERVATION = "FIRST_OBSERVATION"
+    KNOWN_CATALOG_NEW = "KNOWN_CATALOG_NEW"
+    VARIABLE_STAR = "VARIABLE_STAR"
+    BINARY_STAR = "BINARY_STAR"
+    SUPERNOVA_CANDIDATE = "SUPERNOVA_CANDIDATE"
+    UNKNOWN = "UNKNOWN"
+    ASTEROID = "ASTEROID"
+    COMET = "COMET"
+    MOVING_UNKNOWN = "MOVING_UNKNOWN"
+    SPACE_DEBRIS = "SPACE_DEBRIS"
+
 
 # Alert-worthy types (used for log-level selection)
-_ALERT_TYPES: frozenset[str] = frozenset({
-    _TYPE_SUPERNOVA,
-    _TYPE_MOVING_UNKNOWN,
-    _TYPE_SPACE_DEBRIS,
-    _TYPE_UNKNOWN,
+_ALERT_TYPES: frozenset[AnomalyType] = frozenset({
+    AnomalyType.SUPERNOVA_CANDIDATE,
+    AnomalyType.MOVING_UNKNOWN,
+    AnomalyType.SPACE_DEBRIS,
+    AnomalyType.UNKNOWN,
 })
 
 # ---------------------------------------------------------------------------
@@ -255,24 +265,31 @@ async def _prefetch_history_data(
     """
     extra = {"frame_id": frame_id, "log_filename": log_filename}
 
-    # Collect unique tiles that need queries
-    # Only unmatched sources (catalog_name=None) need history queries
+    # Collect unique tiles that need queries. Every source needs both a
+    # coverage check and a source-history query — see the comment below.
     tiles_needing_sources: set[tuple[float, float]] = set()
     tiles_needing_coverage: set[tuple[float, float]] = set()
 
     for source in sources:
         ra = float(source.get("ra", 0))
         dec = float(source.get("dec", 0))
-        catalog_name = source.get("catalog_name")
 
         tile = _tile_key(ra, dec)
 
         # All sources need coverage check (unless already matched in a known catalog that implies stationarity)
         tiles_needing_coverage.add(tile)
 
-        # Only unmatched and MPC sources need source history queries
-        if catalog_name is None or catalog_name == "MPC":
-            tiles_needing_sources.add(tile)
+        # Every source needs a source-history query: unmatched/MPC sources
+        # use it to detect position shifts (moving objects), and
+        # catalog-matched sources (Simbad variable/binary/galaxy types) use
+        # it further below to detect magnitude changes for VARIABLE_STAR /
+        # BINARY_STAR / SUPERNOVA_CANDIDATE. Restricting this query to only
+        # catalog_name in (None, "MPC") — as an earlier revision did — meant
+        # those three classifications could never fire for any
+        # catalog-matched source, since _classify_source_sync() would then
+        # always see an empty history for them regardless of what actually
+        # happened in previous frames.
+        tiles_needing_sources.add(tile)
 
     logger.info(
         "Prefetching history data: %d tiles for sources, %d tiles for coverage",
@@ -373,6 +390,11 @@ def _classify_source_sync(
     object_type:      str | None = source.get("object_type")
     elongation:       float      = float(source.get("elongation", 0.0))
     from_subtraction: bool       = bool(source.get("_from_subtraction", False))
+    # Resolved sources.id from POST /frames/{id}/sources — see pipeline.py's
+    # Step 7, which zips the API's returned `source_ids` back onto each
+    # source dict as "_source_id". None if that round-trip failed/mismatched
+    # or this source was skipped by the API (invalid ra/dec).
+    source_id:        str | None = source.get("_source_id")
 
     extra = {"frame_id": frame_id, "log_filename": log_filename}
     tile = _tile_key(ra, dec)
@@ -382,7 +404,7 @@ def _classify_source_sync(
     # ------------------------------------------------------------------
 
     if catalog_name == "MPC":
-        anomaly_type = _TYPE_ASTEROID if object_type == "ASTEROID" else _TYPE_COMET
+        anomaly_type = AnomalyType.ASTEROID if object_type == "ASTEROID" else AnomalyType.COMET
 
         logger.info(
             "Classified as %s: designation=%s ra=%.4f dec=%.4f",
@@ -392,6 +414,7 @@ def _classify_source_sync(
 
         return {
             "anomaly_type":    anomaly_type,
+            "source_id":       source_id,
             "ra":              ra,
             "dec":             dec,
             "magnitude":       mag,
@@ -413,9 +436,9 @@ def _classify_source_sync(
 
         if _is_position_shifted(ra, dec, wide_history):
             if elongation > 3.0:
-                anomaly_type = _TYPE_SPACE_DEBRIS
+                anomaly_type = AnomalyType.SPACE_DEBRIS
             else:
-                anomaly_type = _TYPE_MOVING_UNKNOWN
+                anomaly_type = AnomalyType.MOVING_UNKNOWN
 
             logger.warning(
                 "ALERT — %s: unmatched position-shifted source ra=%.4f dec=%.4f elongation=%.2f",
@@ -425,6 +448,7 @@ def _classify_source_sync(
 
             return {
                 "anomaly_type":    anomaly_type,
+                "source_id":       source_id,
                 "ra":              ra,
                 "dec":             dec,
                 "magnitude":       mag,
@@ -445,14 +469,15 @@ def _classify_source_sync(
     coverage = coverage_by_tile.get(tile, [])
     n_coverage = len(coverage)
 
-    # Get narrow-cone history from prefetched data
-    if catalog_name is None:
-        tile_sources = history_by_tile.get(tile, [])
-        history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
-    else:
-        # Catalog-matched sources don't need history lookup for UNKNOWN classification
-        history = []
-
+    # Get narrow-cone history from prefetched data. This is needed
+    # regardless of catalog-match status: unmatched sources use it for the
+    # UNKNOWN / FIRST_OBSERVATION / KNOWN_CATALOG_NEW distinction above, and
+    # catalog-matched sources use it below to detect magnitude changes
+    # (VARIABLE_STAR / BINARY_STAR / SUPERNOVA_CANDIDATE) — forcing history
+    # to [] for catalog-matched sources, as an earlier revision did, made
+    # those three classifications permanently unreachable.
+    tile_sources = history_by_tile.get(tile, [])
+    history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
     n_history = len(history)
 
     # --- FIRST_OBSERVATION: sky area never imaged before ---
@@ -472,7 +497,8 @@ def _classify_source_sync(
             extra=extra,
         )
         return {
-            "anomaly_type":    _TYPE_UNKNOWN,
+            "anomaly_type":    AnomalyType.UNKNOWN,
+            "source_id":       source_id,
             "ra":              ra,
             "dec":             dec,
             "magnitude":       mag,
@@ -496,7 +522,8 @@ def _classify_source_sync(
             extra=extra,
         )
         return {
-            "anomaly_type":    _TYPE_SUPERNOVA,
+            "anomaly_type":    AnomalyType.SUPERNOVA_CANDIDATE,
+            "source_id":       source_id,
             "ra":              ra,
             "dec":             dec,
             "magnitude":       mag,
@@ -525,7 +552,8 @@ def _classify_source_sync(
             extra=extra,
         )
         return {
-            "anomaly_type":    _TYPE_UNKNOWN,
+            "anomaly_type":    AnomalyType.UNKNOWN,
+            "source_id":       source_id,
             "ra":              ra,
             "dec":             dec,
             "magnitude":       mag,
@@ -563,6 +591,37 @@ def _classify_source_sync(
     )
 
     if mag_changed:
+        # --- SUPERNOVA_CANDIDATE — brightening in/near an already-known
+        # galaxy. Checked first, before BINARY_STAR/VARIABLE_STAR: a genuine
+        # supernova should take priority, and in practice the checks don't
+        # overlap since the galaxy OTYPE tokens in _GALAXY_OTYPES are
+        # disjoint from the binary/variable ones. Only "brightening"
+        # (delta_mag negative — mag = mag - median_hist_mag, so lower mag
+        # means brighter) counts here; a host galaxy's own foreground star
+        # simply fading is not a supernova signature. ---
+        if delta_mag is not None and delta_mag < -config.DELTA_MAG_ALERT and _is_galaxy(object_type):
+            logger.warning(
+                "ALERT — SUPERNOVA_CANDIDATE: brightening near galaxy object_type=%s "
+                "ra=%.4f dec=%.4f delta_mag=%.3f",
+                object_type, ra, dec, delta_mag,
+                extra=extra,
+            )
+            return {
+                "anomaly_type":    AnomalyType.SUPERNOVA_CANDIDATE,
+                "source_id":       source_id,
+                "ra":              ra,
+                "dec":             dec,
+                "magnitude":       mag,
+                "delta_mag":       delta_mag,
+                "mpc_designation": None,
+                "ephemeris":       None,
+                "notes": (
+                    f"Brightness increase near known galaxy "
+                    f"(object_type='{object_type}') delta_mag={delta_mag:.3f} "
+                    f"(threshold {config.DELTA_MAG_ALERT:.2f})."
+                ),
+            }
+
         # --- BINARY_STAR — check before VARIABLE_STAR (more specific match) ---
         if _is_binary_star(object_type):
             logger.info(
@@ -571,7 +630,8 @@ def _classify_source_sync(
                 extra=extra,
             )
             return {
-                "anomaly_type":    _TYPE_BINARY_STAR,
+                "anomaly_type":    AnomalyType.BINARY_STAR,
+                "source_id":       source_id,
                 "ra":              ra,
                 "dec":             dec,
                 "magnitude":       mag,
@@ -594,7 +654,8 @@ def _classify_source_sync(
                 extra=extra,
             )
             return {
-                "anomaly_type":    _TYPE_VARIABLE_STAR,
+                "anomaly_type":    AnomalyType.VARIABLE_STAR,
+                "source_id":       source_id,
                 "ra":              ra,
                 "dec":             dec,
                 "magnitude":       mag,
@@ -700,7 +761,9 @@ async def detect(
     sources:
         List of source dicts as enriched by catalog_matcher.match().
         Each dict must have at minimum: ra, dec, mag, catalog_name, catalog_id,
-        object_type, elongation.
+        object_type, elongation. Also reads "_source_id" if present — the
+        resolved sources.id that pipeline.py attaches after POST
+        /frames/{id}/sources, propagated into each anomaly's "source_id".
     catalog_matches:
         Same list as sources (catalog_matcher enriches in-place). The
         parameter exists for API compatibility with the pipeline orchestrator.
@@ -713,8 +776,8 @@ async def detect(
     list[dict]
         Anomaly dicts ready to be sent to POST /frames/{id}/anomalies.
         FIRST_OBSERVATION and KNOWN_CATALOG_NEW are suppressed (not returned).
-        Each returned dict has keys: anomaly_type, ra, dec, magnitude,
-        delta_mag, mpc_designation, ephemeris, notes.
+        Each returned dict has keys: anomaly_type, source_id, ra, dec,
+        magnitude, delta_mag, mpc_designation, ephemeris, notes.
     """
     obs_time     = str(frame_meta.get("obs_time", ""))
     log_filename = str(frame_meta.get("filename", "<unknown>"))

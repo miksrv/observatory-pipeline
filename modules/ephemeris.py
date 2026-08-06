@@ -90,11 +90,15 @@ async def query(designation: str, obs_time: str) -> dict | None:
         except (KeyError, TypeError, ValueError):
             pass
 
-        # Angular velocity: sqrt(dRA_cos_dec^2 + dDec^2), arcsec/hour
+        # Angular velocity: sqrt(RA_rate^2 + DEC_rate^2), arcsec/hour.
+        # astroquery's Horizons.ephemerides() table names these columns
+        # "RA_rate" / "DEC_rate" (RA_rate already includes the cos(dec) factor,
+        # matching raw Horizons' "dRA*cosD" label) — NOT "dRA*cosD" / "dDec",
+        # which are just the raw-text column labels astroquery itself doesn't use.
         angular_velocity: float | None = None
         try:
-            dra_val  = row["dRA*cosD"]
-            ddec_val = row["dDec"]
+            dra_val  = row["RA_rate"]
+            ddec_val = row["DEC_rate"]
             if not npma.is_masked(dra_val) and not npma.is_masked(ddec_val):
                 angular_velocity = math.sqrt(float(dra_val) ** 2 + float(ddec_val) ** 2)
         except (KeyError, TypeError, ValueError):

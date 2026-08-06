@@ -71,7 +71,11 @@ def _find_archive_frames(archive_dir: str, filter_name: Optional[str]) -> list[s
 
     if filter_name:
         token = f"_{filter_name.upper()}_"
-        matching = [f for f in all_files if token in os.path.basename(f)]
+        # Compare case-insensitively: normalized filter tokens are not all
+        # uppercase (e.g. "Ha"), so a literal uppercased token would never
+        # match a mixed-case filename token and this branch would silently
+        # always fall through to the cross-filter fallback below.
+        matching = [f for f in all_files if token in os.path.basename(f).upper()]
         if len(matching) >= config.SUBTRACTION_MIN_FRAMES:
             return matching[:_MAX_FRAMES]
 
@@ -157,17 +161,29 @@ def _detect_diff_sources(diff: np.ndarray) -> list[dict]:
 
         out: list[dict] = []
         for obj in objs:
+            # `obj` is a numpy.void record (one row of sep.extract()'s
+            # structured array) — it supports dict-style bracket access
+            # (obj["field"]) but has NO .get() method. The previous code
+            # called obj.get(...) here, which raised AttributeError on every
+            # single object, was swallowed by the try/except below, and
+            # made this function return [] unconditionally whenever SEP
+            # actually found anything on the difference image.
+            # "fwhm" is also not a native sep.extract() field — it is
+            # derived from the "a"/"b" second-moment axes, the same
+            # Gaussian approximation used in modules/astrometry.py.
             flux = float(obj["flux"])
             npix = int(obj["npix"])
             snr = flux / (rms * math.sqrt(npix)) if npix > 0 else 0.0
-            b_axis = max(float(obj.get("b", 0.001)), 0.001)
+            a_axis = float(obj["a"])
+            b_axis = max(float(obj["b"]), 0.001)
+            fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0) * (a_axis ** 2 + b_axis ** 2) / 2.0)
             out.append({
                 "x":          float(obj["x"]),
                 "y":          float(obj["y"]),
                 "flux":       flux,
                 "snr":        snr,
-                "fwhm":       float(obj.get("fwhm", 0.0)),
-                "elongation": float(obj.get("a", 1.0)) / b_axis,
+                "fwhm":       fwhm,
+                "elongation": a_axis / b_axis,
             })
         return out
     except Exception as exc:
@@ -303,8 +319,18 @@ async def run(
     aligned: list[np.ndarray] = []
     for ref_path in archive_files:
         ref_data = _load_frame_data(ref_path)
-        if ref_data is None or ref_data.shape != new_data.shape:
+        if ref_data is None:
             continue
+        # NOTE: deliberately no shape-equality gate here. astroalign performs
+        # triangle-pattern star matching and resamples the reference frame
+        # onto the new frame's pixel grid — it is explicitly designed to
+        # align frames with different pixel dimensions, scale, rotation, and
+        # FOV (e.g. an archived frame captured with a different camera/
+        # resolution than tonight's frame). Rejecting shape mismatches before
+        # ever calling astroalign silently disabled subtraction for exactly
+        # the case it exists to handle. _align_frame()'s own try/except below
+        # still catches genuine alignment failures (too few common stars,
+        # no overlapping field, etc.).
         result_frame = _align_frame(ref_data, new_data)
         if result_frame is not None:
             aligned.append(result_frame)
