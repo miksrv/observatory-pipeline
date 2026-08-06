@@ -63,6 +63,7 @@ def _make_source(
     catalog_id: str | None = None,
     catalog_mag: float | None = None,
     object_type: str | None = None,
+    source_id: str | None = None,
 ) -> dict:
     return {
         "ra":           ra,
@@ -75,6 +76,10 @@ def _make_source(
         "catalog_id":   catalog_id,
         "catalog_mag":  catalog_mag,
         "object_type":  object_type,
+        # Resolved sources.id, as attached by pipeline.py's Step 7 after
+        # POST /frames/{id}/sources. None by default, matching a source
+        # the pipeline couldn't resolve an id for.
+        "_source_id":   source_id,
     }
 
 
@@ -226,7 +231,7 @@ class TestDetectStationaryClassifications:
 
     async def test_detect_unknown_alert(self):
         """Covered, no history, no catalog match → UNKNOWN."""
-        source = _make_source(catalog_name=None)
+        source = _make_source(catalog_name=None, source_id="src-unknown-001")
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
@@ -244,6 +249,7 @@ class TestDetectStationaryClassifications:
         assert result[0]["dec"] == pytest.approx(_DEC)
         assert result[0]["mpc_designation"] is None
         assert result[0]["ephemeris"] is None
+        assert result[0]["source_id"] == "src-unknown-001"
 
     async def test_detect_known_catalog_new(self):
         """Covered, no history, has catalog match → KNOWN_CATALOG_NEW → not in output."""
@@ -253,22 +259,27 @@ class TestDetectStationaryClassifications:
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
             patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
         ):
-            mock_sources.return_value = {}  # No history needed for catalog-matched sources
+            mock_sources.return_value = {"0": []}  # queried, but nothing found — no prior history
             mock_cov.return_value = {"0": [_make_coverage_frame()]}
 
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
         assert result == []
 
-    async def test_detect_supernova_candidate(self):
-        """Covered, no history, galaxy object_type → SUPERNOVA_CANDIDATE."""
+    async def test_detect_supernova_candidate_new_source(self):
+        """Covered, no history at all, galaxy object_type → SUPERNOVA_CANDIDATE.
+
+        This is the "new point source with no prior detection" variant
+        (n_history == 0). See test_detect_supernova_candidate_brightening
+        below for the "already-known host, got brighter" variant.
+        """
         source = _make_source(catalog_name="Simbad", object_type="G")
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
             patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
         ):
-            mock_sources.return_value = {}  # No history needed for catalog-matched sources
+            mock_sources.return_value = {"0": []}  # queried, nothing found
             mock_cov.return_value = {"0": [_make_coverage_frame()]}
 
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
@@ -278,8 +289,65 @@ class TestDetectStationaryClassifications:
         assert result[0]["ephemeris"] is None
         assert result[0]["mpc_designation"] is None
 
+    async def test_detect_supernova_candidate_brightening(self):
+        """
+        Regression test: an already-known host galaxy that brightens well
+        beyond DELTA_MAG_ALERT must be flagged SUPERNOVA_CANDIDATE.
+
+        Previously unreachable for two compounding reasons (both fixed):
+        1. History was never queried for catalog-matched sources at all,
+           so n_history was always 0 and this branch of the function
+           (which requires n_history > 0) could never execute.
+        2. Even with history present, the "has prior history" branch only
+           checked _is_binary_star / _is_variable_star — never
+           _is_galaxy — so a brightening galaxy fell through to "no
+           anomaly" regardless.
+        """
+        source = _make_source(mag=16.0, catalog_name="Simbad", object_type="G")
+        hist   = [_make_hist_source(mag=20.0)]  # quiescent host baseline
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "SUPERNOVA_CANDIDATE"
+        assert result[0]["delta_mag"] == pytest.approx(-4.0)
+
+    async def test_detect_supernova_candidate_dimming_not_flagged(self):
+        """A galaxy-associated source that DIMS (not brightens) must not be
+        flagged SUPERNOVA_CANDIDATE — a fading foreground star is not a
+        supernova signature."""
+        source = _make_source(mag=20.0, catalog_name="Simbad", object_type="G")
+        hist   = [_make_hist_source(mag=16.0)]  # was brighter, now fainter
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
     async def test_detect_variable_star(self):
-        """History with brightness change and variable OTYPE → VARIABLE_STAR."""
+        """
+        Regression test: history with brightness change and variable OTYPE
+        → VARIABLE_STAR.
+
+        Previously catalog-matched sources (required for object_type to be
+        set at all, since it comes from Simbad) never got a history lookup
+        — a structural gap that made this classification permanently
+        unreachable. Now fixed: history is queried for every source
+        regardless of catalog-match status.
+        """
         # Current mag = 14.5; history median = 12.0 → delta = 2.5 > DELTA_MAG_ALERT
         source = _make_source(mag=14.5, catalog_name="Simbad", object_type="V*")
         hist   = [_make_hist_source(mag=12.0)]
@@ -288,62 +356,64 @@ class TestDetectStationaryClassifications:
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
             patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
         ):
-            # Simbad-matched sources don't query history batch, but do need coverage
-            mock_sources.return_value = {}
+            mock_sources.return_value = {"0": hist}
             mock_cov.return_value = {"0": [_make_coverage_frame()]}
 
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
-        # NOTE: Variable stars need history to detect magnitude change.
-        # Since Simbad-matched sources don't query source history (only unmatched do),
-        # this source won't show magnitude change. Let's test with unmatched + variable otype.
-        # Actually, for this test we need to verify the _classify_source_sync logic directly.
-        # The catalog_name being Simbad means history=[] (not queried), so no delta_mag.
-        # Let's adjust: unmatched source with history showing mag change.
-        assert result == []  # No anomaly because catalog-matched sources don't get history lookup
-
-    async def test_detect_variable_star_correct(self):
-        """Unmatched source with history and mag change → detected via history lookup."""
-        # For unmatched sources, history is queried. If we want to test VARIABLE_STAR,
-        # the source needs object_type="V*" but we also need history.
-        # However, the current logic only queries history for unmatched sources.
-        # Let's test what actually happens: unmatched with V* type (from some prior catalog match?)
-        # Actually, if catalog_name is None, we can't have object_type from Simbad.
-        # So VARIABLE_STAR classification requires catalog_name to be set (Simbad).
-        # But catalog-matched sources don't get history lookup.
-        # This means VARIABLE_STAR classification requires both:
-        # - catalog_name="Simbad" with object_type="V*"
-        # - AND history with mag change
-        # But history is only fetched for unmatched sources!
-        # This is a logic gap - let's just verify the current behavior.
-        pass
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "VARIABLE_STAR"
+        assert result[0]["delta_mag"] == pytest.approx(2.5)
 
     async def test_detect_binary_star(self):
-        """History with brightness change and binary OTYPE → BINARY_STAR."""
+        """Regression test: history with brightness change and binary OTYPE
+        → BINARY_STAR (see test_detect_variable_star for why this was
+        previously unreachable)."""
         source = _make_source(mag=14.5, catalog_name="Simbad", object_type="EB")
+        hist   = [_make_hist_source(mag=12.0)]
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
             patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
         ):
-            mock_sources.return_value = {}
+            mock_sources.return_value = {"0": hist}
             mock_cov.return_value = {"0": [_make_coverage_frame()]}
 
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
-        # Same issue as variable_star: catalog-matched sources don't get history lookup
-        assert result == []
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "BINARY_STAR"
 
     async def test_detect_no_anomaly_stable_star(self):
-        """History present, mag change below threshold → no anomaly."""
-        # For catalog-matched sources, no history is fetched, so this is expected to pass
+        """Catalog-matched source with no history at all → KNOWN_CATALOG_NEW
+        (suppressed, not an anomaly)."""
         source = _make_source(mag=14.5, catalog_name="Gaia DR3")
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
             patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
         ):
-            mock_sources.return_value = {}
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_detect_no_anomaly_stable_star_with_history(self):
+        """
+        Regression test: a catalog-matched source WITH real, essentially
+        unchanged historical magnitude must NOT become a false-positive
+        anomaly now that history is fetched for catalog-matched sources too.
+        """
+        source = _make_source(mag=14.5, catalog_name="Gaia DR3", object_type="STAR")
+        hist   = [_make_hist_source(mag=14.4)]  # within DELTA_MAG_ALERT
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
             mock_cov.return_value = {"0": [_make_coverage_frame()]}
 
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
@@ -360,6 +430,7 @@ class TestDetectMpcMovingObjects:
             catalog_name="MPC",
             catalog_id=designation,
             object_type="ASTEROID",
+            source_id="src-vesta-001",
         )
 
         with (
@@ -378,7 +449,32 @@ class TestDetectMpcMovingObjects:
         assert anomaly["mpc_designation"] == designation
         assert anomaly["ephemeris"] == _EPH_DICT
         assert "_needs_ephemeris" not in anomaly
+        # Regression: anomalies[].source_id was previously never populated
+        # at all (always null in the API) — see CLAUDE.md Known Issues.
+        assert anomaly["source_id"] == "src-vesta-001"
         mock_eph.assert_awaited_once_with(designation, _OBS_TIME)
+
+    async def test_detect_asteroid_without_resolved_source_id(self):
+        """When pipeline.py couldn't resolve a sources.id (e.g. post_sources
+        failed or returned a mismatched source_ids list), source_id must be
+        None rather than crashing or being silently omitted."""
+        source = _make_source(
+            catalog_name="MPC",
+            catalog_id="2019 XY3",
+            object_type="ASTEROID",
+        )
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+            patch("modules.anomaly_detector.ephemeris.query", new_callable=AsyncMock, return_value=_EPH_DICT),
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": []}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result[0]["source_id"] is None
 
     async def test_detect_comet(self):
         """MPC-matched non-ASTEROID → COMET."""
@@ -442,7 +538,7 @@ class TestDetectUnmatchedMovingObjects:
 
     async def test_detect_moving_unknown(self):
         """Wide-cone history has shifted source (>5"), no MPC, elongation < 3 → MOVING_UNKNOWN."""
-        source = _make_source(catalog_name=None, elongation=1.2)
+        source = _make_source(catalog_name=None, elongation=1.2, source_id="src-mover-001")
         far    = self._far_hist_source()
 
         with (
@@ -459,6 +555,7 @@ class TestDetectUnmatchedMovingObjects:
         assert result[0]["anomaly_type"] == "MOVING_UNKNOWN"
         assert result[0]["mpc_designation"] is None
         assert result[0]["ephemeris"] is None
+        assert result[0]["source_id"] == "src-mover-001"
 
     async def test_detect_space_debris(self):
         """Wide-cone history has shifted source (>5"), no MPC, elongation > 3 → SPACE_DEBRIS."""

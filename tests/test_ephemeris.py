@@ -30,8 +30,8 @@ _EXPECTED_RA  = 123.456
 _EXPECTED_DEC = 45.678
 _EXPECTED_MAG = 17.8
 _EXPECTED_AU  = 1.23
-_EXPECTED_DRA  = 3.0   # arcsec/hour  (dRA*cosD)
-_EXPECTED_DDEC = 4.0   # arcsec/hour  (dDec)
+_EXPECTED_DRA  = 3.0   # arcsec/hour  (RA_rate, astroquery's column name)
+_EXPECTED_DDEC = 4.0   # arcsec/hour  (DEC_rate, astroquery's column name)
 _EXPECTED_VEL  = 5.0   # sqrt(3^2 + 4^2)
 
 
@@ -62,8 +62,8 @@ def _make_eph_row(
         "DEC":      np.float64(dec),
         "V":        _masked_or_val(v),
         "delta":    _masked_or_val(delta),
-        "dRA*cosD": _masked_or_val(dra),
-        "dDec":     _masked_or_val(ddec),
+        "RA_rate":  _masked_or_val(dra),
+        "DEC_rate": _masked_or_val(ddec),
     }
 
     row = MagicMock()
@@ -158,7 +158,7 @@ class TestEphemerisQuery:
         assert result["predicted_ra"] == pytest.approx(_EXPECTED_RA)
 
     async def test_query_angular_velocity_computed_correctly(self):
-        """dRA=3.0, dDec=4.0 → angular_velocity = 5.0 (Pythagorean triple)."""
+        """RA_rate=3.0, DEC_rate=4.0 → angular_velocity = 5.0 (Pythagorean triple)."""
         row = _make_eph_row(dra=3.0, ddec=4.0)
         mock_horizons = _make_horizons_mock(row)
 
@@ -184,7 +184,7 @@ class TestEphemerisQuery:
         assert location["elevation"] == pytest.approx(config.SITE_ELEV / 1000.0)
 
     async def test_query_handles_masked_angular_velocity(self):
-        """When dRA*cosD and dDec are masked, angular_velocity must be None."""
+        """When RA_rate and DEC_rate are masked, angular_velocity must be None."""
         row = _make_eph_row(dra=None, ddec=None)
         mock_horizons = _make_horizons_mock(row)
 

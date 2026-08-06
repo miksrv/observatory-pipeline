@@ -1,0 +1,329 @@
+"""
+tests/test_subtraction.py — Unit tests for modules/subtraction.py
+
+Covers:
+  - _find_archive_frames(): same-filter matching + fallback to any filter
+  - _load_frame_data(): loading a 2-D image HDU, gracefully returning None
+  - _align_frame(): success/failure wrapping of astroalign.register()
+  - _detect_diff_sources(): SEP detection on a synthetic difference image
+  - _pixel_to_sky(): WCS pixel -> sky conversion
+  - run(): end-to-end orchestration
+
+run()'s own control flow is tested by monkeypatching its private helpers
+directly (_find_archive_frames / _load_frame_data / _align_frame /
+_detect_diff_sources / _pixel_to_sky). This keeps these tests fast and
+focused on subtraction.py's own orchestration logic rather than re-testing
+astroalign/sep themselves, and lets us simulate scenarios (e.g. reference
+frames with a different pixel resolution than the new frame) without
+needing real multi-megapixel FITS fixtures.
+
+asyncio_mode = auto is set in pytest.ini, so async tests need no decorator.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from astropy.io import fits
+from astropy.wcs import WCS as AstropyWCS
+
+from modules import subtraction
+
+
+# ---------------------------------------------------------------------------
+# _find_archive_frames
+# ---------------------------------------------------------------------------
+
+class TestFindArchiveFrames:
+
+    def test_missing_directory_returns_empty(self, tmp_path):
+        assert subtraction._find_archive_frames(str(tmp_path / "does_not_exist"), None) == []
+
+    def test_no_filter_returns_all_frames(self, tmp_path):
+        for name in ("a.fits", "b.fit", "c.FITS"):
+            (tmp_path / name).write_bytes(b"x")
+
+        result = subtraction._find_archive_frames(str(tmp_path), None)
+
+        assert len(result) == 3
+
+    def test_filter_token_matching_with_enough_same_filter_frames(self, tmp_path):
+        # 3 Ha frames (>= default SUBTRACTION_MIN_FRAMES=3) + 1 R frame.
+        for name in (
+            "M51_L_Ha_120_2024-01-01T00-00-00.fits",
+            "M51_L_Ha_120_2024-01-02T00-00-00.fits",
+            "M51_L_Ha_120_2024-01-03T00-00-00.fits",
+            "M51_L_R_120_2024-01-04T00-00-00.fits",
+        ):
+            (tmp_path / name).write_bytes(b"x")
+
+        result = subtraction._find_archive_frames(str(tmp_path), "Ha")
+
+        assert len(result) == 3
+        assert all("_HA_" in p.upper() for p in result)
+
+    def test_filter_token_falls_back_to_all_when_too_few_same_filter(self, tmp_path):
+        # Only 2 Ha frames (< SUBTRACTION_MIN_FRAMES=3) + 2 R frames — must
+        # fall back to cross-filter subtraction using all 4 frames.
+        for name in (
+            "M51_L_Ha_120_a.fits",
+            "M51_L_Ha_120_b.fits",
+            "M51_L_R_120_c.fits",
+            "M51_L_R_120_d.fits",
+        ):
+            (tmp_path / name).write_bytes(b"x")
+
+        result = subtraction._find_archive_frames(str(tmp_path), "Ha")
+
+        assert len(result) == 4
+
+
+# ---------------------------------------------------------------------------
+# _load_frame_data
+# ---------------------------------------------------------------------------
+
+class TestLoadFrameData:
+
+    def test_loads_2d_image_hdu(self, tmp_path):
+        data = np.arange(12, dtype=np.float64).reshape(3, 4)
+        path = tmp_path / "frame.fits"
+        fits.PrimaryHDU(data).writeto(path)
+
+        loaded = subtraction._load_frame_data(str(path))
+
+        assert loaded is not None
+        assert loaded.shape == (3, 4)
+        assert loaded.dtype == np.float32
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert subtraction._load_frame_data(str(tmp_path / "missing.fits")) is None
+
+    def test_header_only_hdu_returns_none(self, tmp_path):
+        path = tmp_path / "empty.fits"
+        fits.PrimaryHDU().writeto(path)
+
+        assert subtraction._load_frame_data(str(path)) is None
+
+
+# ---------------------------------------------------------------------------
+# _align_frame
+# ---------------------------------------------------------------------------
+
+class TestAlignFrame:
+
+    def test_align_success_returns_registered_array(self, monkeypatch):
+        import astroalign
+        fake_aligned = np.zeros((5, 5), dtype=np.float64)
+        monkeypatch.setattr(astroalign, "register", lambda source, target: (fake_aligned, None))
+
+        result = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
+
+        assert result is not None
+        assert result.shape == (5, 5)
+        assert result.dtype == np.float32
+
+    def test_align_failure_returns_none(self, monkeypatch):
+        import astroalign
+
+        def _raise(source, target):
+            raise ValueError("not enough matching triangles")
+
+        monkeypatch.setattr(astroalign, "register", _raise)
+
+        result = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _detect_diff_sources
+# ---------------------------------------------------------------------------
+
+class TestDetectDiffSources:
+
+    def test_detects_injected_blob(self):
+        rng = np.random.default_rng(42)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+
+        # Inject a bright Gaussian blob well above SUBTRACTION_DETECT_SIGMA * rms
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 60) ** 2 + (yy - 40) ** 2) / (2 * 3.0 ** 2)))
+        diff = diff + blob
+
+        candidates = subtraction._detect_diff_sources(diff)
+
+        assert len(candidates) >= 1
+        closest = min(candidates, key=lambda c: (c["x"] - 60) ** 2 + (c["y"] - 40) ** 2)
+        assert abs(closest["x"] - 60) < 3
+        assert abs(closest["y"] - 40) < 3
+        assert closest["flux"] > 0
+
+    def test_pure_noise_finds_nothing(self):
+        rng = np.random.default_rng(7)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+
+        candidates = subtraction._detect_diff_sources(diff)
+
+        assert candidates == []
+
+    def test_zero_rms_returns_empty(self):
+        # A perfectly flat image has rms == 0 — must not raise or divide by zero.
+        diff = np.zeros((50, 50))
+
+        assert subtraction._detect_diff_sources(diff) == []
+
+
+# ---------------------------------------------------------------------------
+# _pixel_to_sky
+# ---------------------------------------------------------------------------
+
+class TestPixelToSky:
+
+    @staticmethod
+    def _make_wcs_fits(tmp_path, ra=202.47, dec=47.20, scale_deg=0.000278):
+        w = AstropyWCS(naxis=2)
+        w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        w.wcs.crpix = [50.0, 50.0]
+        w.wcs.crval = [ra, dec]
+        w.wcs.cdelt = [-scale_deg, scale_deg]
+        w.wcs.set()
+
+        data = np.zeros((100, 100), dtype=np.float32)
+        path = tmp_path / "solved.fits"
+        fits.PrimaryHDU(data=data, header=w.to_header()).writeto(path)
+        return str(path)
+
+    def test_converts_pixel_to_expected_sky_position(self, tmp_path):
+        path = self._make_wcs_fits(tmp_path, ra=202.47, dec=47.20)
+        # CRPIX is 1-indexed per the FITS standard ([50.0, 50.0] in
+        # _make_wcs_fits); pixel_to_world() takes 0-indexed pixel
+        # coordinates (see _pixel_to_sky's own docstring), so 0-indexed
+        # pixel (49.0, 49.0) is the one that lands exactly on CRVAL.
+        candidates = [{"x": 49.0, "y": 49.0, "flux": 123.0}]
+
+        result = subtraction._pixel_to_sky(candidates, path)
+
+        assert len(result) == 1
+        assert result[0]["ra"] == pytest.approx(202.47, abs=1e-6)
+        assert result[0]["dec"] == pytest.approx(47.20, abs=1e-6)
+        assert "x" not in result[0] and "y" not in result[0]
+        assert result[0]["flux"] == 123.0
+
+    def test_no_wcs_returns_empty(self, tmp_path):
+        data = np.zeros((10, 10), dtype=np.float32)
+        path = tmp_path / "no_wcs.fits"
+        fits.PrimaryHDU(data=data).writeto(path)
+
+        result = subtraction._pixel_to_sky([{"x": 5.0, "y": 5.0}], str(path))
+
+        assert result == []
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        result = subtraction._pixel_to_sky([{"x": 5.0, "y": 5.0}], str(tmp_path / "missing.fits"))
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# run() — end-to-end orchestration
+# ---------------------------------------------------------------------------
+
+class TestRun:
+
+    async def test_skips_when_too_few_archive_frames(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f: ["a.fits", "b.fits"])
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result == {"performed": False, "reference_frame_count": 0, "candidates": []}
+
+    async def test_skips_when_new_frame_unloadable(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: ["a.fits", "b.fits", "c.fits"],
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: None)
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result["performed"] is False
+        assert result["candidates"] == []
+
+    async def test_regression_differently_shaped_reference_frames_are_still_aligned(
+        self, monkeypatch, tmp_path,
+    ):
+        """
+        Regression test for the fixed shape-mismatch bug: reference frames
+        whose pixel dimensions differ from the new frame (e.g. archived with
+        a different camera/resolution) must still be handed to
+        _align_frame() — not silently skipped by a shape-equality check
+        before alignment is ever attempted. astroalign resamples onto the
+        target's pixel grid regardless of the source's original shape, so
+        this scenario is exactly what subtraction.py is meant to handle.
+        """
+        new_shape = (80, 100)
+        ref_shape = (50, 60)  # deliberately different resolution
+        new_data = np.ones(new_shape, dtype=np.float32)
+
+        def fake_load(path):
+            return new_data if path.endswith("new.fits") else np.ones(ref_shape, dtype=np.float32)
+
+        def fake_align(source, target):
+            assert source.shape == ref_shape  # the differently-shaped ref was actually passed through
+            return np.ones(target.shape, dtype=np.float32)
+
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
+        monkeypatch.setattr(subtraction, "_align_frame", fake_align)
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff: [])
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path: [])
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result["performed"] is True
+        assert result["reference_frame_count"] == 3
+
+    async def test_skips_when_alignment_fails_for_all_frames(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones((10, 10), dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: None)
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result["performed"] is False
+
+    async def test_successful_run_returns_candidates_flagged_from_subtraction(
+        self, monkeypatch, tmp_path,
+    ):
+        shape = (10, 10)
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
+        monkeypatch.setattr(
+            subtraction, "_detect_diff_sources",
+            lambda diff: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+        )
+        monkeypatch.setattr(
+            subtraction, "_pixel_to_sky",
+            lambda cands, path: [{"ra": 10.0, "dec": 20.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+        )
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result["performed"] is True
+        assert result["reference_frame_count"] == 3
+        assert len(result["candidates"]) == 1
+
+        cand = result["candidates"][0]
+        assert cand["_from_subtraction"] is True
+        assert cand["mag"] is None
+        assert cand["ra"] == 10.0
+        assert cand["dec"] == 20.0
