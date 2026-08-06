@@ -512,6 +512,13 @@ async def run(fits_path: str) -> None:
     # silently skip the chart entirely — see CLAUDE.md Known Issues.
     # ------------------------------------------------------------------
     try:
+        # Bake astap's verified, freshly-solved WCS into fits_path's own
+        # header before it gets archived — see _write_solved_wcs()'s
+        # docstring below for why (2026-08-06 UGC_6930 incident).
+        solved_wcs = astro_result.get("wcs")
+        if solved_wcs is not None:
+            _write_solved_wcs(fits_path, solved_wcs)
+
         # Use object name for directory structure (normalized if normalization enabled)
         dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
         os.makedirs(dest_dir, exist_ok=True)
@@ -644,6 +651,41 @@ def _prefer_candidate(candidate: dict, existing: dict) -> bool:
     if candidate_is_sub != existing_is_sub:
         return existing_is_sub  # prefer the non-subtraction detection
     return (candidate.get("flux") or 0.0) > (existing.get("flux") or 0.0)
+
+
+def _write_solved_wcs(fits_path: str, wcs) -> bool:
+    """
+    Write astap's verified, freshly-solved WCS into fits_path's own header.
+
+    astap runs without ``-update`` (see modules/astrometry.py), so it never
+    writes its solution into the FITS file itself — only into a `.wcs` side
+    file that _cleanup_astap_files() below deletes right after this frame's
+    processing finishes. If nothing here corrected the header first, the
+    archived file would keep whatever WCS it originally arrived with —
+    e.g. a capture program's mount-pointing/tracking estimate, not a real
+    plate solve — forever. modules/finder_chart.py (and any future code)
+    reads WCS straight back out of the archived file's own header when
+    rendering a source's history, so every consumer downstream would
+    silently re-inherit the same stale-coordinate problem astrometry.py was
+    just fixed to stop trusting.
+
+    Real incident (2026-08-06, "UGC_6930" test frame): the header's own WCS
+    and astap's fresh solve differed by ~178" (astap's own solve log had
+    already reported and corrected that same "Mount offset").
+
+    Called right before the archive move (Step 9.5), while fits_path is
+    still writable at its pre-archive location. Best-effort: any failure is
+    logged and returns False — never raises, never blocks the archive move.
+    """
+    try:
+        from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+        with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
+            hdul[0].header.update(wcs.to_header())
+        return True
+    except Exception as exc:
+        logger.warning("Could not write solved WCS into %s: %s", fits_path, exc)
+        return False
 
 
 def _cleanup_astap_files(fits_path: str) -> None:

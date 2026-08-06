@@ -8,8 +8,8 @@ The single public entry point is:
 It measures image quality metrics (FWHM, elongation, SNR, sky background,
 star count, cosmic ray fraction), classifies the frame, and — when rejected —
 moves the file to the appropriate subdirectory under FITS_REJECTED before
-returning.  No plate-solving is required; all measurements use the raw pixel
-data only.
+returning (unless called with ``move_on_reject=False``).  No plate-solving
+is required; all measurements use the raw pixel data only.
 
 Rejected frames are never sent to the API.  The pipeline orchestrator checks
 ``quality_flag`` and stops processing if it is not ``"OK"``.
@@ -103,7 +103,7 @@ def _compute_fwhm_pixels(a: float, b: float) -> float:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def analyze(fits_path: str) -> dict:
+async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     """
     Measure quality metrics for a single FITS frame and classify it.
 
@@ -114,6 +114,13 @@ async def analyze(fits_path: str) -> dict:
     ----------
     fits_path:
         Absolute path to the FITS file on disk.
+    move_on_reject:
+        When True (the default — what pipeline.py relies on), a non-"OK"
+        quality_flag moves fits_path to FITS_REJECTED before returning, same
+        as always. Pass False to compute metrics/flag only and leave the
+        file exactly where it is — used by debug/debug_catalog_match.py,
+        which promises not to move/touch the frame it's given but otherwise
+        calls this same production analyze() path.
 
     Returns
     -------
@@ -142,14 +149,14 @@ async def analyze(fits_path: str) -> dict:
         logger.error("QC: failed to open FITS file %s: %s", fits_path, exc)
         return _result(
             quality_flag="BAD",
-            rejected_path=_move_rejected(fits_path, "BAD", "_UNKNOWN"),
+            rejected_path=_move_rejected(fits_path, "BAD", "_UNKNOWN") if move_on_reject else None,
         )
 
     if raw_data is None:
         logger.error("QC: primary HDU has no image data in %s", fits_path)
         return _result(
             quality_flag="BAD",
-            rejected_path=_move_rejected(fits_path, "BAD", "_UNKNOWN"),
+            rejected_path=_move_rejected(fits_path, "BAD", "_UNKNOWN") if move_on_reject else None,
         )
 
     # Normalize to C-contiguous float64 as required by sep
@@ -190,7 +197,7 @@ async def analyze(fits_path: str) -> dict:
             quality_flag="BAD",
             sky_background=sky_background,
             sky_sigma=sky_sigma,
-            rejected_path=_move_rejected(fits_path, "BAD", object_name),
+            rejected_path=_move_rejected(fits_path, "BAD", object_name) if move_on_reject else None,
         )
 
     # ------------------------------------------------------------------
@@ -211,7 +218,7 @@ async def analyze(fits_path: str) -> dict:
             quality_flag="BAD",
             sky_background=sky_background,
             sky_sigma=sky_sigma,
-            rejected_path=_move_rejected(fits_path, "BAD", object_name),
+            rejected_path=_move_rejected(fits_path, "BAD", object_name) if move_on_reject else None,
         )
 
     raw_detection_count: int = len(objects)
@@ -229,7 +236,7 @@ async def analyze(fits_path: str) -> dict:
             sky_background=sky_background,
             sky_sigma=sky_sigma,
             star_count=raw_detection_count,
-            rejected_path=_move_rejected(fits_path, "LOW_STARS", object_name),
+            rejected_path=_move_rejected(fits_path, "LOW_STARS", object_name) if move_on_reject else None,
         )
 
     # ------------------------------------------------------------------
@@ -437,7 +444,7 @@ async def analyze(fits_path: str) -> dict:
     # 9. Move rejected frames
     # ------------------------------------------------------------------
     rejected_path: str | None = None
-    if quality_flag != "OK":
+    if quality_flag != "OK" and move_on_reject:
         rejected_path = _move_rejected(fits_path, quality_flag, object_name)
 
     return _result(

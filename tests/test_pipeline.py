@@ -11,7 +11,10 @@ import copy
 import os
 from unittest.mock import AsyncMock, MagicMock, patch, Mock
 
+import numpy as np
 import pytest
+from astropy.io import fits
+from astropy.wcs import WCS as AstropyWCS
 
 import pipeline
 import config
@@ -252,6 +255,48 @@ async def test_archive_move_correct_path(mock_modules, tmp_path):
     # File is archived with normalized filename, not original
     expected = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
     assert os.path.exists(expected), f"Expected archived file at {expected}"
+
+
+@pytest.mark.asyncio
+async def test_archived_file_gets_solved_wcs(mock_modules, tmp_path):
+    """
+    Regression test for the 2026-08-06 UGC_6930 incident: the archived FITS
+    file must carry astap's own freshly-solved WCS (astro_result["wcs"]),
+    not whatever WCS (if any) it originally arrived with — see
+    pipeline.py's _write_solved_wcs(). Without this, modules/finder_chart.py
+    (and any future code) reading WCS back out of the archived file would
+    silently re-inherit stale/mount-pointing coordinates forever, since
+    astap itself never writes into the FITS file (no -update).
+    """
+    fits_path = mock_modules  # real path from the fits_file fixture
+
+    # The fits_file fixture writes a deliberately-minimal, invalid byte stub
+    # (fine for the other, fully-mocked steps) — overwrite it with a real,
+    # valid minimal FITS so this test can actually exercise the header
+    # rewrite in mode="update".
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    solved_wcs = AstropyWCS(naxis=2)
+    solved_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    solved_wcs.wcs.crval = [202.47, 47.20]
+    solved_wcs.wcs.crpix = [5, 5]
+    solved_wcs.wcs.cdelt = [-0.001, 0.001]
+    solved_wcs.wcs.set()
+
+    pipeline.astrometry.solve = AsyncMock(
+        return_value={**copy.deepcopy(_GOOD_ASTRO), "wcs": solved_wcs}
+    )
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    assert os.path.exists(archive_path), f"Expected archived file at {archive_path}"
+
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["CRVAL1"] == pytest.approx(202.47, abs=1e-6)
+        assert hdul[0].header["CRVAL2"] == pytest.approx(47.20, abs=1e-6)
 
 
 @pytest.mark.asyncio

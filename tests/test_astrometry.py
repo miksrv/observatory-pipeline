@@ -483,6 +483,72 @@ class TestInvalidWcs:
 
 
 # ---------------------------------------------------------------------------
+# Test 6b — astap's fresh .wcs side file is preferred over a pre-existing,
+# already-celestial WCS in the FITS header itself.
+#
+# Regression test for the 2026-08-06 "UGC_6930" incident: the incoming FITS
+# already carried a plausible-looking celestial WCS (written by capture
+# software from mount pointing, not a genuine plate solve). The old code
+# only ever consulted the .wcs side file when the header's own WCS lacked
+# celestial axes — so a header WCS that merely *looked* valid, but was off
+# by ~178", was silently trusted over astap's own freshly-solved output.
+# ---------------------------------------------------------------------------
+
+class TestPrefersFreshWcsSidecarOverStaleHeader:
+    async def test_sidecar_wcs_wins_over_celestial_header_wcs(self):
+        stale_wcs = _make_wcs(ra=100.0, dec=10.0)     # e.g. mount-pointing estimate
+        fresh_wcs = _make_wcs(ra=202.47, dec=47.20)   # astap's own fresh solve
+
+        header_hdul = _make_hdul(header={"NAXIS1": _IMAGE_SHAPE[1], "NAXIS2": _IMAGE_SHAPE[0]})
+        sidecar_hdul = _make_hdul(header={"_MARKER": "sidecar"})
+        primary_header_obj = header_hdul[0].header
+        sidecar_header_obj = sidecar_hdul[0].header
+
+        def _fits_open(path, *args, **kwargs):
+            return sidecar_hdul if path.endswith(".wcs") else header_hdul
+
+        def _wcs_ctor(hdr, *args, **kwargs):
+            return fresh_wcs if hdr is sidecar_header_obj else stale_wcs
+
+        fake_bkg = _FakeBackground()
+
+        with (
+            patch(
+                "modules.astrometry.subprocess.run",
+                return_value=MagicMock(
+                    returncode=0,
+                    stdout="Solution found: RA=13h29m52s, Dec=+47d12m00s",
+                    stderr="",
+                ),
+            ),
+            patch("modules.astrometry.fits.open", side_effect=_fits_open),
+            patch("modules.astrometry.os.path.exists", return_value=True),
+            patch("modules.astrometry.WCS", side_effect=_wcs_ctor),
+            patch("modules.astrometry.sep.Background", return_value=fake_bkg),
+            patch("modules.astrometry.sep.extract", return_value=_make_sources()),
+        ):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result != {}
+        # Must match fresh_wcs's centre (202.47, 47.20), NOT stale_wcs's (100.0, 10.0).
+        assert result["ra_center"] == pytest.approx(202.47, abs=0.01)
+        assert result["dec_center"] == pytest.approx(47.20, abs=0.01)
+
+    async def test_falls_back_to_header_wcs_when_sidecar_missing(self):
+        """
+        No .wcs side file on disk (os.path.exists → False) → must fall back
+        to whatever WCS the FITS header itself carries, same as before this
+        fix, rather than failing outright.
+        """
+        with _patch_astrometry(wcs=_make_wcs(ra=202.47, dec=47.20)):
+            with patch("modules.astrometry.os.path.exists", return_value=False):
+                result = await astrometry.solve(_FITS_PATH)
+
+        assert result != {}
+        assert result["ra_center"] == pytest.approx(202.47, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
 # Test 7 — WCS object is propagated to caller
 # ---------------------------------------------------------------------------
 

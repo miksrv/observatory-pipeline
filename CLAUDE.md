@@ -297,8 +297,17 @@ Examples:
 When normalization is enabled, the API receives only normalized values (no duplicates).
 
 ### `modules/astrometry.py`
-- Calls `astap` binary as a subprocess via `xvfb-run` (astap needs a display even headless) for plate solving
-- Parses resulting WCS header written back into the FITS file
+- Calls `astap` binary as a subprocess via `xvfb-run` (astap needs a display even headless) for plate solving,
+  invoked without `-update` — astap therefore never writes into the FITS file itself, only into a `.wcs` side
+  file (plus `.ini`/`.log`) next to it, or under an optional `output_base` (`-o`) path
+- Parses the WCS from that fresh `.wcs` side file — deliberately preferred over any WCS the incoming FITS
+  header might already carry, even when the header's own WCS already looks celestial. A capture program can
+  write an approximate WCS from mount pointing alone (not a real plate solve) with valid-looking
+  `CTYPE`/`CRVAL`/`CD*` keywords; trusting that over astap's own verified solve defeats the purpose of running
+  astap at all (real incident, 2026-08-06, `UGC_6930` test frame: header WCS and astap's fresh solve differed
+  by ~178″/3′ — astap's own `.wcs` comment had already reported and corrected that exact "Mount offset", but
+  the pipeline was silently discarding it and using the stale header value for every downstream step). Only
+  falls back to the header's own WCS if the `.wcs` side file is missing or fails to parse.
 - Runs `sep` (SourceExtractor) for source detection, dynamically narrowing the upper FWHM bound using an estimated `psf_fwhm_arcsec` when available
 - Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`
 - Returns a dict: `{ra_center, dec_center, fov_deg, naxis1, naxis2, sources, sources_all, wcs}`
