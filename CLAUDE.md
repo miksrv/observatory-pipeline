@@ -192,16 +192,25 @@ Orchestrates processing of a single FITS file in order:
 14.5. Move file to `/fits/archive/{object_name}/` directory — must run **before** step 15: that
      step looks up this same frame's own file at its archive path, so moving it later than
      chart generation would mean the current epoch is never found there.
-15. `finder_chart.update_charts_for_sources(anomaly_type_by_source_id)` → for every anomaly with
-     a resolved `source_id` (deduped per frame), (re)generates and uploads that source's finder/
-     discovery chart, one call for the whole frame: fetches every source's full position track in
-     a single `POST /sources/tracks/batch` call, renders each against the matching local archive
-     FITS files, then uploads every rendered chart in a single `POST /sources/charts/batch` call
-     — one HTTP round trip each for the whole frame, regardless of how many anomalies it has.
-     Best-effort — gated by `CHART_ENABLED`, and any failure (missing local file, API error,
-     rendering error) only downgrades that one source_id's own result to `False`; it never
-     affects any other source_id in the same call or frame processing overall. See
-     `modules/finder_chart.py` below.
+15. `finder_chart.update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id)`
+     → for every anomaly with a resolved `source_id` (deduped per frame), (re)generates and
+     uploads that source's finder/discovery chart, one call for the whole frame: fetches every
+     source's full position track in a single `POST /sources/tracks/batch` call, renders each
+     against the matching local archive FITS files, then uploads every rendered chart in a single
+     `POST /sources/charts/batch` call — one HTTP round trip each for the whole frame, regardless
+     of how many anomalies it has. `designation_by_source_id` is built here preferring each
+     anomaly's own `mpc_designation` (set by `anomaly_detector.py` from the exact source that
+     produced that classification) over `sources`.`catalog_id` looked up by `source_id` — the
+     latter is a fallback only, since `source_id` is resolved positionally by the API and can end
+     up shared with an unrelated, previously-catalogued object at nearly the same sky position
+     (real incident, 2026-08-06, `Vesta_A807_FA` test data: an MPC-matched asteroid's `source_id`
+     also carried a `Gaia DR3` star's identity in `sources`, from a different detection sharing
+     that row — using the `sources` lookup unconditionally would have shown `ASTEROID
+     (3971465931154563840)` instead of `ASTEROID (2014 RY1)`). An uncatalogued source_id is simply
+     absent from the dict rather than mapped to `None`. Best-effort — gated by `CHART_ENABLED`,
+     and any failure (missing local file, API error, rendering error) only downgrades that one
+     source_id's own result to `False`; it never affects any other source_id in the same call or
+     frame processing overall. See `modules/finder_chart.py` below.
 
 **Calibration frames (Dark, Flat, Bias):** These frames are used for image calibration but
 contain no astronomical data to analyze. The pipeline simply normalizes the filename
@@ -467,13 +476,22 @@ Two rendering styles, chosen by `anomaly_type`:
 
 | Style | Anomaly types | What it shows |
 |---|---|---|
-| `track` | `ASTEROID`, `COMET`, `MOVING_UNKNOWN`, `SPACE_DEBRIS` | One background image (the most recent epoch's own frame) with a small marker at every epoch's true position + connecting line, in chronological order. Every epoch's (RA, Dec) is converted into the *background* epoch's WCS pixel grid via `WCS.world_to_pixel()` — no pixel-level alignment between frames is needed, only a per-epoch coordinate transform. Each marker's epoch number sits at the end of a short leader line spread evenly around the point cluster's centroid, rather than on top of the marker itself — epochs are often only a few pixels apart (e.g. a slow-moving asteroid on a wide-field frame), and a label stacked directly on the point would both obscure it and collide with neighbouring labels. |
-| `stamp_strip` | everything else (`SUPERNOVA_CANDIDATE`, `UNKNOWN`, `VARIABLE_STAR`, `BINARY_STAR`, `KNOWN_CATALOG_NEW`, `FIRST_OBSERVATION`) | One small crop per epoch, centred on that epoch's own detected position using that frame's own WCS, each circled and labelled with its timestamp and magnitude — a "blink" before/after strip for a source that isn't expected to move. |
+| `track` | `ASTEROID`, `COMET`, `MOVING_UNKNOWN`, `SPACE_DEBRIS` | A crop of the most recent epoch's own frame, zoomed to the epoch cluster (not the whole frame — a full wide-field frame scaled down to figure size makes a slow mover's few-dozen-pixel drift between epochs invisible; the crop half-size is whichever is bigger: a generous fixed context window, or the cluster's own footprint plus margin, so a genuinely wide multi-epoch trail still renders in full) with a small marker at every epoch's true position + connecting line, in chronological order. Every epoch's (RA, Dec) is converted into the *background* epoch's WCS pixel grid via `WCS.world_to_pixel()` — no pixel-level alignment between frames is needed, only a per-epoch coordinate transform. Each marker's epoch number sits at the end of a short leader line spread evenly around the point cluster's centroid, rather than on top of the marker itself — epochs are often only a few pixels apart (e.g. a slow-moving asteroid on a wide-field frame), and a label stacked directly on the point would both obscure it and collide with neighbouring labels. Each marker's own RA/Dec is listed in a small monospace legend under the image instead, keyed by the same number as its marker. |
+| `stamp_strip` | everything else (`SUPERNOVA_CANDIDATE`, `UNKNOWN`, `VARIABLE_STAR`, `BINARY_STAR`, `KNOWN_CATALOG_NEW`, `FIRST_OBSERVATION`) | One small crop per epoch, centred on that epoch's own detected position using that frame's own WCS, each circled and labelled with its timestamp, magnitude, and RA/Dec — a "blink" before/after strip for a source that isn't expected to move. |
 
-The single public entry point, `update_charts_for_sources(anomaly_type_by_source_id)`, takes
-every (source_id → anomaly_type) pair for one frame at once (see pipeline.py Step 15), so it can
-fetch every source's track and upload every chart in one HTTP round trip each, regardless of how
-many anomalies the frame has.
+Both styles' chart title is either just `anomaly_type`, or — when the underlying source is
+catalog-matched — `anomaly_type` plus its resolved catalog designation in parentheses, e.g.
+`ASTEROID (Vesta)` or `VARIABLE_STAR (TYC 1430-1407-1)`. An uncatalogued source's chart keeps the
+bare `anomaly_type` title.
+
+The single public entry point,
+`update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None)`, takes every
+(source_id → anomaly_type) pair for one frame at once (see pipeline.py Step 15), so it can fetch
+every source's track and upload every chart in one HTTP round trip each, regardless of how many
+anomalies the frame has. `designation_by_source_id` is optional and keyed the same way — built by
+pipeline.py from `sources`' own `catalog_name`/`catalog_id` (already resolved by catalog matching,
+Step 8), not queried by this module itself; a source_id absent from it gets the bare-`anomaly_type`
+title.
 
 Steps:
 1. `api_client.get_source_tracks_batch(source_ids)` → `POST /sources/tracks/batch` — every

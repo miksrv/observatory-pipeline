@@ -203,6 +203,20 @@ async def solve(
             try:
                 with fits.open(wcs_file_path) as wcs_hdul:
                     wcs_hdr = wcs_hdul[0].header
+                    # astap writes BOTH CD* (correct, direct deg/px) AND
+                    # PC*+CDELT* into .wcs files. The PC values are NOT a
+                    # proper rotation matrix (det≈1) as the FITS standard
+                    # requires — they're just copies of the CD values.
+                    # When astropy sees both, pixel_scale_matrix computes
+                    # PC * diag(CDELT), double-applying the scale (real
+                    # incident 2026-08-06: 0.78"/px became 0.0002"/px,
+                    # making all FWHM values ≈0 and rejecting every source).
+                    # Fix: strip PC/CDELT when CD is present — CD is the
+                    # authoritative representation from astap's solver.
+                    if "CD1_1" in wcs_hdr:
+                        for key in list(wcs_hdr.keys()):
+                            if key.startswith("PC") or key.startswith("CDELT"):
+                                del wcs_hdr[key]
                     wcs_candidate = WCS(wcs_hdr)
                     if wcs_candidate.has_celestial:
                         wcs = wcs_candidate

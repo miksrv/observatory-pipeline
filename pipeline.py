@@ -567,9 +567,56 @@ async def run(fits_path: str) -> None:
             if source_id and source_id not in anomaly_type_by_source:
                 anomaly_type_by_source[source_id] = anomaly.get("anomaly_type")
 
+        # Catalog designation (e.g. an MPC name for an asteroid/comet, or a
+        # Simbad main_id for a known variable/binary star) to show next to
+        # anomaly_type on the rendered chart — see modules/finder_chart.py.
+        #
+        # Prefer each anomaly's OWN "mpc_designation" (set by
+        # anomaly_detector.py straight from the one `source` dict that
+        # produced this specific classification) over `sources`.catalog_id
+        # looked up by "_source_id". The latter is NOT always safe: the API
+        # resolves "_source_id" positionally, so a moving object that
+        # happens to pass near an already-catalogued star's position can get
+        # folded into that SAME `sources` row — whose catalog_name/catalog_id
+        # may then reflect the star (from a different detection, possibly on
+        # a different frame entirely), not the asteroid actually detected
+        # here. Real incident, 2026-08-06, Vesta_A807_FA test data: anomaly
+        # 6a7514b504c7f9.00535350 has mpc_designation="2014 RY1", but its
+        # source_id's `sources` row carries catalog_name="Gaia DR3" — a star
+        # that shares that source_id from an earlier/other detection — so a
+        # naive sources-lookup would have labelled the chart
+        # "ASTEROID (3971465931154563840)" instead of "ASTEROID (2014 RY1)".
+        # mpc_designation has no such ambiguity: it's captured once, at
+        # classification time, from the exact source that triggered it.
+        # Only anomaly types without an mpc_designation field at all
+        # (everything but ASTEROID/COMET) fall back to the sources-table
+        # lookup, which is safe in practice since those don't hinge on a
+        # per-frame moving-object identity the way MPC matches do.
+        designation_by_source: dict = {}
+        if anomaly_type_by_source:
+            mpc_designation_by_source: dict = {}
+            for anomaly in anomalies:
+                source_id = anomaly.get("source_id")
+                mpc_designation = anomaly.get("mpc_designation")
+                if source_id and mpc_designation and source_id not in mpc_designation_by_source:
+                    mpc_designation_by_source[source_id] = mpc_designation
+
+            catalog_id_by_source_id = {
+                src["_source_id"]: src["catalog_id"]
+                for src in sources
+                if src.get("_source_id") and src.get("catalog_name") and src.get("catalog_id")
+            }
+
+            for source_id in anomaly_type_by_source:
+                designation = mpc_designation_by_source.get(source_id) or catalog_id_by_source_id.get(source_id)
+                if designation:
+                    designation_by_source[source_id] = designation
+
         if anomaly_type_by_source:
             try:
-                chart_results = await finder_chart.update_charts_for_sources(anomaly_type_by_source)
+                chart_results = await finder_chart.update_charts_for_sources(
+                    anomaly_type_by_source, designation_by_source,
+                )
                 for source_id, anomaly_type in anomaly_type_by_source.items():
                     logger.debug(
                         "Finder chart %s for source_id=%s (%s)",
