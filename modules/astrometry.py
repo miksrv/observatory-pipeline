@@ -49,9 +49,13 @@ async def solve(
         Absolute path to the FITS file on disk.
     psf_fwhm_arcsec:
         Median PSF FWHM in arcseconds from QC analysis. When provided, the
-        star filter upper FWHM bound is tightened to ``psf_fwhm_arcsec * 1.5``
-        (capped at ``STAR_FWHM_MAX_ARCSEC``) to better reject compact galaxies
-        and other extended sources whose FWHM significantly exceeds stellar PSF.
+        star filter's FWHM bounds are tightened around it: the upper bound to
+        ``psf_fwhm_arcsec * 1.5`` (capped at ``STAR_FWHM_MAX_ARCSEC``) to
+        better reject compact galaxies and other extended sources whose FWHM
+        significantly exceeds stellar PSF, and the lower bound to
+        ``psf_fwhm_arcsec / 1.5`` (floored at ``STAR_FWHM_MIN_ARCSEC``) to
+        reject hot/warm pixel clusters and other artifacts that are far
+        sharper than any real star in this frame.
     output_base:
         Base path (no extension) astap should write its own output files
         under — ``-o`` on the astap command line. astap only ever opens
@@ -408,19 +412,34 @@ async def solve(
             # 3. SNR > min (reject faint noise detections)
             # 4. Positive flux (reject artifacts)
             #
-            # When psf_fwhm_arcsec is provided from QC, the upper FWHM bound is
-            # tightened to psf_fwhm_arcsec * 1.5 to reject compact galaxies that
-            # are slightly broader than the stellar PSF but still pass the
-            # static STAR_FWHM_MAX_ARCSEC threshold.
+            # When psf_fwhm_arcsec is provided from QC, BOTH FWHM bounds are
+            # tightened around it:
+            #   - upper bound -> psf_fwhm_arcsec * 1.5, to reject compact galaxies
+            #     that are slightly broader than the stellar PSF but still pass
+            #     the static STAR_FWHM_MAX_ARCSEC threshold.
+            #   - lower bound -> psf_fwhm_arcsec / 1.5, to reject sources that are
+            #     dramatically SHARPER than every real star in this same frame.
+            #     A genuine point source's profile is set by the shared
+            #     atmospheric/optical PSF, so it cannot be much narrower than
+            #     what every other star in the frame actually measures.
+            #     STAR_FWHM_MIN_ARCSEC alone is a static, site-agnostic floor
+            #     (default 2.5") that a hot/warm pixel cluster can sit
+            #     comfortably above while still being far more compact than any
+            #     real star here — this was observed 2026-08-06 on Vesta test
+            #     frames, where sensor hot pixels around 2.6-3.0" FWHM sailed
+            #     through the static floor even though this frame's own stars
+            #     measured ~4.5" FWHM, and ended up posted as UNKNOWN anomalies.
             # ---------------------------------------------------------
 
             fwhm_max_arcsec = config.STAR_FWHM_MAX_ARCSEC
+            fwhm_min_arcsec = config.STAR_FWHM_MIN_ARCSEC
             if psf_fwhm_arcsec is not None and psf_fwhm_arcsec > 0:
                 fwhm_max_arcsec = min(config.STAR_FWHM_MAX_ARCSEC, psf_fwhm_arcsec * 1.5)
+                fwhm_min_arcsec = max(config.STAR_FWHM_MIN_ARCSEC, psf_fwhm_arcsec / 1.5)
 
             # Count rejections per criterion for debugging
             mask_elongation = elongations < config.STAR_ELONGATION_MAX
-            mask_fwhm_min = fwhm_arcsec >= config.STAR_FWHM_MIN_ARCSEC
+            mask_fwhm_min = fwhm_arcsec >= fwhm_min_arcsec
             mask_fwhm_max = fwhm_arcsec <= fwhm_max_arcsec
             mask_snr = snr >= config.STAR_SNR_MIN
             mask_flux = objects["flux"] > 0
@@ -456,7 +475,7 @@ async def solve(
             # Log filter thresholds for reference
             logger.info(
                 "Filter thresholds: FWHM=[%.1f-%.1f]\"%s, elong<%.1f, SNR>%.1f  file=%s",
-                config.STAR_FWHM_MIN_ARCSEC, fwhm_max_arcsec,
+                fwhm_min_arcsec, fwhm_max_arcsec,
                 " (PSF-based)" if psf_fwhm_arcsec is not None else "",
                 config.STAR_ELONGATION_MAX, config.STAR_SNR_MIN, fits_filename,
             )
@@ -483,7 +502,11 @@ async def solve(
             #   - Compact galaxies above the PSF-based FWHM limit
             #
             # sources_all keeps everything with:
-            #   - FWHM >= STAR_FWHM_MIN_ARCSEC (rejects single-pixel hot pixels)
+            #   - FWHM >= fwhm_min_arcsec (same PSF-tightened floor as star_mask
+            #     above — rejects single-pixel hot pixels, and, when a per-frame
+            #     PSF estimate is available, multi-pixel hot/warm pixel clusters
+            #     too, even when their measured FWHM clears the static
+            #     STAR_FWHM_MIN_ARCSEC default)
             #   - elongation < 5.0  (rejects strongly trailed cosmic rays)
             #   - positive flux
             #

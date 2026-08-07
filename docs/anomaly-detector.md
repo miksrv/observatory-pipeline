@@ -74,7 +74,7 @@ flowchart TD
 
     P1 -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
     Sat -- yes --> Suppressed(["suppressed — return None\n(bright-star/subtraction artifact,\nnot a real transient)"])
-    Sat -- no --> P2{"catalog_name is None\nAND a historical source exists\nin the wide cone (MOVING_CONE_ARCSEC)\nfarther than MATCH_CONE_ARCSEC?"}
+    Sat -- no --> P2{"catalog_name is None\nAND no history within MATCH_CONE_ARCSEC\nof the CURRENT position\nAND a wide-cone (MOVING_CONE_ARCSEC) historical\nposition has vacated\n(no source in THIS frame near it)?"}
     P2 -- yes --> Elong{"elongation > 3.0?"}
     Elong -- yes --> SpaceDebris["🔔 SPACE_DEBRIS"]
     Elong -- no --> MovingUnknown["🔔 MOVING_UNKNOWN"]
@@ -145,10 +145,24 @@ one condition matches, the function returns and no further checks run:
    saturated source that *is* MPC- or Simbad-matched (bullet 1, or the history-based
    branches below) is a legitimate detection and is unaffected — it just never gets a
    usable `magnitude`, since `photometry.py` never measures a saturated source.
-3. **Unmatched position-shifted source** — `catalog_name is None` and the wide cone
-   (`MOVING_CONE_ARCSEC`, default 120″) found a historical position farther than
-   `MATCH_CONE_ARCSEC` (5″) → `MOVING_UNKNOWN` (elongation ≤ 3.0) or `SPACE_DEBRIS`
-   (elongation > 3.0, fast trail).
+3. **Unmatched position-shifted source** — `catalog_name is None` and **both**: (a) no
+   historical detection within `MATCH_CONE_ARCSEC` (5″) of the source's *current*
+   position, and (b) a historical detection within the wider `MOVING_CONE_ARCSEC`
+   (120″) whose own position is no longer occupied by anything else in *this* frame
+   (`_is_still_occupied()` is `False` for it) → `MOVING_UNKNOWN` (elongation ≤ 3.0) or
+   `SPACE_DEBRIS` (elongation > 3.0, fast trail).
+
+   Condition (b) alone (an earlier revision's entire check) is true near almost any
+   populated field regardless of real motion: `MOVING_CONE_ARCSEC` covers enough sky
+   that some unrelated historical detection — a neighbouring star, a galaxy smudge,
+   anything ever recorded nearby — is virtually always present there. That made
+   ordinary sub-arcsecond centroid/seeing noise on an otherwise-static source
+   indistinguishable from a real mover, as long as *anything else* happened to be
+   within 120″ (real incident, 2026-08-06 — see docs/ISSUES.md #1). Condition (a)
+   requires the source's *own* current position to be genuinely new, and the
+   "vacated" check in (b) requires the *candidate's* old position to have genuinely
+   emptied out — a persistent neighbour that's still detected at its own spot in this
+   frame no longer counts as evidence that anything moved.
 4. **Stationary sources** — decided next by coverage (`coverage`) and local history
    (`history`, `MATCH_CONE_ARCSEC` cone):
    - no coverage at all → `FIRST_OBSERVATION` (not an anomaly), except when
@@ -250,9 +264,8 @@ dicts before they're returned.
   `UNKNOWN`/`MOVING_UNKNOWN` volume was actually caused by saturation artifacts, since
   that requires comparing anomaly counts before/after the fix against the deployed
   database (see docs/ISSUES.md #1's remaining checklist). If a large volume of
-  `UNKNOWN`/`MOVING_UNKNOWN` persists after deploying this fix, the more likely
-  remaining causes are the width of `MOVING_CONE_ARCSEC` and the missing magnitude
-  threshold discussed above.
+  `UNKNOWN` persists after deploying this fix and the `MOVING_CONE_ARCSEC` fix below,
+  the more likely remaining cause is the missing magnitude threshold discussed above.
 
 Resolved issues in this module (history not queried for catalog-matched sources,
 `source_id` not propagated to anomalies, etc.) are no longer tracked in the docs — see

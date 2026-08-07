@@ -216,29 +216,69 @@ def _find_sources_within_radius(
 # Moving-object detection
 # ---------------------------------------------------------------------------
 
-def _is_position_shifted(
-    ra: float,
-    dec: float,
-    wide_history: list[dict],
+def _is_still_occupied(
+    hist_ra: float,
+    hist_dec: float,
+    current_frame_positions: list[tuple[float, float]],
 ) -> bool:
     """
-    Return True if *any* historical source in the wide-cone query is further
-    than MATCH_CONE_ARCSEC from the current position.
+    Return True if some OTHER source in the same current frame sits within
+    MATCH_CONE_ARCSEC of a historical detection's position.
 
-    A shifted detection means the source appeared in this sky region before but
-    at a meaningfully different position — the hallmark of a moving object.
+    Used to tell "something used to be here and genuinely isn't anymore"
+    (the actual signature of a mover having left) apart from "something is
+    just permanently parked nearby" (a neighbouring star/galaxy that is
+    still sitting at that same spot in THIS frame too, and therefore cannot
+    be the thing that moved to the position under test).
     """
-    stationary_threshold = config.MATCH_CONE_ARCSEC
+    threshold = config.MATCH_CONE_ARCSEC
+    for cur_ra, cur_dec in current_frame_positions:
+        if _haversine_arcsec(hist_ra, hist_dec, cur_ra, cur_dec) <= threshold:
+            return True
+    return False
+
+
+def _is_position_shifted(
+    narrow_history: list[dict],
+    wide_history: list[dict],
+    current_frame_positions: list[tuple[float, float]],
+) -> bool:
+    """
+    Return True only when BOTH hold:
+
+    1. Nothing was ever detected within MATCH_CONE_ARCSEC of the CURRENT
+       position (`narrow_history` is empty) — this exact spot is new.
+    2. At least one historical detection within the wider MOVING_CONE_ARCSEC
+       neighbourhood has genuinely vanished — no source in the CURRENT frame
+       sits near its old position anymore (`_is_still_occupied` is False for it).
+
+    Checking only condition 1 (the old behaviour looked at wide_history
+    alone) false-positived on almost every uncatalogued source: MOVING_CONE_ARCSEC
+    (120″ by default) covers a large enough patch of sky that *some* unrelated
+    historical detection — a neighbouring star, a galaxy smudge, anything ever
+    recorded nearby — is virtually always present there, whether or not this
+    particular source moved a single pixel (see docs/ISSUES.md #1; the tiny
+    sub-arcsecond scatter between epochs on an otherwise-static source is
+    ordinary centroid/seeing noise, not motion, and used to be enough to
+    trigger this branch purely because *something else* happened to be in the
+    neighbourhood). Requiring the old position to have actually emptied out
+    (condition 2) rules out that class of false positive while still catching
+    real movers, whose old position is — by definition — no longer occupied
+    by anything once they've moved away from it.
+    """
+    if narrow_history:
+        return False
+
     for hist_src in wide_history:
         hist_ra  = hist_src.get("ra")
         hist_dec = hist_src.get("dec")
         if hist_ra is None or hist_dec is None:
             continue
         try:
-            sep = _haversine_arcsec(ra, dec, float(hist_ra), float(hist_dec))
+            hist_ra_f, hist_dec_f = float(hist_ra), float(hist_dec)
         except (TypeError, ValueError):
             continue
-        if sep > stationary_threshold:
+        if not _is_still_occupied(hist_ra_f, hist_dec_f, current_frame_positions):
             return True
     return False
 
@@ -373,6 +413,7 @@ def _classify_source_sync(
     log_filename: str,
     history_by_tile: dict[tuple, list],
     coverage_by_tile: dict[tuple, list],
+    current_frame_positions: list[tuple[float, float]],
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).
@@ -398,6 +439,15 @@ def _classify_source_sync(
 
     extra = {"frame_id": frame_id, "log_filename": log_filename}
     tile = _tile_key(ra, dec)
+
+    # Narrow-cone (MATCH_CONE_ARCSEC) history at THIS source's own position.
+    # Computed once up front — Priority 2 needs it to gate the position-shift
+    # check (see _is_position_shifted's docstring), and Priority 3 needs the
+    # exact same query for the UNKNOWN/FIRST_OBSERVATION/KNOWN_CATALOG_NEW
+    # distinction and for delta_mag, so there is no reason to run it twice.
+    tile_sources = history_by_tile.get(tile, [])
+    history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
+    n_history = len(history)
 
     # ------------------------------------------------------------------
     # Priority 1 — MPC-matched moving objects
@@ -448,11 +498,16 @@ def _classify_source_sync(
             )
             return None
 
-        # Get wide-cone history from prefetched data
-        tile_sources = history_by_tile.get(tile, [])
+        # Wide-cone (MOVING_CONE_ARCSEC) history — candidates for "this used
+        # to be somewhere nearby". _is_position_shifted() itself gates on
+        # `history` being empty (this exact spot is new) and additionally
+        # requires that a wide-cone candidate's own position is no longer
+        # occupied by anything in THIS frame — see its docstring for why
+        # "any nearby historical detection" alone is not sufficient evidence
+        # of a mover (docs/ISSUES.md #1).
         wide_history = _find_sources_within_radius(ra, dec, config.MOVING_CONE_ARCSEC, tile_sources)
 
-        if _is_position_shifted(ra, dec, wide_history):
+        if _is_position_shifted(history, wide_history, current_frame_positions):
             if elongation > 3.0:
                 anomaly_type = AnomalyType.SPACE_DEBRIS
             else:
@@ -474,8 +529,10 @@ def _classify_source_sync(
                 "mpc_designation": None,
                 "ephemeris":       None,
                 "notes": (
-                    f"Position shifted >{config.MATCH_CONE_ARCSEC:.1f} arcsec from prior detection; "
-                    f"not matched in MPC. Elongation={elongation:.2f}."
+                    f"No detection within {config.MATCH_CONE_ARCSEC:.1f} arcsec of this position, "
+                    f"but a historical detection within {config.MOVING_CONE_ARCSEC:.1f} arcsec of it "
+                    f"is no longer present in this frame; not matched in MPC. "
+                    f"Elongation={elongation:.2f}."
                 ),
             }
 
@@ -487,16 +544,14 @@ def _classify_source_sync(
     coverage = coverage_by_tile.get(tile, [])
     n_coverage = len(coverage)
 
-    # Get narrow-cone history from prefetched data. This is needed
-    # regardless of catalog-match status: unmatched sources use it for the
-    # UNKNOWN / FIRST_OBSERVATION / KNOWN_CATALOG_NEW distinction above, and
-    # catalog-matched sources use it below to detect magnitude changes
-    # (VARIABLE_STAR / BINARY_STAR / SUPERNOVA_CANDIDATE) — forcing history
-    # to [] for catalog-matched sources, as an earlier revision did, made
-    # those three classifications permanently unreachable.
-    tile_sources = history_by_tile.get(tile, [])
-    history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
-    n_history = len(history)
+    # `history`/`n_history` (MATCH_CONE_ARCSEC cone) were already computed
+    # above — needed regardless of catalog-match status: unmatched sources
+    # use it for the UNKNOWN / FIRST_OBSERVATION / KNOWN_CATALOG_NEW
+    # distinction below, and catalog-matched sources use it further down to
+    # detect magnitude changes (VARIABLE_STAR / BINARY_STAR /
+    # SUPERNOVA_CANDIDATE) — forcing history to [] for catalog-matched
+    # sources, as an earlier revision did, made those three classifications
+    # permanently unreachable.
 
     # --- FIRST_OBSERVATION: sky area never imaged before ---
     if n_coverage == 0:
@@ -821,6 +876,22 @@ async def detect(
     # ------------------------------------------------------------------
     # Classify all sources using prefetched data (no additional API calls)
     # ------------------------------------------------------------------
+    # Positions of every source detected in THIS frame — used by
+    # _is_position_shifted() (via _is_still_occupied()) to tell whether a
+    # candidate historical position has genuinely emptied out (a real mover
+    # left it) or is still occupied by something in this very frame (a
+    # permanent neighbour, not evidence of motion). Built once for the whole
+    # frame rather than per-source.
+    current_frame_positions: list[tuple[float, float]] = []
+    for s in sources:
+        s_ra, s_dec = s.get("ra"), s.get("dec")
+        if s_ra is None or s_dec is None:
+            continue
+        try:
+            current_frame_positions.append((float(s_ra), float(s_dec)))
+        except (TypeError, ValueError):
+            continue
+
     anomalies: list[dict] = []
 
     for source in sources:
@@ -831,6 +902,7 @@ async def detect(
                 log_filename=log_filename,
                 history_by_tile=history_by_tile,
                 coverage_by_tile=coverage_by_tile,
+                current_frame_positions=current_frame_positions,
             )
             if result is not None:
                 anomalies.append(result)

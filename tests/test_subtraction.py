@@ -215,6 +215,39 @@ class TestDetectDiffSources:
 
         assert len(candidates) >= 1
 
+    def test_fwhm_floor_rejects_sharper_than_floor_candidate(self):
+        """
+        A hot/warm pixel candidate (unresolved, near-delta-function profile —
+        much narrower than any real PSF-shaped blob) must be dropped when a
+        fwhm_min_px floor is given, even though it clears the detection
+        threshold and minarea just as easily as a real source would.
+        """
+        rng = np.random.default_rng(3)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        # A near-single-pixel spike: sigma=0.5px is far too sharp to be a real
+        # PSF-convolved point source at any normal seeing/plate scale.
+        yy, xx = np.mgrid[0:100, 0:100]
+        spike = 800.0 * np.exp(-(((xx - 60) ** 2 + (yy - 40) ** 2) / (2 * 0.5 ** 2)))
+        diff = diff + spike
+
+        # Without a floor, the sharp spike is detected like any other source.
+        assert subtraction._detect_diff_sources(diff) != []
+
+        # With a floor well above the spike's own FWHM, it must be rejected.
+        assert subtraction._detect_diff_sources(diff, fwhm_min_px=5.0) == []
+
+    def test_fwhm_floor_keeps_candidate_at_or_above_floor(self):
+        """A candidate whose FWHM already meets the floor must still pass."""
+        rng = np.random.default_rng(42)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 60) ** 2 + (yy - 40) ** 2) / (2 * 3.0 ** 2)))
+        diff = diff + blob
+
+        candidates = subtraction._detect_diff_sources(diff, fwhm_min_px=1.0)
+
+        assert len(candidates) >= 1
+
 
 # ---------------------------------------------------------------------------
 # _build_saturation_mask (docs/ISSUES.md #1, #2)
@@ -445,7 +478,7 @@ class TestRun:
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
-        monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff, mask=None: [])
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff, mask=None, fwhm_min_px=None: [])
         monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
@@ -477,7 +510,7 @@ class TestRun:
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
-            lambda diff, mask=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+            lambda diff, mask=None, fwhm_min_px=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
         )
         monkeypatch.setattr(
             subtraction, "_pixel_to_sky",
@@ -522,7 +555,7 @@ class TestRun:
 
         captured: dict = {}
 
-        def fake_detect(diff, mask=None):
+        def fake_detect(diff, mask=None, fwhm_min_px=None):
             captured["mask"] = mask
             return []
 
@@ -547,7 +580,7 @@ class TestRun:
 
         captured: dict = {}
 
-        def fake_detect(diff, mask=None):
+        def fake_detect(diff, mask=None, fwhm_min_px=None):
             captured["mask"] = mask
             return []
 
@@ -577,7 +610,7 @@ class TestRun:
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
-            lambda diff, mask=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+            lambda diff, mask=None, fwhm_min_px=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
         )
 
         sentinel_wcs = AstropyWCS(naxis=2)

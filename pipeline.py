@@ -176,6 +176,20 @@ async def run(fits_path: str) -> None:
         logger.warning("QC rejected %s: %s", basename, quality_flag, extra=extra)
         return
 
+    # qc.analyze() reports fwhm_median in "arcsec" when the frame's headers
+    # carried enough info to derive a plate scale, otherwise in raw "pixels"
+    # (see modules/qc.py's _read_pixel_scale()). Both astrometry.solve() and
+    # subtraction.run() below treat this value as an angular PSF FWHM to
+    # tighten their own detection filters — passing a pixel count through as
+    # if it were arcsec would silently corrupt those filters (e.g. all-sky
+    # cameras/lenses with no XPIXSZ/FOCALLEN headers), so only pass it on
+    # when the unit actually matches.
+    psf_fwhm_arcsec: float | None = (
+        qc_result.get("fwhm_median")
+        if qc_result.get("fwhm_unit") == "arcsec"
+        else None
+    )
+
     # ------------------------------------------------------------------
     # Step 3 — Astrometry (optional)
     # ------------------------------------------------------------------
@@ -184,7 +198,7 @@ async def run(fits_path: str) -> None:
         try:
             astro_result = await astrometry.solve(
                 fits_path,
-                psf_fwhm_arcsec=qc_result.get("fwhm_median"),
+                psf_fwhm_arcsec=psf_fwhm_arcsec,
             )
             logger.info(
                 "Astrometry: ra=%.4f dec=%.4f sources=%d",
@@ -245,6 +259,7 @@ async def run(fits_path: str) -> None:
                 archive_dir=archive_object_dir,
                 filter_name=filter_name,
                 wcs=astro_result.get("wcs"),
+                psf_fwhm_arcsec=psf_fwhm_arcsec,
             )
             sub_candidates = sub_result.get("candidates", [])
             subtraction_info = {

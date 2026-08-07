@@ -180,25 +180,87 @@ class TestHistoryMedianMag:
         assert ad._history_median_mag([]) is None
 
 
-class TestIsPositionShifted:
+class TestIsStillOccupied:
 
-    def test_is_position_shifted_no_history(self):
-        """No historical sources — cannot be shifted."""
-        assert ad._is_position_shifted(_RA, _DEC, []) is False
-
-    def test_is_position_shifted_close(self):
-        """Historical source within MATCH_CONE_ARCSEC — not shifted."""
-        # Place hist source 1 arcsec away (well inside 5 arcsec default cone)
+    def test_still_occupied_true_when_current_source_nearby(self):
+        """A current-frame source within MATCH_CONE_ARCSEC counts as occupied."""
         tiny_offset = 1.0 / 3600.0
-        hist = [_make_hist_source(ra=_RA + tiny_offset, dec=_DEC)]
-        assert ad._is_position_shifted(_RA, _DEC, hist) is False
+        current = [(_RA + tiny_offset, _DEC)]
+        assert ad._is_still_occupied(_RA, _DEC, current) is True
 
-    def test_is_position_shifted_far(self):
-        """Historical source more than MATCH_CONE_ARCSEC away — shifted."""
-        # 60 arcsec offset in dec — far outside any reasonable narrow cone
-        large_offset = 60.0 / 3600.0
-        hist = [_make_hist_source(ra=_RA, dec=_DEC + large_offset)]
-        assert ad._is_position_shifted(_RA, _DEC, hist) is True
+    def test_still_occupied_false_when_nothing_nearby(self):
+        """No current-frame source anywhere near — not occupied."""
+        far_offset = 60.0 / 3600.0
+        current = [(_RA + far_offset, _DEC)]
+        assert ad._is_still_occupied(_RA, _DEC, current) is False
+
+    def test_still_occupied_false_when_no_current_sources(self):
+        assert ad._is_still_occupied(_RA, _DEC, []) is False
+
+
+class TestIsPositionShifted:
+    """
+    _is_position_shifted(narrow_history, wide_history, current_frame_positions)
+    requires BOTH: nothing at the current position (narrow_history empty),
+    AND a wide-cone historical position that has genuinely emptied out (not
+    still occupied by something in the current frame). See docs/ISSUES.md #1.
+    """
+
+    def test_no_narrow_no_wide_history(self):
+        """No history anywhere — cannot be shifted."""
+        assert ad._is_position_shifted([], [], []) is False
+
+    def test_narrow_history_present_short_circuits(self):
+        """
+        Something already detected within MATCH_CONE_ARCSEC of the current
+        position — this is NOT a "new" position, regardless of what's in the
+        wide cone or the current frame. This is the exact false-positive
+        this fix targets: sub-arcsecond centroid/seeing noise on an
+        otherwise-stable source used to still fall through to the wide-cone
+        check and get flagged MOVING_UNKNOWN purely because some unrelated
+        object happened to be nearby.
+        """
+        narrow = [_make_hist_source(ra=_RA, dec=_DEC)]
+        far_offset = 60.0 / 3600.0
+        wide = [_make_hist_source(ra=_RA, dec=_DEC + far_offset)]
+        assert ad._is_position_shifted(narrow, wide, []) is False
+
+    def test_wide_history_vacated_is_shifted(self):
+        """
+        Nothing at the current position, and the wide-cone historical
+        position is empty in the current frame too — genuine mover.
+        """
+        far_offset = 15.0 / 3600.0
+        wide = [_make_hist_source(ra=_RA, dec=_DEC + far_offset)]
+        assert ad._is_position_shifted([], wide, []) is True
+
+    def test_wide_history_still_occupied_is_not_shifted(self):
+        """
+        Nothing at the current position, BUT the wide-cone historical
+        position is still occupied by another source in THIS frame — that's
+        a permanent neighbour (another star/galaxy), not evidence that
+        anything moved away from there. Must NOT be flagged shifted.
+        """
+        far_offset = 15.0 / 3600.0
+        neighbour_dec = _DEC + far_offset
+        wide = [_make_hist_source(ra=_RA, dec=neighbour_dec)]
+        current_frame_positions = [(_RA, neighbour_dec)]  # neighbour still there now
+        assert ad._is_position_shifted([], wide, current_frame_positions) is False
+
+    def test_mixed_wide_history_one_vacated_one_still_occupied(self):
+        """
+        Two wide-cone candidates: one still occupied (persistent neighbour,
+        ignored), one genuinely vacated (real mover's old spot) — must still
+        report shifted because of the second one.
+        """
+        occupied_dec = _DEC + 10.0 / 3600.0
+        vacated_dec  = _DEC + 20.0 / 3600.0
+        wide = [
+            _make_hist_source(ra=_RA, dec=occupied_dec),
+            _make_hist_source(ra=_RA, dec=vacated_dec),
+        ]
+        current_frame_positions = [(_RA, occupied_dec)]
+        assert ad._is_position_shifted([], wide, current_frame_positions) is True
 
 
 # ===========================================================================
@@ -575,6 +637,40 @@ class TestDetectUnmatchedMovingObjects:
 
         assert len(result) == 1
         assert result[0]["anomaly_type"] == "SPACE_DEBRIS"
+
+    async def test_detect_persistent_neighbour_is_not_moving(self):
+        """
+        Regression for docs/ISSUES.md #1: a faint uncatalogued source with no
+        detection of its own within MATCH_CONE_ARCSEC (e.g. its first-ever
+        epoch, or one where centroid noise happens to exceed 5") must NOT be
+        flagged MOVING_UNKNOWN just because a bright/persistent neighbour
+        sits within MOVING_CONE_ARCSEC — as long as that neighbour is still
+        detected at its own spot in THIS frame (i.e. it plainly didn't move
+        anywhere; it was never the thing "shifting"). The area has prior
+        coverage but no history at the target's own position, so this must
+        fall through to UNKNOWN — not MOVING_UNKNOWN/SPACE_DEBRIS.
+        """
+        neighbour_offset_deg = 15.0 / 3600.0
+        neighbour_ra, neighbour_dec = _RA, _DEC + neighbour_offset_deg
+
+        target    = _make_source(catalog_name=None, elongation=1.2)
+        neighbour = _make_source(ra=neighbour_ra, dec=neighbour_dec, catalog_name=None)
+        # The neighbour's own past detections, at the exact spot it's still
+        # sitting at in this frame — this is what used to trip up
+        # _is_position_shifted() for the unrelated `target` source.
+        neighbour_hist = _make_hist_source(ra=neighbour_ra, dec=neighbour_dec)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [neighbour_hist]}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [target, neighbour], [target, neighbour], _FRAME_META)
+
+        target_anomaly = next(a for a in result if a["ra"] == pytest.approx(_RA) and a["dec"] == pytest.approx(_DEC))
+        assert target_anomaly["anomaly_type"] == "UNKNOWN"
 
 
 class TestDetectSaturatedArtifacts:

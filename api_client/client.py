@@ -633,9 +633,9 @@ async def _get_frames_covering_batch_with_retry(
 
         resp_json = response.json()
 
-    # Expected format: {"results": {"0": [...], "1": [...], ...}}
-    data = resp_json.get("results", resp_json) if isinstance(resp_json, dict) else {}
-    return data if isinstance(data, dict) else {}
+    # Documented format: {"results": {"0": [...], "1": [...], ...}}
+    # Also accepted: {"results": [[...], [...], ...]} — see _normalize_batch_results.
+    return _normalize_batch_results(resp_json)
 
 
 async def get_frames_covering_batch(
@@ -757,8 +757,8 @@ async def _get_source_tracks_batch_with_retry(source_ids: list[str]) -> dict:
         resp_json = response.json()
 
     # Documented format: {"results": {"<source_id>": [epoch, ...], ...}}
-    data = resp_json.get("results", resp_json) if isinstance(resp_json, dict) else {}
-    return data if isinstance(data, dict) else {}
+    # Also accepted: {"results": [[...], [...], ...]} — see _normalize_batch_results.
+    return _normalize_batch_results(resp_json)
 
 
 async def get_source_tracks_batch(source_ids: list[str]) -> dict:

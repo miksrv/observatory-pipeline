@@ -162,8 +162,8 @@ Orchestrates processing of a single FITS file in order:
    - If `Light` → continue processing
 4. `qc.analyze(fits_path)` → returns metrics + quality flag
 5. If `quality_flag != OK` → move file to `/fits/rejected/{object_name}/` → **STOP** (no API call)
-6. `astrometry.solve(fits_path)` → returns WCS + two source lists: `sources` (strict star filter) and `sources_all` (loose filter — also keeps bright/saturated and faint detections, used for matching). This selection is made *before* step 7's merge below — `sources`/`sources_all` must already exist as names before anything tries to extend them.
-7. `subtraction.run(fits_path, archive_dir, filter_name, wcs=astro_result["wcs"])` → if ≥`SUBTRACTION_MIN_FRAMES` archived frames of the same object exist, aligns them (via `astroalign`), builds a median reference, subtracts, and returns candidate sources found only in the difference image. These are merged into the source list and flagged `_from_subtraction=True`. Skipped gracefully otherwise. The `wcs` passed here is step 6's already-solved WCS, not re-derived from `fits_path`'s own header — that header isn't corrected until step 14.5 archives the frame (see `modules/astrometry.py`'s section below), so re-deriving it here would give subtraction's candidates a different systematic sky-position offset than every other source in the frame.
+6. `astrometry.solve(fits_path, psf_fwhm_arcsec=...)` → returns WCS + two source lists: `sources` (strict star filter) and `sources_all` (loose filter — also keeps bright/saturated and faint detections, used for matching). This selection is made *before* step 7's merge below — `sources`/`sources_all` must already exist as names before anything tries to extend them. `psf_fwhm_arcsec` is step 4's `qc_result["fwhm_median"]`, forwarded only when `qc_result["fwhm_unit"] == "arcsec"` (see step 7 below for why).
+7. `subtraction.run(fits_path, archive_dir, filter_name, wcs=astro_result["wcs"], psf_fwhm_arcsec=...)` → if ≥`SUBTRACTION_MIN_FRAMES` archived frames of the same object exist, aligns them (via `astroalign`), builds a median reference, subtracts, and returns candidate sources found only in the difference image. These are merged into the source list and flagged `_from_subtraction=True`. Skipped gracefully otherwise. The `wcs` passed here is step 6's already-solved WCS, not re-derived from `fits_path`'s own header — that header isn't corrected until step 14.5 archives the frame (see `modules/astrometry.py`'s section below), so re-deriving it here would give subtraction's candidates a different systematic sky-position offset than every other source in the frame. `psf_fwhm_arcsec` is `qc_result["fwhm_median"]` from step 4 — passed only when `qc_result["fwhm_unit"] == "arcsec"` (it can instead be a raw pixel count when the frame's headers don't carry enough to derive a plate scale; see `modules/qc.py` below), since `astrometry.solve()`'s call in step 6 uses the same guard. See `modules/subtraction.py`'s section below for what this enables.
 8. `catalog_matcher.match(sources, frame_meta)` → identifies known objects. **Runs before photometry** so matched Gaia DR3 stars can serve as the photometric zero-point reference.
 8.5. `_dedupe_by_catalog_identity(sources, extra)` → collapses sources that share the same
      `(catalog_name, catalog_id)` within this one frame into a single representative source —
@@ -317,7 +317,18 @@ When normalization is enabled, the API receives only normalized values (no dupli
   by ~178″/3′ — astap's own `.wcs` comment had already reported and corrected that exact "Mount offset", but
   the pipeline was silently discarding it and using the stale header value for every downstream step). Only
   falls back to the header's own WCS if the `.wcs` side file is missing or fails to parse.
-- Runs `sep` (SourceExtractor) for source detection, dynamically narrowing the upper FWHM bound using an estimated `psf_fwhm_arcsec` when available
+- Runs `sep` (SourceExtractor) for source detection, dynamically narrowing **both** FWHM bounds
+  around an estimated `psf_fwhm_arcsec` (this frame's own measured stellar PSF, from
+  `qc.analyze()`'s `fwhm_median`) when available: upper bound → `psf_fwhm_arcsec × 1.5` (rejects
+  compact galaxies broader than the stellar PSF), lower bound → `psf_fwhm_arcsec / 1.5` (rejects
+  hot/warm sensor pixel clusters and similar artifacts far sharper than any real star in this
+  frame — a static, site-agnostic `STAR_FWHM_MIN_ARCSEC` floor alone can sit comfortably below a
+  hot pixel's measured FWHM even when that pixel is still far more compact than every genuine
+  star here; real incident, 2026-08-06, Vesta test frames, `sources_all` fed hot pixels ~2.6–3.0″
+  FWHM into anomaly detection as `UNKNOWN` alerts on a frame whose real stars measured ~4.5″).
+  Both bounds fall back to the static `STAR_FWHM_MIN_ARCSEC`/`STAR_FWHM_MAX_ARCSEC` config values
+  when no PSF estimate is available. This tightened lower bound applies to `sources_all` too, not
+  just the strict `sources` list, since both share the same underlying FWHM mask.
 - Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`
 - Returns a dict: `{ra_center, dec_center, fov_deg, naxis1, naxis2, sources, sources_all, wcs}`
   - `sources` — strict star filter, list of dicts `{ra, dec, flux, fwhm, elongation, saturated, ...}`
@@ -362,6 +373,18 @@ entry at all, at any position).
    are zeroed in the background-subtracted diff image before extraction, so no candidate can be
    detected there. See docs/ISSUES.md #1, #2.
 5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry.py`), since `sep.extract()` doesn't return a native `fwhm` field.
+5.5. Rejects any candidate whose `fwhm` is below `psf_fwhm_arcsec / 1.5` (converted to pixels via
+   the frame's plate scale — same ratio `modules/astrometry.py` uses for its own lower FWHM bound;
+   see that module's section above), where `psf_fwhm_arcsec` is `pipeline.py`'s forwarded
+   `qc.analyze()` measurement of this frame's actual stellar PSF. This exists because step 3's
+   median reference stack only removes reference-frame artifacts that move between frames when
+   `astroalign` resamples them onto the new frame's grid — a sensor hot/warm pixel is fixed to the
+   *detector* grid, not the sky, so each reference's own copy of it lands at a different resampled
+   pixel and gets averaged away, while the **new** frame's own hot pixel sits untouched at its
+   native position and survives the subtraction as a sharp, undiffused positive residual with no
+   real-star-like PSF profile at all (real incident, 2026-08-06, Vesta test frames — see
+   `modules/astrometry.py`'s section above for the same underlying failure mode). Skipped
+   (behavior unchanged) when `psf_fwhm_arcsec` or the frame's plate scale isn't available.
 6. Converts detected pixel positions back to (RA, Dec) using the frame's WCS — preferring the
    already-solved `wcs` passed in from `astrometry.solve()` (see `pipeline.py` step 7 above) over
    re-deriving one from the new frame's own header, which can still carry a stale/mount-pointing
@@ -425,6 +448,20 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | Source present but shifted > MATCH_CONE_ARCSEC, matches MPC | `ASTEROID` or `COMET` |
 | Source present but shifted, not in MPC, elongation ≤ 3.0 | `MOVING_UNKNOWN` → **ALERT** |
 | Source present but shifted, not in MPC, elongation > 3.0 (fast trail) | `SPACE_DEBRIS` → **ALERT** |
+
+"Shifted" (for the unmatched `MOVING_UNKNOWN`/`SPACE_DEBRIS` branch — MPC matches don't need this
+check) requires **both**: no historical detection within `MATCH_CONE_ARCSEC` of the source's
+*current* position, **and** a historical detection within the wider `MOVING_CONE_ARCSEC` whose
+own position is no longer occupied by anything else in *this* frame. Checking only the second half
+(an earlier revision's entire condition) false-positived on almost every uncatalogued source:
+`MOVING_CONE_ARCSEC` (120″ by default) covers enough sky that some unrelated historical
+detection — a neighbouring star, a galaxy smudge, anything ever recorded nearby — is virtually
+always present there, whether or not this particular source moved at all (real incident,
+2026-08-06: several sources whose position drifted by <1″ across epochs — ordinary
+centroid/seeing noise — were repeatedly flagged `MOVING_UNKNOWN` solely because an unrelated
+star sat within 120″; see docs/ISSUES.md #1). Requiring the *old* position to have actually
+emptied out rules that out while still catching real movers, whose previous position is — by
+definition — vacated once they've moved away from it.
 
 The saturated-artifact suppression is deliberately scoped to `catalog_name is None`: a saturated
 source that *is* MPC- or Simbad-matched (a genuinely bright asteroid, a known star flaring) is a

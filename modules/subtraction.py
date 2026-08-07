@@ -5,13 +5,22 @@ Algorithm:
   1. Find N >= SUBTRACTION_MIN_FRAMES archived FITS of same object/filter.
   2. Load new frame data + WCS.
   3. Align each reference frame to the new frame using astroalign triangle matching.
-  4. Median-stack aligned frames -> clean reference (removes cosmic rays, hot pixels).
+  4. Median-stack aligned frames -> clean reference (removes cosmic rays and hot
+     pixels FROM THE REFERENCE STACK — each reference's own detector-fixed
+     defects get scattered to different pixels by the sky-based astroalign
+     resampling, then averaged away by the median. This does NOT remove the
+     NEW frame's own hot pixels, which are still sitting at their native,
+     unresampled positions — see step 7's FWHM floor below for how those get
+     filtered instead).
   5. diff = new_frame - reference.
   6. Mask the vicinity of any saturated pixel (new frame or a reference) —
      astroalign resampling leaves large non-Gaussian residuals there even
      under near-perfect registration, which sep would otherwise report as
      spurious bright "transients" (see docs/ISSUES.md #1, #2).
-  7. Run SEP detection on positive residuals in the (masked) diff.
+  7. Run SEP detection on positive residuals in the (masked) diff, rejecting
+     candidates far sharper than this frame's own measured stellar PSF (see
+     run()'s psf_fwhm_arcsec docstring) — this is what catches the new
+     frame's own hot/warm pixels, which step 4 above cannot.
   8. Convert pixel coords to RA/Dec via WCS.
   9. Return candidates list.
 
@@ -131,7 +140,11 @@ def _align_frame(source: np.ndarray, target: np.ndarray) -> Optional[np.ndarray]
 # Difference-image source detection
 # ---------------------------------------------------------------------------
 
-def _detect_diff_sources(diff: np.ndarray, mask: Optional[np.ndarray] = None) -> list[dict]:
+def _detect_diff_sources(
+    diff: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    fwhm_min_px: Optional[float] = None,
+) -> list[dict]:
     """
     Detect positive residuals in the difference image using SEP.
 
@@ -151,6 +164,11 @@ def _detect_diff_sources(diff: np.ndarray, mask: Optional[np.ndarray] = None) ->
         background model and zeroed in the background-subtracted image
         before extraction, so no candidate can be detected there. Ignored
         (treated as no mask) if its shape doesn't match *diff*.
+    fwhm_min_px:
+        Minimum acceptable FWHM in pixels. Candidates narrower than this are
+        dropped as artifacts rather than returned — see run()'s docstring for
+        why this exists and how the threshold is derived. None (the default)
+        disables this filter, keeping every SEP detection as before.
 
     Returns
     -------
@@ -175,6 +193,7 @@ def _detect_diff_sources(diff: np.ndarray, mask: Optional[np.ndarray] = None) ->
             return []
 
         out: list[dict] = []
+        n_rejected_sharp = 0
         for obj in objs:
             # `obj` is a numpy.void record (one row of sep.extract()'s
             # structured array) — it supports dict-style bracket access
@@ -192,6 +211,20 @@ def _detect_diff_sources(diff: np.ndarray, mask: Optional[np.ndarray] = None) ->
             a_axis = float(obj["a"])
             b_axis = max(float(obj["b"]), 0.001)
             fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0) * (a_axis ** 2 + b_axis ** 2) / 2.0)
+
+            # Reject candidates far sharper than the frame's own stellar PSF —
+            # see run()'s docstring. A real transient's light still passes
+            # through the same optics/atmosphere as every star in the frame,
+            # so it cannot be dramatically narrower than that shared PSF. A
+            # sensor hot/warm pixel, by contrast, is a detector-space defect:
+            # it doesn't move with the sky when astroalign resamples the
+            # reference frames onto this frame's grid, so it never gets
+            # subtracted out and shows up here as an unrealistically compact
+            # positive residual (real incident, 2026-08-06, Vesta test data).
+            if fwhm_min_px is not None and fwhm < fwhm_min_px:
+                n_rejected_sharp += 1
+                continue
+
             out.append({
                 "x":          float(obj["x"]),
                 "y":          float(obj["y"]),
@@ -200,6 +233,14 @@ def _detect_diff_sources(diff: np.ndarray, mask: Optional[np.ndarray] = None) ->
                 "fwhm":       fwhm,
                 "elongation": a_axis / b_axis,
             })
+
+        if n_rejected_sharp:
+            logger.info(
+                "Subtraction: rejected %d candidate(s) narrower than %.2fpx "
+                "FWHM floor (likely hot/warm pixel artifacts, not real transients)",
+                n_rejected_sharp, fwhm_min_px,
+            )
+
         return out
     except Exception as exc:
         logger.warning("SEP detection on diff image failed: %s", exc)
@@ -390,6 +431,7 @@ async def run(
     archive_dir: str,
     filter_name: Optional[str],
     wcs: Optional[WCS] = None,
+    psf_fwhm_arcsec: Optional[float] = None,
 ) -> dict:
     """
     Run image subtraction to detect transient / moving sources.
@@ -418,6 +460,26 @@ async def run(
         fall back to reading WCS straight from fits_path's own header (see
         _pixel_to_sky()'s docstring for why that's a fallback, not the
         default, in the real pipeline).
+    psf_fwhm_arcsec:
+        This frame's own measured stellar PSF FWHM in arcseconds (QC's
+        ``fwhm_median`` — the same value astrometry.solve() uses to tighten
+        its own star filter). Converted to pixels via the frame's plate
+        scale and used as a minimum-FWHM floor (``psf_fwhm_arcsec / 1.5``,
+        mirroring astrometry.py's ratio) when detecting candidates on the
+        difference image: a genuine astrophysical transient's light is still
+        shaped by the same optical/atmospheric PSF as every star in this
+        frame, so it cannot be dramatically sharper than that. A sensor
+        hot/warm pixel is fixed to the *detector* grid, not the sky, so
+        astroalign's per-frame resampling scatters it to a different pixel
+        in each aligned reference — it never lines up with, and so never
+        gets subtracted out by, the median reference stack. Left unfiltered,
+        it appears in the difference image as an unrealistically compact
+        positive residual and gets reported as a spurious transient
+        candidate (real incident, 2026-08-06, Vesta test data — hot pixels
+        far more compact than any real star ended up posted as UNKNOWN
+        anomalies). None (e.g. a caller that never ran QC, such as a
+        standalone script) disables this filter, preserving the old
+        unfiltered behavior.
 
     Returns
     -------
@@ -510,9 +572,18 @@ async def run(
         )
 
     # ------------------------------------------------------------------
+    # Minimum-FWHM floor for candidate shape — see psf_fwhm_arcsec's
+    # docstring above. Needs the same pixel scale already computed for the
+    # saturation mask radius, so only convert when both are available.
+    # ------------------------------------------------------------------
+    fwhm_min_px: Optional[float] = None
+    if psf_fwhm_arcsec is not None and psf_fwhm_arcsec > 0 and pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        fwhm_min_px = (psf_fwhm_arcsec / 1.5) / pixel_scale_arcsec
+
+    # ------------------------------------------------------------------
     # Detect and project candidates
     # ------------------------------------------------------------------
-    pixel_cands = _detect_diff_sources(diff, mask=sat_mask)
+    pixel_cands = _detect_diff_sources(diff, mask=sat_mask, fwhm_min_px=fwhm_min_px)
     sky_cands   = _pixel_to_sky(pixel_cands, fits_path, wcs=wcs)
 
     for cand in sky_cands:
