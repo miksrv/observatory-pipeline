@@ -60,28 +60,24 @@ from typing import Any, Optional
 # `import config` / `from modules import ...` resolve regardless of cwd.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import pymysql
 import pymysql.cursors
 
 import config
-# Reuse the production rendering code (and its exact visual style) for the
-# multi-epoch case instead of re-implementing it — same reasoning as
-# debug_catalog_match.py reusing modules/catalog_matcher.py etc. Underscore
-# names are "internal to the module", not "off limits to a debug tool in the
-# same repo" — see debug/README.md.
-from modules.finder_chart import (
-    MOVING_TYPES,
-    _arcsec_per_pixel,
-    _crop_around,
-    _load_frame,
-    _render_stamp_strip,
-    _render_track_chart,
-    _stamp_half_size_px,
-    _stretch,
-)
+# Reuse the production rendering code (and its exact visual style) instead
+# of re-implementing it — same reasoning as debug_catalog_match.py reusing
+# modules/catalog_matcher.py etc. Underscore names are "internal to the
+# module", not "off limits to a debug tool in the same repo" — see
+# debug/README.md. Since debug/debug_anomaly_charts.py now calls the exact
+# same _render_track_chart() / _render_stamp_strip() / _render_before_after_chart()
+# functions modules/finder_chart.py uses for the charts it actually uploads
+# via the API, a chart generated here is pixel-for-pixel what the real
+# pipeline would produce for the same (epochs, anomaly_type, designation) —
+# see debug/README.md's "Fourth follow-up" for the remaining, structural
+# differences that this sharing does NOT eliminate (which frames count as
+# "epochs" at all, and CHART_MAX_EPOCHS).
+from modules import finder_chart
+from modules.finder_chart import _load_frame
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -91,9 +87,6 @@ DB_PORT = int(os.getenv("DEBUG_DB_PORT", "3306"))
 DB_NAME = os.getenv("DEBUG_DB_NAME", "db")
 DB_USER = os.getenv("DEBUG_DB_USER", "user")
 DB_PASSWORD = os.getenv("DEBUG_DB_PASSWORD", "password")
-
-BEFORE_COLOR = "#999999"
-AFTER_COLOR = "#ff4040"
 
 
 # ---------------------------------------------------------------------------
@@ -236,135 +229,60 @@ def _load_epoch(object_name: str, occ: dict) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Rendering — multi-occurrence groups (2+ frames for the same source_id)
+# Rendering — mirrors modules/finder_chart.py's own _render_chart_for_source():
+# cap to CHART_MAX_EPOCHS, load whatever's still present locally, pick a
+# style from the loaded count + anomaly_type, render via the SAME production
+# rendering functions. The only real differences from production are
+# upstream of this function — which rows count as "epochs" at all (this
+# script's anomalies-table grouping vs. the API's full source_observations
+# track) — see debug/README.md.
 # ---------------------------------------------------------------------------
 
-def render_multi_frame_group(
-    object_name: str, occurrences: list[dict], out_path: str, designation: Optional[str] = None,
+def render_chart_for_group(
+    conn: pymysql.connections.Connection, object_name: str, occurrences: list[dict],
+    out_path: str, designation: Optional[str] = None,
 ) -> bool:
-    """
-    Same rendering as production finder charts: "track" style for moving
-    anomaly types, "stamp_strip" (one crop per epoch) for everything else —
-    RA/Dec per epoch included the same way (see modules/finder_chart.py's
-    own docstring). Style is chosen from the LATEST occurrence's
-    anomaly_type, matching how
-    modules/finder_chart.update_charts_for_sources() picks style from the
-    anomaly that just triggered the update. `designation`, if the source is
-    catalog-matched, is shown next to that anomaly_type, e.g.
-    "ASTEROID (4 Vesta)".
-    """
+    """Renders and writes one chart PNG for one source_id group. Returns False on any failure."""
+    if len(occurrences) > config.CHART_MAX_EPOCHS:
+        logger.info(
+            "group has %d occurrences — keeping the most recent %d (CHART_MAX_EPOCHS)",
+            len(occurrences), config.CHART_MAX_EPOCHS,
+        )
+        occurrences = occurrences[-config.CHART_MAX_EPOCHS:]
+
     loaded = [ep for ep in (_load_epoch(object_name, occ) for occ in occurrences) if ep is not None]
     if not loaded:
         logger.warning("none of %d occurrence(s) could be loaded — skipping group", len(occurrences))
         return False
 
     latest_type = occurrences[-1]["anomaly_type"]
-    style = "track" if latest_type in MOVING_TYPES else "stamp_strip"
+    style = finder_chart._style_for_source(latest_type, len(loaded))
     label = f"{latest_type} ({designation})" if designation else latest_type
-    png_bytes = _render_track_chart(loaded, label=label) if style == "track" else _render_stamp_strip(loaded, label=label)
+
+    if style == finder_chart.STYLE_BEFORE_AFTER:
+        current_ep = loaded[-1]
+        earlier_frame = fetch_earlier_frame(conn, object_name, current_ep["obs_time"])
+        before_ep = None
+        missing_reason = None
+        if earlier_frame is None:
+            missing_reason = f"No earlier frame of {object_name} exists — this is its first-ever frame."
+        else:
+            before_frame = _load_frame(_epoch_fits_path(object_name, earlier_frame["filename"]))
+            if before_frame is None:
+                missing_reason = (
+                    f"Earlier frame {earlier_frame['filename']} exists in the DB but could not be "
+                    f"loaded from the local archive ({config.FITS_ARCHIVE})."
+                )
+            else:
+                before_ep = {"data": before_frame[0], "wcs": before_frame[1], "obs_time": str(earlier_frame["obs_time"])}
+        png_bytes = finder_chart._render_before_after_chart(current_ep, before_ep, label=label, missing_reason=missing_reason)
+    elif style == finder_chart.STYLE_TRACK:
+        png_bytes = finder_chart._render_track_chart(loaded, label=label)
+    else:
+        png_bytes = finder_chart._render_stamp_strip(loaded, label=label)
 
     with open(out_path, "wb") as f:
         f.write(png_bytes)
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Rendering — single-occurrence groups: before/after 2-panel mosaic
-# ---------------------------------------------------------------------------
-
-def render_before_after(
-    object_name: str, occ: dict, earlier_frame: Optional[dict], out_path: str, designation: Optional[str] = None,
-) -> bool:
-    """
-    2-panel mosaic: a crop at this anomaly's exact sky position from the most
-    recent earlier frame of the same object (nothing expected there) next to
-    a crop from the anomaly's own frame (circled). Falls back to a 1-panel
-    "after only" view — with an explicit note why — if there is no earlier
-    frame at all, or it exists in the DB but isn't loadable locally.
-
-    Both panels are centred on the SAME (ra, dec) — this anomaly's own
-    detected position — on purpose: the whole point of the comparison is
-    "was anything at this exact sky position before vs. after", so the two
-    crops must be queried at one fixed point, not each panel's own position
-    (there is no "each panel's own position" here in the first place — a
-    single-occurrence anomaly has exactly one). That shared coordinate is
-    shown once, in the figure's overall title, rather than repeated
-    identically under both panels — showing the same number twice previously
-    read as a bug (coordinates that don't shift between "before" and
-    "after") rather than the intentional fixed query point it actually is.
-    `designation`, if the source is catalog-matched, is shown next to
-    anomaly_type on the AFTER panel, e.g. "ASTEROID (4 Vesta)".
-    """
-    after_ep = _load_epoch(object_name, occ)
-    if after_ep is None:
-        return False
-
-    before_ep = None
-    missing_reason = None
-    if earlier_frame is None:
-        missing_reason = f"No earlier frame of {object_name} exists — this is its first-ever frame."
-    else:
-        before_frame = _load_frame(_epoch_fits_path(object_name, earlier_frame["filename"]))
-        if before_frame is None:
-            missing_reason = (
-                f"Earlier frame {earlier_frame['filename']} exists in the DB but could not be "
-                f"loaded from the local archive ({config.FITS_ARCHIVE})."
-            )
-        else:
-            before_ep = {"data": before_frame[0], "wcs": before_frame[1], "obs_time": str(earlier_frame["obs_time"])}
-
-    n_panels = 2 if before_ep else 1
-    fig, axes = plt.subplots(1, n_panels, figsize=(4.6 * n_panels, 4.7), dpi=120)
-    axes = [axes] if n_panels == 1 else list(axes)
-
-    if before_ep:
-        ax_before = axes[0]
-        try:
-            half_px = _stamp_half_size_px(before_ep["wcs"])
-            crop, (cx, cy) = _crop_around(before_ep["data"], before_ep["wcs"], occ["ra"], occ["dec"], half_px)
-            ax_before.imshow(_stretch(crop), cmap="gray", origin="lower")
-            r = max(6.0, 10.0 / _arcsec_per_pixel(before_ep["wcs"]))
-            ax_before.add_patch(plt.Circle((cx, cy), radius=r, edgecolor=BEFORE_COLOR,
-                                            facecolor="none", linewidth=1.2, linestyle="--"))
-        except Exception as exc:
-            logger.debug("before-crop failed for anomaly=%s: %s", occ["anomaly_id"], exc)
-            ax_before.text(0.5, 0.5, "crop failed", ha="center", va="center", transform=ax_before.transAxes)
-        ax_before.set_title(f"BEFORE — {before_ep['obs_time']}\n(nothing expected here)",
-                             fontsize=9, color=BEFORE_COLOR)
-        ax_before.set_xticks([]); ax_before.set_yticks([])
-
-    ax_after = axes[-1]
-    try:
-        half_px = _stamp_half_size_px(after_ep["wcs"])
-        crop, (cx, cy) = _crop_around(after_ep["data"], after_ep["wcs"], occ["ra"], occ["dec"], half_px)
-        ax_after.imshow(_stretch(crop), cmap="gray", origin="lower")
-        r = max(6.0, 10.0 / _arcsec_per_pixel(after_ep["wcs"]))
-        ax_after.add_patch(plt.Circle((cx, cy), radius=r, edgecolor=AFTER_COLOR, facecolor="none", linewidth=1.8))
-    except Exception as exc:
-        logger.debug("after-crop failed for anomaly=%s: %s", occ["anomaly_id"], exc)
-        ax_after.text(0.5, 0.5, "crop failed", ha="center", va="center", transform=ax_after.transAxes)
-    mag_txt = f"  mag={occ['magnitude']:.2f}" if occ.get("magnitude") is not None else ""
-    type_txt = f"{occ['anomaly_type']} ({designation})" if designation else occ["anomaly_type"]
-    ax_after.set_title(f"AFTER — {after_ep['obs_time']}\n{type_txt}{mag_txt}",
-                        fontsize=9, color=AFTER_COLOR)
-    ax_after.set_xticks([]); ax_after.set_yticks([])
-
-    source_txt = f"source_id={occ['source_id']}" if occ["source_id"] else "no source_id"
-    # The shared query position lives here, once, rather than repeated
-    # identically under both panels — see the docstring above for why it's
-    # identical in the first place (both crops are centred on this same
-    # point on purpose, not a bug).
-    fig.suptitle(
-        f"{object_name} — anomaly {occ['anomaly_id']}  ({source_txt})\n"
-        f"fixed query position: RA {occ['ra']:.4f}°  Dec {occ['dec']:.4f}°  (same in both panels, by design)",
-        fontsize=10,
-    )
-    if missing_reason:
-        fig.text(0.5, 0.01, missing_reason, ha="center", fontsize=7.5, color=BEFORE_COLOR)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.86))
-
-    fig.savefig(out_path)
-    plt.close(fig)
     return True
 
 
@@ -406,12 +324,7 @@ def main(object_name: str, out_dir: str) -> None:
 
             designation = resolve_designation(occurrences, designations)
             try:
-                if len(occurrences) >= 2:
-                    ok = render_multi_frame_group(object_name, occurrences, out_path, designation)
-                else:
-                    occ = occurrences[0]
-                    earlier = fetch_earlier_frame(conn, object_name, occ["obs_time"])
-                    ok = render_before_after(object_name, occ, earlier, out_path, designation)
+                ok = render_chart_for_group(conn, object_name, occurrences, out_path, designation)
             except Exception:
                 logger.exception("rendering group %s failed", key)
                 ok = False

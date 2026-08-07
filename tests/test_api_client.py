@@ -21,6 +21,7 @@ import pytest
 from api_client import client as api_client_module
 from api_client.client import (
     get_frames_covering,
+    get_nearest_frame_before,
     get_source_tracks_batch,
     get_sources_near,
     post_anomalies,
@@ -452,6 +453,77 @@ class TestGetFramesCovering:
             result = await get_frames_covering(1.0, 2.0, "2024-01-01T00:00:00Z")
 
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Test 5.5: get_nearest_frame_before
+# ---------------------------------------------------------------------------
+
+class TestGetNearestFrameBefore:
+    async def test_returns_frame_dict(self):
+        payload = {"frame": {"id": "f1", "filename": "a.fits", "object": "M51", "obs_time": "2024-01-01T00:00:00Z"}}
+        resp = _mock_response(status_code=200, json_data=payload)
+        with _patch_client(get_response=resp):
+            result = await get_nearest_frame_before("M51", "2024-01-02T00:00:00Z")
+
+        assert result == payload["frame"]
+
+    async def test_returns_none_when_no_earlier_frame(self):
+        """{"frame": null} — the object's first-ever frame — must return None, not raise."""
+        resp = _mock_response(status_code=200, json_data={"frame": None})
+        with _patch_client(get_response=resp):
+            result = await get_nearest_frame_before("M51", "2024-01-02T00:00:00Z")
+
+        assert result is None
+
+    async def test_passes_object_and_before_time_params(self):
+        resp = _mock_response(status_code=200, json_data={"frame": None})
+        with _patch_client(get_response=resp) as mock_client:
+            await get_nearest_frame_before("Vesta_A807_FA", "2025-03-15T08:00:00Z")
+
+        _, call_kwargs = mock_client.get.call_args
+        params = call_kwargs["params"]
+        assert params["object"] == "Vesta_A807_FA"
+        assert params["before_time"] == "2025-03-15T08:00:00Z"
+
+    async def test_uses_correct_endpoint(self):
+        resp = _mock_response(status_code=200, json_data={"frame": None})
+        with _patch_client(get_response=resp) as mock_client:
+            await get_nearest_frame_before("M51", "2024-01-01T00:00:00Z")
+
+        call_args = mock_client.get.call_args
+        assert call_args[0][0] == "/frames/nearest-before"
+
+    async def test_returns_none_on_error(self):
+        """Any exception after retries exhausted must return None, not raise."""
+        exc = httpx.ConnectError("connection refused")
+        with patch.object(
+            api_client_module,
+            "_get_nearest_frame_before_with_retry",
+            AsyncMock(side_effect=exc),
+        ):
+            result = await get_nearest_frame_before("M51", "2024-01-01T00:00:00Z")
+
+        assert result is None
+
+    async def test_returns_none_on_5xx(self):
+        exc = _make_5xx_status_error()
+        with patch.object(
+            api_client_module,
+            "_get_nearest_frame_before_with_retry",
+            AsyncMock(side_effect=exc),
+        ):
+            result = await get_nearest_frame_before("M51", "2024-01-01T00:00:00Z")
+
+        assert result is None
+
+    async def test_malformed_response_returns_none(self):
+        """A bare list (or any non-dict body) must not crash — treated as 'no frame'."""
+        resp = _mock_response(status_code=200, json_data=["unexpected"])
+        with _patch_client(get_response=resp):
+            result = await get_nearest_frame_before("M51", "2024-01-01T00:00:00Z")
+
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

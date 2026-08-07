@@ -426,6 +426,87 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
 
 
 # ---------------------------------------------------------------------------
+# Before/after (single-epoch sources)
+# ---------------------------------------------------------------------------
+
+def _render_before_after_chart(
+    current_ep: dict, before_ep: Optional[dict], label: Optional[str] = None,
+    missing_reason: Optional[str] = None,
+) -> bytes:
+    """
+    2-panel chart for a source detected on only one epoch so far: a crop of
+    the most recent EARLIER frame of the same object at this exact sky
+    position (nothing expected there yet) next to a crop of the frame the
+    source was actually detected on (circled). Falls back to a single
+    "after only" panel — with `missing_reason` shown as an explicit note —
+    if `before_ep` is None (no earlier frame of the object exists yet, or it
+    couldn't be loaded).
+
+    Both panels are centred on the SAME (ra, dec) — current_ep's own
+    detected position — on purpose: a single-occurrence source has exactly
+    one detected position, so there's no "each panel's own position" to
+    begin with; the whole point of the comparison is "was anything at this
+    one, fixed sky position before vs. after". That shared coordinate is
+    shown once, in the figure's overall title, rather than repeated
+    identically under both panels — see this module's docstring.
+
+    `label`, if given (e.g. "MOVING_UNKNOWN (2014 RY1)" — the anomaly_type
+    plus its resolved catalog designation, see update_charts_for_sources()),
+    is shown as part of the figure's overall title.
+    """
+    n_panels = 2 if before_ep else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.6 * n_panels, 4.7), dpi=120)
+    axes = [axes] if n_panels == 1 else list(axes)
+
+    if before_ep:
+        ax_before = axes[0]
+        try:
+            half_px = _stamp_half_size_px(before_ep["wcs"])
+            crop, (cx, cy) = _crop_around(
+                before_ep["data"], before_ep["wcs"], current_ep["ra"], current_ep["dec"], half_px,
+            )
+            ax_before.imshow(_stretch(crop), cmap="gray", origin="lower")
+            r = max(6.0, 10.0 / _arcsec_per_pixel(before_ep["wcs"]))
+            ax_before.add_patch(plt.Circle((cx, cy), radius=r, edgecolor=_BEFORE_AFTER_BEFORE_COLOR,
+                                            facecolor="none", linewidth=1.2, linestyle="--"))
+        except Exception as exc:
+            logger.debug("finder_chart: before_after BEFORE crop failed: %s", exc)
+            ax_before.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax_before.transAxes)
+        ax_before.set_title(f"BEFORE — {before_ep.get('obs_time', '')}\n(nothing expected here)",
+                             fontsize=9, color=_BEFORE_AFTER_BEFORE_COLOR)
+        ax_before.set_xticks([]); ax_before.set_yticks([])
+
+    ax_after = axes[-1]
+    try:
+        half_px = _stamp_half_size_px(current_ep["wcs"])
+        crop, (cx, cy) = _crop_around(
+            current_ep["data"], current_ep["wcs"], current_ep["ra"], current_ep["dec"], half_px,
+        )
+        ax_after.imshow(_stretch(crop), cmap="gray", origin="lower")
+        r = max(6.0, 10.0 / _arcsec_per_pixel(current_ep["wcs"]))
+        ax_after.add_patch(plt.Circle((cx, cy), radius=r, edgecolor=_BEFORE_AFTER_AFTER_COLOR,
+                                       facecolor="none", linewidth=1.8))
+    except Exception as exc:
+        logger.debug("finder_chart: before_after AFTER crop failed: %s", exc)
+        ax_after.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax_after.transAxes)
+    mag_txt = f"  mag {current_ep['mag']:.2f}" if current_ep.get("mag") is not None else ""
+    ax_after.set_title(f"AFTER — {current_ep.get('obs_time', '')}{mag_txt}",
+                        fontsize=9, color=_BEFORE_AFTER_AFTER_COLOR)
+    ax_after.set_xticks([]); ax_after.set_yticks([])
+
+    coord_line = (
+        f"fixed query position: RA {current_ep['ra']:.4f}°  Dec {current_ep['dec']:.4f}°"
+        "  (same in both panels, by design)"
+    )
+    fig.suptitle(f"{label}\n{coord_line}" if label else coord_line, fontsize=10)
+    if missing_reason:
+        fig.text(0.5, 0.01, missing_reason, ha="center", fontsize=7.5, color=_BEFORE_AFTER_BEFORE_COLOR)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.86))
+
+    return _fig_to_png_bytes(fig)
+
+
+# ---------------------------------------------------------------------------
 # Rendering (local — no API calls). Caps to CHART_MAX_EPOCHS, loads whatever
 # epochs are still present in the local archive, and renders the PNG.
 # Failure at any step logs and returns None rather than raising, so a single
@@ -433,8 +514,63 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
 # same update_charts_for_sources() batch.
 # ---------------------------------------------------------------------------
 
-def _render_chart_for_source(
+async def _fetch_and_load_earlier_frame(
+    object_name: Optional[str], before_obs_time: Optional[str],
+) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Query GET /frames/nearest-before for the most recent frame of
+    `object_name` strictly before `before_obs_time`, then load it locally.
+
+    Returns (loaded_epoch_or_None, missing_reason_or_None) — the loaded dict
+    has "data"/"wcs"/"obs_time", ready for _render_before_after_chart()'s
+    BEFORE panel. `missing_reason` is always set when the loaded dict is
+    None, for the chart's own explicit "why there's no before panel" note.
+    """
+    if not object_name or not before_obs_time:
+        return None, "current epoch has no object/obs_time to query an earlier frame with"
+
+    try:
+        frame_info = await api_client.get_nearest_frame_before(object_name, before_obs_time)
+    except Exception as exc:
+        logger.warning("finder_chart: GET /frames/nearest-before failed for object=%s: %s", object_name, exc)
+        return None, f"could not query for an earlier frame of {object_name}"
+
+    if frame_info is None:
+        # get_nearest_frame_before() can't distinguish "queried fine, no
+        # earlier frame exists" from "the query itself failed" (same as
+        # get_source_tracks_batch's per-source absence) — the caption stays
+        # accurate either way.
+        return None, f"no earlier frame of {object_name} available (none exists yet, or the lookup failed)"
+
+    path = _local_fits_path({"object": frame_info.get("object") or object_name, "filename": frame_info.get("filename")})
+    frame = _load_frame(path)
+    if frame is None:
+        return None, f"earlier frame {frame_info.get('filename')} of {object_name} exists but could not be loaded locally"
+
+    data, wcs = frame
+    return {"data": data, "wcs": wcs, "obs_time": frame_info.get("obs_time", "")}, None
+
+
+async def _get_earlier_frame_epoch(
+    current_ep: dict, cache: dict[tuple[Any, Any], tuple[Optional[dict], Optional[str]]],
+) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Cached wrapper around _fetch_and_load_earlier_frame(), keyed by
+    (object, obs_time). Every single-occurrence source rendered within one
+    update_charts_for_sources() call shares the exact same object and
+    current obs_time — they're all anomalies from the one frame just
+    processed — so this collapses to at most one GET /frames/nearest-before
+    call per update_charts_for_sources() call, not one per source.
+    """
+    cache_key = (current_ep.get("object"), current_ep.get("obs_time"))
+    if cache_key not in cache:
+        cache[cache_key] = await _fetch_and_load_earlier_frame(*cache_key)
+    return cache[cache_key]
+
+
+async def _render_chart_for_source(
     source_id: str, epochs: list[dict], anomaly_type: str, designation: Optional[str] = None,
+    earlier_frame_cache: Optional[dict] = None,
 ) -> Optional[tuple[bytes, str, int]]:
     """
     Returns (png_bytes, style, frame_count), or None on any failure.
@@ -445,6 +581,11 @@ def _render_chart_for_source(
     anomaly_type as the chart's title, e.g. "ASTEROID (4 Vesta)". None for an
     uncatalogued source, in which case the chart is titled with just
     anomaly_type.
+
+    `earlier_frame_cache`: shared across one update_charts_for_sources()
+    call — see _get_earlier_frame_epoch(). Only ever read/written when this
+    source ends up needing the "before_after" style (exactly one loaded
+    epoch); unused (and safe to omit) otherwise.
     """
     # Epochs come back chronologically ordered (oldest first) — keep the
     # most recent CHART_MAX_EPOCHS so the image size and the number of local
@@ -473,16 +614,28 @@ def _render_chart_for_source(
         )
         return None
 
-    style = _style_for_anomaly_type(anomaly_type)
+    style = _style_for_source(anomaly_type, len(loaded))
     label = f"{anomaly_type} ({designation})" if designation else anomaly_type
 
     try:
-        png_bytes = _render_track_chart(loaded, label=label) if style == STYLE_TRACK else _render_stamp_strip(loaded, label=label)
+        if style == STYLE_BEFORE_AFTER:
+            current_ep = loaded[-1]
+            before_ep, missing_reason = await _get_earlier_frame_epoch(
+                current_ep, earlier_frame_cache if earlier_frame_cache is not None else {},
+            )
+            png_bytes = _render_before_after_chart(current_ep, before_ep, label=label, missing_reason=missing_reason)
+            frame_count = 1 + (1 if before_ep else 0)
+        elif style == STYLE_TRACK:
+            png_bytes = _render_track_chart(loaded, label=label)
+            frame_count = len(loaded)
+        else:
+            png_bytes = _render_stamp_strip(loaded, label=label)
+            frame_count = len(loaded)
     except Exception as exc:
         logger.warning("finder_chart: rendering (%s) failed for source_id=%s: %s", style, source_id, exc)
         return None
 
-    return png_bytes, style, len(loaded)
+    return png_bytes, style, frame_count
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +661,10 @@ async def update_charts_for_sources(
     anomaly_type_by_source_id:
         Maps each `sources.id` with a just-detected anomaly (from
         `_source_id` — see pipeline.py Step 7) to that anomaly's
-        anomaly_type, which decides the chart style (MOVING_TYPES →
-        "track", everything else → "stamp_strip").
+        anomaly_type. Together with how many epochs the source actually has,
+        this decides the chart style — see _style_for_source(): exactly one
+        epoch → "before_after" regardless of anomaly_type; 2+ epochs →
+        "track" for MOVING_TYPES, "stamp_strip" otherwise.
     designation_by_source_id:
         Optional. Maps a subset of the same source_ids to their resolved
         catalog identity (e.g. the MPC designation for an ASTEROID/COMET, or
@@ -544,6 +699,10 @@ async def update_charts_for_sources(
 
     results: dict[str, bool] = {source_id: False for source_id in source_ids}
     charts_to_upload: list[dict[str, Any]] = []
+    # Shared across every source in this call — see _get_earlier_frame_epoch()
+    # for why this collapses to at most one extra API call regardless of how
+    # many sources end up needing the "before_after" style.
+    earlier_frame_cache: dict[tuple[Any, Any], tuple[Optional[dict], Optional[str]]] = {}
 
     for source_id in source_ids:
         epochs = tracks.get(source_id) or []
@@ -551,9 +710,10 @@ async def update_charts_for_sources(
             logger.debug("finder_chart: no epochs for source_id=%s — skipping", source_id)
             continue
 
-        rendered = _render_chart_for_source(
+        rendered = await _render_chart_for_source(
             source_id, epochs, anomaly_type_by_source_id[source_id],
             designation_by_source_id.get(source_id),
+            earlier_frame_cache,
         )
         if rendered is None:
             continue

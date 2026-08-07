@@ -320,7 +320,7 @@ async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
     expected_archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
     archive_existed_at_chart_time = {}
 
-    async def fake_update_charts_for_sources(anomaly_type_by_source_id):
+    async def fake_update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None):
         archive_existed_at_chart_time["exists"] = os.path.exists(expected_archive_path)
         return {sid: True for sid in anomaly_type_by_source_id}
 
@@ -333,8 +333,11 @@ async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
 
     await pipeline.run(fits_path)
 
+    # designation_by_source_id is {} here: mock_modules' post_sources mock
+    # returns None by default, so no source ever gets "_source_id" attached
+    # (see pipeline.py Step 7) and the designation lookup has nothing to key on.
     finder_chart_mock.update_charts_for_sources.assert_called_once_with(
-        {"src-1": "UNKNOWN"}
+        {"src-1": "UNKNOWN"}, {}
     )
     assert archive_existed_at_chart_time.get("exists") is True, (
         "finder_chart.update_charts_for_sources() ran before the archive move — "
@@ -342,6 +345,100 @@ async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
     )
     # And the archive move must still have actually happened.
     assert os.path.exists(expected_archive_path)
+
+
+@pytest.mark.asyncio
+async def test_finder_chart_receives_catalog_designation(mock_modules, monkeypatch):
+    """
+    A catalog-matched source's designation (catalog_id) must reach
+    finder_chart.update_charts_for_sources() as designation_by_source_id, so
+    the rendered chart's title can show it next to anomaly_type (e.g.
+    "ASTEROID (4 Vesta)") — see modules/finder_chart.py. An uncatalogued
+    source's source_id must be absent from that dict, not present with a
+    None/empty value.
+    """
+    fits_path = str(mock_modules)
+
+    async def mock_match(sources, frame_meta):
+        sources[0]["catalog_name"] = "MPC"
+        sources[0]["catalog_id"] = "4 Vesta"
+        sources[1]["catalog_name"] = None
+        sources[1]["catalog_id"] = None
+        return sources
+    pipeline.catalog_matcher.match = AsyncMock(side_effect=mock_match)
+
+    pipeline.api_client.post_sources.return_value = ["src-vesta", "src-uncat"]
+    pipeline.anomaly_detector.detect = AsyncMock(return_value=[
+        {"anomaly_type": "ASTEROID", "source_id": "src-vesta"},
+        {"anomaly_type": "UNKNOWN", "source_id": "src-uncat"},
+    ])
+
+    captured = {}
+
+    async def fake_update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None):
+        captured["anomaly_type_by_source_id"] = anomaly_type_by_source_id
+        captured["designation_by_source_id"] = designation_by_source_id
+        return {sid: True for sid in anomaly_type_by_source_id}
+
+    finder_chart_mock = MagicMock()
+    finder_chart_mock.update_charts_for_sources = AsyncMock(side_effect=fake_update_charts_for_sources)
+    monkeypatch.setattr("pipeline.finder_chart", finder_chart_mock)
+    monkeypatch.setattr(config, "CHART_ENABLED", True)
+
+    await pipeline.run(fits_path)
+
+    assert captured["anomaly_type_by_source_id"] == {"src-vesta": "ASTEROID", "src-uncat": "UNKNOWN"}
+    assert captured["designation_by_source_id"] == {"src-vesta": "4 Vesta"}
+    assert "src-uncat" not in captured["designation_by_source_id"]
+
+
+@pytest.mark.asyncio
+async def test_finder_chart_designation_prefers_mpc_designation_over_stale_source_catalog_id(
+    mock_modules, monkeypatch,
+):
+    """
+    Regression test, real incident 2026-08-06 (Vesta_A807_FA test data):
+    the API can resolve "_source_id" positionally, so a moving object that
+    passes near an already-catalogued star's position can get folded into
+    that SAME `sources` row — whose catalog_name/catalog_id then reflects
+    the star, not the asteroid this specific anomaly is actually about. The
+    anomaly's own "mpc_designation" (set by anomaly_detector.py from the
+    exact source that triggered THIS classification) must win over that
+    stale/misleading `sources`.catalog_id every time.
+    """
+    fits_path = str(mock_modules)
+
+    # sources[0] carries a Gaia DR3 identity totally unrelated to the
+    # asteroid — modelling the real `sources` row having been last updated
+    # by a different (star) detection sharing the same source_id.
+    async def mock_match(sources, frame_meta):
+        sources[0]["catalog_name"] = "Gaia DR3"
+        sources[0]["catalog_id"] = "3971465931154563840"
+        sources[1]["catalog_name"] = None
+        sources[1]["catalog_id"] = None
+        return sources
+    pipeline.catalog_matcher.match = AsyncMock(side_effect=mock_match)
+
+    pipeline.api_client.post_sources.return_value = ["src-shared", "src-uncat"]
+    pipeline.anomaly_detector.detect = AsyncMock(return_value=[
+        {"anomaly_type": "ASTEROID", "source_id": "src-shared", "mpc_designation": "2014 RY1"},
+        {"anomaly_type": "UNKNOWN", "source_id": "src-uncat"},
+    ])
+
+    captured = {}
+
+    async def fake_update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None):
+        captured["designation_by_source_id"] = designation_by_source_id
+        return {sid: True for sid in anomaly_type_by_source_id}
+
+    finder_chart_mock = MagicMock()
+    finder_chart_mock.update_charts_for_sources = AsyncMock(side_effect=fake_update_charts_for_sources)
+    monkeypatch.setattr("pipeline.finder_chart", finder_chart_mock)
+    monkeypatch.setattr(config, "CHART_ENABLED", True)
+
+    await pipeline.run(fits_path)
+
+    assert captured["designation_by_source_id"] == {"src-shared": "2014 RY1"}
 
 
 @pytest.mark.asyncio

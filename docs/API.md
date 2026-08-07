@@ -139,6 +139,12 @@ stops the retry loop first. HTTP 4xx errors are logged immediately and never ret
 
 ---
 
+### 13. Get the Nearest Earlier Frame of an Object
+
+**[GET /frames/nearest-before](#13-get-the-nearest-earlier-frame-of-an-object)**
+
+---
+
 ---
 
 ## 1. Register a Frame
@@ -1213,5 +1219,73 @@ one entry — every other entry in the same batch is still processed and stored.
 | Status | When |
 |--------|------|
 | `400` | Missing or non-array `charts` (the whole request body is malformed — distinct from a per-entry `status: "error"` above) |
+| `401` | Invalid or missing `X-API-Key` |
+
+---
+
+## 13. Get the Nearest Earlier Frame of an Object
+
+The single most recent frame of a given object strictly before a given time. Used by
+`modules/finder_chart.py`'s `"before_after"` chart style: for a source detected on only one frame
+so far, a crop of an earlier frame of the same object at that exact sky position (nothing expected
+there yet) next to a crop of the frame the source was actually detected on. Distinct from
+`GET /frames/covering` (section 5) — that one answers "was this sky position ever imaged", a
+spatial query; this one answers "what's the most recent frame of this object", a purely temporal
+one, and doesn't need `ra`/`dec` at all.
+
+### Request
+
+```
+GET /frames/nearest-before?object={object}&before_time={iso8601}
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Accept: application/json
+```
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `object` | string | yes | Normalized object/archive-directory name, exactly as stored on `frames.object` |
+| `before_time` | string (ISO 8601) | yes | Only consider frames observed strictly before this timestamp |
+
+**Example:**
+
+```
+GET /frames/nearest-before?object=Vesta_A807_FA&before_time=2021-03-14T18%3A05%3A44Z
+```
+
+### Response
+
+**Status: `200 OK`**
+
+```json
+{
+  "frame": {
+    "id": "6a7514232443c0.32759270",
+    "filename": "Vesta_A807_FA_Light_L_60_2021-03-14T17-05-27.fits",
+    "object": "Vesta_A807_FA",
+    "obs_time": "2021-03-14T17:05:27Z"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|--------------|
+| `frame` | object or null | `null` if no earlier frame of this object exists (e.g. this is the object's first-ever frame) |
+| `frame.id` | string | Frame ID |
+| `frame.filename` | string | Frame's stored filename — combine with `frame.object` to locate the FITS file in the local archive (`FITS_ARCHIVE/{object}/{filename}`), same convention as section 8's track epochs |
+| `frame.object` | string | Echoes the query's `object` parameter |
+| `frame.obs_time` | string (ISO 8601) | Observation timestamp |
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `400` | Missing `object` or `before_time`, or `before_time` isn't a valid ISO 8601 datetime |
 | `401` | Invalid or missing `X-API-Key` |
 

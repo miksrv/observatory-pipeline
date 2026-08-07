@@ -7,6 +7,7 @@ Public functions:
   post_anomalies(frame_id, filename, anomalies)             → None
   get_sources_near(ra, dec, radius_arcsec, before_time)     → list
   get_frames_covering(ra, dec, before_time)                 → list
+  get_nearest_frame_before(object_name, before_time)        → dict | None
   get_sources_near_batch(positions, radius_arcsec, before_time)  → dict
   get_frames_covering_batch(positions, before_time)         → dict
   get_source_track(source_id)                               → list
@@ -465,6 +466,72 @@ async def get_frames_covering(
             extra={"frame_id": None, "log_filename": None},
         )
         return []
+
+
+# ---------------------------------------------------------------------------
+# get_nearest_frame_before — the single most recent frame of an object
+# strictly before a given time. Used by modules/finder_chart.py's
+# "before_after" chart style (see docs/API.md section 13) — distinct from
+# get_frames_covering above, which is a spatial "was this position ever
+# imaged" query, not a temporal "what's this object's previous frame" one.
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _get_nearest_frame_before_with_retry(object_name: str, before_time: str) -> dict | None:
+    """Inner retryable core for get_nearest_frame_before."""
+    params = {
+        "object": object_name,
+        "before_time": before_time,
+    }
+
+    async with _make_client() as client:
+        response = await client.get("/frames/nearest-before", params=params)
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    return resp_json.get("frame") if isinstance(resp_json, dict) else None
+
+
+async def get_nearest_frame_before(object_name: str, before_time: str) -> dict | None:
+    """
+    Retrieve the most recent frame of `object_name` strictly before `before_time`.
+
+    Parameters
+    ----------
+    object_name:
+        Normalized object/archive-directory name, exactly as stored on
+        `frames.object`.
+    before_time:
+        ISO 8601 timestamp — only consider frames observed before this time.
+
+    Returns
+    -------
+    dict | None
+        `{"id", "filename", "object", "obs_time"}`, or `None` if no earlier
+        frame exists, or on any failure (network error, retries exhausted,
+        malformed response) — a caller can't tell those two cases apart from
+        the return value alone, same as get_source_tracks_batch's per-source
+        absence; modules/finder_chart.py treats both as "no before panel".
+    """
+    logger.debug(
+        "GET /frames/nearest-before object=%s before_time=%s",
+        object_name,
+        before_time,
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _get_nearest_frame_before_with_retry(object_name, before_time)
+    except Exception as exc:
+        logger.error(
+            "Error querying /frames/nearest-before object=%s: %s",
+            object_name,
+            exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
