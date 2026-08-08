@@ -545,6 +545,49 @@ class TestZeroPoint:
 
 
 # ---------------------------------------------------------------------------
+# Test 6.4 — skip_calibration (narrowband filters)
+# ---------------------------------------------------------------------------
+
+class TestSkipCalibration:
+    async def test_skip_calibration_true_uncalibrated_even_with_enough_gaia_stars(self):
+        """
+        skip_calibration=True must leave every source uncalibrated even when
+        there would otherwise be >= 3 valid Gaia DR3 references — a
+        narrowband bandpass makes the zero-point itself untrustworthy
+        regardless of how many Gaia stars happen to match (see measure()'s
+        docstring / CLAUDE.md's "Filters — real astronomy context").
+        """
+        srcs = _make_gaia_sources(n=5, catalog_mag=14.0)
+        with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
+            result = await photometry.measure(_FITS_PATH, srcs, skip_calibration=True)
+
+        assert all(src["calibrated"] is False for src in result)
+        assert all(src["mag_calibrated"] is None for src in result)
+        assert all(src["zero_point"] is None for src in result)
+        assert all(src["zero_point_err"] is None for src in result)
+
+    async def test_skip_calibration_still_measures_instrumental_flux(self):
+        """
+        skip_calibration only skips the Gaia zero-point step — aperture
+        photometry (flux_aperture, mag_instrumental) must still run normally.
+        """
+        srcs = _make_gaia_sources(n=5, catalog_mag=14.0)
+        with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
+            result = await photometry.measure(_FITS_PATH, srcs, skip_calibration=True)
+
+        assert all(src["flux_aperture"] is not None for src in result)
+        assert all(src["mag_instrumental"] is not None for src in result)
+
+    async def test_skip_calibration_false_is_default_and_unaffected(self):
+        """The default (skip_calibration omitted) must behave exactly as before."""
+        srcs = _make_gaia_sources(n=5, catalog_mag=14.0)
+        with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert all(src["calibrated"] is True for src in result)
+
+
+# ---------------------------------------------------------------------------
 # Test 6.5 — Saturated sources (docs/ISSUES.md #2)
 # ---------------------------------------------------------------------------
 

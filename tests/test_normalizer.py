@@ -117,6 +117,31 @@ class TestNormalizeFilterName:
         assert normalizer.normalize_filter_name("Blue filter")[0] == "B"
         assert normalizer.normalize_filter_name("Luminance Filter")[0] == "L"
 
+    def test_is_narrowband_true_for_emission_line_filters(self):
+        """Ha/OIII/SII/NII (and raw header spellings thereof) are narrowband."""
+        assert normalizer.is_narrowband("Ha") is True
+        assert normalizer.is_narrowband("H-Alpha") is True
+        assert normalizer.is_narrowband("OIII") is True
+        assert normalizer.is_narrowband("[OIII]") is True
+        assert normalizer.is_narrowband("SII") is True
+        assert normalizer.is_narrowband("NII") is True
+        assert normalizer.is_narrowband("[NII]") is True
+
+    def test_is_narrowband_false_for_broadband_filters(self):
+        """L/R/G/B/Johnson-Cousins/SDSS filters are not narrowband."""
+        assert normalizer.is_narrowband("L") is False
+        assert normalizer.is_narrowband("Luminance") is False
+        assert normalizer.is_narrowband("R") is False
+        assert normalizer.is_narrowband("G") is False
+        assert normalizer.is_narrowband("B") is False
+        assert normalizer.is_narrowband("V") is False
+        assert normalizer.is_narrowband("r'") is False
+
+    def test_is_narrowband_false_for_none_and_unknown(self):
+        """Missing or unrecognized filter values must not be treated as narrowband."""
+        assert normalizer.is_narrowband(None) is False
+        assert normalizer.is_narrowband("SomeWeirdFilterName") is False
+
     def test_none_and_empty(self):
         """Test None and empty string handling."""
         assert normalizer.normalize_filter_name(None)[0] is None

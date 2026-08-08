@@ -139,7 +139,7 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
 
     # photometry — returns sources with photometry fields added
     phot_mock = MagicMock()
-    async def mock_measure(fits_path, sources):
+    async def mock_measure(fits_path, sources, skip_calibration=False):
         for s in sources:
             s.setdefault("flux_aperture", 1000.0)
             s.setdefault("mag_instrumental", -7.5)
@@ -161,6 +161,12 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
     norm_mock = MagicMock()
     norm_mock.normalize_headers = lambda h: h  # Pass through
     norm_mock.generate_normalized_filename = lambda **kwargs: "M51_L_V_120_2024-03-15T22-01-34.fits"
+    # is_narrowband — mirrors the real modules.normalizer.is_narrowband()
+    # closely enough for these fixtures: every test header filter used here
+    # ("V" by default) is already a canonical short code, so a plain
+    # membership check against config.NARROWBAND_FILTERS gives the same
+    # answer the real function would.
+    norm_mock.is_narrowband = lambda f: f in config.NARROWBAND_FILTERS
     monkeypatch.setattr("pipeline.normalizer", norm_mock)
 
     return fits_file
@@ -194,6 +200,121 @@ async def test_qc_ok_all_steps_called(mock_modules, tmp_path):
         config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME
     )
     assert os.path.exists(archive_path), f"Expected archived file at {archive_path}"
+
+
+# ---------------------------------------------------------------------------
+# Narrowband filter wiring: skip_calibration + per-source "_filter" tagging
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_broadband_filter_does_not_skip_calibration(mock_modules):
+    """_GOOD_HEADER's filter is 'V' (broadband) — skip_calibration must be False."""
+    await pipeline.run(str(mock_modules))
+
+    _, kwargs = pipeline.photometry.measure.call_args
+    assert kwargs.get("skip_calibration") is False
+
+
+@pytest.mark.asyncio
+async def test_narrowband_filter_skips_calibration(monkeypatch, mock_modules):
+    """A narrowband (Hα) frame must call photometry.measure(skip_calibration=True)."""
+    narrowband_header = copy.deepcopy(_GOOD_HEADER)
+    narrowband_header["observation"]["filter"] = "Ha"
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: narrowband_header)
+
+    await pipeline.run(str(mock_modules))
+
+    _, kwargs = pipeline.photometry.measure.call_args
+    assert kwargs.get("skip_calibration") is True
+
+
+@pytest.mark.asyncio
+async def test_sources_are_tagged_with_frame_filter(mock_modules):
+    """
+    Every source reaching anomaly_detector.detect() must carry "_filter" —
+    needed to restrict its historical Δmag comparison to same-filter epochs
+    (see modules/anomaly_detector.py's _same_filter_history()).
+    """
+    await pipeline.run(str(mock_modules))
+
+    detect_call_sources = pipeline.anomaly_detector.detect.call_args.args[1]
+    assert detect_call_sources, "expected at least one source"
+    assert all(s.get("_filter") == "V" for s in detect_call_sources)
+
+
+# ---------------------------------------------------------------------------
+# _from_wire_source() / detect_anomalies_for_frame_id(): standalone-task
+# filter propagation
+# ---------------------------------------------------------------------------
+
+
+def test_from_wire_source_attaches_frame_filter():
+    """
+    _from_wire_source() has no per-source filter field on the wire
+    (source_observations has none) — the caller must pass the parent
+    frame's own filter through explicitly.
+    """
+    api_source = {"ra": 202.47, "dec": 47.20, "mag": 14.5, "source_id": "src-1"}
+    result = pipeline._from_wire_source(api_source, frame_filter="Ha")
+    assert result["_filter"] == "Ha"
+
+
+def test_from_wire_source_defaults_filter_to_none():
+    """Omitting frame_filter must not crash and must leave "_filter" as None."""
+    api_source = {"ra": 202.47, "dec": 47.20, "mag": 14.5}
+    result = pipeline._from_wire_source(api_source)
+    assert result["_filter"] is None
+
+
+def test_from_wire_source_reconstructs_near_edge():
+    """
+    Regression for the 2026-08-07 T_CrB coma fix: "near_edge" must round-trip
+    through the wire and back, same as "saturated" — a standalone
+    DETECT_ANOMALIES re-run has no in-memory pixel position to recompute it
+    from, so anomaly_detector.py's edge-aware SPACE_DEBRIS threshold would
+    silently never fire on that path if this were lost.
+    """
+    api_source = {"ra": 202.47, "dec": 47.20, "mag": 14.5, "near_edge": True}
+    result = pipeline._from_wire_source(api_source)
+    assert result["near_edge"] is True
+
+
+def test_from_wire_source_defaults_near_edge_to_false():
+    """An API response predating this field (or a central source) must not crash."""
+    api_source = {"ra": 202.47, "dec": 47.20, "mag": 14.5}
+    result = pipeline._from_wire_source(api_source)
+    assert result["near_edge"] is False
+
+
+@pytest.mark.asyncio
+async def test_detect_anomalies_for_frame_id_propagates_frame_filter(monkeypatch):
+    """
+    detect_anomalies_for_frame_id() reconstructs sources purely from the API
+    — every reconstructed source must carry the PARENT FRAME's own filter
+    (GET /frames/{id}'s flattened "filter" field), since source_observations
+    itself has no per-source filter column.
+    """
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(return_value={
+        "filename": "M51_L_Ha_300_2024-03-15T22-01-34.fits",
+        "obs_time": "2024-03-15T22:01:34",
+        "filter": "Ha",
+    })
+    api_mock.get_frame_sources = AsyncMock(return_value=[
+        {"ra": 202.47, "dec": 47.20, "mag": 14.5, "source_id": "src-1"},
+    ])
+    api_mock.post_anomalies = AsyncMock(return_value=None)
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+
+    anom_mock = MagicMock()
+    anom_mock.detect = AsyncMock(return_value=[])
+    monkeypatch.setattr("pipeline.anomaly_detector", anom_mock)
+
+    await pipeline.detect_anomalies_for_frame_id("frame-123")
+
+    detect_call_sources = pipeline.anomaly_detector.detect.call_args.args[1]
+    assert detect_call_sources[0]["_filter"] == "Ha"
 
 
 @pytest.mark.asyncio
@@ -724,7 +845,7 @@ async def test_mag_field_is_none_when_uncalibrated(mock_modules):
     values for entire uncalibrated frames in production.
     """
 
-    async def mock_measure_uncalibrated(fits_path, sources):
+    async def mock_measure_uncalibrated(fits_path, sources, skip_calibration=False):
         for s in sources:
             s["flux_aperture"] = 100.0
             s["mag_instrumental"] = -5.0
@@ -745,7 +866,7 @@ async def test_mag_field_is_none_when_uncalibrated(mock_modules):
 async def test_mag_field_uses_calibrated_value_when_available(mock_modules):
     """When photometry did calibrate a source, "mag" must be mag_calibrated."""
 
-    async def mock_measure_calibrated(fits_path, sources):
+    async def mock_measure_calibrated(fits_path, sources, skip_calibration=False):
         for s in sources:
             s["flux_aperture"]   = 100.0
             s["mag_instrumental"] = -5.0
@@ -915,7 +1036,36 @@ async def test_pipeline_dedupes_duplicate_catalog_matches_before_posting(mock_mo
 
 # ---------------------------------------------------------------------------
 # Watcher tests
+#
+# watcher.py no longer dispatches to pipeline.run() directly — it buffers
+# arriving paths and submits them as batched ANALYZE tasks via
+# api_client.create_task() (see that module's docstring). These tests mock
+# `watcher.enqueue_path` / `watcher.api_client` / `watcher.threading.Timer`
+# rather than `pipeline.run`/`asyncio.run` the old suite mocked.
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_watcher_state():
+    """
+    watcher.py's pending-batch state (`_pending_paths`, `_pending_realpaths`,
+    `_flush_timer`) is module-level mutable state shared across tests —
+    without resetting it, a timer or buffered path left over from one test
+    could leak into the next. Runs for every test in this file (cheap and
+    harmless for non-watcher tests), not just the watcher ones below.
+    """
+    import watcher
+
+    def _clear():
+        watcher._pending_paths.clear()
+        watcher._pending_realpaths.clear()
+        if watcher._flush_timer is not None:
+            watcher._flush_timer.cancel()
+            watcher._flush_timer = None
+
+    _clear()
+    yield
+    _clear()
 
 
 def _make_event(src_path: str, is_directory: bool = False) -> MagicMock:
@@ -926,142 +1076,351 @@ def _make_event(src_path: str, is_directory: bool = False) -> MagicMock:
     return event
 
 
-def test_watcher_ignores_non_fits():
-    """on_created with a .jpg file must not dispatch to the pipeline."""
-    from watcher import FitsEventHandler
+class TestFitsEventHandler:
+    def test_ignores_non_fits(self, monkeypatch):
+        """on_created with a .jpg file must not enqueue anything."""
+        import watcher
 
-    handler = FitsEventHandler()
-    event = _make_event("/fits/incoming/photo.jpg")
+        enqueue_mock = MagicMock()
+        monkeypatch.setattr(watcher, "enqueue_path", enqueue_mock)
+        handler = watcher.FitsEventHandler()
 
-    with patch("watcher.asyncio.run") as mock_run:
-        handler.on_created(event)
-        mock_run.assert_not_called()
+        handler.on_created(_make_event("/fits/incoming/photo.jpg"))
 
+        enqueue_mock.assert_not_called()
 
-def test_watcher_dispatches_fits():
-    """on_created with a .fits file must call asyncio.run(pipeline.run(...))."""
-    from watcher import FitsEventHandler
+    def test_enqueues_fits_file(self, monkeypatch):
+        """on_created with a .fits file must enqueue its path."""
+        import watcher
 
-    handler = FitsEventHandler()
-    event = _make_event("/fits/incoming/frame.fits")
+        enqueue_mock = MagicMock()
+        monkeypatch.setattr(watcher, "enqueue_path", enqueue_mock)
+        monkeypatch.setattr(watcher.time, "sleep", MagicMock())
+        handler = watcher.FitsEventHandler()
 
-    # process_fits_file() now requires the path to exist (duplicate-event
-    # guard) — the test path is fake, so stub existence for this call.
-    with (
-        patch("watcher.time.sleep"),
-        patch("watcher.os.path.exists", return_value=True),
-        patch("watcher.asyncio.run") as mock_run,
-    ):
-        handler.on_created(event)
-        mock_run.assert_called_once()
-        # The coroutine passed to asyncio.run is pipeline.run(path)
-        called_coro = mock_run.call_args.args[0]
-        # Coroutine name should be 'run' (from pipeline.run)
-        assert called_coro.__name__ == "run"
-        # Clean up the coroutine to avoid ResourceWarning
-        called_coro.close()
+        handler.on_created(_make_event("/fits/incoming/frame.fits"))
 
+        enqueue_mock.assert_called_once_with("/fits/incoming/frame.fits")
 
-def test_watcher_dispatches_fit_uppercase():
-    """on_created with a .FIT extension (uppercase) must also be dispatched."""
-    from watcher import FitsEventHandler
+    def test_enqueues_fit_uppercase(self, monkeypatch):
+        """on_created with a .FIT extension (uppercase) must also be enqueued."""
+        import watcher
 
-    handler = FitsEventHandler()
-    event = _make_event("/fits/incoming/FRAME.FIT")
+        enqueue_mock = MagicMock()
+        monkeypatch.setattr(watcher, "enqueue_path", enqueue_mock)
+        monkeypatch.setattr(watcher.time, "sleep", MagicMock())
+        handler = watcher.FitsEventHandler()
 
-    with (
-        patch("watcher.time.sleep"),
-        patch("watcher.os.path.exists", return_value=True),
-        patch("watcher.asyncio.run") as mock_run,
-    ):
-        handler.on_created(event)
-        mock_run.assert_called_once()
-        called_coro = mock_run.call_args.args[0]
-        assert called_coro.__name__ == "run"
-        called_coro.close()
+        handler.on_created(_make_event("/fits/incoming/FRAME.FIT"))
 
+        enqueue_mock.assert_called_once_with("/fits/incoming/FRAME.FIT")
 
-def test_watcher_ignores_directory_event():
-    """Directory creation events must be silently ignored."""
-    from watcher import FitsEventHandler
+    def test_ignores_directory_event(self, monkeypatch):
+        """Directory creation events must be silently ignored."""
+        import watcher
 
-    handler = FitsEventHandler()
-    event = _make_event("/fits/incoming/subdir/", is_directory=True)
+        enqueue_mock = MagicMock()
+        monkeypatch.setattr(watcher, "enqueue_path", enqueue_mock)
+        handler = watcher.FitsEventHandler()
 
-    with patch("watcher.asyncio.run") as mock_run:
-        handler.on_created(event)
-        mock_run.assert_not_called()
+        handler.on_created(_make_event("/fits/incoming/subdir/", is_directory=True))
+
+        enqueue_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Watcher — duplicate-dispatch guard (regression: the same file was
-# registered as two separate frames a few seconds apart — see the
-# `_paths_in_flight` module comment in watcher.py).
+# enqueue_path — buffering, debounce (re)arming, duplicate-event guard
 # ---------------------------------------------------------------------------
 
 
-def test_process_fits_file_skips_nonexistent_path():
-    """A path that doesn't exist (already processed and moved away by an
-    earlier duplicate event) must not be dispatched."""
-    import watcher
+class TestEnqueuePath:
+    def test_skips_nonexistent_path(self, monkeypatch):
+        """A path that doesn't exist (e.g. a duplicate event for an already
+        flushed-and-processed file) must not be buffered or arm a timer."""
+        import watcher
 
-    with patch("watcher.asyncio.run") as mock_run:
-        watcher.process_fits_file("/fits/incoming/does-not-exist.fits")
-        mock_run.assert_not_called()
+        timer_mock = MagicMock()
+        monkeypatch.setattr(watcher.threading, "Timer", timer_mock)
+
+        watcher.enqueue_path("/fits/incoming/does-not-exist.fits")
+
+        assert watcher._pending_paths == []
+        timer_mock.assert_not_called()
+
+    def test_adds_to_buffer_and_arms_debounce_timer(self, monkeypatch, tmp_path):
+        import watcher
+
+        monkeypatch.setattr(config, "WATCHER_DEBOUNCE_SEC", 5.0)
+        monkeypatch.setattr(config, "WATCHER_MAX_BATCH_SIZE", 200)
+        timer_instance = MagicMock()
+        timer_mock = MagicMock(return_value=timer_instance)
+        monkeypatch.setattr(watcher.threading, "Timer", timer_mock)
+
+        fits_path = str(tmp_path / "frame.fits")
+        (tmp_path / "frame.fits").write_bytes(b"SIMPLE  =                    T")
+
+        watcher.enqueue_path(fits_path)
+
+        assert watcher._pending_paths == [fits_path]
+        timer_mock.assert_called_once_with(5.0, watcher.flush_pending_batch)
+        timer_instance.start.assert_called_once()
+
+    def test_second_arrival_cancels_first_timer_and_rearms(self, monkeypatch, tmp_path):
+        """Debounce: a new arrival must cancel the previous timer and start
+        a fresh one, rather than letting both run."""
+        import watcher
+
+        monkeypatch.setattr(config, "WATCHER_DEBOUNCE_SEC", 5.0)
+        monkeypatch.setattr(config, "WATCHER_MAX_BATCH_SIZE", 200)
+        first_timer, second_timer = MagicMock(), MagicMock()
+        timer_mock = MagicMock(side_effect=[first_timer, second_timer])
+        monkeypatch.setattr(watcher.threading, "Timer", timer_mock)
+
+        path_a = str(tmp_path / "a.fits")
+        path_b = str(tmp_path / "b.fits")
+        (tmp_path / "a.fits").write_bytes(b"x")
+        (tmp_path / "b.fits").write_bytes(b"x")
+
+        watcher.enqueue_path(path_a)
+        watcher.enqueue_path(path_b)
+
+        first_timer.cancel.assert_called_once()
+        second_timer.start.assert_called_once()
+        assert watcher._pending_paths == [path_a, path_b]
+
+    def test_skips_duplicate_already_in_pending_batch(self, monkeypatch, tmp_path):
+        """A duplicate on_created event for a path already buffered (not
+        yet flushed) must not be added twice — see watcher.py's real
+        incident this guards against (the same file registered as two
+        separate frames a few seconds apart)."""
+        import watcher
+
+        monkeypatch.setattr(watcher.threading, "Timer", MagicMock())
+
+        fits_path = str(tmp_path / "frame.fits")
+        (tmp_path / "frame.fits").write_bytes(b"x")
+
+        watcher.enqueue_path(fits_path)
+        watcher.enqueue_path(fits_path)
+
+        assert watcher._pending_paths == [fits_path]
+
+    def test_flushes_immediately_at_max_batch_size(self, monkeypatch, tmp_path):
+        """Reaching WATCHER_MAX_BATCH_SIZE must flush right away (a
+        zero-delay timer) instead of waiting out the full debounce window."""
+        import watcher
+
+        monkeypatch.setattr(config, "WATCHER_DEBOUNCE_SEC", 5.0)
+        monkeypatch.setattr(config, "WATCHER_MAX_BATCH_SIZE", 1)
+        timer_instance = MagicMock()
+        timer_mock = MagicMock(return_value=timer_instance)
+        monkeypatch.setattr(watcher.threading, "Timer", timer_mock)
+
+        fits_path = str(tmp_path / "frame.fits")
+        (tmp_path / "frame.fits").write_bytes(b"x")
+
+        watcher.enqueue_path(fits_path)
+
+        timer_mock.assert_called_once_with(0.0, watcher.flush_pending_batch)
+        timer_instance.start.assert_called_once()
 
 
-def test_process_fits_file_skips_path_already_in_flight(tmp_path):
-    """A path already marked in-flight (a duplicate on_created event firing
-    while the first dispatch is still running) must be skipped, not
-    processed a second time."""
-    import watcher
-
-    fits_path = str(tmp_path / "frame.fits")
-    (tmp_path / "frame.fits").write_bytes(b"SIMPLE  =                    T")
-    real_path = os.path.realpath(fits_path)
-
-    watcher._paths_in_flight.add(real_path)
-    try:
-        with patch("watcher.asyncio.run") as mock_run:
-            watcher.process_fits_file(fits_path)
-            mock_run.assert_not_called()
-    finally:
-        watcher._paths_in_flight.discard(real_path)
+# ---------------------------------------------------------------------------
+# flush_pending_batch — batched ANALYZE task submission
+# ---------------------------------------------------------------------------
 
 
-def test_process_fits_file_clears_in_flight_marker_after_success(tmp_path):
-    """The in-flight marker must be released once processing finishes, so a
-    later, legitimate re-processing of a different file at the same path
-    isn't permanently blocked."""
-    import watcher
+class TestFlushPendingBatch:
+    def test_empty_buffer_is_a_noop(self, monkeypatch):
+        import watcher
 
-    fits_path = str(tmp_path / "frame.fits")
-    (tmp_path / "frame.fits").write_bytes(b"SIMPLE  =                    T")
-    real_path = os.path.realpath(fits_path)
+        create_task_mock = AsyncMock()
+        monkeypatch.setattr(watcher.api_client, "create_task", create_task_mock)
 
-    with patch("watcher.asyncio.run") as mock_run:
-        watcher.process_fits_file(fits_path)
-        mock_run.assert_called_once()
+        watcher.flush_pending_batch()
 
-    assert real_path not in watcher._paths_in_flight
+        create_task_mock.assert_not_called()
+
+    def test_submits_one_task_with_every_buffered_path(self, monkeypatch):
+        import watcher
+
+        watcher._pending_paths.extend(["/fits/incoming/a.fits", "/fits/incoming/b.fits"])
+        watcher._pending_realpaths.update({"/fits/incoming/a.fits", "/fits/incoming/b.fits"})
+
+        create_task_mock = AsyncMock(return_value={"id": "task-1"})
+        monkeypatch.setattr(watcher.api_client, "create_task", create_task_mock)
+
+        watcher.flush_pending_batch()
+
+        create_task_mock.assert_called_once_with(
+            "ANALYZE",
+            [{"filename": "/fits/incoming/a.fits"}, {"filename": "/fits/incoming/b.fits"}],
+        )
+        # Buffer must be cleared so the next arrival starts a fresh batch.
+        assert watcher._pending_paths == []
+        assert watcher._pending_realpaths == set()
+
+    def test_create_task_returning_none_is_logged_not_raised(self, monkeypatch):
+        import watcher
+
+        watcher._pending_paths.append("/fits/incoming/a.fits")
+        watcher._pending_realpaths.add("/fits/incoming/a.fits")
+        monkeypatch.setattr(watcher.api_client, "create_task", AsyncMock(return_value=None))
+
+        watcher.flush_pending_batch()  # must not raise
+
+        assert watcher._pending_paths == []
+
+    def test_create_task_exception_is_caught(self, monkeypatch):
+        import watcher
+
+        watcher._pending_paths.append("/fits/incoming/a.fits")
+        watcher._pending_realpaths.add("/fits/incoming/a.fits")
+        monkeypatch.setattr(
+            watcher.api_client, "create_task",
+            AsyncMock(side_effect=RuntimeError("API unreachable")),
+        )
+
+        watcher.flush_pending_batch()  # must not raise
+
+        # The buffer was already captured-and-cleared before the failing
+        # call, so the (now-lost) files simply aren't resubmitted — they're
+        # still on disk, unlike the old per-file dispatch which would have
+        # already moved a successfully-processed file away.
+        assert watcher._pending_paths == []
 
 
-def test_process_fits_file_clears_in_flight_marker_even_on_failure(tmp_path):
-    """A crash inside asyncio.run() must not leave the path permanently
-    stuck in `_paths_in_flight` (which would silently black-hole every
-    future file at that same path)."""
-    import watcher
+# ---------------------------------------------------------------------------
+# process_existing_files — startup scan
+# ---------------------------------------------------------------------------
 
-    fits_path = str(tmp_path / "frame.fits")
-    (tmp_path / "frame.fits").write_bytes(b"SIMPLE  =                    T")
-    real_path = os.path.realpath(fits_path)
 
-    with patch("watcher.asyncio.run", side_effect=RuntimeError("boom")) as mock_run:
-        with pytest.raises(RuntimeError):
-            watcher.process_fits_file(fits_path)
-        # asyncio.run() is mocked out, so the coroutine it was given is
-        # never actually awaited — close it explicitly to avoid an unrelated
-        # ResourceWarning from the garbage collector.
-        mock_run.call_args.args[0].close()
+class TestProcessExistingFiles:
+    def test_enqueues_every_fits_file_found(self, monkeypatch, tmp_path):
+        import watcher
 
-    assert real_path not in watcher._paths_in_flight
+        (tmp_path / "a.fits").write_bytes(b"x")
+        (tmp_path / "b.fit").write_bytes(b"x")
+        (tmp_path / "notes.txt").write_bytes(b"x")
+        (tmp_path / "subdir").mkdir()
+
+        enqueue_mock = MagicMock()
+        monkeypatch.setattr(watcher, "enqueue_path", enqueue_mock)
+
+        count = watcher.process_existing_files(str(tmp_path))
+
+        assert count == 2
+        enqueued = {c.args[0] for c in enqueue_mock.call_args_list}
+        assert enqueued == {str(tmp_path / "a.fits"), str(tmp_path / "b.fit")}
+
+
+# ---------------------------------------------------------------------------
+# preview_catalog_match — Stage 4 (diagnostic tool, uploads the chart itself)
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewCatalogMatch:
+    async def test_renders_then_uploads_chart_and_returns_summary(self, monkeypatch):
+        render_mock = AsyncMock(return_value={
+            "png_bytes": b"\x89PNG\r\n\x1a\nfakepngdata",
+            "matched": 82, "total": 98, "quality_flag": "OK",
+        })
+        monkeypatch.setattr(pipeline.catalog_preview, "render", render_mock)
+        upload_mock = AsyncMock(return_value=True)
+        monkeypatch.setattr(pipeline.api_client, "upload_task_item_chart", upload_mock)
+
+        result = await pipeline.preview_catalog_match("/fits/archive/M51/frame.fits", "task-1", "item-1")
+
+        render_mock.assert_called_once_with("/fits/archive/M51/frame.fits")
+        upload_mock.assert_called_once_with(
+            "task-1", "item-1", b"\x89PNG\r\n\x1a\nfakepngdata",
+            style="catalog_preview", frame_count=1,
+        )
+        assert result == {"matched": 82, "total": 98, "quality_flag": "OK", "chart_uploaded": True}
+
+    async def test_upload_failure_does_not_raise_and_reports_not_uploaded(self, monkeypatch):
+        monkeypatch.setattr(pipeline.catalog_preview, "render", AsyncMock(return_value={
+            "png_bytes": b"\x89PNG\r\n\x1a\n", "matched": 1, "total": 1, "quality_flag": "OK",
+        }))
+        monkeypatch.setattr(pipeline.api_client, "upload_task_item_chart", AsyncMock(return_value=False))
+
+        result = await pipeline.preview_catalog_match("/x.fits", "task-1", "item-1")
+
+        assert result["chart_uploaded"] is False
+
+    async def test_astrometry_failure_propagates(self, monkeypatch):
+        monkeypatch.setattr(
+            pipeline.catalog_preview, "render",
+            AsyncMock(side_effect=RuntimeError("Astrometry failed for frame.fits")),
+        )
+
+        with pytest.raises(RuntimeError, match="Astrometry failed"):
+            await pipeline.preview_catalog_match("/x.fits", "task-1", "item-1")
+
+    async def test_no_api_client_skips_upload_without_crashing(self, monkeypatch):
+        monkeypatch.setattr(pipeline.catalog_preview, "render", AsyncMock(return_value={
+            "png_bytes": b"\x89PNG\r\n\x1a\n", "matched": 1, "total": 1, "quality_flag": "OK",
+        }))
+        monkeypatch.setattr(pipeline, "api_client", None)
+
+        result = await pipeline.preview_catalog_match("/x.fits", "task-1", "item-1")
+
+        assert result["chart_uploaded"] is False
+
+    async def test_bare_filename_is_resolved_against_archive_before_render(self, tmp_path, monkeypatch):
+        """
+        A task_item built from an already-registered frame's `frames.filename` (see
+        observatory-api's Web\\FramesController::createTask()) carries a basename only. This
+        must resolve to the real archived path before catalog_preview.render() is called.
+        """
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path / "archive"))
+        archived = tmp_path / "archive" / "M51" / "frame.fits"
+        archived.parent.mkdir(parents=True)
+        archived.touch()
+
+        render_mock = AsyncMock(return_value={
+            "png_bytes": b"\x89PNG\r\n\x1a\n", "matched": 1, "total": 1, "quality_flag": "OK",
+        })
+        monkeypatch.setattr(pipeline.catalog_preview, "render", render_mock)
+        monkeypatch.setattr(pipeline, "api_client", None)
+
+        await pipeline.preview_catalog_match("frame.fits", "task-1", "item-1")
+
+        render_mock.assert_called_once_with(str(archived))
+
+
+# ---------------------------------------------------------------------------
+# _resolve_bare_filename — fallback for task_items built from frames.filename
+# (a basename only) instead of a full path, e.g. observatory-api's debug UI
+# ---------------------------------------------------------------------------
+
+
+class TestResolveBareFilename:
+    def test_path_with_directory_component_is_returned_unchanged(self):
+        assert pipeline._resolve_bare_filename("/fits/incoming/frame.fits") == "/fits/incoming/frame.fits"
+        assert pipeline._resolve_bare_filename("relative/frame.fits") == "relative/frame.fits"
+
+    def test_bare_filename_resolves_to_its_single_archive_match(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path / "archive"))
+        archived = tmp_path / "archive" / "M51" / "frame.fits"
+        archived.parent.mkdir(parents=True)
+        archived.touch()
+
+        assert pipeline._resolve_bare_filename("frame.fits") == str(archived)
+
+    def test_bare_filename_with_no_archive_match_is_returned_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path / "archive"))
+        (tmp_path / "archive").mkdir()
+
+        assert pipeline._resolve_bare_filename("missing.fits") == "missing.fits"
+
+    def test_bare_filename_with_multiple_archive_matches_uses_first_sorted(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path / "archive"))
+        for obj in ("M51", "NGC1234"):
+            d = tmp_path / "archive" / obj
+            d.mkdir(parents=True)
+            (d / "dup.fits").touch()
+
+        result = pipeline._resolve_bare_filename("dup.fits")
+
+        assert result == str(tmp_path / "archive" / "M51" / "dup.fits")
