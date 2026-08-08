@@ -1,8 +1,34 @@
 """
 watcher.py — Entry point for the observatory-pipeline service.
 
-Monitors the FITS_INCOMING directory using watchdog and dispatches each
-new FITS file to the pipeline for processing.
+Monitors the FITS_INCOMING directory using watchdog and batches newly
+arrived files into ANALYZE tasks submitted to observatory-api's job queue
+(api_client.create_task, docs/API.md section 15) instead of running each
+file through the pipeline directly — worker.py is the process that actually
+consumes these tasks (pipeline.analyze_frame() per item).
+
+Batching, not one task per file, and why:
+  - A bulk import (a whole archive dropped into FITS_INCOMING at once) would
+    otherwise create one task PER FILE — thousands of tiny tasks instead of
+    a handful of reasonably-sized ones, defeating the point of task-level
+    batching entirely.
+  - A live overnight run (one frame every 5-10 minutes) naturally produces
+    small batches of 1 (or a handful, if several frames land close
+    together) — the SAME debounce mechanism below handles both cases
+    without a separate "bulk mode" code path.
+
+Debounce mechanism: every newly arrived path is added to an in-memory
+buffer, and a WATCHER_DEBOUNCE_SEC-second timer is (re)armed. If no new file
+arrives before the timer fires, the buffer is flushed into one ANALYZE task.
+If the buffer reaches WATCHER_MAX_BATCH_SIZE first (a large bulk drop),
+it's flushed immediately instead of waiting out the full debounce window —
+this also means progress becomes visible sooner during a big import instead
+of one giant task sitting at 0% for a long time.
+
+The flush itself (an HTTP call to observatory-api) always runs via
+threading.Timer — even for the immediate/max-size case (a zero-delay timer)
+— never inline inside the watchdog observer's own event-delivery thread, so
+a slow API call never delays detection of the next arriving file.
 """
 
 import asyncio
@@ -15,7 +41,7 @@ from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 from watchdog.observers import Observer
 
 import config
-import pipeline
+from api_client import client as api_client
 
 logger = logging.getLogger(__name__)
 
@@ -23,27 +49,26 @@ logger = logging.getLogger(__name__)
 FITS_EXTENSIONS: frozenset[str] = frozenset({".fits", ".fit"})
 
 # ---------------------------------------------------------------------------
-# Duplicate-dispatch guard.
+# Pending-batch state, guarded by one lock — shared between the watchdog
+# observer thread (on_created, via enqueue_path) and whichever thread a
+# debounce/flush timer fires on (flush_pending_batch).
 #
-# Regression: the same FITS file was seen registered as TWO separate frames
-# a few seconds apart (same filename, same obs_time, same photometry —
-# `Vesta_A807_FA_Light_L_60_2021-03-14T17-05-27.fits` got two distinct
-# frame_ids in the API, inflating object_stats.frame_count and
-# sources.observation_count for every source in it). watchdog is known to
-# occasionally deliver two FileCreatedEvent for one path — e.g. on the
-# polling-based emitter used for Docker Desktop bind mounts on macOS, or
-# when a capture program writes-then-renames the file. `_paths_in_flight`
-# rejects a second dispatch for a path that's still being processed; the
-# `os.path.exists` check in `process_fits_file` catches the remaining case
-# where the duplicate event arrives strictly after the first dispatch
-# already finished and moved the file out of FITS_INCOMING.
+# `_pending_paths` holds the ORIGINAL path strings, in arrival order, that
+# get submitted as the task's items. `_pending_realpaths` mirrors it as a
+# set of resolved paths, used only for the duplicate-event dedup check
+# below — kept as a separate structure (rather than deduping on the
+# original path) because watchdog is known to occasionally deliver two
+# FileCreatedEvents for the same file whose reported path can differ in
+# resolvable ways (e.g. a symlinked bind mount).
 # ---------------------------------------------------------------------------
-_paths_in_flight: set[str] = set()
-_paths_in_flight_lock = threading.Lock()
+_pending_paths: list[str] = []
+_pending_realpaths: set[str] = set()
+_pending_lock = threading.Lock()
+_flush_timer: threading.Timer | None = None
 
 
 class FitsEventHandler(FileSystemEventHandler):
-    """Handle filesystem events, dispatching FITS files to the pipeline."""
+    """Handle filesystem events, buffering FITS files for batched ANALYZE tasks."""
 
     def on_created(self, event: FileCreatedEvent) -> None:
         """Respond to file-creation events in the monitored directory."""
@@ -59,49 +84,127 @@ class FitsEventHandler(FileSystemEventHandler):
         # Wait briefly for the writing process to finish flushing the file.
         time.sleep(2)
 
-        process_fits_file(event.src_path)
+        enqueue_path(event.src_path)
 
 
-def process_fits_file(fits_path: str) -> None:
+def enqueue_path(fits_path: str) -> None:
     """
-    Process a single FITS file through the pipeline.
+    Add one file path to the pending ANALYZE batch and (re)arm the debounce
+    timer — or flush immediately if the batch has now reached
+    WATCHER_MAX_BATCH_SIZE.
 
-    Guards against processing the same file twice from a duplicate
-    filesystem event (see the `_paths_in_flight` module comment above):
-    skips dispatch if this exact path is already being processed, or if it
-    no longer exists (already processed and moved out of FITS_INCOMING by
-    an earlier, still-in-flight or already-finished call).
+    Skips a path that no longer exists (e.g. a duplicate filesystem event
+    delivered after this exact file was already flushed into a task and
+    processed) or one already sitting in the current pending batch
+    (watchdog occasionally delivers two FileCreatedEvents for the same
+    path — e.g. the polling emitter used for Docker Desktop bind mounts on
+    macOS, or a capture program that writes-then-renames the file).
     """
     if not os.path.exists(fits_path):
         logger.warning(
             "Skipping %s — file no longer exists (likely a duplicate "
-            "filesystem event for an already-processed file)",
+            "filesystem event for an already-enqueued file)",
             fits_path,
         )
         return
 
     real_path = os.path.realpath(fits_path)
-    with _paths_in_flight_lock:
-        if real_path in _paths_in_flight:
+
+    with _pending_lock:
+        if real_path in _pending_realpaths:
             logger.warning(
-                "Skipping %s — already being processed by another event "
-                "(duplicate on_created event for the same file)",
+                "Skipping %s — already in the pending batch (duplicate "
+                "on_created event for the same file)",
                 fits_path,
             )
             return
-        _paths_in_flight.add(real_path)
+
+        _pending_paths.append(fits_path)
+        _pending_realpaths.add(real_path)
+        batch_size = len(_pending_paths)
+
+        _cancel_flush_timer_locked()
+
+        if batch_size >= config.WATCHER_MAX_BATCH_SIZE:
+            logger.info(
+                "Pending batch reached WATCHER_MAX_BATCH_SIZE=%d — flushing immediately",
+                config.WATCHER_MAX_BATCH_SIZE,
+            )
+            _arm_flush_timer_locked(delay=0.0)
+        else:
+            _arm_flush_timer_locked(delay=config.WATCHER_DEBOUNCE_SEC)
+
+
+def _cancel_flush_timer_locked() -> None:
+    """Cancel the currently armed flush timer, if any. Caller must hold `_pending_lock`."""
+    global _flush_timer
+    if _flush_timer is not None:
+        _flush_timer.cancel()
+        _flush_timer = None
+
+
+def _arm_flush_timer_locked(delay: float) -> None:
+    """(Re)arm the flush timer for `flush_pending_batch()`. Caller must hold `_pending_lock`."""
+    global _flush_timer
+    _flush_timer = threading.Timer(delay, flush_pending_batch)
+    _flush_timer.daemon = True
+    _flush_timer.start()
+
+
+def flush_pending_batch() -> None:
+    """
+    Submit every currently-buffered path as one ANALYZE task and clear the
+    buffer.
+
+    Runs on the debounce timer's own thread (or, for a shutdown-triggered
+    flush, the main thread) — never inline inside the watchdog observer
+    thread — so a slow API call here never delays detection of the next
+    arriving file. Best-effort: any failure submitting the task is logged;
+    the files involved simply aren't processed until resubmitted (they're
+    still sitting in FITS_INCOMING, unlike the old per-file dispatch, which
+    would have already moved a successfully-processed file out of it).
+    """
+    global _flush_timer
+
+    with _pending_lock:
+        paths = _pending_paths.copy()
+        _pending_paths.clear()
+        _pending_realpaths.clear()
+        _flush_timer = None
+
+    if not paths:
+        return
+
+    items = [{"filename": p} for p in paths]
 
     try:
-        logger.info("Dispatching to pipeline: %s", fits_path)
-        asyncio.run(pipeline.run(fits_path))
-    finally:
-        with _paths_in_flight_lock:
-            _paths_in_flight.discard(real_path)
+        created = asyncio.run(api_client.create_task("ANALYZE", items))
+    except Exception:
+        logger.exception("Failed to submit ANALYZE task for %d file(s)", len(paths))
+        return
+
+    if created is None:
+        logger.warning(
+            "ANALYZE task submission returned no task for %d file(s) — "
+            "these files will not be processed until resubmitted",
+            len(paths),
+        )
+        return
+
+    logger.info(
+        "Submitted ANALYZE task_id=%s for %d file(s)",
+        created.get("id"),
+        len(paths),
+    )
 
 
 def process_existing_files(directory: str) -> int:
     """
-    Scan directory for existing FITS files and process them.
+    Scan directory for existing FITS files and enqueue them into the
+    pending batch — the same path a freshly-arrived file takes. Handles the
+    "pipeline was down, files piled up" startup case as one bulk batch
+    (or a few, if WATCHER_MAX_BATCH_SIZE is exceeded) rather than dispatching
+    each file as its own separate event.
 
     Parameters
     ----------
@@ -111,7 +214,7 @@ def process_existing_files(directory: str) -> int:
     Returns
     -------
     int
-        Number of files processed.
+        Number of files found and enqueued.
     """
     count = 0
     try:
@@ -127,7 +230,7 @@ def process_existing_files(directory: str) -> int:
                 continue
 
             logger.info("Found existing FITS file: %s", filepath)
-            process_fits_file(filepath)
+            enqueue_path(filepath)
             count += 1
     except OSError as exc:
         logger.error("Error scanning directory %s: %s", directory, exc)
@@ -142,12 +245,15 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    logger.info("Starting watcher on %s (log level: %s)", config.FITS_INCOMING, config.LOG_LEVEL)
+    logger.info(
+        "Starting watcher on %s (log level: %s, debounce: %.1fs, max batch: %d)",
+        config.FITS_INCOMING, config.LOG_LEVEL, config.WATCHER_DEBOUNCE_SEC, config.WATCHER_MAX_BATCH_SIZE,
+    )
 
-    # Process any FITS files that already exist in the incoming directory
+    # Enqueue any FITS files that already exist in the incoming directory
     existing_count = process_existing_files(config.FITS_INCOMING)
     if existing_count > 0:
-        logger.info("Processed %d existing file(s)", existing_count)
+        logger.info("Enqueued %d existing file(s)", existing_count)
 
     # Now start watching for new files
     event_handler = FitsEventHandler()
@@ -163,6 +269,14 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutdown requested — stopping")
         observer.stop()
+        # Submit whatever's still buffered right now rather than dropping it
+        # silently — otherwise files that arrived just before the debounce
+        # window would have fired are lost from the task queue's view (they
+        # remain on disk, but nothing would ever pick them up again until
+        # the watcher restarts and rescans FITS_INCOMING).
+        with _pending_lock:
+            _cancel_flush_timer_locked()
+        flush_pending_batch()
 
     observer.join()
     logger.info("Watcher stopped")
