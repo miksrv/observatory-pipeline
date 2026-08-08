@@ -161,6 +161,42 @@ class TestArcsecPerPixel:
 
 
 # ---------------------------------------------------------------------------
+# _format_angular_shift / _angular_separation_arcsec
+# ---------------------------------------------------------------------------
+
+class TestFormatAngularShift:
+
+    def test_sub_arcminute_uses_arcsec(self):
+        assert finder_chart._format_angular_shift(12.345) == "12.35″"
+
+    def test_boundary_below_60_arcsec_stays_arcsec(self):
+        assert finder_chart._format_angular_shift(59.99).endswith("″")
+
+    def test_arcminute_range_uses_arcmin(self):
+        assert finder_chart._format_angular_shift(90.0) == "1.50′"
+
+    def test_boundary_at_3600_arcsec_uses_degrees(self):
+        # Exactly 1° — the arcmin branch is `< 3600.0`, so 3600.0 itself
+        # falls through to degrees.
+        assert finder_chart._format_angular_shift(3600.0) == "1.000°"
+
+    def test_multi_degree_uses_degrees(self):
+        assert finder_chart._format_angular_shift(7200.0) == "2.000°"
+
+
+class TestAngularSeparationArcsec:
+
+    def test_same_point_is_zero(self):
+        sep = finder_chart._angular_separation_arcsec(202.47, 47.20, 202.47, 47.20)
+        assert sep == pytest.approx(0.0, abs=1e-6)
+
+    def test_matches_known_small_offset(self):
+        # 1 arcsec in Dec at Dec=0 is exactly 1 arcsec of great-circle separation.
+        sep = finder_chart._angular_separation_arcsec(10.0, 0.0, 10.0, 1.0 / 3600.0)
+        assert sep == pytest.approx(1.0, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
 # _crop_around
 # ---------------------------------------------------------------------------
 

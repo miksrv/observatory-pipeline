@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 from astropy.wcs import WCS as AstropyWCS
 
+import config
 from modules import astrometry
 
 
@@ -99,6 +100,34 @@ def _make_sources(
     arr = np.zeros(n, dtype=dtype)
     arr["x"]    = np.linspace(100.0, 900.0, n)
     arr["y"]    = np.linspace(100.0, 900.0, n)
+    arr["a"]    = a
+    arr["b"]    = b
+    arr["flux"] = flux
+    arr["peak"] = peak
+    return arr
+
+
+def _make_sources_at(
+    positions: list[tuple[float, float]],
+    a: float = 1.5,
+    b: float = 1.4,
+    flux: float = 5000.0,
+    peak: float = 1000.0,
+) -> np.ndarray:
+    """Like _make_sources(), but with explicit (x, y) pixel positions — used
+    by TestNearEdgeFlag to place sources at known distances from the frame
+    edge."""
+    dtype = np.dtype([
+        ("x",    np.float64),
+        ("y",    np.float64),
+        ("a",    np.float64),
+        ("b",    np.float64),
+        ("flux", np.float64),
+        ("peak", np.float64),
+    ])
+    arr = np.zeros(len(positions), dtype=dtype)
+    arr["x"]    = [p[0] for p in positions]
+    arr["y"]    = [p[1] for p in positions]
     arr["a"]    = a
     arr["b"]    = b
     arr["flux"] = flux
@@ -262,9 +291,38 @@ def _patch_astrometry(
         patch("modules.astrometry.fits.open", return_value=hdul),
         patch("modules.astrometry.WCS", return_value=wcs),
         patch("modules.astrometry.sep.Background", side_effect=_sep_background),
-        patch("modules.astrometry.sep.extract", return_value=sources),
+        patch("modules.astrometry.sep.extract", side_effect=_make_sep_extract_side_effect(sources)),
     ):
         yield
+
+
+# ---------------------------------------------------------------------------
+# sep.extract side_effect helper — solve() now calls sep.extract() TWICE:
+# once for _build_streak_mask()'s coarse, non-deblended, segmentation_map=True
+# pre-pass, and once for the real point-source extraction. A plain
+# return_value= mock (the old approach) would hand the coarse pass the same
+# structured array meant for the real extraction, which solve() then tries to
+# unpack as `objs, seg = sep.extract(...)` — breaking every test. This
+# discriminates on the segmentation_map kwarg so the coarse pass gets an
+# empty "nothing streak-like found" result by default, leaving every
+# pre-existing test's behavior unchanged; TestStreakMasking below overrides
+# it explicitly to exercise the masking path itself.
+# ---------------------------------------------------------------------------
+
+def _empty_coarse_objects() -> np.ndarray:
+    return np.zeros(0, dtype=[
+        ("a", np.float64), ("b", np.float64),
+        ("xmin", np.int32), ("xmax", np.int32),
+        ("ymin", np.int32), ("ymax", np.int32),
+    ])
+
+
+def _make_sep_extract_side_effect(sources: np.ndarray):
+    def _sep_extract(data, *args, **kwargs):
+        if kwargs.get("segmentation_map"):
+            return _empty_coarse_objects(), np.zeros(np.asarray(data).shape, dtype=np.int32)
+        return sources
+    return _sep_extract
 
 
 # ---------------------------------------------------------------------------
@@ -318,11 +376,11 @@ class TestSuccessfulSolve:
 
 class TestSourceFormat:
     async def test_sources_have_correct_keys(self):
-        """Every source dict must carry exactly: ra, dec, flux, fwhm, elongation, saturated."""
+        """Every source dict must carry exactly: ra, dec, flux, fwhm, elongation, saturated, near_edge."""
         with _patch_astrometry():
             result = await astrometry.solve(_FITS_PATH)
 
-        required = {"ra", "dec", "flux", "fwhm", "elongation", "saturated"}
+        required = {"ra", "dec", "flux", "fwhm", "elongation", "saturated", "near_edge"}
         for src in result["sources"]:
             assert set(src.keys()) == required
 
@@ -335,14 +393,14 @@ class TestSourceFormat:
             assert isinstance(src["dec"], float), "dec must be a Python float"
 
     async def test_sources_all_fields_are_floats(self):
-        """Every field except the boolean ``saturated`` flag must be a Python float."""
+        """Every field except the boolean ``saturated``/``near_edge`` flags must be a Python float."""
         with _patch_astrometry():
             result = await astrometry.solve(_FITS_PATH)
 
         for src in result["sources"]:
             for key, val in src.items():
-                if key == "saturated":
-                    assert isinstance(val, bool), "saturated must be a Python bool"
+                if key in ("saturated", "near_edge"):
+                    assert isinstance(val, bool), f"{key} must be a Python bool"
                     continue
                 assert isinstance(val, float), f"{key} must be a Python float, got {type(val)}"
 
@@ -403,6 +461,67 @@ class TestSaturationFlag:
 
         assert result["sources_all"]
         assert all(src["saturated"] is True for src in result["sources_all"])
+
+
+# ---------------------------------------------------------------------------
+# Test 2.6 — Near-edge geometry flag (coma false-positive fix, 2026-08-07)
+# ---------------------------------------------------------------------------
+
+class TestNearEdgeFlag:
+    """
+    A 1024x1024 frame with the default EDGE_MARGIN_FRAC=0.1 has a 102.4px
+    margin on every side — sources inside [102.4, 921.6] on both axes are
+    "central", everything else is "near_edge".
+    """
+
+    async def test_central_source_is_not_near_edge(self):
+        centre = _make_sources_at([(512.0, 512.0)])
+        with _patch_astrometry(sources=centre, naxis1=1024, naxis2=1024):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"][0]["near_edge"] is False
+
+    async def test_corner_source_is_near_edge(self):
+        corner = _make_sources_at([(20.0, 20.0)])
+        with _patch_astrometry(sources=corner, naxis1=1024, naxis2=1024):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"][0]["near_edge"] is True
+
+    async def test_near_right_or_bottom_edge_is_near_edge(self):
+        # Only one axis needs to be within the margin — OR across all 4 sides.
+        edges = _make_sources_at([(1000.0, 512.0), (512.0, 1000.0)])
+        with _patch_astrometry(sources=edges, naxis1=1024, naxis2=1024):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert all(src["near_edge"] is True for src in result["sources"])
+
+    async def test_near_edge_flag_present_in_sources_all_too(self):
+        corner = _make_sources_at([(20.0, 20.0)])
+        with _patch_astrometry(sources=corner, naxis1=1024, naxis2=1024):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources_all"]
+        assert result["sources_all"][0]["near_edge"] is True
+
+    async def test_margin_scales_with_frame_size(self):
+        """The margin is a FRACTION of NAXIS1/NAXIS2, not a fixed pixel count —
+        x=20 sits inside the 25.6px margin of a 256px-wide frame."""
+        small_frame_edge = _make_sources_at([(20.0, 128.0)])
+        with _patch_astrometry(sources=small_frame_edge, naxis1=256, naxis2=256):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"][0]["near_edge"] is True
+
+    async def test_custom_edge_margin_frac_widens_the_zone(self, monkeypatch):
+        """A source comfortably central under the default 0.1 margin becomes
+        near-edge once EDGE_MARGIN_FRAC is widened to cover it."""
+        monkeypatch.setattr(config, "EDGE_MARGIN_FRAC", 0.4)
+        mid = _make_sources_at([(300.0, 512.0)])  # within 409.6px of the left edge
+        with _patch_astrometry(sources=mid, naxis1=1024, naxis2=1024):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"][0]["near_edge"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -579,3 +698,130 @@ class TestDegenerateSource:
         assert isinstance(result, dict)
         # All sources are filtered out because elongation = a/1e-6 >> 2.0
         assert len(result.get("sources", [])) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — Streak masking (satellite trails / diffraction spikes)
+#
+# Real incident, 2026-08-07, T_CrB_Light_L_60_2024-05-28T19-06-10.fits: a
+# full-frame satellite trail fragmented into several small, roundish "stars"
+# at the ordinary extraction settings. _build_streak_mask()'s coarse,
+# non-deblended pre-pass finds long+elongated coarse features and zeroes
+# their pixels in data_sub before the real extraction runs.
+# ---------------------------------------------------------------------------
+
+def _make_coarse_object(a: float, xmin: int, xmax: int, ymin: int, ymax: int, b: float = 1.0) -> np.ndarray:
+    obj = np.zeros(1, dtype=[
+        ("a", np.float64), ("b", np.float64),
+        ("xmin", np.int32), ("xmax", np.int32),
+        ("ymin", np.int32), ("ymax", np.int32),
+    ])
+    obj["a"] = a
+    obj["b"] = b
+    obj["xmin"], obj["xmax"] = xmin, xmax
+    obj["ymin"], obj["ymax"] = ymin, ymax
+    return obj
+
+
+class TestStreakMasking:
+    async def test_long_elongated_streak_is_masked_before_final_extraction(self):
+        """
+        A coarse candidate that is both highly elongated and far longer than
+        any real star's footprint must have its pixels zeroed in the data
+        the real (second) sep.extract() call receives.
+        """
+        calls: list[tuple[np.ndarray, dict]] = []
+        streak_col = 10  # a 1px-wide vertical streak at x=10, y in [10, 200)
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            calls.append((arr.copy(), kwargs))
+            if kwargs.get("segmentation_map"):
+                # elongation = 190/1 = 190; bbox diagonal ~= 190px, both well
+                # past the default STREAK_ELONGATION_MIN (5.0) and
+                # STREAK_MIN_LENGTH_ARCSEC (30") at ~1"/px default WCS scale.
+                coarse = _make_coarse_object(a=95.0, xmin=streak_col, xmax=streak_col, ymin=10, ymax=200)
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:200, streak_col] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                result = await astrometry.solve(_FITS_PATH)
+
+        assert result != {}
+        assert len(calls) == 2
+        final_data, final_kwargs = calls[1]
+        assert not final_kwargs.get("segmentation_map")
+        assert np.all(final_data[10:200, streak_col] == 0.0)
+
+    async def test_short_elongated_feature_is_not_masked(self):
+        """A coarse candidate elongated enough but far shorter than
+        STREAK_MIN_LENGTH_ARCSEC (an ordinary elongated star, not a streak)
+        must be left alone."""
+        calls: list[tuple[np.ndarray, dict]] = []
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            calls.append((arr.copy(), kwargs))
+            if kwargs.get("segmentation_map"):
+                # a=6, elongation=6 (>5.0) but bbox diagonal only ~6px — far
+                # below the length floor, so this must NOT be treated as a streak.
+                coarse = _make_coarse_object(a=6.0, xmin=10, xmax=16, ymin=10, ymax=10)
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10, 10:16] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                await astrometry.solve(_FITS_PATH)
+
+        final_data, _ = calls[1]
+        assert not np.any(final_data[10, 10:16] == 0.0)
+
+    async def test_long_but_round_feature_is_not_masked(self):
+        """A coarse candidate that spans a long bounding box but isn't
+        elongated (e.g. a large round nebula/galaxy core) must not be
+        mistaken for a streak."""
+        calls: list[tuple[np.ndarray, dict]] = []
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            calls.append((arr.copy(), kwargs))
+            if kwargs.get("segmentation_map"):
+                # a == b -> elongation == 1.0, well under STREAK_ELONGATION_MIN,
+                # even though the bbox itself is long.
+                coarse = _make_coarse_object(a=100.0, b=100.0, xmin=10, xmax=210, ymin=10, ymax=210)
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:210, 10:210] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                await astrometry.solve(_FITS_PATH)
+
+        final_data, _ = calls[1]
+        assert not np.any(final_data[10:210, 10:210] == 0.0)
+
+    async def test_no_streak_found_leaves_data_untouched(self):
+        """Default fixture behavior (empty coarse pass) — pre-existing tests'
+        assumption that data_sub reaches the real extraction unmodified."""
+        calls: list[tuple[np.ndarray, dict]] = []
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            calls.append((arr.copy(), kwargs))
+            if kwargs.get("segmentation_map"):
+                return _empty_coarse_objects(), np.zeros(arr.shape, dtype=np.int32)
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                await astrometry.solve(_FITS_PATH)
+
+        coarse_data, _ = calls[0]
+        final_data, _ = calls[1]
+        assert np.array_equal(coarse_data, final_data)

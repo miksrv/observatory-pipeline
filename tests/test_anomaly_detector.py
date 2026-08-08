@@ -65,6 +65,8 @@ def _make_source(
     object_type: str | None = None,
     source_id: str | None = None,
     saturated: bool = False,
+    filter: str | None = "L",
+    near_edge: bool = False,
 ) -> dict:
     return {
         "ra":           ra,
@@ -82,11 +84,28 @@ def _make_source(
         # POST /frames/{id}/sources. None by default, matching a source
         # the pipeline couldn't resolve an id for.
         "_source_id":   source_id,
+        # This frame's own filter (pipeline.py's Step 5.5) — defaults to "L"
+        # so every existing Δmag test keeps comparing same-filter history
+        # unless a test explicitly asks for a mismatch (see
+        # TestDetectSameFilterDeltaMag below).
+        "_filter":      filter,
+        # Set by astrometry.py/subtraction.py from the detection's own pixel
+        # position — see TestDetectSpaceDebrisNearEdge below. Defaults to
+        # False so every existing SPACE_DEBRIS test keeps using the ordinary
+        # (non-edge) elongation threshold unless a test explicitly opts in.
+        # No leading underscore — mirrors "saturated" above, since it must
+        # survive to the wire for a standalone DETECT_ANOMALIES re-run.
+        "near_edge":    near_edge,
     }
 
 
-def _make_hist_source(ra: float = _RA, dec: float = _DEC, mag: float = 14.5) -> dict:
-    return {"ra": ra, "dec": dec, "mag": mag}
+def _make_hist_source(
+    ra: float = _RA,
+    dec: float = _DEC,
+    mag: float = 14.5,
+    filter: str | None = "L",
+) -> dict:
+    return {"ra": ra, "dec": dec, "mag": mag, "filter": filter}
 
 
 def _make_coverage_frame() -> dict:
@@ -178,6 +197,39 @@ class TestHistoryMedianMag:
     def test_history_median_mag_empty(self):
         """Empty list must return None."""
         assert ad._history_median_mag([]) is None
+
+
+class TestSameFilterHistory:
+    """
+    _same_filter_history() restricts magnitude comparisons to same-filter
+    epochs — comparing an L-band magnitude against an old R-band/Hα epoch is
+    a color-term artifact, not real variability (see the function's own
+    docstring and CLAUDE.md's "Filters — real astronomy context").
+    """
+
+    def test_keeps_only_matching_filter(self):
+        history = [
+            _make_hist_source(mag=14.0, filter="L"),
+            _make_hist_source(mag=12.0, filter="R"),
+            _make_hist_source(mag=13.5, filter="L"),
+        ]
+        result = ad._same_filter_history(history, "L")
+        assert [h["mag"] for h in result] == [14.0, 13.5]
+
+    def test_no_same_filter_entries_returns_empty(self):
+        history = [_make_hist_source(mag=12.0, filter="R")]
+        assert ad._same_filter_history(history, "L") == []
+
+    def test_unknown_current_filter_returns_empty(self):
+        """A source with no known filter of its own can't safely be compared."""
+        history = [_make_hist_source(mag=12.0, filter="L")]
+        assert ad._same_filter_history(history, None) == []
+
+    def test_history_entry_missing_filter_key_never_matches(self):
+        """A pre-migration history row (no 'filter' key at all) must not be
+        optimistically assumed to match — excluded rather than guessed."""
+        history = [{"ra": _RA, "dec": _DEC, "mag": 12.0}]  # no "filter" key
+        assert ad._same_filter_history(history, "L") == []
 
 
 class TestIsStillOccupied:
@@ -485,6 +537,87 @@ class TestDetectStationaryClassifications:
         assert result == []
 
 
+class TestDetectSameFilterDeltaMag:
+    """
+    End-to-end (via ad.detect()) coverage for the same-filter Δmag
+    restriction: a magnitude comparison against a DIFFERENT filter's history
+    must never fire VARIABLE_STAR/BINARY_STAR/the brightening branch of
+    SUPERNOVA_CANDIDATE — see TestSameFilterHistory for the unit-level tests
+    and modules/anomaly_detector.py's _same_filter_history() docstring.
+    """
+
+    async def test_cross_filter_brightening_does_not_fire_variable_star(self):
+        """
+        Same scenario as test_detect_variable_star (delta would be 2.5 mag,
+        well past DELTA_MAG_ALERT), except the history was observed in a
+        DIFFERENT filter — must NOT fire VARIABLE_STAR; the two magnitudes
+        are not comparable at all (color term), so no anomaly is reported.
+        """
+        source = _make_source(mag=14.5, catalog_name="Simbad", object_type="V*", filter="L")
+        hist   = [_make_hist_source(mag=12.0, filter="R")]
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_cross_filter_history_does_not_mark_first_observation(self):
+        """
+        The EXISTENCE check (n_history, used for FIRST_OBSERVATION / UNKNOWN /
+        KNOWN_CATALOG_NEW) must stay filter-agnostic — an ordinary LRGB
+        sequence re-images the same field in several filters per session, and
+        a position already detected in R must not look "brand new" (and
+        therefore alert as UNKNOWN) the moment an L-filtered frame of the
+        same field comes in.
+
+        Uses an uncatalogued source so the distinction is observable: if the
+        existence check were (incorrectly) restricted to same-filter history
+        too, n_history would come out 0 here and this would misfire UNKNOWN;
+        done correctly, the position's prior (cross-filter) detection is
+        still recognized, and — with no same-filter magnitude to compare —
+        the source falls through to "no anomaly", not an alert.
+        """
+        source = _make_source(mag=14.5, catalog_name=None, object_type=None, filter="L")
+        hist   = [_make_hist_source(mag=14.5, filter="R")]  # different filter, same position
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_history_missing_filter_key_treated_as_pre_migration(self):
+        """
+        A historical row with no 'filter' key at all (observed before the API
+        started returning it) must not be assumed to match — no anomaly
+        fires from an assumed-same-filter comparison that was never verified.
+        """
+        source = _make_source(mag=14.5, catalog_name="Simbad", object_type="V*", filter="L")
+        hist   = [{"ra": _RA, "dec": _DEC, "mag": 12.0}]  # no "filter" key
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+
 class TestDetectMpcMovingObjects:
 
     async def test_detect_asteroid(self):
@@ -638,6 +771,59 @@ class TestDetectUnmatchedMovingObjects:
         assert len(result) == 1
         assert result[0]["anomaly_type"] == "SPACE_DEBRIS"
 
+    async def test_detect_space_debris_trail_without_vacated_history(self):
+        """
+        Regression for the 2026-08-07 C_2020_R4_ATLAS incident: a satellite/
+        debris trail spans the whole frame within a single exposure, so it
+        never has a *prior* detection anywhere nearby whose position could
+        be shown to have "vacated" — condition 2 of _is_position_shifted()
+        can never be satisfied for it. Elongation alone (>3.0) must be
+        enough to classify it SPACE_DEBRIS; it must NOT fall through to
+        generic UNKNOWN just because there is no earlier-epoch evidence of
+        movement (there never will be, for a single-exposure trail).
+
+        No history at all — narrow OR wide cone — near this position, ever;
+        the area itself has been covered by prior frames.
+        """
+        source = _make_source(catalog_name=None, elongation=6.0, source_id="src-trail-001")
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "SPACE_DEBRIS"
+        assert result[0]["mpc_designation"] is None
+        assert result[0]["source_id"] == "src-trail-001"
+
+    async def test_detect_recurring_elongated_source_is_not_space_debris(self):
+        """
+        Guardrail for the fix above: the elongation-alone shortcut must stay
+        gated on `history` (condition 1) being empty. A recurring elongated
+        detection — e.g. a diffraction spike or an uncatalogued extended
+        object sitting at the exact same position every frame — is the
+        opposite of trail evidence and must NOT be swept into SPACE_DEBRIS
+        just because its measured elongation happens to exceed 3.0.
+        """
+        source = _make_source(catalog_name=None, elongation=4.0)
+        same_spot_hist = _make_hist_source(ra=_RA, dec=_DEC, mag=14.5)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [same_spot_hist]}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
     async def test_detect_persistent_neighbour_is_not_moving(self):
         """
         Regression for docs/ISSUES.md #1: a faint uncatalogued source with no
@@ -671,6 +857,73 @@ class TestDetectUnmatchedMovingObjects:
 
         target_anomaly = next(a for a in result if a["ra"] == pytest.approx(_RA) and a["dec"] == pytest.approx(_DEC))
         assert target_anomaly["anomaly_type"] == "UNKNOWN"
+
+
+class TestDetectSpaceDebrisNearEdge:
+    """
+    Regression coverage for the 2026-08-07 T_CrB incident: coma stretches an
+    otherwise ordinary, non-moving star's PSF near the edge/corners of a
+    wide-field frame, inflating its measured elongation for purely optical
+    reasons. A source flagged `near_edge` (astrometry.py/subtraction.py, see
+    config.EDGE_MARGIN_FRAC) must clear the higher
+    config.SPACE_DEBRIS_EDGE_ELONGATION_MIN bar (default 6.0) instead of the
+    ordinary config.SPACE_DEBRIS_ELONGATION_MIN (default 3.0) to be reported
+    SPACE_DEBRIS.
+    """
+
+    async def test_near_edge_source_below_edge_threshold_is_not_space_debris(self):
+        """elongation=4.5 clears the ordinary 3.0 bar but not the edge bar (6.0)."""
+        source = _make_source(catalog_name=None, elongation=4.5, near_edge=True)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "UNKNOWN"
+
+    async def test_near_edge_source_above_edge_threshold_is_space_debris(self):
+        """elongation=6.5 clears even the higher edge bar (6.0)."""
+        source = _make_source(catalog_name=None, elongation=6.5, near_edge=True, source_id="src-edge-trail")
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "SPACE_DEBRIS"
+        assert result[0]["source_id"] == "src-edge-trail"
+
+    async def test_central_source_at_same_elongation_is_unaffected(self):
+        """
+        The same elongation=4.5 that's suppressed near the edge above must
+        still trigger SPACE_DEBRIS for a central (near_edge=False) source —
+        this is the existing test_detect_space_debris behaviour, unaffected
+        by the edge-aware threshold.
+        """
+        source = _make_source(catalog_name=None, elongation=4.5, near_edge=False)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "SPACE_DEBRIS"
 
 
 class TestDetectSaturatedArtifacts:
