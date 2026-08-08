@@ -6,15 +6,26 @@ archive, or any other pipeline side effects. These are developer tools, not
 part of the production pipeline (`pipeline.py` never imports anything from
 here).
 
-## debug_catalog_match.py
+## modules/catalog_preview.py (catalog-matching visual test)
 
-Runs a single FITS frame through the real pipeline steps up to catalog
-matching — `qc.analyze()` → `astrometry.solve()` → `subtraction.run()` →
-`catalog_matcher.match()` — using the actual production code from
-`modules/`, with no API calls and no file moves. It then renders every
-detected source (`sources_all`, the loose filter that `catalog_matcher`/
-`anomaly_detector` actually operate on) as a circle on top of the frame's
-own pixel data:
+Used to be a standalone script here (`debug_catalog_match.py`) — removed
+once its logic moved to `modules/catalog_preview.py` and became a real
+job-queue task type (`PREVIEW_CATALOG_MATCH`, see CLAUDE.md's job-queue
+section and `worker.py`) rather than a manual-only tool. There's no
+command-line entry point anymore; to render one now, create a task:
+
+```bash
+curl -X POST -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"type": "PREVIEW_CATALOG_MATCH", "items": [{"filename": "/fits/debug/<filename>.fits"}]}' \
+  "$API_BASE_URL/tasks"
+```
+
+`worker.py` picks it up, runs the exact same steps the old script did —
+`qc.analyze()` → `astrometry.solve()` → `subtraction.run()` →
+`catalog_matcher.match()`, no API calls beyond uploading the result, no
+file moves — and renders every detected source (`sources_all`, the loose
+filter that `catalog_matcher`/`anomaly_detector` actually operate on) as a
+circle on top of the frame's own pixel data:
 
 - **Green circle + label** `CatalogName:id` — the source matched a catalog
   (Simbad / Gaia DR3 / 2MASS / Pan-STARRS / MPC).
@@ -26,19 +37,10 @@ before `catalog_matcher.match()`'s WCS-offset correction shifts
 aligned with what's actually visible on this frame's own pixel grid rather
 than the Gaia-corrected sky position.
 
-### Usage
-
-```bash
-# From the host (project root), via docker compose:
-docker compose exec pipeline python debug/debug_catalog_match.py /fits/debug/<filename>.fits
-
-# Or with a custom output path:
-docker compose exec pipeline python debug/debug_catalog_match.py /fits/debug/<filename>.fits debug/output/my_output.png
-```
-
-If `output.png` is omitted, the image is saved to
-`debug/output/<fits-filename-stem>.png` (the directory is created
-automatically). `debug/output/` is gitignored — treat it as scratch space.
+Nothing is saved locally — the finished PNG is uploaded straight to
+observatory-api via `POST /tasks/{task_id}/items/{item_id}/chart` and lives
+there; fetch it back with `GET /tasks/{task_id}/items/{item_id}/chart.png`
+(`item_id` comes from `GET /tasks/{task_id}`'s `items[].id`).
 
 ### Debug FITS files
 
@@ -86,17 +88,17 @@ caller — this script called it exactly like `pipeline.py` does and so
 inherited that side effect, silently relocating two `HIGH_BACKGROUND` test
 frames out of `debug/` and into `/fits/rejected/{object}/` (not deleted,
 just moved — but still a real violation of what this tool is for). Fixed by
-adding `qc.analyze(fits_path, move_on_reject=False)`; this script now always
-passes that. If you add a new stage here that calls another module
-function shared with `pipeline.py`, check whether it has a similar hidden
-side effect before assuming "read-only" from the docstring alone.
+adding `qc.analyze(fits_path, move_on_reject=False)`; `modules/catalog_preview.py`
+always passes that today. If you add a new stage here that calls another
+module function shared with `pipeline.py`, check whether it has a similar
+hidden side effect before assuming "read-only" from the docstring alone.
 
 ## debug_anomaly_charts.py
 
 Renders debug PNGs for anomalies already sitting in the test database — a
-different kind of tool than `debug_catalog_match.py`: it doesn't run any
-pipeline stage, it reads back what a real pipeline run already produced and
-visualizes it more usefully than one flat frame per anomaly row.
+different kind of tool than `modules/catalog_preview.py` above: it doesn't
+run any pipeline stage, it reads back what a real pipeline run already
+produced and visualizes it more usefully than one flat frame per anomaly row.
 
 It connects **directly to the test `observatory-api` database** (a
 deliberate, scoped exception to "the pipeline has no direct DB access" — see
