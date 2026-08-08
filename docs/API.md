@@ -145,6 +145,21 @@ stops the retry loop first. HTTP 4xx errors are logged immediately and never ret
 
 ---
 
+### 14. List / Get Frames
+
+**[GET /frames](#14-list--get-frames)**, **[GET /frames/{id}](#14-list--get-frames)**,
+**[GET /frames/{id}/sources](#14-list--get-frames)**
+
+---
+
+### 15. Task Queue
+
+**[POST /tasks](#15-task-queue)**, **[GET /tasks](#15-task-queue)**,
+**[GET /tasks/{id}](#15-task-queue)**, **[PATCH /tasks/{id}](#15-task-queue)**,
+**[POST /tasks/{id}/items/progress](#15-task-queue)**
+
+---
+
 ---
 
 ## 1. Register a Frame
@@ -170,7 +185,6 @@ Accept: application/json
 ```json
 {
   "filename": "frame_20240315_220134.fits",
-  "original_filepath": "/fits/archive/M51/frame_20240315_220134.fits",
   "obs_time": "2024-03-15T22:01:34Z",
   "ra_center": 202.4696,
   "dec_center": 47.1952,
@@ -231,7 +245,6 @@ Accept: application/json
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `filename` | string | yes | Original FITS filename (basename only) |
-| `original_filepath` | string | yes | Full path on the observatory server after archiving |
 | `obs_time` | string (ISO 8601) | yes | Observation start time in UTC, e.g. `2024-03-15T22:01:34Z` |
 | `ra_center` | float | yes | Right ascension of frame center in decimal degrees |
 | `dec_center` | float | yes | Declination of frame center in decimal degrees |
@@ -375,6 +388,9 @@ Accept: application/json
 | `sources[].catalog_id` | string\|null | no | Catalog object identifier (Gaia source_id, Simbad MAIN_ID, MPC designation) |
 | `sources[].catalog_mag` | float\|null | no | Reference magnitude from catalog (Gaia G-band), or `null` |
 | `sources[].object_type` | string\|null | no | Object type: `"STAR"`, Simbad OTYPE string, `"ASTEROID"`, `"COMET"`, or `null` |
+| `sources[].saturated` | bool | no | Default `false`. Mirrors `modules/astrometry.py`'s `saturated` flag on the source dict — persisted so a later, decoupled `DETECT_ANOMALIES` task can reconstruct `anomaly_detector.py`'s saturated-suppression rule purely from stored data (see section 15 below) |
+| `sources[].near_edge` | bool | no | Default `false`. Mirrors `modules/astrometry.py`'s (and `modules/subtraction.py`'s) `near_edge` flag — pixel position within `EDGE_MARGIN_FRAC` of any frame edge, where coma inflates a star's measured elongation for purely optical reasons. Persisted for the same reason as `saturated`: a decoupled `DETECT_ANOMALIES` re-run reconstructs `anomaly_detector.py`'s edge-aware `SPACE_DEBRIS` threshold purely from stored data (see section 15 below) |
+| `sources[].from_subtraction` | bool | no | Default `false`. Wire name for `modules/subtraction.py`'s internal `_from_subtraction` flag — `api_client.post_sources()` renames it and strips every other leading-underscore key before sending (see `api_client/client.py`'s `_to_wire_source()`) |
 
 ### Response
 
@@ -410,7 +426,13 @@ Accept: application/json
 
 ## 3. Save Anomalies for a Frame
 
-Saves the list of classified anomalies for a previously registered frame. An empty list is valid and expected for frames with no anomalies.
+Saves the list of classified anomalies for a previously registered frame. **This call REPLACES the
+frame's entire anomaly set** — any anomalies already stored for this frame are deleted server-side
+before the new batch is inserted. This matters for `pipeline.detect_anomalies_for_frame_id()` /
+worker.py's `DETECT_ANOMALIES` task (section 15): re-running anomaly detection for an
+already-classified frame (a fixed classifier, a re-run across an object's whole history) never
+leaves stale anomalies from the previous run sitting alongside the new ones. An empty list is
+valid and correctly represents "re-ran, found nothing this time".
 
 ### Request
 
@@ -773,7 +795,8 @@ Accept: application/json
         "mag": 14.21,
         "flux": 44850.0,
         "frame_id": "38",
-        "obs_time": "2024-03-14T21:55:12Z"
+        "obs_time": "2024-03-14T21:55:12Z",
+        "filter": "L"
       }
     ],
     "1": [],
@@ -784,7 +807,8 @@ Accept: application/json
         "mag": 16.50,
         "flux": 12000.0,
         "frame_id": "35",
-        "obs_time": "2024-03-13T20:30:00Z"
+        "obs_time": "2024-03-13T20:30:00Z",
+        "filter": "Ha"
       }
     ]
   }
@@ -796,7 +820,13 @@ Accept: application/json
 | `results` | object | Dictionary mapping position index (as string "0", "1", ...) to list of source dicts |
 | `results["N"]` | array | List of historical sources near position N. Empty array if none found |
 
-Each source in the results has the same fields as the single-position endpoint (see section 4).
+Each source in the results has the same fields as the single-position endpoint (see section 4)
+**plus `filter`** (string\|null — the normalized filter of the frame that produced this
+detection, resolved server-side via a join against `frames.filter`; `source_observations` itself
+has no filter column). `modules/anomaly_detector.py`'s `_same_filter_history()` uses this to
+restrict Δmag comparisons to same-filter epochs only (see CLAUDE.md's "Filters — real astronomy
+context") — this is the one field that differs between the batch and single-position response
+shapes; the single-position `GET /sources/near` (section 4) predates it and does not return it.
 
 **Error responses:**
 
@@ -1288,4 +1318,97 @@ GET /frames/nearest-before?object=Vesta_A807_FA&before_time=2021-03-14T18%3A05%3
 |--------|------|
 | `400` | Missing `object` or `before_time`, or `before_time` isn't a valid ISO 8601 datetime |
 | `401` | Invalid or missing `X-API-Key` |
+
+---
+
+## 14. List / Get Frames
+
+`api_client.get_frames()` / `get_frame()` / `get_frame_sources()`. The scope-resolution query
+behind `pipeline.detect_anomalies_for_frame_id()` and any standalone task: turns "object=M51"
+(optionally + a date range) into a concrete list of `frame_id`s covering that object's **entire**
+observation history, old and new frames alike — something the inline per-frame `pipeline.run()`
+flow has no way to express.
+
+```
+GET /frames?object={object}&date_from={iso8601}&date_to={iso8601}&limit={n}&offset={n}
+GET /frames/{id}
+GET /frames/{id}/sources
+```
+
+All parameters on `GET /frames` are optional. `GET /frames/{id}` returns `{"frame": {...}}` — the
+same flattened field set `POST /frames` accepted (no nested `observation`/`instrument`/... groups)
+— or `{"frame": null}`-shaped 404 handling (the pipeline's `get_frame()` returns `None`).
+`GET /frames/{id}/sources` returns `{"frame_id": ..., "data": [...]}`, each entry the frame's own
+measured values for that source (`ra`, `dec`, `mag`, `elongation`, `saturated`, `near_edge`,
+`from_subtraction`, ...) plus its catalog identity (`catalog_name`, `catalog_id`, `catalog_mag`,
+`object_type`) and its resolved `source_id`. `pipeline._from_wire_source()` translates one entry
+of this response back into the internal shape `modules/anomaly_detector.py` expects — the inverse
+of `_to_wire_source()` (section 2).
+
+**Errors:** `400` unparseable `date_from`/`date_to` on the list endpoint · `404` frame not found
+(single-frame/sources endpoints)
+
+---
+
+## 15. Task Queue
+
+The granular pipeline job queue — see CLAUDE.md's job-queue section for the full design.
+`worker.py` polls `GET /tasks?status=PENDING` and dispatches each task's items to the matching
+`pipeline.py` stage function (`ANALYZE` → `analyze_frame()`, `DETECT_ANOMALIES` →
+`detect_anomalies_for_frame_id()`, `GENERATE_CHARTS` → `generate_charts_for_source_ids()`,
+`PREVIEW_CATALOG_MATCH` → `preview_catalog_match()` — a diagnostic tool, not part of the
+ANALYZE/DETECT_ANOMALIES/GENERATE_CHARTS production chain; see CLAUDE.md's job-queue section).
+
+```
+POST /tasks
+GET  /tasks?status={s}&type={t}&object={o}&limit={n}&order={asc|desc}
+GET  /tasks/{id}
+PATCH /tasks/{id}
+POST /tasks/{id}/items/progress
+```
+
+**`POST /tasks`** — `api_client.create_task(task_type, items, scope=None, parent_task_id=None)`.
+Body: `{"type": "ANALYZE"|"DETECT_ANOMALIES"|"GENERATE_CHARTS"|"PREVIEW_CATALOG_MATCH", "items": [...], "scope": {...}?, "parent_task_id": "..."?}`.
+Each item needs exactly one of `filename` (`ANALYZE` and `PREVIEW_CATALOG_MATCH` — the FULL path
+to the FITS file, not just a basename), `frame_id` (`DETECT_ANOMALIES`), or `source_id`
+(`GENERATE_CHARTS`), plus an optional `payload` (arbitrary JSON — a `GENERATE_CHARTS` item's
+`{"anomaly_type": ..., "designation": ...}`, set once by the `DETECT_ANOMALIES` task that produced
+it, since `task_items` has no other place to carry that forward). Response: `{"id", "type",
+"status", "total_items", "message"}`.
+
+**`GET /tasks`** — `api_client.get_tasks(status=None, task_type=None, object_name=None, limit=50, order=None)`.
+`order="asc"` claims the OLDEST `PENDING` task first — this is what `worker.py` passes; the API's
+own default (`desc`, omit `order`) suits a human/dashboard view instead. Response: `{"data": [...]}`.
+
+**`GET /tasks/{id}`** — `api_client.get_task(task_id)`. Response: `{"task": {...}, "items": [...]}`,
+each item carrying its own `status` (`PENDING`/`DONE`/`FAILED`) — `worker.py` only ever processes
+the ones still `PENDING`, so a task interrupted mid-run resumes cleanly rather than redoing
+already-finished items.
+
+**`PATCH /tasks/{id}`** — `api_client.update_task(task_id, status, error=None)`. `worker.py` sets
+`RUNNING` when it claims a task and `FAILED` (with `error`) on an unhandled exception; reaching
+`COMPLETED` happens automatically on the API side once every item resolves.
+
+**`POST /tasks/{id}/items/progress`** — `api_client.post_task_items_progress(task_id, items)`.
+Body: `{"items": [{"item_id": ..., "status": "DONE"|"FAILED", "frame_id": ...?, "error": ...?, "payload": {...}?}]}`.
+`worker.py` calls this immediately after EACH item finishes (one-item list per call), not batched
+across the whole task — batching would leave `task_items`/`tasks.completed_items` stuck showing
+every item as `PENDING` for the task's entire duration, with no live progress visibility while
+it's still running. `payload` here is a RESULT overwriting the item's stored payload — e.g.
+`PREVIEW_CATALOG_MATCH` reports `{"matched", "total", "quality_flag", "chart_uploaded"}` once that
+file's chart has been rendered and uploaded (see `POST .../items/{item_id}/chart` below) — the same
+field `GENERATE_CHARTS` reads as *input* at task-creation time (section above); which direction
+it's used in depends on the task type, not the field itself.
+
+**`POST /tasks/{task_id}/items/{item_id}/chart?style=catalog_preview&frame_count=1`** —
+`api_client.upload_task_item_chart(task_id, item_id, png_bytes, style="catalog_preview", frame_count=1)`.
+Raw PNG bytes as the request body (`Content-Type: image/png`), same shape as
+`POST /sources/{id}/chart` — the `task_item_id`-keyed counterpart of a source's finder chart, for a
+diagnostic with no source to key on at all. Fully replaces any previous chart for that item.
+Response: `{"task_item_id", "style", "frame_count", "updated_at"}`.
+
+**`GET /tasks/{task_id}/items/{item_id}/chart.png`** — serves the stored PNG as raw image bytes.
+Not called by the pipeline itself; for a future consumer such as the observatory website/dashboard.
+
+**Errors:** `400` invalid/missing required fields · `404` task not found
 

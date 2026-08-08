@@ -1,8 +1,12 @@
 # ISSUES.md — вопросы по данным в БД `observatory-api`, требующие разбора
 
 Зафиксировано 2026-08-05 по итогам разбора реальных данных в таблице `anomalies`
-(и связанной `sources`). Три пункта ниже требуют доведения до конца — детали и
-ссылки на код см. в разборе.
+(и связанной `sources`). Пункты ниже требуют доведения до конца — детали и
+ссылки на код см. в разборе. (Пункт 4 добавлен 2026-08-07 по итогам отдельного
+разбора и написан на английском — см. правило про язык markdown-документов в
+CLAUDE.md. Пункт 5 добавлен 2026-08-07.) Уже реализованные и протестированные
+исправления сюда не переносятся — их история в `git log`; здесь остаются
+только реально открытые пункты.
 
 ---
 
@@ -20,52 +24,6 @@
   они не матчатся ни в один каталог и попадают в `UNKNOWN`/`MOVING_UNKNOWN`, хотя
   физически являются остаточными артефактами выравнивания (`astroalign`), а не
   транзиентами.
-
-**Сделано (2026-08-06):** реализована и покрыта тестами часть, устраняющая
-причину, названную наиболее вероятной (насыщенные звёзды → subtraction-
-артефакты → `UNKNOWN`/`MOVING_UNKNOWN`):
-- `modules/subtraction.py` теперь маскирует окрестность любого насыщенного
-  пикселя (в новом кадре **или** в любом из reference-кадров) перед
-  `sep.extract()` на разностном изображении — см. п.2 ниже, там же детали
-  реализации (`_build_saturation_mask`, `SATURATION_MASK_RADIUS_ARCSEC`).
-  Кандидаты из этой зоны больше не попадают в `subtraction.run()`'s
-  `candidates` вообще, то есть не доходят даже до `anomaly_detector.py`.
-- `modules/anomaly_detector.py`: источник с `catalog_name is None` и
-  `saturated=True` (см. п.2 — флаг выставляется в `astrometry.py`) теперь
-  безусловно подавляется (`return None`) до проверки на сдвиг позиции —
-  то есть больше не может стать ни `MOVING_UNKNOWN`/`SPACE_DEBRIS`, ни
-  `UNKNOWN`. MPC- или Simbad-матченные насыщенные источники (реально яркий
-  астероид, вспыхнувшая известная звезда) не затрагиваются — это легитимные
-  детекции, просто без вычисленной magnitude (см. п.2).
-
-**Сделано (2026-08-06, вторым заходом на этот пункт):** живой разбор реальных
-finder-чартов (5 примеров `MOVING_UNKNOWN`, все с дрожанием позиции между
-эпохами <1″ — обычный шум центроида/атмосферной дисперсии, никакого реального
-движения) подтвердил, что доминирующая причина — не насыщение, а сама логика
-`_is_position_shifted()` в `modules/anomaly_detector.py`. Условие «сдвинулся»
-проверяло только «есть ли *хоть какая-то* историческая детекция в широком
-конусе (`MOVING_CONE_ARCSEC`=120″) дальше `MATCH_CONE_ARCSEC` (5″) от текущей
-позиции» — а это истинно почти в любом населённом поле: соседняя звезда или
-галактика-смазка в пределах 2 угловых минут гарантированно найдётся в истории
-независимо от того, сдвинулся ли сам источник хоть на пиксель. Хуже того, эта
-проверка (Priority 2) шла *раньше* проверки собственной истории источника
-(Priority 3), то есть даже стабильный, многократно наблюдавшийся на том же
-месте источник перебивался чужим соседом.
-
-Исправлено: `_is_position_shifted()` теперь требует **оба** условия —
-(а) в текущей позиции самого источника (`MATCH_CONE_ARCSEC`) истории нет
-(позиция действительно новая), **и** (б) историческая позиция-кандидат из
-широкого конуса **освободилась**: в текущем кадре рядом с ней (`MATCH_CONE_ARCSEC`)
-больше ничего не обнаружено (`_is_still_occupied()` = `False`). Условие (б) в
-одиночку (старое поведение) отличить «сосед всегда был рядом» от «объект
-отсюда ушёл» не могло; вместе с (а) это устраняет доминирующий класс ложных
-срабатываний, не теряя настоящих движущихся объектов — у них старая позиция
-по определению пустует после того, как объект её покинул.
-
-Тесты: `tests/test_anomaly_detector.py::TestIsStillOccupied`,
-`TestIsPositionShifted` (переписан под новую сигнатуру `(narrow_history,
-wide_history, current_frame_positions)`),
-`TestDetectUnmatchedMovingObjects::test_detect_persistent_neighbour_is_not_moving`.
 
 **Что осталось сделать** (требует доступа к БД на проде — вне возможностей
 этой сессии, поскольку `observatory-pipeline` не имеет прямого доступа к БД
@@ -106,37 +64,6 @@ directly"):
   сигнал от неидеального `astroalign` там тоже даёт экстремальную magnitude при
   последующем измерении фотометрии на реальном кадре.
 
-**Сделано (2026-08-06):**
-- [x] Добавлена saturation-детекция: `config.SATURATION_ADU` (новая настройка,
-      по умолчанию `60000`, синхронизирована в `.env.example`/README.md).
-      `modules/astrometry.py` сравнивает raw ADU в пике каждой детекции
-      (`sep`'s `peak` + `bkg.globalback`, т.к. `peak` — уже
-      background-subtracted) с этим порогом и добавляет булево поле
-      `saturated` в каждый словарь источника (и в `sources`, и в `sources_all`).
-- [x] Флаг прокинут через цепочку и источники **явно маркируются, а не
-      отбрасываются**: `modules/photometry.py` теперь пропускает измерение
-      апертурной фотометрии для любого `saturated=True` источника — все
-      `flux_aperture`/`mag_instrumental`/`mag_calibrated` остаются `None`
-      (как для источника вне границ кадра), вместо вычисления физически
-      бессмысленной экстремальной величины. Насыщенные источники также
-      исключены из набора Gaia DR3-звёзд для zero-point (иначе один
-      насыщенный "Gaia-матч" испортил бы калибровку всего кадра).
-- [x] `modules/subtraction.py`: перед `sep.extract()` на разностном
-      изображении теперь маскируется окрестность (`SATURATION_MASK_RADIUS_ARCSEC`,
-      по умолчанию `10″`, конвертируется в пиксели через WCS кадра) любого
-      пикселя ≥ `SATURATION_ADU` — в новом кадре или в любом из
-      reference-кадров (`_build_saturation_mask()`, дилатация через
-      `scipy.ndimage.binary_dilation`, новая зависимость в `requirements.txt`).
-      Маскированные пиксели зануляются в background-subtracted diff-image
-      перед `sep.extract()`, так что кандидат там просто не может быть
-      обнаружен.
-- Тесты: `tests/test_astrometry.py::TestSaturationFlag`,
-  `tests/test_photometry.py::TestSaturatedSources`,
-  `tests/test_subtraction.py::TestBuildSaturationMask` /
-  `TestDetectDiffSourcesMasking` (класс тестов внутри `TestDetectDiffSources`)
-  и `TestRun::test_saturation_mask_is_built_and_passed_to_detect_diff_sources`,
-  `tests/test_anomaly_detector.py::TestDetectSaturatedArtifacts`.
-
 **Обновление (2026-08-06, после реального прогона на пересобранном контейнере):**
 saturation-фикс выше — реальный и нужный, но живой прогон на тестовых FITS
 (Vesta, 5 кадров) показал, что он покрывает **не главную** причину. В
@@ -159,7 +86,7 @@ frame_id                    cnt   min_mag   max_mag
 конкретных источников с "-15" подтвердила: рядом нет насыщения (реальный
 максимум в апертуре — единицы-десятки тысяч ADU, ниже `SATURATION_ADU`) — это
 просто **непрокалиброванный `mag_instrumental`**, который `pipeline.py`
-(Step 5.5, до фикса ниже) подставлял в `mag` вместо `mag_calibrated`, когда
+(Step 5.5, до фикса) подставлял в `mag` вместо `mag_calibrated`, когда
 `calibrated=False`. `mag_instrumental = -2.5·log10(flux_ADU)` не имеет
 абсолютного zero-point и не является настоящей звёздной величиной сама по
 себе — у откалиброванных кадров в этом же прогоне `zero_point` был ~21.7–22.4,
@@ -167,20 +94,6 @@ frame_id                    cnt   min_mag   max_mag
 нормальные +7. Это, судя по всему, и есть основная причина исходного примера
 "−13.8722" из самого первого наблюдения по этой проблеме — сатурация объясняет
 только часть случаев.
-
-**Сделано (2026-08-06, вторым заходом):**
-- [x] `pipeline.py` Step 5.5: `mag` теперь **всегда** `None`, когда
-      `calibrated=False` — фолбэк на `mag_instrumental` убран полностью, а не
-      только для насыщенных источников. Решение принято осознанно (обсуждено
-      с пользователем): потеря `delta_mag`-сигнала для непрокалиброванных
-      кадров — приемлемая цена, поскольку сравнивать непрокалиброванную
-      величину с калиброванной историей физически некорректно в любом случае.
-- [x] `docs/API.md`: `sources[].mag` теперь документирован как «калиброванная
-      величина или `null`», без слов «or instrumental».
-- [x] Тесты: `tests/test_pipeline.py::test_mag_field_is_none_when_uncalibrated`
-      (переименован и переписан из старого теста, который проверял прямо
-      противоположное поведение) +
-      `test_mag_field_uses_calibrated_value_when_available`.
 
 **Что осталось сделать:**
 - [ ] После деплоя перепроверить в БД: непрокалиброванные кадры теперь должны
@@ -235,3 +148,91 @@ frame_id                    cnt   min_mag   max_mag
 - [ ] Закоммитить текущие изменения `modules/anomaly_detector.py` и передеплоить
 - [ ] После передеплоя перепроверить — `delta_mag` должен начать заполняться для
       реальных переменных/двойных звёзд и повторных вспышек около известных галактик
+
+---
+
+## 4. Coma near the frame edge inflating `SPACE_DEBRIS` false positives
+
+**Observation (2026-08-07):** analyzing 4 new `T_CrB` frames produced 305 anomalies —
+almost all false positives. A specific example (finder chart for anomaly
+`6a7677e3b0e3a7.00850315`) showed a star at the very edge of the frame, visibly
+elongated/blurred by coma — not a real trail or moving object.
+
+**Root cause (verified in code, not a hypothesis):** the `SPACE_DEBRIS` shortcut in
+`modules/anomaly_detector.py` (`if not history and elongation > 3.0: SPACE_DEBRIS`) used a
+single global elongation threshold with **no awareness of where on the frame the source
+actually sits**. Neither `modules/astrometry.py`, `modules/subtraction.py`, nor
+`modules/anomaly_detector.py` tracked a source's position relative to the frame edge
+anywhere in the pipeline before this fix — the only pre-existing edge-related field,
+`edge_flag` in `modules/photometry.py`, is a separate, purely photometric concept (aperture
+proximity to the image boundary, hardcoded 10px threshold) that never reaches
+`anomaly_detector.py` at all. Coma and other off-axis optical aberrations progressively
+stretch an ordinary, non-moving star's PSF toward the edges/corners of a wide-field frame,
+inflating its measured `elongation` for purely optical reasons. An uncatalogued star there
+(too faint for Gaia/Simbad, or simply outside their match cone) with no prior history at
+its position would clear `elongation > 3.0` from coma alone and get reported `SPACE_DEBRIS`
+with no real motion involved.
+
+**Known limitation of the fix already shipped for this:** re-running `DETECT_ANOMALIES` for
+an already-processed frame replaces that frame's anomaly set via `POST /frames/{id}/anomalies`
+(a previously false `SPACE_DEBRIS` row disappears), but a finder chart already uploaded for
+that `source_id` is **not** deleted or regenerated — `POST /sources/charts/batch` only touches
+`source_id`s that still have a resolved anomaly in the new run (see
+`modules/finder_chart.py` / `worker.py`'s `GENERATE_CHARTS` batching). A stale chart for a
+now-non-anomalous source stays orphaned in `observatory-api` until cleaned up there directly.
+
+**What's left to do:**
+- [ ] After deploying, re-run `DETECT_ANOMALIES` on the 4 `T_CrB` frames and compare the
+      anomaly count before/after
+- [ ] Decide whether `EDGE_MARGIN_FRAC`/`SPACE_DEBRIS_EDGE_ELONGATION_MIN`'s defaults need
+      tuning for this specific telescope/corrector — both are site-specific, same as
+      `QC_FWHM_MAX_ARCSEC`
+- [ ] Manually clean up orphaned charts in `observatory-api` for source_ids whose
+      `SPACE_DEBRIS`/`MOVING_UNKNOWN` anomaly no longer reproduces after this fix
+
+---
+
+## 5. Possible density-dependent WCS-offset correction failure on star-rich frames
+
+**Observation (2026-08-07):** on frames with a large number of detected sources
+(~1000), the sky position reported for a source — and consequently the link generated
+to the Aladin portal — appears slightly off from the actual star. On sparser frames
+(~300 sources) the same kind of link lands precisely on the star.
+
+**Hypothesis (not yet verified against logs — reasoned from code, not confirmed by a real
+repro):** `modules/catalog_matcher.py::_compute_wcs_offset()` receives the frame's full
+`sources_all` list (loose filter — every detection, not just strict stars) together with
+Gaia DR3 stars for the same field, then:
+1. Runs a quick nearest-neighbour check and exits early with no correction
+   (`return 0.0, 0.0`) whenever `median_sep <= 10.0` arcsec — treating the WCS as
+   "already accurate".
+2. Otherwise falls back to an all-pairs vote accumulator (`search_around_sky` +
+   histogram peak) to estimate a systematic offset.
+
+On a star-dense field, both `sources_all` and the Gaia catalog for that sky region are
+correspondingly dense, so the chance nearest-neighbour separation between an arbitrary
+source and an unrelated, nearby-but-wrong Gaia star can be small purely from geometry —
+independent of whether a genuine systematic WCS offset (typical for astap, up to ~30″)
+is actually present. This could make step 1's `median_sep <= 10.0` shortcut fire
+incorrectly on crowded fields, silently skipping the offset correction that a sparser
+field of the same real WCS quality would correctly apply. The vote accumulator's
+background-pair count (`expected_bg`) also scales with source density, which could weaken
+its significance test in the same regime.
+
+This is **not** an issue with `modules/astrometry.py`'s astap invocation — astap receives
+only the raw FITS file and does its own internal star detection/matching; it never sees
+`sources`/`sources_all`, so limiting the sep-detected source count would not change
+astap's own WCS solve at all. Any fix belongs in `catalog_matcher.py`'s offset-correction
+logic, not in source extraction, and catalog matching itself should keep using the full
+source list (`sources_all`) as it does today.
+
+**What's left to do:**
+- [ ] Compare pipeline logs for a real dense (~1000 sources) frame vs. a sparse
+      (~300 sources) frame of similar depth: check whether `"Gaia match (raw): min=...
+      median=..."` and `"WCS offset detected: dRA=... dDec=..."` show the correction
+      being skipped on the dense frame but applied on the sparse one
+- [ ] If confirmed, make the `median_sep <= 10.0` early-exit density-aware (or drop it
+      and always rely on the vote accumulator) instead of capping the number of sources
+      fed into `_compute_wcs_offset()`
+- [ ] Re-verify the vote accumulator's significance test (`MIN_PEAK_VOTES`/`SIGMA_MARGIN`)
+      still holds up as source/Gaia density increases
