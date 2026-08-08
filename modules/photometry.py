@@ -169,7 +169,11 @@ def _compute_zero_point(
 # Public entry point
 # ---------------------------------------------------------------------------
 
-async def measure(fits_path: str, sources: list[dict]) -> list[dict]:
+async def measure(
+    fits_path: str,
+    sources: list[dict],
+    skip_calibration: bool = False,
+) -> list[dict]:
     """
     Perform aperture photometry and differential magnitude calibration.
 
@@ -185,6 +189,21 @@ async def measure(fits_path: str, sources: list[dict]) -> list[dict]:
         Source list produced by ``astrometry.solve()``, optionally enriched by
         ``catalog_matcher.match()`` (may carry ``catalog_name`` / ``catalog_mag``
         keys).  Input dicts are never modified; copies are returned.
+    skip_calibration:
+        True when this frame's own filter is narrowband (Hα/[OIII]/[SII]/
+        [NII] by default — see pipeline.py's caller, which derives this from
+        ``modules.normalizer.is_narrowband()``). A narrowband bandpass lets
+        through too few Gaia-bright stars for a reliable zero-point, and even
+        a zero-point computed from the few that do pass through is
+        systematically biased relative to Gaia's broadband G — comparing a
+        narrowband instrumental magnitude to a Gaia G-band reference isn't a
+        valid photometric calibration regardless of how many reference stars
+        happen to match (see CLAUDE.md's "Filters — real astronomy context").
+        Aperture photometry itself (``flux_aperture``, ``mag_instrumental``)
+        still runs normally; only the Gaia zero-point step is skipped, so
+        every source's ``calibrated`` stays False and ``mag_calibrated``
+        stays None — same outward result as "fewer than 3 Gaia references",
+        just without ever attempting the (untrustworthy) calibration at all.
 
     Returns
     -------
@@ -452,7 +471,17 @@ async def measure(fits_path: str, sources: list[dict]) -> list[dict]:
     # ------------------------------------------------------------------
     # Step 5 — Differential magnitude calibration
     # ------------------------------------------------------------------
-    zero_point, zero_point_err = _compute_zero_point(output)
+    if skip_calibration:
+        logger.info(
+            "photometry: skipping Gaia DR3 zero-point calibration for %s — "
+            "frame's filter is narrowband, so mag_calibrated stays None for "
+            "every source regardless of Gaia match count (see measure()'s "
+            "docstring)",
+            fits_filename,
+        )
+        zero_point, zero_point_err = None, None
+    else:
+        zero_point, zero_point_err = _compute_zero_point(output)
 
     for out in output:
         out["zero_point"]     = zero_point

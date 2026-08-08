@@ -30,6 +30,7 @@ import sep
 
 import config
 from modules.fits_header import extract_headers, sanitize_object_name
+from modules.normalizer import is_narrowband
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,85 @@ def _read_pixel_scale(hdr: fits.Header) -> float | None:
         return 206265.0 * (xpixsz / 1000.0) / focal_length
 
     return None
+
+
+def _build_streak_mask(
+    data_sub: np.ndarray,
+    rms: float,
+    pixel_scale_arcsec: float | None,
+) -> np.ndarray | None:
+    """
+    Coarse, low-threshold, non-deblended pre-pass that finds long thin
+    streaks — satellite/aircraft trails and bright-star diffraction-spike
+    arms — and returns a boolean pixel mask covering them, or None if none
+    were found.
+
+    Duplicated from modules/astrometry.py's identical helper rather than
+    imported, mirroring how this module already duplicates the FWHM/
+    elongation star-filtering formulas above/below it (both cross-reference
+    each other in comments) — see that module's docstring for the full
+    rationale and real-data verification (2026-08-07, T_CrB test frame).
+    Kept in sync by hand with astrometry.py's version.
+
+    pixel_scale_arcsec may be None here (this module runs before plate
+    solving, so it only has whatever XPIXSZ/FOCALLEN/PIXSCALE the FITS
+    header itself carries via _read_pixel_scale() above) — falls back to a
+    conservative fixed 200px length floor and 1px dilation in that case.
+    """
+    if rms is None or rms <= 0:
+        return None
+
+    try:
+        objs, seg = sep.extract(
+            data_sub,
+            thresh=config.STREAK_DETECT_SIGMA,
+            err=rms,
+            minarea=config.SEP_MIN_AREA,
+            deblend_cont=1.0,
+            segmentation_map=True,
+        )
+    except Exception as exc:
+        logger.debug("QC: streak coarse pass failed: %s", exc)
+        return None
+
+    if len(objs) == 0:
+        return None
+
+    safe_b = np.where(objs["b"] > 0, objs["b"], 1e-6)
+    elongation = objs["a"] / safe_b
+    bbox_diag_px = np.sqrt(
+        (objs["xmax"] - objs["xmin"]).astype(np.float64) ** 2
+        + (objs["ymax"] - objs["ymin"]).astype(np.float64) ** 2
+    )
+
+    if pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        min_len_px = config.STREAK_MIN_LENGTH_ARCSEC / pixel_scale_arcsec
+    else:
+        min_len_px = 200.0
+
+    streak_idx = np.where(
+        (elongation >= config.STREAK_ELONGATION_MIN) & (bbox_diag_px >= min_len_px)
+    )[0]
+    if len(streak_idx) == 0:
+        return None
+
+    mask = np.isin(seg, streak_idx + 1)
+
+    dilate_px = 1
+    if pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        dilate_px = max(1, int(round(config.STREAK_MASK_DILATE_ARCSEC / pixel_scale_arcsec)))
+    try:
+        from scipy.ndimage import binary_dilation
+        structure = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
+        mask = binary_dilation(mask, structure=structure)
+    except Exception as exc:
+        logger.debug("QC: streak mask dilation failed (%s) — using un-dilated mask", exc)
+
+    logger.info(
+        "QC: streak masking: %d streak-like feature(s) found, masking %d pixel(s)",
+        len(streak_idx), int(mask.sum()),
+    )
+    return mask
 
 
 def _compute_fwhm_pixels(a: float, b: float) -> float:
@@ -174,6 +254,18 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         os.path.basename(fits_path),
     )
 
+    # A narrowband (Hα/[OIII]/[SII]/[NII]) frame of the exact same field
+    # genuinely detects far fewer stars than a broadband one — only the
+    # sliver of stellar continuum that leaks through the line filter is
+    # visible at all — so the star-count floor below uses a separate, softer
+    # threshold for it rather than QC_STARS_MIN. Checked directly off the raw
+    # header value (not pipeline.py's already-normalized `header` dict, which
+    # this function never sees) so the right threshold is picked regardless
+    # of NORMALIZE_ENABLED.
+    raw_filter = header_info.get("observation", {}).get("filter")
+    narrowband = is_narrowband(raw_filter)
+    effective_stars_min = config.QC_STARS_MIN_NARROWBAND if narrowband else config.QC_STARS_MIN
+
     # ------------------------------------------------------------------
     # 2. Sky background estimation
     # ------------------------------------------------------------------
@@ -185,6 +277,18 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         sky_background = float(bkg.globalback)
         sky_sigma = float(bkg.globalrms)
         data_sub: np.ndarray = np.ascontiguousarray(data - bkg)
+
+        # Streak masking — see _build_streak_mask()'s docstring and
+        # modules/astrometry.py's identical pre-pass. Keeps this module's own
+        # fwhm_median/elongation_median/star_count consistent with what
+        # astrometry.py will end up extracting from the same frame (a trail
+        # fragmenting into several roundish "stars" would otherwise inflate
+        # star_count here too).
+        streak_mask = _build_streak_mask(data_sub, sky_sigma, plate_scale)
+        if streak_mask is not None:
+            data_sub = np.array(data_sub, copy=True)
+            data_sub[streak_mask] = 0.0
+
         logger.debug(
             "QC: sky_background=%.2f sky_sigma=%.2f file=%s",
             sky_background,
@@ -409,9 +513,12 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
 
     # LOW_STARS only applies when BLUR, TRAIL, and HIGH_BACKGROUND are all
     # false (otherwise a low star count is a consequence of one of those).
+    # Uses effective_stars_min (QC_STARS_MIN_NARROWBAND on a narrowband
+    # frame, QC_STARS_MIN otherwise — see above) rather than QC_STARS_MIN
+    # unconditionally.
     low_stars: bool = (
         not blur and not trail and not high_background
-        and star_count < config.QC_STARS_MIN
+        and star_count < effective_stars_min
     )
 
     issue_count: int = sum([blur, trail, high_background, low_stars])
@@ -430,12 +537,15 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         quality_flag = "OK"
 
     logger.info(
-        "QC: quality_flag=%s  fwhm=%.3f %s  elongation=%.3f  stars=%d  sky_background=%.1f  file=%s",
+        "QC: quality_flag=%s  fwhm=%.3f %s  elongation=%.3f  stars=%d "
+        "(min=%d%s)  sky_background=%.1f  file=%s",
         quality_flag,
         fwhm_median if fwhm_median is not None else 0.0,
         fwhm_unit,
         elongation_median if elongation_median is not None else 0.0,
         star_count,
+        effective_stars_min,
+        ", narrowband" if narrowband else "",
         sky_background if sky_background is not None else 0.0,
         os.path.basename(fits_path),
     )

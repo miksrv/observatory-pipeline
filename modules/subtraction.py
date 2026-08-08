@@ -17,6 +17,10 @@ Algorithm:
      astroalign resampling leaves large non-Gaussian residuals there even
      under near-perfect registration, which sep would otherwise report as
      spurious bright "transients" (see docs/ISSUES.md #1, #2).
+  6.5. Also mask any streak-like feature (satellite/aircraft trail present in
+     the new frame but absent from the reference stack) found by a coarse,
+     low-threshold pre-pass — see _build_streak_mask() and config.STREAK_* —
+     before it can fragment into dozens of separate elongated candidates.
   7. Run SEP detection on positive residuals in the (masked) diff, rejecting
      candidates far sharper than this frame's own measured stellar PSF (see
      run()'s psf_fwhm_arcsec docstring) — this is what catches the new
@@ -137,6 +141,122 @@ def _align_frame(source: np.ndarray, target: np.ndarray) -> Optional[np.ndarray]
 
 
 # ---------------------------------------------------------------------------
+# Streak masking — see config.STREAK_* and modules/astrometry.py's identical
+# pre-pass (duplicated here rather than imported, mirroring how this module
+# already keeps its own independent copy of the FWHM-floor/near-edge logic
+# used by modules/astrometry.py).
+# ---------------------------------------------------------------------------
+
+def _build_streak_mask(
+    data_sub: np.ndarray,
+    rms: float,
+    pixel_scale_arcsec: Optional[float],
+) -> Optional[np.ndarray]:
+    """
+    Coarse, low-threshold, non-deblended pre-pass over a difference image
+    that finds long thin streaks and returns a boolean pixel mask covering
+    them, or None if none were found.
+
+    A satellite trail crossing the *new* frame but absent from the reference
+    stack shows up in the diff image as a strong positive residual just like
+    any other transient — and, at the diff image's ordinary detection
+    settings, fragments into dozens of separate elongated candidates rather
+    than one (real data, 2026-08-07, T_CrB test frames: 42 candidates with
+    elongation > 3 along a single trail — each individually classifiable by
+    anomaly_detector.py as its own SPACE_DEBRIS anomaly). See
+    modules/astrometry.py's identical helper for the full rationale; this
+    module's own `fwhm_min_px` floor in _detect_diff_sources() below already
+    rejects candidates far SHARPER than the stellar PSF (hot pixels) — it
+    has no equivalent protection against a genuine, coherent, but heavily
+    over-fragmented elongated feature, which is what this pre-pass adds.
+
+    Parameters
+    ----------
+    data_sub:
+        Background-subtracted difference image (post any saturation
+        masking already applied by the caller).
+    rms:
+        Background RMS — used as this coarse pass's relative detection
+        threshold (config.STREAK_DETECT_SIGMA).
+    pixel_scale_arcsec:
+        Plate scale in arcsec/px, or None (e.g. no WCS available) — falls
+        back to a conservative fixed 200px length floor and 1px dilation.
+
+    Returns
+    -------
+    np.ndarray | None
+        Boolean mask, same shape as data_sub, or None when nothing
+        streak-like was found or the coarse pass itself failed.
+    """
+    if rms is None or rms <= 0:
+        return None
+
+    try:
+        objs, seg = sep.extract(
+            data_sub,
+            thresh=config.STREAK_DETECT_SIGMA,
+            err=rms,
+            # minarea=5, matching _detect_diff_sources()'s own final-pass
+            # minarea below — NOT config.SEP_MIN_AREA (15), which belongs to
+            # the main-frame extraction context in astrometry.py/qc.py.
+            # Using a coarser (larger) minarea here than the real detection
+            # pass would let small trail fragments slip past this pre-pass
+            # invisibly while still being individually detected as their own
+            # elongated candidates by the real, more sensitive pass below —
+            # exactly the gap that let 40 trail-fragment candidates survive
+            # in a live run against real T_CrB data before this fix.
+            minarea=5,
+            deblend_cont=1.0,
+            segmentation_map=True,
+        )
+    except Exception as exc:
+        logger.debug("Subtraction: streak coarse pass failed: %s", exc)
+        return None
+
+    if len(objs) == 0:
+        return None
+
+    safe_b = np.where(objs["b"] > 0, objs["b"], 1e-6)
+    elongation = objs["a"] / safe_b
+    bbox_diag_px = np.sqrt(
+        (objs["xmax"] - objs["xmin"]).astype(np.float64) ** 2
+        + (objs["ymax"] - objs["ymin"]).astype(np.float64) ** 2
+    )
+
+    if pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        min_len_px = config.STREAK_MIN_LENGTH_ARCSEC / pixel_scale_arcsec
+    else:
+        min_len_px = 200.0
+
+    streak_idx = np.where(
+        (elongation >= config.STREAK_ELONGATION_MIN) & (bbox_diag_px >= min_len_px)
+    )[0]
+    if len(streak_idx) == 0:
+        return None
+
+    mask = np.isin(seg, streak_idx + 1)
+
+    dilate_px = 1
+    if pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        dilate_px = max(1, int(round(config.STREAK_MASK_DILATE_ARCSEC / pixel_scale_arcsec)))
+    try:
+        from scipy.ndimage import binary_dilation
+        structure = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
+        mask = binary_dilation(mask, structure=structure)
+    except Exception as exc:
+        logger.debug(
+            "Subtraction: streak mask dilation failed (%s) — using un-dilated mask", exc
+        )
+
+    logger.info(
+        "Subtraction: streak masking: %d streak-like feature(s) found, "
+        "masking %d diff-image pixel(s)",
+        len(streak_idx), int(mask.sum()),
+    )
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # Difference-image source detection
 # ---------------------------------------------------------------------------
 
@@ -144,6 +264,7 @@ def _detect_diff_sources(
     diff: np.ndarray,
     mask: Optional[np.ndarray] = None,
     fwhm_min_px: Optional[float] = None,
+    pixel_scale_arcsec: Optional[float] = None,
 ) -> list[dict]:
     """
     Detect positive residuals in the difference image using SEP.
@@ -169,11 +290,25 @@ def _detect_diff_sources(
         dropped as artifacts rather than returned — see run()'s docstring for
         why this exists and how the threshold is derived. None (the default)
         disables this filter, keeping every SEP detection as before.
+    pixel_scale_arcsec:
+        Plate scale in arcsec/px, forwarded to _build_streak_mask() above so
+        a satellite trail present in the new frame but absent from the
+        reference stack — which otherwise fragments into dozens of separate
+        elongated candidates on the diff image — gets masked out before
+        detection instead of producing one spurious candidate per fragment.
+        None (the default) falls back to a conservative fixed-pixel length
+        floor there rather than disabling the pre-pass outright.
 
     Returns
     -------
     list[dict]
-        Pixel-space candidate dicts with keys: x, y, flux, snr, fwhm, elongation.
+        Pixel-space candidate dicts with keys: x, y, flux, snr, fwhm,
+        elongation, near_edge (bool — see config.EDGE_MARGIN_FRAC and
+        modules/astrometry.py's identical flag; no leading underscore, same
+        as "saturated" there, since it must survive to the API for
+        pipeline.py's standalone DETECT_ANOMALIES reconstruction — see
+        run()'s own docstring below. Survives _pixel_to_sky()'s conversion
+        since only "x"/"y" are stripped there).
         Returns an empty list on any failure.
     """
     try:
@@ -186,11 +321,27 @@ def _detect_diff_sources(
         rms = float(bkg.globalrms)
         if rms <= 0:
             return []
+
+        streak_mask = _build_streak_mask(sub, rms, pixel_scale_arcsec)
+        if streak_mask is not None:
+            sub[streak_mask] = 0.0
         thresh = config.SUBTRACTION_DETECT_SIGMA * rms
         try:
             objs = sep.extract(sub, thresh=thresh, minarea=5)
         except Exception:
             return []
+
+        # Near-edge geometry flag — see config.EDGE_MARGIN_FRAC and
+        # modules/astrometry.py's identical computation for ordinary
+        # detections. Coma distorts the PSF (and therefore astroalign's own
+        # resampling residuals) most strongly toward the frame's edges, so a
+        # diff-image candidate born there needs the same "demand stronger
+        # elongation evidence" treatment in anomaly_detector.py that an
+        # ordinary edge star gets. `arr.shape` is (height, width) =
+        # (NAXIS2, NAXIS1), same convention as astropy.io.fits data arrays.
+        height, width = arr.shape
+        margin_x = config.EDGE_MARGIN_FRAC * width
+        margin_y = config.EDGE_MARGIN_FRAC * height
 
         out: list[dict] = []
         n_rejected_sharp = 0
@@ -225,13 +376,21 @@ def _detect_diff_sources(
                 n_rejected_sharp += 1
                 continue
 
+            obj_x = float(obj["x"])
+            obj_y = float(obj["y"])
+            near_edge = (
+                obj_x < margin_x or obj_x > width - margin_x
+                or obj_y < margin_y or obj_y > height - margin_y
+            )
+
             out.append({
-                "x":          float(obj["x"]),
-                "y":          float(obj["y"]),
+                "x":          obj_x,
+                "y":          obj_y,
                 "flux":       flux,
                 "snr":        snr,
                 "fwhm":       fwhm,
                 "elongation": a_axis / b_axis,
+                "near_edge":  near_edge,
             })
 
         if n_rejected_sharp:
@@ -492,7 +651,10 @@ async def run(
         candidates : list[dict]
             Sky-space candidates.  Each dict has keys:
             ra, dec, flux, snr, fwhm, elongation, mag=None,
-            _from_subtraction=True.
+            _from_subtraction=True, near_edge (bool, see
+            config.EDGE_MARGIN_FRAC — no leading underscore, unlike
+            _from_subtraction, since it must be persisted to the API; see
+            _detect_diff_sources()'s docstring above).
             Compatible with the source dicts produced by astrometry.solve().
     """
     empty: dict = {"performed": False, "reference_frame_count": 0, "candidates": []}
@@ -583,7 +745,10 @@ async def run(
     # ------------------------------------------------------------------
     # Detect and project candidates
     # ------------------------------------------------------------------
-    pixel_cands = _detect_diff_sources(diff, mask=sat_mask, fwhm_min_px=fwhm_min_px)
+    pixel_cands = _detect_diff_sources(
+        diff, mask=sat_mask, fwhm_min_px=fwhm_min_px,
+        pixel_scale_arcsec=pixel_scale_arcsec,
+    )
     sky_cands   = _pixel_to_sky(pixel_cands, fits_path, wcs=wcs)
 
     for cand in sky_cands:
