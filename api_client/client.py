@@ -14,6 +14,17 @@ Public functions:
   get_source_tracks_batch(source_ids)                       → dict
   upload_source_chart(source_id, png_bytes, style, frame_count)  → bool
   upload_source_charts_batch(charts)                        → dict
+
+  get_frames(object_name, date_from, date_to, limit, offset) → list
+  get_frame(frame_id)                                        → dict | None
+  get_frame_sources(frame_id)                                → list
+
+  create_task(task_type, items, scope, parent_task_id)       → dict | None
+  get_tasks(status, task_type, object_name, limit, order)    → list
+  get_task(task_id)                                          → dict | None
+  update_task(task_id, status, error)                        → dict | None
+  post_task_items_progress(task_id, items)                   → dict | None
+  upload_task_item_chart(task_id, item_id, png_bytes, style, frame_count)  → bool
 """
 
 from __future__ import annotations
@@ -170,6 +181,50 @@ async def post_frame(frame_data: dict) -> str:
 # ML-7-3: post_sources
 # ---------------------------------------------------------------------------
 
+def _to_wire_source(source: dict) -> dict:
+    """
+    Translate one pipeline-internal source dict into the shape
+    POST /frames/{id}/sources documents.
+
+    Two things happen here, not before:
+      - Rename "_from_subtraction" (modules/subtraction.py's internal flag,
+        also read by modules/anomaly_detector.py and pipeline.py's Step 4.5
+        dedup) to the wire field name "from_subtraction" the API persists on
+        source_observations — see that migration's docblock for why this is
+        persisted at all: a standalone DETECT_ANOMALIES task re-run later,
+        with no in-memory source list, needs it back from stored data.
+      - Drop every other underscore-prefixed key ("_source_id",
+        "_wcs_offset_ra", "_wcs_offset_dec", ...) — these are pipeline-only
+        bookkeeping with no place in the API schema. Leading-underscore is
+        this codebase's existing convention for "internal, not for the wire"
+        (mirrors "_from_subtraction" and "_source_id" themselves), so this is
+        one generic rule rather than a hardcoded list that would need
+        updating every time a module grows a new internal field.
+
+    Fields with no underscore prefix (mag_instrumental, calibrated, edge_flag,
+    saturated, near_edge, etc.) still travel through unfiltered, exactly as
+    before this function existed — the API already ignores keys it doesn't
+    recognize, and tightening that further is out of scope here. "saturated"
+    and "near_edge" are deliberately named without a leading underscore
+    (unlike "_from_subtraction") for exactly this reason: both need to be
+    persisted and later reconstructed by pipeline.py's own
+    `_from_wire_source()` for a standalone DETECT_ANOMALIES re-run, same
+    rationale as "_from_subtraction" above.
+
+    "from_subtraction" is only added to the wire dict when the source
+    actually carries "_from_subtraction" truthy — not unconditionally set to
+    False for every source — so a source dict with no such key at all (the
+    normal case for anything from astrometry.py, not subtraction.py) travels
+    over the wire completely unchanged from before this function existed.
+    The API defaults an omitted "from_subtraction" to false itself, so
+    nothing is lost by not sending an explicit false.
+    """
+    wire = {k: v for k, v in source.items() if not k.startswith("_")}
+    if source.get("_from_subtraction"):
+        wire["from_subtraction"] = True
+    return wire
+
+
 @_retry
 async def _post_sources_with_retry(
     frame_id: str,
@@ -185,10 +240,12 @@ async def _post_sources_with_retry(
         extra={"frame_id": frame_id, "log_filename": filename},
     )
 
+    wire_sources = [_to_wire_source(s) for s in sources]
+
     async with _make_client() as client:
         response = await client.post(
             f"/frames/{frame_id}/sources",
-            json={"filename": filename, "sources": sources},
+            json={"filename": filename, "sources": wire_sources},
         )
 
         if 400 <= response.status_code < 500:
@@ -986,4 +1043,622 @@ async def upload_source_charts_batch(charts: list[dict]) -> dict:
             extra={"frame_id": None, "log_filename": None},
         )
     return {}
+
+
+# ---------------------------------------------------------------------------
+# get_frames — GET /frames (list, filtered by object/date range)
+#
+# The scope-resolution query behind a standalone DETECT_ANOMALIES/
+# GENERATE_CHARTS task: turns "object=M51" (optionally + a date range) into a
+# concrete list of frame ids covering that object's entire observation
+# history, old and new frames alike — not just frames from one pipeline run.
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _get_frames_with_retry(
+    object_name: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    limit: int,
+    offset: int,
+) -> list:
+    """Inner retryable core for get_frames."""
+    params: dict = {"limit": limit, "offset": offset}
+    if object_name is not None:
+        params["object"] = object_name
+    if date_from is not None:
+        params["date_from"] = date_from
+    if date_to is not None:
+        params["date_to"] = date_to
+
+    async with _make_client() as client:
+        response = await client.get("/frames", params=params)
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    data = resp_json.get("data") if isinstance(resp_json, dict) else None
+    return data if isinstance(data, list) else []
+
+
+async def get_frames(
+    object_name: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list:
+    """
+    List previously registered frames, optionally filtered by object and/or
+    an obs_time range.
+
+    Parameters
+    ----------
+    object_name:
+        Exact match on the normalized object/archive-directory name, or None
+        for no object filter.
+    date_from, date_to:
+        ISO 8601 timestamps bounding obs_time (date_from inclusive, date_to
+        exclusive), or None for no bound on that side.
+    limit, offset:
+        Pagination — the API caps limit at 1000 regardless of what's passed.
+
+    Returns
+    -------
+    list
+        List of frame dicts (same shape as get_frame()'s single-frame
+        return value). [] on any failure or if nothing matches.
+    """
+    logger.debug(
+        "GET /frames object=%s date_from=%s date_to=%s",
+        object_name, date_from, date_to,
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _get_frames_with_retry(object_name, date_from, date_to, limit, offset)
+    except Exception as exc:
+        logger.error(
+            "Error querying /frames object=%s: %s",
+            object_name, exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
+# get_frame — GET /frames/{id}
+#
+# A single frame's full stored record, echoed back flat. Lets a standalone
+# task reconstruct the frame_meta anomaly_detector.py needs without any
+# local filesystem access to the original FITS file at all.
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _get_frame_with_retry(frame_id: str) -> dict | None:
+    """Inner retryable core for get_frame."""
+    async with _make_client() as client:
+        response = await client.get(f"/frames/{frame_id}")
+
+        if response.status_code == 404:
+            return None
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    return resp_json.get("frame") if isinstance(resp_json, dict) else None
+
+
+async def get_frame(frame_id: str) -> dict | None:
+    """
+    Retrieve a single previously registered frame's full stored record.
+
+    Parameters
+    ----------
+    frame_id:
+        Frame ID returned by post_frame() (or from a DETECT_ANOMALIES task
+        item's "frame_id").
+
+    Returns
+    -------
+    dict | None
+        The frame's fields (filename, obs_time, ra_center, dec_center,
+        fov_deg, object, filter, ...), or None if not found or on any
+        failure — a caller can't tell those two cases apart from the return
+        value alone (same convention as get_nearest_frame_before()).
+    """
+    logger.debug(
+        "GET /frames/%s",
+        frame_id,
+        extra={"frame_id": frame_id, "log_filename": None},
+    )
+    try:
+        return await _get_frame_with_retry(frame_id)
+    except Exception as exc:
+        logger.error(
+            "Error querying /frames/%s: %s",
+            frame_id, exc,
+            extra={"frame_id": frame_id, "log_filename": None},
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# get_frame_sources — GET /frames/{id}/sources
+#
+# The piece a standalone DETECT_ANOMALIES task needs to reconstruct
+# anomaly_detector.py's per-source input for an already-processed frame
+# entirely from stored data — no re-running astrometry/photometry, no local
+# FITS access required.
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _get_frame_sources_with_retry(frame_id: str) -> list:
+    """Inner retryable core for get_frame_sources."""
+    async with _make_client() as client:
+        response = await client.get(f"/frames/{frame_id}/sources")
+
+        if response.status_code == 404:
+            return []
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    data = resp_json.get("data") if isinstance(resp_json, dict) else None
+    return data if isinstance(data, list) else []
+
+
+async def get_frame_sources(frame_id: str) -> list:
+    """
+    Retrieve the sources currently linked to a frame, each with that frame's
+    own measured values (ra, dec, mag, elongation, saturated,
+    from_subtraction, ...) plus catalog identity fields.
+
+    Parameters
+    ----------
+    frame_id:
+        Frame ID returned by post_frame().
+
+    Returns
+    -------
+    list
+        List of source dicts in the API's wire shape (see
+        docs/API.md's GET /frames/{id}/sources) — NOT yet translated into
+        the internal shape anomaly_detector.py expects (leading-underscore
+        keys etc.); see pipeline.py's detect_anomalies_for_frame_id() for
+        that translation. [] on any failure or if the frame has no sources.
+    """
+    logger.debug(
+        "GET /frames/%s/sources",
+        frame_id,
+        extra={"frame_id": frame_id, "log_filename": None},
+    )
+    try:
+        return await _get_frame_sources_with_retry(frame_id)
+    except Exception as exc:
+        logger.error(
+            "Error querying /frames/%s/sources: %s",
+            frame_id, exc,
+            extra={"frame_id": frame_id, "log_filename": None},
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Task queue — POST /tasks, GET /tasks(/{id}), PATCH /tasks/{id},
+# POST /tasks/{id}/items/progress
+#
+# Backs worker.py's task consumption and any future task-submitting tool
+# (a manual reprocess CLI, a future watcher.py rewrite). See CLAUDE.md's
+# job-queue section.
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _create_task_with_retry(
+    task_type: str,
+    items: list[dict],
+    scope: dict | None,
+    parent_task_id: str | None,
+) -> dict | None:
+    """Inner retryable core for create_task."""
+    payload: dict = {"type": task_type, "items": items}
+    if scope is not None:
+        payload["scope"] = scope
+    if parent_task_id is not None:
+        payload["parent_task_id"] = parent_task_id
+
+    async with _make_client() as client:
+        response = await client.post("/tasks", json=payload)
+
+        if 400 <= response.status_code < 500:
+            logger.error(
+                "API rejected POST /tasks (type=%s) with HTTP %d: %s",
+                task_type, response.status_code, response.text,
+                extra={"frame_id": None, "log_filename": None},
+            )
+            return None
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    return resp_json if isinstance(resp_json, dict) else None
+
+
+async def create_task(
+    task_type: str,
+    items: list[dict],
+    scope: dict | None = None,
+    parent_task_id: str | None = None,
+) -> dict | None:
+    """
+    Create a task with its full, fixed item list.
+
+    Parameters
+    ----------
+    task_type:
+        "ANALYZE", "DETECT_ANOMALIES", or "GENERATE_CHARTS".
+    items:
+        List of item dicts, each with exactly one of "filename" (ANALYZE),
+        "frame_id" (DETECT_ANOMALIES), or "source_id" (GENERATE_CHARTS) —
+        plus an optional "payload" (arbitrary JSON-encodable value, e.g. a
+        GENERATE_CHARTS item's {"anomaly_type": ..., "designation": ...}).
+    scope:
+        Optional descriptive scope ({"object": ..., "date_from": ...,
+        "date_to": ...}) — display/filtering only, not authoritative.
+    parent_task_id:
+        Optional — links a re-run to the task it re-runs.
+
+    Returns
+    -------
+    dict | None
+        {"id", "type", "status", "total_items", "message"}, or None on any
+        failure — the caller (worker.py) must handle a None return (log and
+        move on; the work that would have been queued is simply not queued).
+    """
+    logger.info(
+        "POST /tasks type=%s items=%d",
+        task_type, len(items),
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _create_task_with_retry(task_type, items, scope, parent_task_id)
+    except _RETRYABLE as exc:
+        logger.error(
+            "All retries exhausted creating task type=%s: %s",
+            task_type, exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+    return None
+
+
+@_retry
+async def _get_tasks_with_retry(
+    status: str | None,
+    task_type: str | None,
+    object_name: str | None,
+    limit: int,
+    order: str | None,
+) -> list:
+    """Inner retryable core for get_tasks."""
+    params: dict = {"limit": limit}
+    if status is not None:
+        params["status"] = status
+    if task_type is not None:
+        params["type"] = task_type
+    if object_name is not None:
+        params["object"] = object_name
+    if order is not None:
+        params["order"] = order
+
+    async with _make_client() as client:
+        response = await client.get("/tasks", params=params)
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    data = resp_json.get("data") if isinstance(resp_json, dict) else None
+    return data if isinstance(data, list) else []
+
+
+async def get_tasks(
+    status: str | None = None,
+    task_type: str | None = None,
+    object_name: str | None = None,
+    limit: int = 50,
+    order: str | None = None,
+) -> list:
+    """
+    List tasks, filtered by status/type/object.
+
+    Parameters
+    ----------
+    status, task_type, object_name:
+        Optional exact-match filters.
+    limit:
+        Max rows (the API caps at 500).
+    order:
+        "asc" or "desc" (API default "desc" — most recent first). A FIFO
+        worker polling for PENDING work should pass "asc" to claim the
+        oldest queued task first rather than whatever was just submitted.
+
+    Returns
+    -------
+    list
+        List of task summary dicts (no "items" — see get_task() for that).
+        [] on any failure.
+    """
+    logger.debug(
+        "GET /tasks status=%s type=%s object=%s order=%s",
+        status, task_type, object_name, order,
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _get_tasks_with_retry(status, task_type, object_name, limit, order)
+    except Exception as exc:
+        logger.error(
+            "Error querying /tasks: %s",
+            exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+        return []
+
+
+@_retry
+async def _get_task_with_retry(task_id: str) -> dict | None:
+    """Inner retryable core for get_task."""
+    async with _make_client() as client:
+        response = await client.get(f"/tasks/{task_id}")
+
+        if response.status_code == 404:
+            return None
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    return resp_json if isinstance(resp_json, dict) else None
+
+
+async def get_task(task_id: str) -> dict | None:
+    """
+    Retrieve one task's detail, including its full item list.
+
+    Returns
+    -------
+    dict | None
+        {"task": {...}, "items": [...]}, or None if not found or on any
+        failure — a caller can't tell those two cases apart from the return
+        value alone.
+    """
+    logger.debug(
+        "GET /tasks/%s",
+        task_id,
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _get_task_with_retry(task_id)
+    except Exception as exc:
+        logger.error(
+            "Error querying /tasks/%s: %s",
+            task_id, exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+        return None
+
+
+@_retry
+async def _update_task_with_retry(task_id: str, status: str, error: str | None) -> dict | None:
+    """Inner retryable core for update_task."""
+    payload: dict = {"status": status}
+    if error is not None:
+        payload["error"] = error
+
+    async with _make_client() as client:
+        response = await client.patch(f"/tasks/{task_id}", json=payload)
+
+        if 400 <= response.status_code < 500:
+            logger.error(
+                "API rejected PATCH /tasks/%s with HTTP %d: %s",
+                task_id, response.status_code, response.text,
+                extra={"frame_id": None, "log_filename": None},
+            )
+            return None
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    return resp_json.get("task") if isinstance(resp_json, dict) else None
+
+
+async def update_task(task_id: str, status: str, error: str | None = None) -> dict | None:
+    """
+    Update a task's own status — e.g. worker.py flips PENDING -> RUNNING
+    when it picks a task up, or -> FAILED (with `error`) on an unhandled
+    exception. Reaching COMPLETED normally happens automatically on the API
+    side once every item resolves (see post_task_items_progress()) — this is
+    for the states that are always explicit.
+
+    Returns
+    -------
+    dict | None
+        The updated task dict, or None on any failure.
+    """
+    logger.info(
+        "PATCH /tasks/%s status=%s",
+        task_id, status,
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _update_task_with_retry(task_id, status, error)
+    except _RETRYABLE as exc:
+        logger.error(
+            "All retries exhausted updating task_id=%s to status=%s: %s",
+            task_id, status, exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+    return None
+
+
+@_retry
+async def _post_task_items_progress_with_retry(task_id: str, items: list[dict]) -> dict | None:
+    """Inner retryable core for post_task_items_progress."""
+    async with _make_client() as client:
+        response = await client.post(f"/tasks/{task_id}/items/progress", json={"items": items})
+
+        if 400 <= response.status_code < 500:
+            logger.error(
+                "API rejected POST /tasks/%s/items/progress with HTTP %d: %s",
+                task_id, response.status_code, response.text,
+                extra={"frame_id": None, "log_filename": None},
+            )
+            return None
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+        resp_json = response.json()
+
+    return resp_json if isinstance(resp_json, dict) else None
+
+
+async def post_task_items_progress(task_id: str, items: list[dict]) -> dict | None:
+    """
+    Report the outcome of one or more task items in a single call.
+
+    Parameters
+    ----------
+    task_id:
+        The task these items belong to.
+    items:
+        List of {"item_id": ..., "status": "DONE"|"FAILED", "frame_id": ...
+        (optional, ANALYZE items only), "error": ... (optional)}.
+
+    Returns
+    -------
+    dict | None
+        {"results": [...], "task": {...}} (the task's updated counters), or
+        None on any failure — a caller should treat that the same as "we
+        don't know whether this was recorded" and is free to retry the same
+        call later (already-resolved items are a no-op server-side, see
+        docs/API.md).
+    """
+    if not items:
+        return None
+
+    logger.debug(
+        "POST /tasks/%s/items/progress items=%d",
+        task_id, len(items),
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _post_task_items_progress_with_retry(task_id, items)
+    except _RETRYABLE as exc:
+        logger.error(
+            "All retries exhausted reporting item progress for task_id=%s: %s",
+            task_id, exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# upload_task_item_chart — POST /tasks/{task_id}/items/{item_id}/chart
+#
+# The task_item_id-keyed counterpart of upload_source_chart(): backs
+# pipeline.preview_catalog_match(), which has no source_id at all to key a
+# chart on (a PREVIEW_CATALOG_MATCH item is a whole-frame diagnostic, not
+# tied to any celestial object).
+# ---------------------------------------------------------------------------
+
+@_retry
+async def _upload_task_item_chart_with_retry(
+    task_id: str,
+    item_id: str,
+    png_bytes: bytes,
+    style: str,
+    frame_count: int,
+) -> bool:
+    """Inner retryable core for upload_task_item_chart."""
+    url = f"{config.API_BASE_URL}/tasks/{task_id}/items/{item_id}/chart"
+
+    async with _make_client() as client:
+        # The request body IS the image — not JSON — same override as
+        # upload_source_chart() needs, for the same reason.
+        response = await client.post(
+            f"/tasks/{task_id}/items/{item_id}/chart",
+            params={"style": style, "frame_count": frame_count},
+            content=png_bytes,
+            headers={"Content-Type": "image/png"},
+        )
+
+        if 400 <= response.status_code < 500:
+            logger.error(
+                "API rejected POST %s with HTTP %d: %s",
+                url, response.status_code, response.text,
+                extra={"frame_id": None, "log_filename": None},
+            )
+            return False
+
+        if response.status_code >= 500:
+            response.raise_for_status()
+
+    return True
+
+
+async def upload_task_item_chart(
+    task_id: str,
+    item_id: str,
+    png_bytes: bytes,
+    style: str = "catalog_preview",
+    frame_count: int = 1,
+) -> bool:
+    """
+    Upload the diagnostic chart PNG for a PREVIEW_CATALOG_MATCH task item,
+    replacing any previous one for that item.
+
+    Parameters
+    ----------
+    task_id, item_id:
+        Identify the task item this chart belongs to.
+    png_bytes:
+        Encoded PNG image bytes (the full request body — no JSON envelope).
+    style:
+        Always "catalog_preview" today; parameterized for symmetry with
+        upload_source_chart() rather than hardcoded on the wire.
+    frame_count:
+        Always 1 (a single-frame chart, not an epoch series); same reasoning.
+
+    Returns
+    -------
+    bool
+        True on success, False on any failure (never raises — this is a
+        best-effort feature and must not affect item processing; the caller
+        still has a rendered result even if the upload itself failed).
+    """
+    logger.info(
+        "Uploading %s chart for task_id=%s item_id=%s (%d bytes)",
+        style, task_id, item_id, len(png_bytes),
+        extra={"frame_id": None, "log_filename": None},
+    )
+    try:
+        return await _upload_task_item_chart_with_retry(task_id, item_id, png_bytes, style, frame_count)
+    except _RETRYABLE as exc:
+        logger.error(
+            "All retries exhausted uploading chart for task_id=%s item_id=%s: %s",
+            task_id, item_id, exc,
+            extra={"frame_id": None, "log_filename": None},
+        )
+    return False
 

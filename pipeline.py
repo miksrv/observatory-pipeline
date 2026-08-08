@@ -1,17 +1,65 @@
 """
-pipeline.py — Orchestrator for processing a single FITS file end-to-end.
+pipeline.py — Composable pipeline stages for processing FITS frames.
 
-The single public entry point is:
+Split into three independently callable stages (see CLAUDE.md's job-queue
+section for the pipeline-side design this backs):
 
-    await pipeline.run(fits_path: str) -> None
+    await pipeline.analyze_frame(fits_path)                           -> dict | None
+    await pipeline.detect_anomalies_for_frame_data(...)                -> list[dict]
+    await pipeline.detect_anomalies_for_frame_id(frame_id)             -> list[dict]
+    await pipeline.generate_charts_for_anomalies(sources, anomalies)   -> dict
+    await pipeline.generate_charts_for_source_ids(...)                 -> dict
+    await pipeline.run(fits_path)                                     -> None
+    await pipeline.preview_catalog_match(fits_path, task_id, item_id)  -> dict
 
-It calls each module in sequence, handles optional modules gracefully when
-they are not yet implemented, and ensures that no exception from an individual
-step crashes the entire service.
+`analyze_frame()` is "Module 1": header extraction, normalization, QC,
+astrometry, subtraction, catalog matching, photometry, POST /frames +
+POST /frames/{id}/sources, and the archive move — everything that needs the
+FITS file itself on local disk. It ends there: the archive move happens
+immediately after posting sources, NOT after anomaly detection as an
+earlier, monolithic revision of this file did. Anomaly detection never
+touches pixels or the local file at all, so gating the archive move behind
+it only delayed archiving for no benefit, and would have blocked decoupling
+Module 2 into a task that might run much later, well after this file is
+long gone from FITS_INCOMING (see observatory-api's GET /frames/{id} and
+GET /frames/{id}/sources, which is exactly what Module 2 needs instead).
+
+`detect_anomalies_for_frame_data()` / `detect_anomalies_for_frame_id()` are
+"Module 2". The first operates on an in-memory `sources` list — used right
+after `analyze_frame()`, in the same process, by `run()` below. The second
+reconstructs that same input purely from the API for a standalone task
+processing an already-analyzed frame — e.g. re-running anomaly detection
+under a fixed/changed classifier without re-running astrometry/photometry.
+Neither touches local FITS files.
+
+`generate_charts_for_anomalies()` / `generate_charts_for_source_ids()` are
+"Module 3" — thin wrappers around modules/finder_chart.py's batching. The
+`_source_ids` variant is what a standalone GENERATE_CHARTS task uses; the
+`_anomalies` variant additionally knows how to derive each source's display
+designation (MPC designation, or catalog_id as a fallback) from an in-memory
+`sources` list, the way `run()` needs.
+
+`run(fits_path)` composes all three for the single-frame case. watcher.py no
+longer calls this on the live ingestion path — it submits batched ANALYZE
+tasks instead (see watcher.py's own docstring) — so in practice `run()` is
+now mainly a convenience composition for tests and any ad hoc single-file
+invocation; worker.py is the actual task consumer for the three stages
+above, dispatching each item to `analyze_frame()` /
+`detect_anomalies_for_frame_id()` / `generate_charts_for_source_ids()`
+directly rather than through `run()`.
+
+`preview_catalog_match()` is a fourth, separate stage — a diagnostic tool
+(backing the `PREVIEW_CATALOG_MATCH` task type), not part of the
+ANALYZE/DETECT_ANOMALIES/GENERATE_CHARTS production path. It never moves/
+archives its input file, and its only API call is uploading the rendered
+chart (`POST /tasks/{task_id}/items/{item_id}/chart`) — no frame or source
+is ever registered. See modules/catalog_preview.py for what it actually
+renders; nothing from this stage is kept locally, on disk, after it returns.
 """
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import shutil
@@ -28,6 +76,11 @@ try:
     from modules import astrometry
 except ImportError:
     astrometry = None  # type: ignore[assignment]
+
+try:
+    from modules import catalog_preview
+except ImportError:
+    catalog_preview = None  # type: ignore[assignment]
 
 try:
     from modules import photometry
@@ -68,13 +121,15 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Stage 1 — analyze a single FITS file (Module 1)
 # ---------------------------------------------------------------------------
 
 
-async def run(fits_path: str) -> None:
+async def analyze_frame(fits_path: str) -> dict | None:
     """
-    Process a single FITS file through the full pipeline.
+    Process a single FITS file through header extraction, QC, astrometry,
+    subtraction, catalog matching, photometry, and register it (+ its
+    sources) with the API. Archives the file before returning.
 
     Steps:
         1. Extract FITS headers
@@ -84,16 +139,38 @@ async def run(fits_path: str) -> None:
         5. Photometry (optional) — uses Gaia DR3 matches for zero-point calibration
         6. POST frame to API — stop on failure
         7. POST sources to API
-        8. Anomaly detection (optional)
-        9. POST anomalies to API
-        9.5. Move file to archive
-        10. Finder chart update (optional) — per-source discovery chart
+        8. Move file to archive
 
     Parameters
     ----------
     fits_path:
-        Absolute path to the incoming FITS file.
+        Absolute path to the incoming FITS file. A bare basename (no
+        directory component) is treated as a reference to an
+        already-archived frame and resolved against FITS_ARCHIVE first —
+        see `_resolve_bare_filename()` below.
+
+    Returns
+    -------
+    dict | None
+        `None` if processing stopped early — a Dark/Flat/Bias calibration
+        frame (archived with no analysis), a QC rejection, no `api_client`
+        configured, or `POST /frames` itself failing. Otherwise:
+            {
+                "frame_id": str,
+                "filename": str,      # normalized filename actually archived
+                "basename": str,      # original incoming filename
+                "sources": list[dict],  # enriched; "_source_id" attached where resolved
+                "object_name": str,
+                "obs_time": str | None,
+                "subtraction_performed": bool,
+            }
+        A failure in any individual downstream step (catalog matching,
+        photometry, posting sources, the archive move itself) is caught and
+        logged — it degrades the result but does not turn it into `None`;
+        the frame is still registered and its (possibly incompletely
+        enriched) sources are still returned.
     """
+    fits_path = _resolve_bare_filename(fits_path)
     basename = os.path.basename(fits_path)
     # Note: "filename" is a reserved key in logging.LogRecord (set to the
     # source file name of the logger call). Use "fits_filename" instead so
@@ -104,11 +181,11 @@ async def run(fits_path: str) -> None:
     # Step 1 — Header extraction and normalization
     # ------------------------------------------------------------------
     header: dict = fits_header.extract_headers(fits_path)
-    
+
     # Apply normalization if enabled in config
     if config.NORMALIZE_ENABLED and normalizer is not None:
         header = normalizer.normalize_headers(header)
-    
+
     # Get object name for directory organization
     object_name: str = header.get("object_name", "_UNKNOWN") or "_UNKNOWN"
 
@@ -156,7 +233,7 @@ async def run(fits_path: str) -> None:
         shutil.move(fits_path, dest_path)
         _cleanup_astap_files(fits_path)
         logger.info("Archived %s frame: %s → %s", frame_type, basename, dest_path, extra=extra)
-        return
+        return None
 
     # ------------------------------------------------------------------
     # Step 2 — Quality control
@@ -174,7 +251,7 @@ async def run(fits_path: str) -> None:
 
     if quality_flag != "OK":
         logger.warning("QC rejected %s: %s", basename, quality_flag, extra=extra)
-        return
+        return None
 
     # qc.analyze() reports fwhm_median in "arcsec" when the frame's headers
     # carried enough info to derive a plate scale, otherwise in raw "pixels"
@@ -228,10 +305,10 @@ async def run(fits_path: str) -> None:
     #
     # NOTE: this must be assigned BEFORE Step 3.5 (image subtraction) below,
     # which merges its candidates into `sources`. Assigning it later (as an
-    # earlier revision of this file did, in what is now Step 4) made
-    # `sources` a local variable whose first assignment happened after the
-    # read in Step 3.5, raising UnboundLocalError on every frame where
-    # subtraction actually found candidates.
+    # earlier revision of this file did) made `sources` a local variable
+    # whose first assignment happened after the read in Step 3.5, raising
+    # UnboundLocalError on every frame where subtraction actually found
+    # candidates.
     # ------------------------------------------------------------------
     sources: list = astro_result.get("sources_all") or astro_result.get("sources") or []
     sources_stars: list = astro_result.get("sources") or []
@@ -353,7 +430,17 @@ async def run(fits_path: str) -> None:
     # ------------------------------------------------------------------
     if photometry is not None and sources:
         try:
-            sources = await photometry.measure(fits_path, sources)
+            # Narrowband (Hα/[OIII]/[SII]/[NII]) frames never get a Gaia
+            # zero-point — see photometry.measure()'s skip_calibration
+            # docstring and CLAUDE.md's "Filters — real astronomy context".
+            # Checked off the raw header filter (not yet necessarily
+            # normalized if NORMALIZE_ENABLED is false) via
+            # normalizer.is_narrowband(), which normalizes internally.
+            skip_calibration = bool(
+                normalizer is not None
+                and normalizer.is_narrowband(header.get("observation", {}).get("filter"))
+            )
+            sources = await photometry.measure(fits_path, sources, skip_calibration=skip_calibration)
             calibrated_count = sum(1 for s in sources if s.get("calibrated"))
             logger.info(
                 "Photometry complete: %d sources measured, %d calibrated",
@@ -390,16 +477,24 @@ async def run(fits_path: str) -> None:
     # field), photometry.py sets calibrated=False for every source in it, and
     # an earlier revision of this step fell back to mag_instrumental in that
     # case — which is exactly what produced the extreme (e.g. -15) "magnitude"
-    # values investigated in docs/ISSUES.md #2: two whole real frames with
-    # zero_point=None had every single source's "mag" come out negative and
-    # implausible, while frames that did calibrate looked completely normal
-    # (+11 to +19). See that doc for the live reproduction. Sources without a
-    # calibrated magnitude simply get mag=None — delta_mag-based
-    # classifications correctly don't fire for them rather than firing on a
-    # meaningless number.
+    # values investigated in docs/ISSUES.md #2. Sources without a calibrated
+    # magnitude simply get mag=None — delta_mag-based classifications
+    # correctly don't fire for them rather than firing on a meaningless number.
     # ------------------------------------------------------------------
+    # Also tag every source with this frame's own (normalized, if enabled)
+    # filter as "_filter" — leading underscore because, like "_source_id",
+    # it's internal-only and api_client._to_wire_source() strips it before
+    # POST /frames/{id}/sources (source_observations has no filter column;
+    # the frame-level filter already travels via POST /frames' own
+    # "observation.filter"). anomaly_detector.py reads it to restrict its
+    # historical Δmag comparison to same-filter detections only — comparing
+    # an L-band magnitude against an old R-band or Hα epoch is a color-term
+    # artifact, not real variability (see that module's section in
+    # CLAUDE.md's "Filters — real astronomy context").
+    frame_filter = header.get("observation", {}).get("filter")
     for _src in sources:
         _src["mag"] = _src.get("mag_calibrated") if _src.get("calibrated") else None
+        _src["_filter"] = frame_filter
 
     # ------------------------------------------------------------------
     # Step 6 — Post frame to API
@@ -409,13 +504,12 @@ async def run(fits_path: str) -> None:
             "API client not available — skipping all API steps and archive move",
             extra=extra,
         )
-        return
+        return None
 
     frame_data: dict = _build_frame_payload(
         fits_path, header, qc_result, astro_result,
         filename=normalized_filename,
     )
-
 
     try:
         frame_id: str = await api_client.post_frame(frame_data)
@@ -424,7 +518,7 @@ async def run(fits_path: str) -> None:
         logger.error("Failed to register frame %s: %s", basename, exc, extra=extra)
         # Clean up astap temp files even on failure
         _cleanup_astap_files(fits_path)
-        return
+        return None
 
     # ------------------------------------------------------------------
     # Step 7 — Post sources (includes catalog match info from step 4)
@@ -433,9 +527,8 @@ async def run(fits_path: str) -> None:
     # each source dict can be tagged with its resolved `sources.id` here.
     # anomaly_detector.py reads this back (as "_source_id") to populate
     # `anomalies[].source_id` — otherwise the API has no way to know which
-    # catalog source an anomaly refers to (see CLAUDE.md Known Issues).
+    # catalog source an anomaly refers to.
     # ------------------------------------------------------------------
-
     try:
         source_ids = await api_client.post_sources(frame_id, basename, sources)
         logger.debug(
@@ -463,69 +556,14 @@ async def run(fits_path: str) -> None:
             extra=extra,
         )
 
-
     # ------------------------------------------------------------------
-    # Step 8 — Anomaly detection (optional)
-    # ------------------------------------------------------------------
-    anomalies: list = []
-    if anomaly_detector is not None:
-        try:
-            # Build frame_meta with all fields required by anomaly_detector
-            anomaly_frame_meta = {
-                "filename": basename,
-                "obs_time": header.get("obs_time"),
-                "ra_center": astro_result.get("ra_center") or header.get("ra"),
-                "dec_center": astro_result.get("dec_center") or header.get("dec"),
-                "fov_deg": astro_result.get("fov_deg") or 1.0,
-                "subtraction_performed": subtraction_info.get("performed", False),
-            }
-            # sources already have catalog_name/catalog_id from step 4
-            anomalies = await anomaly_detector.detect(frame_id, sources, sources, anomaly_frame_meta)
-            logger.debug(
-                "Anomaly detection complete: %d anomalies",
-                len(anomalies),
-                extra=extra,
-            )
-        except Exception as exc:
-            logger.error(
-                "Anomaly detection failed: %s — continuing",
-                exc,
-                extra=extra,
-            )
-    else:
-        logger.debug("Anomaly detector not available — skipping", extra=extra)
-
-    # ------------------------------------------------------------------
-    # Step 9 — Post anomalies
-    # ------------------------------------------------------------------
-    try:
-        await api_client.post_anomalies(frame_id, normalized_filename, anomalies)
-        logger.debug(
-            "Anomalies posted: frame_id=%s count=%d",
-            frame_id,
-            len(anomalies),
-            extra=extra,
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to post anomalies: frame_id=%s error=%s — continuing",
-            frame_id,
-            exc,
-            extra=extra,
-        )
-
-    # ------------------------------------------------------------------
-    # Step 9.5 — Archive move and cleanup
+    # Step 8 — Archive move and cleanup.
     #
-    # This runs BEFORE the finder chart step (10) below on purpose: chart
-    # rendering loads each epoch's FITS file from
-    # FITS_ARCHIVE/{object}/{filename} (see modules/finder_chart.py's
-    # _local_fits_path()), and that includes *this* frame's own epoch. If
-    # the archive move happened after chart generation, this frame's file
-    # would still be sitting at its pre-archive location and every chart
-    # attempt for a source whose track consists only of this one frame
-    # (i.e. any first-time alert) would find 0 of its epochs loadable and
-    # silently skip the chart entirely — see CLAUDE.md Known Issues.
+    # Runs immediately after posting sources — NOT after anomaly detection.
+    # Anomaly detection (Module 2) never touches the local file, so there is
+    # no reason to keep it sitting in FITS_INCOMING any longer than this;
+    # doing so would also block Module 2 from ever running as a standalone
+    # task well after this function has returned (see module docstring).
     # ------------------------------------------------------------------
     try:
         # Bake astap's verified, freshly-solved WCS into fits_path's own
@@ -543,7 +581,7 @@ async def run(fits_path: str) -> None:
         dest_path = os.path.join(dest_dir, normalized_filename)
         shutil.move(fits_path, dest_path)
 
-        logger.info("Done: %s → %s", original_filename, dest_path, extra=extra)
+        logger.info("Archived: %s → %s", original_filename, dest_path, extra=extra)
 
         # Clean up astap temporary files (.ini, .wcs) left in incoming directory
         _cleanup_astap_files(fits_path)
@@ -551,105 +589,425 @@ async def run(fits_path: str) -> None:
     except Exception as exc:
         logger.error("Failed to archive file: %s", exc, extra=extra)
 
-    # ------------------------------------------------------------------
-    # Step 10 — Finder charts (optional)
-    #
-    # For every anomaly with a resolved source_id, (re)generate and upload
-    # its finder/discovery chart — a small PNG showing every frame that
-    # source has ever been detected on, with its position circled on each
-    # (see modules/finder_chart.py). Best-effort: failures here (missing
-    # local archive file, API hiccup, rendering error) are logged and never
-    # affect frame processing. Deduped by source_id — in practice Step 4.5
-    # already collapses multiple detections of the same catalog identity
-    # within one frame down to a single source, so seeing more than one
-    # anomaly per source_id here would be unusual; this dict-based dedup is
-    # defensive rather than the expected common case.
-    #
-    # Runs AFTER the archive move (step 9.5 above) so that this frame's own
-    # FITS file is already present at FITS_ARCHIVE/{object}/{filename} by
-    # the time chart rendering looks for it there.
-    #
-    # All source_ids for this frame are handled in one call to
-    # finder_chart.update_charts_for_sources() — it fetches every track via
-    # one GET /sources/tracks/batch and uploads every chart via one
-    # POST /sources/charts/batch, instead of one GET+POST round trip per
-    # source_id.
-    # ------------------------------------------------------------------
-    if finder_chart is not None and config.CHART_ENABLED:
-        anomaly_type_by_source: dict = {}
-        for anomaly in anomalies:
-            source_id = anomaly.get("source_id")
-            if source_id and source_id not in anomaly_type_by_source:
-                anomaly_type_by_source[source_id] = anomaly.get("anomaly_type")
+    return {
+        "frame_id": frame_id,
+        "filename": normalized_filename,
+        "basename": basename,
+        "sources": sources,
+        "object_name": object_name,
+        "obs_time": header.get("obs_time"),
+        "subtraction_performed": subtraction_info.get("performed", False),
+    }
 
-        # Catalog designation (e.g. an MPC name for an asteroid/comet, or a
-        # Simbad main_id for a known variable/binary star) to show next to
-        # anomaly_type on the rendered chart — see modules/finder_chart.py.
-        #
-        # Prefer each anomaly's OWN "mpc_designation" (set by
-        # anomaly_detector.py straight from the one `source` dict that
-        # produced this specific classification) over `sources`.catalog_id
-        # looked up by "_source_id". The latter is NOT always safe: the API
-        # resolves "_source_id" positionally, so a moving object that
-        # happens to pass near an already-catalogued star's position can get
-        # folded into that SAME `sources` row — whose catalog_name/catalog_id
-        # may then reflect the star (from a different detection, possibly on
-        # a different frame entirely), not the asteroid actually detected
-        # here. Real incident, 2026-08-06, Vesta_A807_FA test data: anomaly
-        # 6a7514b504c7f9.00535350 has mpc_designation="2014 RY1", but its
-        # source_id's `sources` row carries catalog_name="Gaia DR3" — a star
-        # that shares that source_id from an earlier/other detection — so a
-        # naive sources-lookup would have labelled the chart
-        # "ASTEROID (3971465931154563840)" instead of "ASTEROID (2014 RY1)".
-        # mpc_designation has no such ambiguity: it's captured once, at
-        # classification time, from the exact source that triggered it.
-        # Only anomaly types without an mpc_designation field at all
-        # (everything but ASTEROID/COMET) fall back to the sources-table
-        # lookup, which is safe in practice since those don't hinge on a
-        # per-frame moving-object identity the way MPC matches do.
-        designation_by_source: dict = {}
-        if anomaly_type_by_source:
-            mpc_designation_by_source: dict = {}
-            for anomaly in anomalies:
-                source_id = anomaly.get("source_id")
-                mpc_designation = anomaly.get("mpc_designation")
-                if source_id and mpc_designation and source_id not in mpc_designation_by_source:
-                    mpc_designation_by_source[source_id] = mpc_designation
 
-            catalog_id_by_source_id = {
-                src["_source_id"]: src["catalog_id"]
-                for src in sources
-                if src.get("_source_id") and src.get("catalog_name") and src.get("catalog_id")
-            }
+# ---------------------------------------------------------------------------
+# Stage 2 — anomaly detection (Module 2)
+# ---------------------------------------------------------------------------
 
-            for source_id in anomaly_type_by_source:
-                designation = mpc_designation_by_source.get(source_id) or catalog_id_by_source_id.get(source_id)
-                if designation:
-                    designation_by_source[source_id] = designation
 
-        if anomaly_type_by_source:
-            try:
-                chart_results = await finder_chart.update_charts_for_sources(
-                    anomaly_type_by_source, designation_by_source,
-                )
-                for source_id, anomaly_type in anomaly_type_by_source.items():
-                    logger.debug(
-                        "Finder chart %s for source_id=%s (%s)",
-                        "updated" if chart_results.get(source_id) else "skipped",
-                        source_id,
-                        anomaly_type,
-                        extra=extra,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "Finder chart batch update failed for %d source(s): %s — continuing",
-                    len(anomaly_type_by_source),
-                    exc,
-                    extra=extra,
-                )
+async def detect_anomalies_for_frame_data(
+    frame_id: str,
+    sources: list,
+    frame_meta: dict,
+    *,
+    post_filename: str,
+) -> list[dict]:
+    """
+    Classify anomalies for an already-in-memory `sources` list and post the
+    result to the API. The core of Module 2 — shared by `run()` (called
+    right after `analyze_frame()`, same process) and
+    `detect_anomalies_for_frame_id()` below (called with `sources`
+    reconstructed from the API for a standalone task).
+
+    Parameters
+    ----------
+    frame_id:
+        Frame ID this classification is for.
+    sources:
+        Enriched source dicts (ra, dec, mag, catalog_name, catalog_id,
+        object_type, elongation, saturated, near_edge, "_from_subtraction",
+        "_source_id" — see modules/anomaly_detector.py's `detect()`).
+    frame_meta:
+        Dict with at least "filename" and "obs_time" — the two fields
+        anomaly_detector.py actually reads (used for logging and the
+        before_time bound of its history queries).
+    post_filename:
+        Filename to send with `POST /frames/{id}/anomalies` — kept as a
+        separate parameter from `frame_meta["filename"]` because `run()`
+        historically posts the *normalized* filename here while logging
+        under the frame's *original* incoming basename; preserved rather
+        than unified so existing behavior doesn't shift.
+
+    Returns
+    -------
+    list[dict]
+        The anomaly dicts (whatever anomaly_detector.detect() returned, or
+        [] if the module is unavailable or classification failed). Posted
+        to the API regardless (an empty list is a valid, meaningful
+        payload — see docs/API.md's replace semantics for
+        POST /frames/{id}/anomalies).
+    """
+    extra = {"fits_filename": frame_meta.get("filename", post_filename)}
+
+    anomalies: list = []
+    if anomaly_detector is not None:
+        try:
+            anomalies = await anomaly_detector.detect(frame_id, sources, sources, frame_meta)
+            logger.debug(
+                "Anomaly detection complete: %d anomalies",
+                len(anomalies),
+                extra=extra,
+            )
+        except Exception as exc:
+            logger.error(
+                "Anomaly detection failed: %s — continuing",
+                exc,
+                extra=extra,
+            )
     else:
+        logger.debug("Anomaly detector not available — skipping", extra=extra)
+
+    if api_client is not None:
+        try:
+            await api_client.post_anomalies(frame_id, post_filename, anomalies)
+            logger.debug(
+                "Anomalies posted: frame_id=%s count=%d",
+                frame_id,
+                len(anomalies),
+                extra=extra,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to post anomalies: frame_id=%s error=%s — continuing",
+                frame_id,
+                exc,
+                extra=extra,
+            )
+
+    return anomalies
+
+
+def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict:
+    """
+    Translate one entry of GET /frames/{id}/sources' response into the
+    internal shape modules/anomaly_detector.py expects — the inverse of
+    api_client._to_wire_source(). Used by detect_anomalies_for_frame_id()
+    below to reconstruct a frame's `sources` list purely from API data, with
+    no in-memory state carried over from when the frame was first analyzed.
+
+    `frame_filter` is the parent frame's own filter (GET /frames/{id}'s
+    flattened "filter" field) — every source in a GET /frames/{id}/sources
+    response was observed on that one frame, so they all share it. There is
+    no per-source filter field on the wire (source_observations has no such
+    column; see api_client.py) — this is the standalone-task counterpart of
+    analyze_frame()'s in-memory "_filter" tagging (Step 5.5), needed so
+    anomaly_detector.py's same-filter Δmag comparison also works when
+    DETECT_ANOMALIES is re-run later as its own task.
+    """
+    return {
+        "ra": api_source.get("ra"),
+        "dec": api_source.get("dec"),
+        "mag": api_source.get("mag"),
+        "catalog_name": api_source.get("catalog_name"),
+        "catalog_id": api_source.get("catalog_id"),
+        "object_type": api_source.get("object_type"),
+        "elongation": api_source.get("elongation") or 0.0,
+        "saturated": bool(api_source.get("saturated")),
+        # No leading underscore on the wire, same as "saturated" — see
+        # astrometry.py's near_edge docstring for why it must survive here.
+        "near_edge": bool(api_source.get("near_edge")),
+        "_from_subtraction": bool(api_source.get("from_subtraction")),
+        "_source_id": api_source.get("source_id"),
+        "_filter": frame_filter,
+    }
+
+
+async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
+    """
+    Standalone DETECT_ANOMALIES worker entry point.
+
+    Reconstructs a frame's `sources` list purely from the API
+    (GET /frames/{id}, GET /frames/{id}/sources) and runs anomaly detection
+    against it — no local FITS access needed at all. This is what lets
+    anomaly detection be re-run for an already-analyzed frame (a fixed or
+    new classifier, or simply an object's entire observation history at
+    once, old and new frames alike) without re-running astrometry/photometry.
+
+    Returns
+    -------
+    list[dict]
+        Same shape as detect_anomalies_for_frame_data(), with one addition:
+        every anomaly that has a "source_id" also gets a "_designation" key
+        (its mpc_designation if set, else the matching source's catalog_id,
+        else None) — see modules/finder_chart.py's designation-title
+        feature. worker.py reads this to build a GENERATE_CHARTS task's
+        per-item payload without a second round trip. [] if the frame
+        doesn't exist, the API client isn't configured, or the fetch fails.
+    """
+    if api_client is None:
+        logger.warning("detect_anomalies_for_frame_id: API client not available")
+        return []
+
+    frame = await api_client.get_frame(frame_id)
+    if frame is None:
+        logger.warning("detect_anomalies_for_frame_id: frame_id=%s not found", frame_id)
+        return []
+
+    api_sources = await api_client.get_frame_sources(frame_id)
+    frame_filter = frame.get("filter")
+    sources = [_from_wire_source(s, frame_filter) for s in api_sources]
+
+    frame_meta = {
+        "filename": frame.get("filename"),
+        "obs_time": frame.get("obs_time"),
+    }
+
+    anomalies = await detect_anomalies_for_frame_data(
+        frame_id,
+        sources,
+        frame_meta,
+        post_filename=frame.get("filename") or "<unknown>",
+    )
+
+    # Same "prefer mpc_designation, fall back to catalog_id via source_id"
+    # rule as generate_charts_for_anomalies() below uses for the in-memory
+    # case — see that function's comment for the real incident this guards
+    # against (a shared/stale sources.catalog_id).
+    catalog_id_by_source_id = {
+        s["_source_id"]: s["catalog_id"]
+        for s in sources
+        if s.get("_source_id") and s.get("catalog_name") and s.get("catalog_id")
+    }
+    for anomaly in anomalies:
+        source_id = anomaly.get("source_id")
+        if source_id:
+            anomaly["_designation"] = anomaly.get("mpc_designation") or catalog_id_by_source_id.get(source_id)
+
+    return anomalies
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — finder charts (Module 3)
+# ---------------------------------------------------------------------------
+
+
+async def generate_charts_for_source_ids(
+    anomaly_type_by_source_id: dict,
+    designation_by_source_id: dict | None = None,
+) -> dict:
+    """
+    Standalone GENERATE_CHARTS worker entry point — a thin wrapper kept for
+    a consistent pipeline.py import surface; all the real batching logic
+    lives in modules/finder_chart.py. Safe to call with every source_id a
+    GENERATE_CHARTS task covers at once, regardless of how many frames they
+    originally came from — one call renders and uploads every one of them.
+
+    Returns
+    -------
+    dict
+        source_id -> bool (True on successful chart update). {} if the
+        module is unavailable, charting is disabled (CHART_ENABLED=false),
+        or `anomaly_type_by_source_id` is empty.
+    """
+    if finder_chart is None or not config.CHART_ENABLED or not anomaly_type_by_source_id:
+        return {}
+    return await finder_chart.update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id)
+
+
+async def generate_charts_for_anomalies(sources: list, anomalies: list) -> dict:
+    """
+    Build the (source_id -> anomaly_type) / (source_id -> designation) maps
+    from an in-memory `sources` + `anomalies` pair and update every affected
+    source's finder chart in one batch. This is what `run()` uses right
+    after `detect_anomalies_for_frame_data()`, in the same process.
+
+    Deduped by source_id — in practice pipeline.py's dedup-by-catalog-
+    identity step already collapses multiple detections of the same catalog
+    identity within one frame down to a single source, so seeing more than
+    one anomaly per source_id here would be unusual; this dict-based dedup
+    is defensive rather than the expected common case.
+
+    Designation resolution prefers each anomaly's OWN "mpc_designation" (set
+    by anomaly_detector.py straight from the one `source` dict that produced
+    that specific classification) over `sources`.catalog_id looked up by
+    "_source_id". The latter is NOT always safe: the API resolves
+    "_source_id" positionally, so a moving object that happens to pass near
+    an already-catalogued star's position can get folded into that SAME
+    `sources` row — whose catalog_name/catalog_id may then reflect the star
+    (from a different detection, possibly on a different frame entirely),
+    not the asteroid actually detected here (real incident, 2026-08-06,
+    Vesta_A807_FA test data — see modules/finder_chart.py). Only anomaly
+    types without an mpc_designation field at all fall back to the
+    sources-table lookup, which is safe in practice since those don't hinge
+    on a per-frame moving-object identity the way MPC matches do.
+
+    Best-effort: any exception from the underlying chart update is caught
+    and logged, never raised — this must never affect frame processing.
+
+    Returns
+    -------
+    dict
+        source_id -> bool, or {} if there was nothing to chart (no anomaly
+        had a resolved source_id) or charting is disabled/unavailable.
+    """
+    if finder_chart is None or not config.CHART_ENABLED:
         if finder_chart is None:
-            logger.debug("Finder chart module not available — skipping", extra=extra)
+            logger.debug("Finder chart module not available — skipping")
+        return {}
+
+    anomaly_type_by_source: dict = {}
+    for anomaly in anomalies:
+        source_id = anomaly.get("source_id")
+        if source_id and source_id not in anomaly_type_by_source:
+            anomaly_type_by_source[source_id] = anomaly.get("anomaly_type")
+
+    if not anomaly_type_by_source:
+        return {}
+
+    designation_by_source: dict = {}
+    mpc_designation_by_source: dict = {}
+    for anomaly in anomalies:
+        source_id = anomaly.get("source_id")
+        mpc_designation = anomaly.get("mpc_designation")
+        if source_id and mpc_designation and source_id not in mpc_designation_by_source:
+            mpc_designation_by_source[source_id] = mpc_designation
+
+    catalog_id_by_source_id = {
+        src["_source_id"]: src["catalog_id"]
+        for src in sources
+        if src.get("_source_id") and src.get("catalog_name") and src.get("catalog_id")
+    }
+
+    for source_id in anomaly_type_by_source:
+        designation = mpc_designation_by_source.get(source_id) or catalog_id_by_source_id.get(source_id)
+        if designation:
+            designation_by_source[source_id] = designation
+
+    try:
+        chart_results = await generate_charts_for_source_ids(anomaly_type_by_source, designation_by_source)
+        for source_id, anomaly_type in anomaly_type_by_source.items():
+            logger.debug(
+                "Finder chart %s for source_id=%s (%s)",
+                "updated" if chart_results.get(source_id) else "skipped",
+                source_id,
+                anomaly_type,
+            )
+        return chart_results
+    except Exception as exc:
+        logger.warning(
+            "Finder chart batch update failed for %d source(s): %s — continuing",
+            len(anomaly_type_by_source),
+            exc,
+        )
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Public entry point — composes the three stages for one FITS file
+# ---------------------------------------------------------------------------
+
+
+async def run(fits_path: str) -> None:
+    """
+    Process a single FITS file end-to-end: analyze, detect anomalies,
+    generate charts — the composition of the three stages above, still used
+    by watcher.py for every file it sees land in FITS_INCOMING.
+
+    Parameters
+    ----------
+    fits_path:
+        Absolute path to the incoming FITS file.
+    """
+    result = await analyze_frame(fits_path)
+    if result is None:
+        return
+
+    anomaly_frame_meta = {
+        "filename": result["basename"],
+        "obs_time": result["obs_time"],
+        "subtraction_performed": result["subtraction_performed"],
+    }
+
+    anomalies = await detect_anomalies_for_frame_data(
+        result["frame_id"],
+        result["sources"],
+        anomaly_frame_meta,
+        post_filename=result["filename"],
+    )
+
+    await generate_charts_for_anomalies(result["sources"], anomalies)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 — catalog-match preview (diagnostic tool, not part of the
+# ANALYZE/DETECT_ANOMALIES/GENERATE_CHARTS production path)
+# ---------------------------------------------------------------------------
+
+
+async def preview_catalog_match(fits_path: str, task_id: str, item_id: str) -> dict:
+    """
+    Standalone PREVIEW_CATALOG_MATCH worker entry point. Renders the
+    diagnostic image via modules/catalog_preview.py's render() (never
+    calling the API itself, never moving/archiving `fits_path`), then
+    uploads the resulting PNG to observatory-api via
+    POST /tasks/{task_id}/items/{item_id}/chart — the task_item_id-keyed
+    counterpart of a source's finder chart (see docs/API.md section 15 and
+    observatory-api's SourceChartModel). No local copy of the PNG is kept;
+    it lives only in the API's storage once this returns.
+
+    Reuses modules/catalog_matcher.py directly (not a separate copy of the
+    matching logic), so repeated frames of the same object/session within
+    one task benefit from its on-disk cache exactly like a production
+    ANALYZE run would — only the first frame per sky tile actually re-hits
+    Gaia/Simbad/2MASS/Pan-STARRS/MPC.
+
+    Parameters
+    ----------
+    fits_path:
+        Path to the FITS file — may still be sitting in FITS_INCOMING, or
+        already archived/rejected; never modified, moved, or removed. A bare
+        basename (no directory component) is treated as a reference to an
+        already-archived frame and resolved against FITS_ARCHIVE first —
+        see `_resolve_bare_filename()`.
+    task_id, item_id:
+        Identify the PREVIEW_CATALOG_MATCH task item this chart belongs to
+        — both are required to build the upload URL.
+
+    Returns
+    -------
+    dict
+        {"matched": int, "total": int, "quality_flag": str,
+         "chart_uploaded": bool} — `chart_uploaded` is False if rendering
+        succeeded but the API upload itself failed (logged by api_client;
+        never raises), so the caller can still tell the two apart even
+        though neither is treated as a FAILED item on its own — a rendered-
+        but-unuploaded chart is a real, if incomplete, result, not nothing.
+
+    Raises
+    ------
+    RuntimeError
+        Propagated from render() if astrometry fails — the caller
+        (worker.py) is expected to catch this and report the item FAILED,
+        same as any other stage's per-item failure handling.
+    """
+    if catalog_preview is None:
+        raise RuntimeError("modules.catalog_preview is not available")
+
+    fits_path = _resolve_bare_filename(fits_path)
+    result = await catalog_preview.render(fits_path)
+
+    chart_uploaded = False
+    if api_client is not None:
+        chart_uploaded = await api_client.upload_task_item_chart(
+            task_id, item_id, result["png_bytes"], style="catalog_preview", frame_count=1,
+        )
+
+    return {
+        "matched": result["matched"],
+        "total": result["total"],
+        "quality_flag": result["quality_flag"],
+        "chart_uploaded": chart_uploaded,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -657,12 +1015,59 @@ async def run(fits_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_bare_filename(fits_path: str) -> str:
+    """
+    Resolve a bare filename (no directory component at all) to its actual
+    location under FITS_ARCHIVE.
+
+    ANALYZE and PREVIEW_CATALOG_MATCH task items are documented (see
+    CLAUDE.md's job-queue table, docs/API.md section 15, and this module's
+    own docstrings) as carrying the FULL path to the FITS file — the caller
+    that creates the task_item is supposed to know where the file actually
+    is. observatory-api's Web\\FramesController::createTask() debug page
+    violates that: it builds these task_items straight from an
+    already-registered frame's `frames.filename` column, which is a
+    basename only (see `_build_frame_payload()` above — the API never
+    receives a full path at all). The API can't fix this itself: it has no
+    filesystem access to /fits/... whatsoever (see CLAUDE.md's "Architecture:
+    Two Repositories") and therefore no way to know FITS_ARCHIVE's actual
+    value for this deployment — only this process does, so the fallback has
+    to live here rather than on the API side.
+
+    A path that already has a directory component (relative or absolute) is
+    returned unchanged — this only kicks in for a bare basename, which is
+    unambiguous: a real path is never mistaken for one. Searches every
+    FITS_ARCHIVE/{object}/ subdirectory for an exact filename match and
+    returns the first hit. Zero or more than one match returns the input
+    unchanged, so the caller's normal "file not found" failure still
+    surfaces rather than a confusing resolver-internal one; more than one
+    match is also logged, since normalized filenames are expected to be
+    unique across the whole archive.
+    """
+    if os.path.dirname(fits_path):
+        return fits_path
+
+    matches = sorted(glob.glob(os.path.join(config.FITS_ARCHIVE, "*", fits_path)))
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) > 1:
+        logger.warning(
+            "Bare filename %r matches multiple archived frames; using the first: %s",
+            fits_path, matches,
+        )
+        return matches[0]
+
+    return fits_path
+
+
 def _dedupe_by_catalog_identity(sources: list, extra: dict) -> list:
     """
     Collapse multiple detections in this frame's source list that resolved
     to the very same catalog identity (catalog_name, catalog_id) into a
-    single representative source. See Step 4.5's comment in run() above for
-    the rationale.
+    single representative source. See analyze_frame()'s Step 4.5 comment
+    for the rationale.
 
     Sources with no catalog match (catalog_name is None, or catalog_id is
     None) are never merged — every uncatalogued detection is kept as a
@@ -736,9 +1141,9 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
     and astap's fresh solve differed by ~178" (astap's own solve log had
     already reported and corrected that same "Mount offset").
 
-    Called right before the archive move (Step 9.5), while fits_path is
-    still writable at its pre-archive location. Best-effort: any failure is
-    logged and returns False — never raises, never blocks the archive move.
+    Called right before the archive move, while fits_path is still writable
+    at its pre-archive location. Best-effort: any failure is logged and
+    returns False — never raises, never blocks the archive move.
     """
     try:
         from astropy.io import fits as astropy_fits  # noqa: PLC0415
@@ -787,9 +1192,9 @@ def _build_frame_payload(
     """
     Assemble the POST /frames request body from module outputs.
 
-    The structure matches the POST /frames API payload defined in CLAUDE.md,
+    The structure matches the POST /frames API payload defined in docs/API.md,
     with nested sub-dicts for observation, instrument, sensor, observer, software, and qc.
-    
+
     If normalization is enabled, all values in header are already normalized.
     """
     # Get fov_deg from astrometry, or calculate from FITS headers as fallback
@@ -799,7 +1204,6 @@ def _build_frame_payload(
 
     return {
         "filename": filename,
-        "original_filepath": fits_path,
         "obs_time": header.get("obs_time"),
         "ra_center": astro_result.get("ra_center") or header.get("ra"),
         "dec_center": astro_result.get("dec_center") or header.get("dec"),
@@ -884,4 +1288,3 @@ def _calculate_fov_from_headers(header: dict) -> float | None:
     )
 
     return fov_deg
-
