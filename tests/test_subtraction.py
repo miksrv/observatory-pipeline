@@ -248,6 +248,92 @@ class TestDetectDiffSources:
 
         assert len(candidates) >= 1
 
+    def test_central_candidate_is_not_near_edge(self):
+        """
+        100x100 diff, default EDGE_MARGIN_FRAC=0.1 → 10px margin. A blob at
+        (60, 40) sits well inside [10, 90] on both axes.
+        """
+        rng = np.random.default_rng(42)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 60) ** 2 + (yy - 40) ** 2) / (2 * 3.0 ** 2)))
+        diff = diff + blob
+
+        candidates = subtraction._detect_diff_sources(diff)
+
+        assert len(candidates) >= 1
+        assert all(c["near_edge"] is False for c in candidates)
+
+    def test_corner_candidate_is_near_edge(self):
+        """A blob at (5, 5) on a 100x100 diff falls inside the 10px margin."""
+        rng = np.random.default_rng(9)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 5) ** 2 + (yy - 5) ** 2) / (2 * 2.0 ** 2)))
+        diff = diff + blob
+
+        candidates = subtraction._detect_diff_sources(diff)
+
+        assert len(candidates) >= 1
+        closest = min(candidates, key=lambda c: (c["x"] - 5) ** 2 + (c["y"] - 5) ** 2)
+        assert closest["near_edge"] is True
+
+
+# ---------------------------------------------------------------------------
+# Streak masking on the difference image (docs/ISSUES.md-style real incident,
+# 2026-08-07, T_CrB test frames: a satellite trail present in the new frame
+# but absent from the reference stack fragmented into 42 separate
+# elongation>3 candidates on the diff image — each individually
+# classifiable by anomaly_detector.py as its own SPACE_DEBRIS anomaly).
+# Uses real (unmocked) sep, same style as TestDetectDiffSources above.
+# ---------------------------------------------------------------------------
+
+class TestDetectDiffSourcesStreakMasking:
+
+    def test_streak_segments_are_suppressed_round_blob_survives(self):
+        """
+        Two disjoint elongated strips (simulating a satellite trail that
+        fragmented into disconnected segments — see
+        _build_streak_mask()'s docstring) must be suppressed, while an
+        ordinary round transient elsewhere in the same diff image is
+        unaffected.
+        """
+        rng = np.random.default_rng(11)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(300, 300))
+
+        # Two disjoint 100x4px vertical strips ~60px apart — elongation ~25,
+        # bbox diagonal ~100px. At pixel_scale_arcsec=1.0, that's 100" —
+        # well past the default STREAK_MIN_LENGTH_ARCSEC (30").
+        diff[20:120, 148:152] += 400.0
+        diff[180:280, 148:152] += 400.0
+
+        # A genuine round transient far from the streak.
+        yy, xx = np.mgrid[0:300, 0:300]
+        blob = 600.0 * np.exp(-(((xx - 250) ** 2 + (yy - 250) ** 2) / (2 * 3.0 ** 2)))
+        diff = diff + blob
+
+        candidates = subtraction._detect_diff_sources(diff, pixel_scale_arcsec=1.0)
+
+        # No candidate should land inside the masked streak columns.
+        assert not any(140 <= c["x"] <= 160 for c in candidates)
+        # The round transient must still be found.
+        assert any(abs(c["x"] - 250) < 3 and abs(c["y"] - 250) < 3 for c in candidates)
+
+    def test_without_pixel_scale_short_strip_is_not_masked(self):
+        """
+        A strip whose bbox diagonal falls under the fixed 200px fallback
+        floor (used when pixel_scale_arcsec is None) must be left alone —
+        this is what keeps an ordinary elongated blend from being treated
+        as a streak when no plate scale is available at all.
+        """
+        rng = np.random.default_rng(5)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(300, 300))
+        diff[100:160, 148:152] += 400.0  # ~60px tall — below the 200px floor
+
+        candidates = subtraction._detect_diff_sources(diff)  # pixel_scale_arcsec=None
+
+        assert any(140 <= c["x"] <= 160 and 100 <= c["y"] <= 160 for c in candidates)
+
 
 # ---------------------------------------------------------------------------
 # _build_saturation_mask (docs/ISSUES.md #1, #2)
@@ -383,6 +469,16 @@ class TestPixelToSky:
         assert "x" not in result[0] and "y" not in result[0]
         assert result[0]["flux"] == 123.0
 
+    def test_near_edge_flag_survives_conversion(self, tmp_path):
+        """Only x/y are stripped — near_edge (and any other candidate key)
+        must pass through untouched."""
+        path = self._make_wcs_fits(tmp_path)
+        candidates = [{"x": 49.0, "y": 49.0, "flux": 123.0, "near_edge": True}]
+
+        result = subtraction._pixel_to_sky(candidates, path)
+
+        assert result[0]["near_edge"] is True
+
     def test_no_wcs_returns_empty(self, tmp_path):
         data = np.zeros((10, 10), dtype=np.float32)
         path = tmp_path / "no_wcs.fits"
@@ -478,7 +574,7 @@ class TestRun:
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
-        monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff, mask=None, fwhm_min_px=None: [])
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [])
         monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
@@ -510,7 +606,7 @@ class TestRun:
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
-            lambda diff, mask=None, fwhm_min_px=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+            lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
         )
         monkeypatch.setattr(
             subtraction, "_pixel_to_sky",
@@ -555,7 +651,7 @@ class TestRun:
 
         captured: dict = {}
 
-        def fake_detect(diff, mask=None, fwhm_min_px=None):
+        def fake_detect(diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None):
             captured["mask"] = mask
             return []
 
@@ -580,7 +676,7 @@ class TestRun:
 
         captured: dict = {}
 
-        def fake_detect(diff, mask=None, fwhm_min_px=None):
+        def fake_detect(diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None):
             captured["mask"] = mask
             return []
 
@@ -610,7 +706,7 @@ class TestRun:
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
-            lambda diff, mask=None, fwhm_min_px=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
+            lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
         )
 
         sentinel_wcs = AstropyWCS(naxis=2)

@@ -150,6 +150,34 @@ def _make_hdu_mock(image: np.ndarray, header: dict[str, Any]) -> _FakeHDUL:
     return _FakeHDUL([_FakeHDU(image, header)])
 
 
+# ---------------------------------------------------------------------------
+# sep.extract side_effect helper — qc.analyze() now calls sep.extract() TWICE:
+# once for _build_streak_mask()'s coarse, non-deblended, segmentation_map=True
+# pre-pass, and once for the real detection pass. A plain return_value= mock
+# would hand the coarse pass the same structured array meant for the real
+# detection, which analyze() then tries to unpack as
+# `objs, seg = sep.extract(...)` — breaking every test that patches
+# sep.extract directly. This discriminates on the segmentation_map kwarg so
+# the coarse pass gets an empty "nothing streak-like found" result by
+# default, leaving every pre-existing test's behavior unchanged.
+# ---------------------------------------------------------------------------
+
+def _empty_coarse_objects() -> np.ndarray:
+    return np.zeros(0, dtype=[
+        ("a", np.float64), ("b", np.float64),
+        ("xmin", np.int32), ("xmax", np.int32),
+        ("ymin", np.int32), ("ymax", np.int32),
+    ])
+
+
+def _make_sep_extract_side_effect(sources: np.ndarray):
+    def _sep_extract(data, *args, **kwargs):
+        if kwargs.get("segmentation_map"):
+            return _empty_coarse_objects(), np.zeros(np.asarray(data).shape, dtype=np.int32)
+        return sources
+    return _sep_extract
+
+
 def _sum_circle_return(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Simulate sep.sum_circle returning healthy flux and flux-error arrays."""
     flux    = np.full(n, 5000.0, dtype=np.float64)
@@ -210,7 +238,7 @@ def _patch_qc(
     with (
         patch("modules.qc.fits.open", return_value=hdul_mock),
         patch("modules.qc.sep.Background", return_value=bkg_mock),
-        patch("modules.qc.sep.extract",    return_value=sources),
+        patch("modules.qc.sep.extract",    side_effect=_make_sep_extract_side_effect(sources)),
         patch("modules.qc.sep.sum_circle", return_value=_sum_circle_return(n)),
         patch("modules.qc.astroscrappy.detect_cosmics", side_effect=_detect_cosmics),
         patch("modules.qc.extract_headers",             return_value=header_info),
@@ -333,6 +361,70 @@ class TestLowStarsFlag:
 
 
 # ---------------------------------------------------------------------------
+# Test 4a — LOW_STARS uses a softer threshold on narrowband filters
+# ---------------------------------------------------------------------------
+
+class TestNarrowbandStarsThreshold:
+    """
+    A narrowband (Hα/[OIII]/[SII]/[NII]) frame of the same field genuinely
+    detects far fewer stars than a broadband one — only the sliver of
+    stellar continuum that leaks through the line filter is visible — so it
+    must be judged against QC_STARS_MIN_NARROWBAND, not QC_STARS_MIN.
+    """
+
+    @pytest.mark.asyncio
+    async def test_narrowband_below_broadband_min_still_passes(self):
+        """
+        7 stars is below QC_STARS_MIN (10) but above QC_STARS_MIN_NARROWBAND
+        (5) — must NOT be LOW_STARS when the frame's filter is Hα.
+        """
+        import config
+        header_info = {
+            "object_name": _OBJECT_NAME,
+            "instrument":  {"focal_length_mm": 997.0},
+            "observation": {"filter": "Ha"},
+        }
+        sources = _make_sources(7, _A_NORMAL, _B_NORMAL)
+        assert config.QC_STARS_MIN_NARROWBAND < 7 < config.QC_STARS_MIN
+        with _patch_qc(sources, header_info=header_info):
+            result = await qc.analyze(_FITS_PATH)
+
+        assert result["quality_flag"] != "LOW_STARS"
+
+    @pytest.mark.asyncio
+    async def test_same_star_count_is_low_stars_on_broadband(self):
+        """The same 7-star count on a broadband (L) frame IS LOW_STARS."""
+        import config
+        header_info = {
+            "object_name": _OBJECT_NAME,
+            "instrument":  {"focal_length_mm": 997.0},
+            "observation": {"filter": "L"},
+        }
+        sources = _make_sources(7, _A_NORMAL, _B_NORMAL)
+        assert 7 < config.QC_STARS_MIN
+        with _patch_qc(sources, header_info=header_info):
+            result = await qc.analyze(_FITS_PATH)
+
+        assert result["quality_flag"] == "LOW_STARS"
+
+    @pytest.mark.asyncio
+    async def test_narrowband_below_narrowband_min_is_still_low_stars(self):
+        """4 stars is below QC_STARS_MIN_NARROWBAND (5) even for Hα -> LOW_STARS."""
+        import config
+        header_info = {
+            "object_name": _OBJECT_NAME,
+            "instrument":  {"focal_length_mm": 997.0},
+            "observation": {"filter": "H-Alpha"},  # raw spelling, not yet normalized
+        }
+        sources = _make_sources(4, _A_NORMAL, _B_NORMAL)
+        assert 4 < config.QC_STARS_MIN_NARROWBAND
+        with _patch_qc(sources, header_info=header_info):
+            result = await qc.analyze(_FITS_PATH)
+
+        assert result["quality_flag"] == "LOW_STARS"
+
+
+# ---------------------------------------------------------------------------
 # Test 4b — HIGH_BACKGROUND flag
 # ---------------------------------------------------------------------------
 
@@ -446,7 +538,7 @@ class TestRejectedFileMoved:
         with (
             patch("modules.qc.fits.open", return_value=_make_hdu_mock(_make_image(), {})),
             patch("modules.qc.sep.Background", return_value=_make_bkg_mock()),
-            patch("modules.qc.sep.extract",    return_value=sources),
+            patch("modules.qc.sep.extract",    side_effect=_make_sep_extract_side_effect(sources)),
             patch("modules.qc.sep.sum_circle",
                   return_value=_sum_circle_return(len(sources))),
             patch("modules.qc.astroscrappy.detect_cosmics",
@@ -490,7 +582,7 @@ class TestDestinationDirectoryCreated:
             patch("modules.qc.fits.open",
                   return_value=_make_hdu_mock(_make_image(), {})),
             patch("modules.qc.sep.Background", return_value=_make_bkg_mock()),
-            patch("modules.qc.sep.extract",    return_value=sources),
+            patch("modules.qc.sep.extract",    side_effect=_make_sep_extract_side_effect(sources)),
             patch("modules.qc.sep.sum_circle",
                   return_value=_sum_circle_return(len(sources))),
             patch("modules.qc.astroscrappy.detect_cosmics",
@@ -681,3 +773,108 @@ class TestPlateScale:
         # FWHM in pixels for a=1.5, b=1.4 ≈ 2.4 px → in arcsec ≈ 3.6
         assert result["fwhm_median"] is not None
         assert result["fwhm_median"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Test 13 — Streak masking (satellite trails / diffraction spikes)
+#
+# Mirrors modules/astrometry.py's TestStreakMasking — see that module's
+# _build_streak_mask() docstring for the real-data motivation
+# (2026-08-07, T_CrB test frame).
+# ---------------------------------------------------------------------------
+
+def _make_coarse_object(a: float, xmin: int, xmax: int, ymin: int, ymax: int, b: float = 1.0) -> np.ndarray:
+    obj = np.zeros(1, dtype=[
+        ("a", np.float64), ("b", np.float64),
+        ("xmin", np.int32), ("xmax", np.int32),
+        ("ymin", np.int32), ("ymax", np.int32),
+    ])
+    obj["a"] = a
+    obj["b"] = b
+    obj["xmin"], obj["xmax"] = xmin, xmax
+    obj["ymin"], obj["ymax"] = ymin, ymax
+    return obj
+
+
+class TestStreakMasking:
+    @pytest.mark.asyncio
+    async def test_long_elongated_streak_is_masked_before_final_extraction(self):
+        """
+        A coarse candidate that is both highly elongated and far longer than
+        any real star's footprint must have its pixels zeroed in the data
+        the real (second) sep.extract() call receives. Default _patch_qc()
+        header gives ~1.0 arcsec/px, so a 60px-long 1px-wide feature clears
+        the default STREAK_MIN_LENGTH_ARCSEC (30").
+        """
+        calls: list[tuple[np.ndarray, dict]] = []
+        streak_col = 5  # within the 64x64 _IMAGE_SHAPE test image
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            calls.append((arr.copy(), kwargs))
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(a=30.0, xmin=streak_col, xmax=streak_col, ymin=0, ymax=60)
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[0:60, streak_col] = 1
+                return coarse, seg
+            return _make_sources(_N_SOURCES, _A_NORMAL, _B_NORMAL)
+
+        with _patch_qc(_make_sources(_N_SOURCES, _A_NORMAL, _B_NORMAL)):
+            with patch("modules.qc.sep.extract", side_effect=_sep_extract):
+                result = await qc.analyze(_FITS_PATH)
+
+        assert isinstance(result, dict)
+        assert len(calls) == 2
+        final_data, final_kwargs = calls[1]
+        assert not final_kwargs.get("segmentation_map")
+        assert np.all(final_data[0:60, streak_col] == 0.0)
+
+    @pytest.mark.asyncio
+    async def test_no_plate_scale_still_masks_using_fixed_pixel_floor(self):
+        """
+        With no plate scale (PIXSCALE=None and no XPIXSZ/FOCALLEN),
+        _build_streak_mask() must fall back to its fixed 200px length floor
+        rather than skip masking outright.
+        """
+        calls: list[tuple[np.ndarray, dict]] = []
+        streak_col = 5
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            calls.append((arr.copy(), kwargs))
+            if kwargs.get("segmentation_map"):
+                # bbox diagonal ~250px, well past the 200px fallback floor.
+                coarse = _make_coarse_object(a=125.0, xmin=streak_col, xmax=streak_col, ymin=0, ymax=250)
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[0:60, streak_col] = 1  # only mark within the small test image bounds
+                return coarse, seg
+            return _make_sources(_N_SOURCES, _A_NORMAL, _B_NORMAL)
+
+        with _patch_qc(_make_sources(_N_SOURCES, _A_NORMAL, _B_NORMAL), header={"PIXSCALE": None}):
+            with patch("modules.qc.sep.extract", side_effect=_sep_extract):
+                await qc.analyze(_FITS_PATH)
+
+        final_data, _ = calls[1]
+        assert np.all(final_data[0:60, streak_col] == 0.0)
+
+    @pytest.mark.asyncio
+    async def test_default_fixture_leaves_data_untouched(self):
+        """Default _patch_qc() fixture (empty coarse pass) must not alter
+        data_sub before the real detection call."""
+        calls: list[tuple[np.ndarray, dict]] = []
+        sources = _make_sources(_N_SOURCES, _A_NORMAL, _B_NORMAL)
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            calls.append((arr.copy(), kwargs))
+            if kwargs.get("segmentation_map"):
+                return _empty_coarse_objects(), np.zeros(arr.shape, dtype=np.int32)
+            return sources
+
+        with _patch_qc(sources):
+            with patch("modules.qc.sep.extract", side_effect=_sep_extract):
+                await qc.analyze(_FITS_PATH)
+
+        coarse_data, _ = calls[0]
+        final_data, _ = calls[1]
+        assert np.array_equal(coarse_data, final_data)
