@@ -145,11 +145,32 @@ No hardcoded paths, thresholds, or credentials anywhere else.
 
 ### `watcher.py`
 - Uses `watchdog` to monitor `FITS_INCOMING` directory for new `.fits` / `.fit` files
-- Tracks in-flight paths in a module-level set guarded by a lock, so a duplicate filesystem
-  event for the same path (watchdog is known to occasionally deliver two `FileCreatedEvent`s —
-  e.g. the polling emitter used for Docker Desktop bind mounts on macOS) is skipped rather than
-  processed twice
-- On new file detected: waits briefly for write to complete, then calls `pipeline.run(filepath)`
+- Does **not** call `pipeline.run()` (or anything in `pipeline.py`) itself — it only buffers
+  arriving paths and submits them as batched `ANALYZE` tasks via `api_client.create_task()`;
+  `worker.py` is what actually calls `pipeline.analyze_frame()` per item. See "Job queue" below
+  for the full design and why batching (not one task per file) matters for both a bulk import and
+  a live overnight run.
+- On new file detected: waits briefly for write to complete, then calls `enqueue_path(filepath)`,
+  which appends to a module-level pending-batch buffer and (re)arms a `WATCHER_DEBOUNCE_SEC`
+  debounce timer (`threading.Timer`) — or, if the buffer has now reached
+  `WATCHER_MAX_BATCH_SIZE`, arms a zero-delay one instead of waiting out the full debounce window.
+  When the timer fires, `flush_pending_batch()` submits everything buffered so far as **one**
+  `ANALYZE` task and clears the buffer.
+- The duplicate-event guard moved with it: `enqueue_path()` skips a path already sitting in the
+  current pending batch — not, as before the module split, a path whose `pipeline.run()` call was
+  still in flight, since there's no such long-running in-process call left in `watcher.py` at all
+  now. Still guards against the same real incident (watchdog delivering two `FileCreatedEvent`s
+  for the same path — e.g. the polling emitter used for Docker Desktop bind mounts on macOS, or a
+  capture program that writes-then-renames the file).
+- The flush itself always runs via `threading.Timer` (even the zero-delay max-batch-size case),
+  never inline inside the watchdog observer's own event-delivery thread — so a slow
+  `POST /tasks` call never delays detection of the next arriving file.
+- `process_existing_files()` (the startup scan of files already sitting in `FITS_INCOMING`) also
+  goes through `enqueue_path()` now, so a backlog from downtime becomes one bulk batch (or a few,
+  if it exceeds `WATCHER_MAX_BATCH_SIZE`) instead of one event per file.
+- On `KeyboardInterrupt`, flushes whatever's still buffered before exiting, so files that arrived
+  just before the debounce window would have fired aren't silently dropped from the queue's view
+  (they're still on disk either way — nothing here ever moves a file).
 - Configures `logging.basicConfig()` using `config.LOG_LEVEL` (`DEBUG`/`INFO`/`WARNING`/`ERROR`)
 - Logs all events
 
@@ -187,12 +208,27 @@ Orchestrates processing of a single FITS file in order:
     catalog-matched and photometrically calibrated); returns `source_ids` (positionally parallel
     to `sources`), which this step zips back onto each source dict as `_source_id` so
     `anomaly_detector.py` can populate `anomalies[].source_id`.
+12.5. Move file to `/fits/archive/{object_name}/` directory. Runs immediately after step 12, NOT
+     after anomaly detection (an earlier revision of this file ran it later, between steps 14 and
+     15) — anomaly detection never touches the local file at all, so there was no reason to delay
+     archiving behind it, and doing so would have blocked decoupling anomaly detection into a task
+     that might run much later (see `modules/anomaly_detector.py` below). Must still run **before**
+     step 15: that step looks up this same frame's own file at its archive path, so moving it any
+     later than this would mean the current epoch is never found there. This is where
+     **Module 1** ends — steps 1–12.5 are `pipeline.analyze_frame(fits_path)`'s entire body,
+     independently callable as a task item (see "Job queue" below).
 13. `anomaly_detector.detect(frame_id, sources, catalog_matches, frame_meta)` → finds anomalies, using the batched history/coverage API calls (see `api_client/client.py` below)
-14. `api_client.post_anomalies(frame_id, filename, anomalies)` → saves anomalies
-14.5. Move file to `/fits/archive/{object_name}/` directory — must run **before** step 15: that
-     step looks up this same frame's own file at its archive path, so moving it later than
-     chart generation would mean the current epoch is never found there.
+14. `api_client.post_anomalies(frame_id, filename, anomalies)` → saves anomalies. Steps 13–14 are
+     **Module 2** — `pipeline.detect_anomalies_for_frame_data()` (in-memory `sources`, used right
+     after step 12.5 above) or its standalone counterpart
+     `pipeline.detect_anomalies_for_frame_id(frame_id)` (reconstructs `sources` purely from
+     `GET /frames/{id}` + `GET /frames/{id}/sources`, no local FITS access — see docs/API.md
+     section 14 and "Job queue" below). This call **replaces** the frame's anomaly set rather than
+     appending to it (docs/API.md section 3), so a re-run under a different classifier doesn't
+     leave stale anomalies from the previous run behind.
 15. `finder_chart.update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id)`
+     — **Module 3**, via `pipeline.generate_charts_for_anomalies()` (in-memory) or
+     `pipeline.generate_charts_for_source_ids()` (standalone, task-driven — see "Job queue" below).
      → for every anomaly with a resolved `source_id` (deduped per frame), (re)generates and
      uploads that source's finder/discovery chart, one call for the whole frame: fetches every
      source's full position track in a single `POST /sources/tracks/batch` call, renders each
@@ -217,6 +253,94 @@ contain no astronomical data to analyze. The pipeline simply normalizes the file
 (if `NORMALIZE_ENABLED=true`) and moves them to the archive. No QC, astrometry, photometry,
 or API calls are performed.
 
+### Job queue: `worker.py`
+
+Separate process (own `docker-compose.yml` service) that polls observatory-api's `tasks` table
+(docs/API.md section 15) and dispatches each task's items to the matching `pipeline.py` stage:
+
+| Task `type` | Dispatched to | Item carries |
+|---|---|---|
+| `ANALYZE` | `pipeline.analyze_frame(item["filename"])` | `filename` — the FULL path to the FITS file, not just a basename |
+| `DETECT_ANOMALIES` | `pipeline.detect_anomalies_for_frame_id(item["frame_id"])` | `frame_id` |
+| `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, batched across the WHOLE task | `source_id` + `payload` (`{"anomaly_type", "designation"}`) |
+| `PREVIEW_CATALOG_MATCH` | `pipeline.preview_catalog_match(item["filename"], task_id, item["id"])` | `filename` — same "full path, not a basename" convention as `ANALYZE` |
+
+A bare basename with no directory component at all (no full path) is not rejected outright: both
+`analyze_frame()` and `preview_catalog_match()` run it through `pipeline._resolve_bare_filename()`
+first, which searches every `FITS_ARCHIVE/{object}/` subdirectory for an exact filename match and
+substitutes the full path if it finds exactly one. This exists because observatory-api's
+`Web\FramesController::createTask()` debug page builds `ANALYZE`/`PREVIEW_CATALOG_MATCH` task
+items straight from an already-registered frame's `frames.filename` column (a basename — see
+`api_client/client.py`'s section below), and the API has no way to supply a real full path itself:
+it has no filesystem access to `/fits/...` at all (see "Architecture: Two Repositories"), so it
+can't know `FITS_ARCHIVE`'s actual value for this deployment. Only the pipeline process can
+resolve it, hence the fallback lives here rather than on the API side. Zero or more than one match
+falls through to the input unchanged, so the ordinary "file not found" failure still surfaces
+rather than a confusing resolver-internal one.
+
+Exists so any of the three modules can be re-run independently of the other two — e.g. re-running
+anomaly detection across an object's entire observation history (old and new frames alike, via
+`GET /frames?object=...`, docs/API.md section 14) after fixing the classifier, without re-running
+astrometry/photometry on every frame again. This is the concrete capability the three-way module
+split unlocks; `pipeline.run()` alone can't express it at all — though it's worth noting
+`watcher.py` no longer calls `run()` either; it submits `ANALYZE` tasks (see `watcher.py` above),
+so in practice `run()` today is mainly a convenience composition for tests and any ad hoc
+single-file invocation, not something on the live ingestion path.
+
+After a `DETECT_ANOMALIES` task finishes all its items, `worker.py` submits **one** follow-up
+`GENERATE_CHARTS` task covering every `source_id` with a resolved anomaly across the **whole**
+task — not one per frame. This is the cross-frame batching the job-queue split exists to enable:
+a task spanning hundreds of frames still produces a single downstream chart task, which
+`modules/finder_chart.py` renders/uploads in the same one-or-two-HTTP-call batches it already uses
+for a single frame (see that module's section below).
+
+Politeness ("не нагружать сервер"): polls `GET /tasks?status=PENDING&limit=1&order=asc` (oldest
+queued task first) at `TASK_POLL_INTERVAL_SEC` when idle, backing off exponentially up to
+`TASK_POLL_BACKOFF_MAX_SEC` on consecutive empty polls and resetting the moment a task is found.
+A busy queue is drained back-to-back with no sleep between tasks.
+
+**Known limitation:** no lease/heartbeat/timeout mechanism yet — a task a worker claims (`PATCH
+status=RUNNING`) and then crashes on stays stuck at `RUNNING` forever. Reset it by hand
+(`PATCH /tasks/{id} {"status": "PENDING"}`) if that happens during testing.
+
+**`PREVIEW_CATALOG_MATCH` is a diagnostic tool, not a fourth production module** — it never
+registers a frame or source, never archives/rejects its input file, and doesn't chain into any
+follow-up task (unlike `ANALYZE` → `DETECT_ANOMALIES` → `GENERATE_CHARTS`); its only API call is
+uploading the rendered chart. It exists to let an operator visually sanity-check catalog-matching
+quality on a batch of files — new or already archived — by rendering a PNG per frame with detected
+sources circled green (matched a catalog) or red (didn't). It still calls the real
+`modules/catalog_matcher.py`, so repeated frames of the same object/session within one task benefit
+from its on-disk cache exactly like a production `ANALYZE` run — only the first frame per sky tile
+actually re-hits Gaia/Simbad/2MASS/Pan-STARRS/MPC. See `modules/catalog_preview.py` below. Its
+result (`{"matched", "total", "quality_flag", "chart_uploaded"}`) is written onto each item's own
+`payload` via `POST /tasks/{id}/items/progress` (see docs/API.md section 15), not just logged —
+that endpoint's `payload` field is genuinely bidirectional: `GENERATE_CHARTS` reads it as input at
+task-creation time, this task type writes it as a result at completion time.
+
+### `modules/catalog_preview.py`
+
+Backs the `PREVIEW_CATALOG_MATCH` task type (single public entry point: `render(fits_path)`). Runs
+a frame through the real `qc.analyze()` (with `move_on_reject=False` — this module must never move
+a rejected frame, since it's a read-only diagnostic tool, not part of the QC accept/reject
+pipeline) → `astrometry.solve()` → `subtraction.run()` → `catalog_matcher.match()` — then renders
+every detected source (`sources_all`, the loose filter `catalog_matcher`/`anomaly_detector`
+actually operate on) as a circle on the frame's own pixel data: green + `CatalogName:id` label for
+a matched source, plain red for an unmatched one. Circles are drawn at each source's *originally
+detected* (RA, Dec) — before `catalog_matcher.match()`'s WCS-offset correction shifts
+`source["ra"]`/`["dec"]` in place for cross-matching — and reuse the exact WCS `astrometry.solve()`
+produced (astap's own fresh `.wcs` sidecar), not a fresh `WCS(header)` read from the file, so
+circles land on the actual stars visible in this image rather than the Gaia-corrected sky position.
+
+Nothing here writes a file that outlives the call: the PNG is rendered straight into an in-memory
+buffer and returned as bytes; astap's `.ini`/`.wcs`/`.log` side files land in a `tempfile.
+TemporaryDirectory()` that's removed on the way out regardless of success or failure.
+`pipeline.preview_catalog_match()` uploads those bytes via
+`POST /tasks/{task_id}/items/{item_id}/chart` (observatory-api's `SourceChartModel`, keyed by
+`task_item_id` instead of `source_id` since a catalog-preview chart has no source at all) — that
+upload is the only place the image ends up; there is deliberately no local-save option. There is
+no more standalone CLI script for this (removed — see debug/README.md); create a
+`PREVIEW_CATALOG_MATCH` task instead.
+
 ### `modules/qc.py`
 Computes quality metrics from a FITS file without plate solving:
 - **FWHM** (median over detected stars) — indicator of focus quality
@@ -229,8 +353,10 @@ Computes quality metrics from a FITS file without plate solving:
   raise this without necessarily blurring FWHM or trailing stars — a frame can look perfectly
   sharp and untracked-blurred while still being unusable because faint stars are drowned in an
   elevated background, which is exactly why this check is independent of BLUR/TRAIL.
-- **Star count** (minimum threshold check against `QC_STARS_MIN`; a hard-coded floor of 3 raw
-  detections is also enforced independently, before `QC_STARS_MIN` is even applied)
+- **Star count** (minimum threshold check against `QC_STARS_MIN` — or `QC_STARS_MIN_NARROWBAND`
+  when the frame's own filter is narrowband, per `modules.normalizer.is_narrowband()`; see "Filters
+  — real astronomy context" below for why a narrowband frame needs a softer floor. A hard-coded
+  floor of 3 raw detections is also enforced independently, before either threshold is even applied)
 - **Cosmic ray fraction** (via astroscrappy)
 
 Quality flags and handling:
@@ -306,6 +432,29 @@ Examples:
 When normalization is enabled, the API receives only normalized values (no duplicates).
 
 ### `modules/astrometry.py`
+- Before running `sep` for point-source extraction, a coarse, low-threshold, non-deblended
+  pre-pass (`_build_streak_mask()`, `config.STREAK_*`) finds long thin streaks — satellite/
+  aircraft trails crossing a single exposure, and diffraction-spike arms radiating from bright/
+  saturated stars — and masks their pixels out first. Without this, the trail/spike fragments
+  into several small, roundish sep objects at the ordinary extraction settings (deblending splits
+  an already-faint, gap-prone elongated feature into round sub-blobs), each individually clearing
+  `STAR_ELONGATION_MAX` and getting reported as an ordinary star (real incident, 2026-08-07,
+  `T_CrB_Light_L_60_2024-05-28T19-06-10.fits`: a full-frame satellite trail produced 5 spurious
+  "stars" sitting exactly along its track; with this pre-pass, `sources`/`sources_all` count drops
+  from 757 to 752 and none of the survivors carry elongation above 3). A candidate from the coarse
+  pass is only ever masked when it is BOTH highly elongated (`STREAK_ELONGATION_MIN`) AND far
+  longer than any real stellar PSF footprint (`STREAK_MIN_LENGTH_ARCSEC`, measured off the coarse
+  object's own bounding-box diagonal) — a combination no ordinary star, even a deblended close
+  pair, ever reaches; the real extraction's own `deblend_cont` is left completely untouched, so its
+  ability to split a genuinely close double star in a crowded field is unaffected. `STREAK_DETECT_SIGMA`
+  (the coarse pass's own threshold) is deliberately lower than `SEP_DETECT_THRESH` — a faint
+  trail's brightness dips below a higher threshold often enough along its length that it still
+  breaks into several disconnected coarse components too short to individually clear
+  `STREAK_MIN_LENGTH_ARCSEC` (verified on the same T_CrB frame's difference image, see
+  `modules/subtraction.py` below). `modules/qc.py` duplicates this same helper (its own copy, kept
+  in sync by hand — same convention as the FWHM/elongation filtering logic both modules already
+  independently reimplement) so its `fwhm_median`/`elongation_median`/`star_count` stay consistent
+  with what this module will end up extracting from the same frame.
 - Calls `astap` binary as a subprocess via `xvfb-run` (astap needs a display even headless) for plate solving,
   invoked without `-update` — astap therefore never writes into the FITS file itself, only into a `.wcs` side
   file (plus `.ini`/`.log`) next to it, or under an optional `output_base` (`-o`) path
@@ -331,7 +480,7 @@ When normalization is enabled, the API receives only normalized values (no dupli
   just the strict `sources` list, since both share the same underlying FWHM mask.
 - Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`
 - Returns a dict: `{ra_center, dec_center, fov_deg, naxis1, naxis2, sources, sources_all, wcs}`
-  - `sources` — strict star filter, list of dicts `{ra, dec, flux, fwhm, elongation, saturated, ...}`
+  - `sources` — strict star filter, list of dicts `{ra, dec, flux, fwhm, elongation, saturated, near_edge, ...}`
   - `sources_all` — loose filter; additionally keeps bright/saturated and faint detections rejected by the strict filter, used downstream for catalog matching / WCS offset correction so moving or transient objects aren't lost
   - `wcs` — the `astropy.wcs.WCS` object itself, also consumed by `modules/subtraction.py` to convert difference-image pixel candidates back to sky coordinates
   - `saturated` (bool, on every source in both lists) — raw ADU at the detection's peak
@@ -340,6 +489,17 @@ When normalization is enabled, the API receives only normalized values (no dupli
     (to not lose asteroids), but aperture photometry on a saturated PSF core produces a physically
     meaningless flux — `modules/photometry.py` reads this flag to skip measuring such a source
     instead of returning an extreme (e.g. −14) magnitude. See docs/ISSUES.md #2.
+  - `near_edge` (bool, on every source in both lists) — pixel position within
+    `EDGE_MARGIN_FRAC` of any frame edge (computed straight from `sep`'s own `x`/`y`, no WCS
+    needed). Coma and other off-axis aberrations progressively stretch a star's PSF toward the
+    edges/corners of a wide-field frame, inflating its measured `elongation` for purely optical
+    reasons rather than real motion or trailing — `modules/anomaly_detector.py` reads this flag to
+    demand a higher elongation bar before classifying such a source `SPACE_DEBRIS` (real incident,
+    2026-08-07, `T_CrB` frames: 305 anomalies out of 4 frames, the vast majority coma-elongated but
+    otherwise ordinary corner stars). Deliberately no leading underscore, same as `saturated` above
+    — `api_client`'s `_to_wire_source()` lets it travel to the API unfiltered and it's persisted on
+    `source_observations`, so `pipeline.py`'s standalone `_from_wire_source()` can reconstruct it
+    for a decoupled `DETECT_ANOMALIES` re-run with no in-memory pixel position to recompute it from.
 
 ### `modules/photometry.py`
 - Aperture photometry via `photutils.aperture`
@@ -350,6 +510,13 @@ When normalization is enabled, the API receives only normalized values (no dupli
   also excluded from the Gaia DR3 reference set used to compute the frame's zero-point, so one
   saturated "Gaia match" can't corrupt calibration for every other source in the frame. See
   docs/ISSUES.md #2.
+- `measure(fits_path, sources, skip_calibration=False)` — `pipeline.py` passes `skip_calibration=True`
+  whenever the frame's own filter is narrowband (`modules.normalizer.is_narrowband()`). Aperture
+  photometry itself still runs; only the Gaia zero-point step is skipped unconditionally, so
+  `calibrated` stays `False`/`mag_calibrated` stays `None` for every source regardless of how many
+  Gaia DR3 matches happen to fall in the field — a narrowband zero-point is systematically biased
+  relative to Gaia's broadband G even when ≥3 matches exist. See "Filters — real astronomy context"
+  below.
 
 ### `modules/subtraction.py`
 Image subtraction (difference imaging) — a second, independent detection path for transients
@@ -372,6 +539,22 @@ entry at all, at any position).
    registration, which `sep` would otherwise report as spurious bright "transients". Masked pixels
    are zeroed in the background-subtracted diff image before extraction, so no candidate can be
    detected there. See docs/ISSUES.md #1, #2.
+4.5. Also masks any streak-like feature found by the same coarse pre-pass `modules/astrometry.py`
+   uses (`_build_streak_mask()`, duplicated here — `config.STREAK_*`), run over the diff image
+   itself rather than the raw frame. A satellite trail present in the new frame but absent from the
+   reference stack shows up in the diff image as a strong positive residual just like any other
+   transient — and, left unmasked, fragments into dozens of separate elongated candidates rather
+   than one, each individually classifiable by `anomaly_detector.py` as its own `SPACE_DEBRIS`
+   anomaly (real incident, 2026-08-07, `T_CrB` test frames: 42 elongation>3 candidates strung along
+   a single trail). This pre-pass's own `minarea` is hardcoded to `5` here — matching this module's
+   own final detection pass below, **not** `config.SEP_MIN_AREA` (15, the main-frame extraction
+   context in `modules/astrometry.py`/`modules/qc.py`) — a coarser coarse-pass `minarea` than the
+   real detection left small trail fragments invisible to the pre-pass while the real, more
+   sensitive pass still detected them individually. Reduced the 42 false candidates to 21.
+   `STREAK_DETECT_SIGMA`'s default (`3.0`, lower than `SUBTRACTION_DETECT_SIGMA`'s `5.0`) was tuned
+   against this same real frame: at `5.0σ` the coarse pass still couldn't connect the (very faint)
+   trail's brighter knots into long-enough coarse features, leaving 21 of the 42 candidates
+   unmasked; at `3.0σ` only 1 remained.
 5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry.py`), since `sep.extract()` doesn't return a native `fwhm` field.
 5.5. Rejects any candidate whose `fwhm` is below `psf_fwhm_arcsec / 1.5` (converted to pixels via
    the frame's plate scale — same ratio `modules/astrometry.py` uses for its own lower FWHM bound;
@@ -393,7 +576,9 @@ entry at all, at any position).
    itself) falls back to reading whatever WCS the file's own header has.
 7. Returns `{"performed": bool, "reference_frame_count": int, "candidates": [...]}`. Every
    candidate is tagged `_from_subtraction=True` so `anomaly_detector.py` can apply looser
-   coverage rules to it (see below).
+   coverage rules to it (see below), and `near_edge` (same `EDGE_MARGIN_FRAC` geometry as
+   `modules/astrometry.py`'s section above — computed in step 5 from the candidate's own diff-image
+   pixel position before step 6 converts it to sky coordinates and drops the pixel `x`/`y` keys).
 
 Gracefully skipped (`performed=False`) when fewer than `SUBTRACTION_MIN_FRAMES` archived frames
 exist yet — e.g. the very first observations of a new target.
@@ -432,7 +617,7 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 
 1. **Query history via API** — `POST /sources/near/batch` with every source position in a single call, returning historical sources near each (RA, Dec) from previous frames. Queried for **every** source regardless of catalog-match status — this is what makes the Δmag-based classifications below (`VARIABLE_STAR`, `BINARY_STAR`, and the "already-known host brightened" path of `SUPERNOVA_CANDIDATE`) reachable at all for a catalog-matched source.
 2. **Coverage check** — `POST /frames/covering/batch` — did we ever observe each sky position before? (batched the same way)
-3. **Classify** each source. Real priority order in code: MPC/SkyBot match first → **if unmatched (`catalog_name is None`) and `saturated=True`, suppressed outright** (see below) → position-shifted-but-unmatched (split into `MOVING_UNKNOWN` vs `SPACE_DEBRIS` by a PSF elongation > 3.0 threshold) → no historical coverage (→ `FIRST_OBSERVATION`, *unless* the source came from image subtraction — see below) → no prior detection at this exact position but near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → not in history or any catalog (→ `UNKNOWN`) → in catalog but not history (→ `KNOWN_CATALOG_NEW`) → **has** prior history and brightened beyond `DELTA_MAG_ALERT`: near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → known binary (→ `BINARY_STAR`) → known variable (→ `VARIABLE_STAR`):
+3. **Classify** each source. Real priority order in code: MPC/SkyBot match first → **if unmatched (`catalog_name is None`) and `saturated=True`, suppressed outright** (see below) → unmatched, no detection within `MATCH_CONE_ARCSEC` of this exact position, elongation above the trail threshold (a single-exposure trail — `SPACE_DEBRIS_ELONGATION_MIN`, or the higher `SPACE_DEBRIS_EDGE_ELONGATION_MIN` when the source is flagged `near_edge` — see below) → `SPACE_DEBRIS` immediately, no position-shift evidence required (see below) → position-shifted-but-unmatched, elongation at or below that same threshold (→ `MOVING_UNKNOWN`) → no historical coverage (→ `FIRST_OBSERVATION`, *unless* the source came from image subtraction — see below) → no prior detection at this exact position but near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → not in history or any catalog (→ `UNKNOWN`) → in catalog but not history (→ `KNOWN_CATALOG_NEW`) → **has** prior history and brightened beyond `DELTA_MAG_ALERT`: near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → known binary (→ `BINARY_STAR`) → known variable (→ `VARIABLE_STAR`):
 
 | Situation | Classification |
 |---|---|
@@ -446,22 +631,50 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | Source in history, Δmag > DELTA_MAG_ALERT, known binary (Simbad) | `BINARY_STAR` |
 | Source in history, Δmag > DELTA_MAG_ALERT, known variable (Simbad) | `VARIABLE_STAR` |
 | Source present but shifted > MATCH_CONE_ARCSEC, matches MPC | `ASTEROID` or `COMET` |
+| Unmatched, no detection within `MATCH_CONE_ARCSEC` of this position, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default), or > `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) when `near_edge=True` | `SPACE_DEBRIS` → **ALERT** (elongation alone is treated as sufficient trail evidence — no "vacated old position" proof required, see below) |
 | Source present but shifted, not in MPC, elongation ≤ 3.0 | `MOVING_UNKNOWN` → **ALERT** |
-| Source present but shifted, not in MPC, elongation > 3.0 (fast trail) | `SPACE_DEBRIS` → **ALERT** |
 
-"Shifted" (for the unmatched `MOVING_UNKNOWN`/`SPACE_DEBRIS` branch — MPC matches don't need this
-check) requires **both**: no historical detection within `MATCH_CONE_ARCSEC` of the source's
-*current* position, **and** a historical detection within the wider `MOVING_CONE_ARCSEC` whose
-own position is no longer occupied by anything else in *this* frame. Checking only the second half
-(an earlier revision's entire condition) false-positived on almost every uncatalogued source:
-`MOVING_CONE_ARCSEC` (120″ by default) covers enough sky that some unrelated historical
-detection — a neighbouring star, a galaxy smudge, anything ever recorded nearby — is virtually
-always present there, whether or not this particular source moved at all (real incident,
-2026-08-06: several sources whose position drifted by <1″ across epochs — ordinary
-centroid/seeing noise — were repeatedly flagged `MOVING_UNKNOWN` solely because an unrelated
-star sat within 120″; see docs/ISSUES.md #1). Requiring the *old* position to have actually
-emptied out rules that out while still catching real movers, whose previous position is — by
-definition — vacated once they've moved away from it.
+"Shifted" (for the unmatched `MOVING_UNKNOWN` branch specifically — MPC matches don't need this
+check, and as of the fix below neither does `SPACE_DEBRIS`) requires **both**: no historical
+detection within `MATCH_CONE_ARCSEC` of the source's *current* position, **and** a historical
+detection within the wider `MOVING_CONE_ARCSEC` whose own position is no longer occupied by
+anything else in *this* frame. Checking only the second half (an earlier revision's entire
+condition) false-positived on almost every uncatalogued source: `MOVING_CONE_ARCSEC` (120″ by
+default) covers enough sky that some unrelated historical detection — a neighbouring star, a
+galaxy smudge, anything ever recorded nearby — is virtually always present there, whether or not
+this particular source moved at all (real incident, 2026-08-06: several sources whose position
+drifted by <1″ across epochs — ordinary centroid/seeing noise — were repeatedly flagged
+`MOVING_UNKNOWN` solely because an unrelated star sat within 120″; see docs/ISSUES.md #1).
+Requiring the *old* position to have actually emptied out rules that out while still catching real
+movers, whose previous position is — by definition — vacated once they've moved away from it.
+
+`SPACE_DEBRIS` deliberately does **not** wait for that second half of the evidence. A satellite or
+debris trail's entire visible track — both "endpoints" — exists within a single exposure; unlike a
+slow asteroid-like mover, it never had a *prior* detection anywhere nearby whose position could be
+shown to have vacated, so gating it behind that same "shifted" proof meant a genuine trail could
+never satisfy condition 2 and always fell through to generic `UNKNOWN` instead (real incident,
+2026-08-07, `C_2020_R4_ATLAS` frames: several frame-spanning trails were reported `UNKNOWN` with a
+`stamp_strip`/blink chart rather than `SPACE_DEBRIS` with a `track` chart, because nothing had ever
+been detected near either end of the trail for the old code to show had "vacated"). For an
+unmatched source with no detection at all within `MATCH_CONE_ARCSEC` of its current position
+(condition 1 alone, still required), elongation above the trail threshold is treated as sufficient
+evidence on its own of a single-exposure trail. A recurring elongated detection — e.g. a
+diffraction spike or an uncatalogued extended object sitting at the exact same position every
+frame, the opposite signature of a trail — still fails condition 1 and is unaffected, falling
+through to the ordinary stationary-source classification further down.
+
+That threshold is itself edge-aware: `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default) for an ordinary
+source, but the higher `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) whenever the source is
+flagged `near_edge` (set by `astrometry.py`/`subtraction.py` from the detection's own pixel
+position vs. `EDGE_MARGIN_FRAC` — see those modules' sections above). Coma and other off-axis
+aberrations progressively stretch a perfectly ordinary, non-moving star's PSF toward the
+edges/corners of a wide-field frame, inflating its measured elongation for purely optical
+reasons — real incident, 2026-08-07: 4 `T_CrB` frames produced 305 anomalies, the vast majority
+being coma-elongated but otherwise ordinary corner stars firing this exact shortcut with no real
+motion at all. A genuine single-exposure satellite/debris trail is typically far more elongated
+than coma alone produces, so raising the bar near the edge (rather than removing the
+elongation-alone shortcut there entirely) keeps real edge-of-frame trails detectable while
+filtering out the aberration.
 
 The saturated-artifact suppression is deliberately scoped to `catalog_name is None`: a saturated
 source that *is* MPC- or Simbad-matched (a genuinely bright asteroid, a known star flaring) is a
@@ -480,6 +693,19 @@ ever sets `mag_instrumental`/`mag_calibrated`, never `mag`. `mag` is `None` when
 wasn't calibrated (see that module's section above), so an uncalibrated source's `delta_mag`
 is always `None` too — it correctly never triggers `VARIABLE_STAR`/`BINARY_STAR`/the
 brightening branch of `SUPERNOVA_CANDIDATE` rather than firing on a meaningless number.
+
+`_same_filter_history()` further restricts which historical detections `median_hist_mag` (and
+therefore `delta_mag`) is computed from, to only those carrying the *same filter* as the current
+source — comparing an L-band magnitude against an old R-band or Hα epoch is a color-term artifact,
+not real variability (see "Filters — real astronomy context" below). The current source's own
+filter travels as `_filter` (attached by `pipeline.py`'s Step 5.5 in-process, or by
+`_from_wire_source()` from the parent frame's own filter for the standalone
+`detect_anomalies_for_frame_id()` path); each historical detection's filter comes from
+`POST /sources/near/batch`'s `filter` field (docs/API.md), joined server-side from the frame that
+produced it (`source_observations` itself has no filter column). This restriction is scoped to the
+magnitude comparison only — the **existence** check (`history`/`n_history`, used for
+`FIRST_OBSERVATION`/`UNKNOWN`/`KNOWN_CATALOG_NEW` above) stays filter-agnostic, since a position
+already detected in a different filter is still a real prior detection, not a new source.
 
 4. For `ASTEROID` / `COMET`: calls `ephemeris.py` to compute current ephemeris via JPL Horizons.
 
@@ -570,6 +796,19 @@ the client still implements/exports their older single-position/single-source co
 (`/sources/near`, `/frames/covering`, `/sources/{id}/track`, `/sources/{id}/chart`) — kept for
 API completeness, no longer called from this codebase.
 
+Also implements the frame-listing (`get_frames`, `get_frame`, `get_frame_sources`) and task-queue
+(`create_task`, `get_tasks`, `get_task`, `update_task`, `post_task_items_progress`) functions that
+back `pipeline.detect_anomalies_for_frame_id()` and `worker.py` — see docs/API.md sections 14–15
+and "Job queue" above.
+
+`post_sources()`'s internal `_to_wire_source()` translates each source dict into the wire shape
+before sending: renames `_from_subtraction` (leading underscore — this codebase's convention for
+"internal, not for the wire") to `from_subtraction`, and strips every other leading-underscore key
+(`_source_id`, `_wcs_offset_ra`, `_wcs_offset_dec`, ...). Only adds `from_subtraction` to the wire
+dict when the source actually carries `_from_subtraction` truthy, so a source with no such key at
+all (the normal case for anything from `astrometry.py`) travels unchanged — the API defaults an
+omitted `from_subtraction` to `false` itself.
+
 The pipeline treats the API as a black box. If the API changes its DB schema internally,
 the pipeline only cares that the endpoint contracts remain stable.
 
@@ -628,6 +867,43 @@ Reference stars come from Gaia DR3 catalog.
 Predicted position of a solar system object (asteroid, comet, planet) at a given time.
 Computed via JPL Horizons API. Inputs: MPC designation + time. Outputs: RA, Dec, magnitude,
 distance, angular velocity.
+
+### Filters — real astronomy context
+
+A monochrome camera shoots the exact same field through several different filters — this
+pipeline never gates *whether* a Light frame gets analyzed on which one it used (that's decided
+purely by `IMAGETYP` — see `pipeline.py` above). What the filter *does* change is which parts of
+the analysis its results can be trusted for:
+
+- **Broadband** — Johnson-Cousins `U`/`V`/`I` (`u'`/`g'`/`r'`/`i'`/`z'` are the SDSS analogs),
+  and `L`/Luminance/Clear (panchromatic — the closest analog to Gaia's own broadband G-band).
+  Used for star fields; astrometry, catalog matching, and Gaia zero-point calibration all work
+  normally.
+- **Narrowband** (`Ha`, `OIII`, `SII`, `NII` — `config.NARROWBAND_FILTERS`) — isolates one
+  emission line (e.g. Hα at 656.3 nm) for imaging nebulae/emission regions. Only the sliver of a
+  star's continuum that falls inside that narrow bandpass leaks through, so a narrowband frame of
+  the *same field* genuinely contains far fewer, fainter stars than a broadband one of it — this
+  is expected, not a quality problem with the frame.
+
+**Color term:** a star's brightness in filter R differs from its brightness in filter G (or in
+Gaia's broadband G) purely from its temperature/color, independent of anything actually changing.
+Every serious time-domain survey (ZTF, LSST, ...) therefore keeps light curves **per filter** —
+comparing an L-band magnitude against an old R-band or Hα epoch of the same object reads as a
+brightness change that is really just a filter swap. This is why real, production-grade filter
+handling looks different at each pipeline stage rather than a single global gate:
+
+| Stage | Filter-dependent? | What this pipeline does |
+|---|---|---|
+| QC star-count floor | Yes | `modules/qc.py` uses the softer `QC_STARS_MIN_NARROWBAND` instead of `QC_STARS_MIN` when the frame's filter is narrowband (`modules.normalizer.is_narrowband()`) — the broadband floor would reject good narrowband data as `LOW_STARS` |
+| Astrometry / plate solving | No | Works off however many stars are actually detected, whatever the filter |
+| Catalog matching (by RA/Dec) | No | Position-based cross-matching doesn't care what filter produced the position |
+| Gaia zero-point calibration | Yes | `modules/photometry.py`'s `skip_calibration` (set by `pipeline.py` from `is_narrowband()`) skips it unconditionally on a narrowband frame — too few Gaia-bright stars pass through the bandpass, and even a zero-point computed from the few that do is systematically biased relative to Gaia's broadband G, regardless of match count |
+| Subtraction (differencing) | Yes, and already filter-aware | `modules/subtraction.py` matches its reference stack by filter (see that module's section above) — same-filter differencing is valid and is in fact the *best* transient signal available on a narrowband frame, since it needs no cross-filter magnitude comparison at all |
+| Anomaly Δmag comparison | Yes | `modules/anomaly_detector.py`'s `_same_filter_history()` restricts the historical magnitude used for `VARIABLE_STAR`/`BINARY_STAR`/the brightening branch of `SUPERNOVA_CANDIDATE` to detections carrying the *same* filter as the current source (via each source's `_filter`, and each historical detection's `filter` — see `POST /sources/near/batch` in docs/API.md). The **existence** check (whether this position has ever been detected before, at any point in `FIRST_OBSERVATION`/`UNKNOWN`/`KNOWN_CATALOG_NEW`) stays filter-agnostic on purpose — an ordinary LRGB sequence re-images the same field in 3-4 different filters per session, and a position already seen in R must not look "brand new" the moment an L-filtered frame comes in |
+
+Position-only classifications (`ASTEROID`/`COMET`/`MOVING_UNKNOWN`/`SPACE_DEBRIS`, and `UNKNOWN`
+via subtraction) never depend on magnitude at all, so they are unaffected by any of this — a
+moving object is a moving object regardless of what filter caught it moving.
 
 ---
 
@@ -755,9 +1031,18 @@ Without this check, the first observation of any field would generate false UNKN
 for every single source.
 
 ### Catalog query caching
-Gaia and Simbad queries for a given sky region should be cached locally (simple dict or Redis)
-within a pipeline run to avoid redundant network calls when multiple sources fall in the same
-catalog tile. Cache TTL: 1 hour.
+Implemented in `modules/catalog_matcher.py`: an in-process dict (fast path within one run) backed
+by files under `CATALOG_CACHE_DIR`, TTL `CACHE_TTL_HOURS` (default 1 hour, from `mtime`). The disk
+tier exists specifically because a pipeline restart — frequent during testing, and after every
+code change without `--reload` — would otherwise throw away every cached query and re-hit
+Gaia/Simbad/2MASS/Pan-STARRS/MPC for the same sky region on the very next run. `CATALOG_CACHE_DIR`
+must be bind-mounted from a path OUTSIDE the container (see `docker-compose.yml`'s `worker`
+service) so it survives a container rebuild/recreate too — a path only inside the container's
+writable layer dies with the container, exactly what this cache exists to avoid. In a non-Docker
+production deployment it's just a plain host directory; nothing here depends on being
+containerized. A disk write failure (permission, disk full, not mounted) is logged and swallowed,
+degrading to in-process-only caching for the rest of that run rather than breaking catalog
+matching — see that module's `_cache_set()` docstring.
 
 ### Why bad frames go to /fits/rejected instead of API
 Bad frames (blur, trailing, low star count) have no scientific value for the analysis pipeline.
@@ -827,3 +1112,5 @@ ever comparing it against `QC_SNR_MIN` in the BLUR/TRAIL/LOW_STARS/BAD decision 
 threshold currently has no effect on whether a frame is accepted or rejected.
 
 **Location:** `modules/qc.py`, the flag-decision block; `config.py`.
+
+**Location:** `watcher.py`.

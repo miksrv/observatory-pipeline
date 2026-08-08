@@ -171,10 +171,16 @@ observatory-pipeline/
 ## Modules
 
 ### `watcher.py`
-Entry point. Uses `watchdog` to monitor `FITS_INCOMING` for new `.fits` / `.fit` files. On detection, waits briefly for the write to complete, then calls `pipeline.run(filepath)`.
+Entry point. Uses `watchdog` to monitor `FITS_INCOMING` for new `.fits` / `.fit` files. Does not call the pipeline itself — buffers arriving paths and, after a `WATCHER_DEBOUNCE_SEC` quiet period (or immediately if `WATCHER_MAX_BATCH_SIZE` is reached), submits everything buffered as one `ANALYZE` task to observatory-api's job queue. `worker.py` is what actually processes each item. See CLAUDE.md's `watcher.py` and "Job queue" sections for the full design.
 
 ### `pipeline.py`
-Orchestrates processing of a single FITS file. Calls each module in order and handles failures gracefully — a crash in catalog matching does not abort the frame. Real order: QC → astrometry → image subtraction → catalog matching → photometry → `post_frame`/`post_sources` → anomaly detection → `post_anomalies` → archive (catalog matching and photometry intentionally run *before* the frame is posted to the API, so matched Gaia DR3 stars can be used as the photometric zero-point reference).
+Three independently callable stages, plus `run()` composing all three for one file (still what `watcher.py` calls): `analyze_frame()` (QC → astrometry → image subtraction → catalog matching → photometry → `post_frame`/`post_sources` → archive — catalog matching and photometry intentionally run *before* the frame is posted to the API, so matched Gaia DR3 stars can be used as the photometric zero-point reference), `detect_anomalies_for_frame_data()`/`detect_anomalies_for_frame_id()` (anomaly detection → `post_anomalies`), and `generate_charts_for_anomalies()`/`generate_charts_for_source_ids()` (finder charts). Each stage handles failures in the modules it calls gracefully — a crash in catalog matching does not abort the frame.
+
+### `worker.py`
+Entry point for the job-queue worker (separate `docker-compose.yml` service). Polls observatory-api's `GET /tasks?status=PENDING` and dispatches each task's items to the matching `pipeline.py` stage — see CLAUDE.md's "Job queue" section. Lets any of the three production stages be re-run independently (e.g. re-classifying an object's whole observation history under a fixed anomaly-detection bug, without re-running astrometry/photometry on every frame again). Also dispatches a fourth, non-production task type, `PREVIEW_CATALOG_MATCH` — a diagnostic tool (see `modules/catalog_preview.py` below) that renders a PNG per frame with detected sources circled green (catalog-matched) or red (unmatched) and uploads it to observatory-api, without ever registering a frame/source or touching the input file.
+
+### `modules/catalog_preview.py`
+Backs `PREVIEW_CATALOG_MATCH`. Runs `qc.analyze()` (never moving a rejected frame — this is a read-only diagnostic) → `astrometry.solve()` → `subtraction.run()` → `catalog_matcher.match()` on a frame, then renders every detected source as a circle on the frame's own pixel data straight into an in-memory PNG (no local file left behind — `pipeline.preview_catalog_match()` uploads the bytes via `POST /tasks/{task_id}/items/{item_id}/chart` and that's the only place the image ends up). Calls the real `catalog_matcher.match()`, so repeated frames of the same object/session in one task benefit from its on-disk cache exactly like a production `ANALYZE` run.
 
 ### `modules/fits_header.py`
 Reads the FITS primary header using `astropy.io.fits`. Normalizes keyword aliases (e.g., `CCD-TEMP` vs `CCDTEMP`, `EXPTIME` vs `EXPOSURE`, and pixel-scale aliases `XPIXSZ`/`PIXSIZE`/`PIXSCALE1`/`PIXELSZ`/`PIXSCALE`). Returns a structured dict ready for the API payload.
@@ -209,7 +215,7 @@ Bad frames are never sent to the API — this keeps the remote database clean.
 ### `modules/astrometry.py`
 Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
 
-Returns a dict with `ra_center`, `dec_center`, `fov_deg`, `naxis1`/`naxis2`, the `wcs` object itself, and two source lists: `sources` (strict star filter) and `sources_all` (a looser filter that also keeps bright/saturated and faint detections, used for catalog matching and WCS offset correction so moving/transient objects aren't lost). Every source also carries a `saturated` bool (peak ADU ≥ `SATURATION_ADU`).
+Returns a dict with `ra_center`, `dec_center`, `fov_deg`, `naxis1`/`naxis2`, the `wcs` object itself, and two source lists: `sources` (strict star filter) and `sources_all` (a looser filter that also keeps bright/saturated and faint detections, used for catalog matching and WCS offset correction so moving/transient objects aren't lost). Every source also carries a `saturated` bool (peak ADU ≥ `SATURATION_ADU`) and a `near_edge` bool (pixel position within `EDGE_MARGIN_FRAC` of any frame edge — see the anomaly detector's `SPACE_DEBRIS` classification below).
 
 ### `modules/photometry.py`
 Aperture photometry via `photutils`. Performs differential photometry against Gaia DR3 reference stars in the field (requires ≥3 Gaia matches for a zero-point) — this makes brightness measurements immune to atmospheric transparency variations. Adds `flux_aperture`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `calibrated`, `zero_point` (and a few more) to each source. A source flagged `saturated=True` is never measured (its aperture flux is not physically meaningful) and is excluded from the Gaia zero-point reference set.
@@ -241,8 +247,8 @@ Core science logic. Queries the API in a single batched call per frame (`POST /s
 | `ASTEROID` | Shifted source, matched in MPC/SkyBot as an asteroid | No (logged + ephemeris) |
 | `COMET` | Shifted source, matched in MPC/SkyBot as a comet | No (logged + ephemeris) |
 | `SUPERNOVA_CANDIDATE` | New point source with no history near a Simbad galaxy, or an already-known galaxy brightening beyond `DELTA_MAG_ALERT` | **YES** |
-| `MOVING_UNKNOWN` | Shifted source, not in MPC, elongation ≤ 3.0 | **YES** |
-| `SPACE_DEBRIS` | Shifted source, not in MPC, elongation > 3.0 (fast trail) | **YES** |
+| `MOVING_UNKNOWN` | Shifted source, not in MPC, elongation at or below the trail threshold | **YES** |
+| `SPACE_DEBRIS` | Shifted source, not in MPC, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) near the frame edge (fast trail) | **YES** |
 | `UNKNOWN` | New point source, not in any catalog, area covered — or detected via image subtraction regardless of coverage | **YES** |
 
 `FAINT_UNCATALOGUED`, a proposed classification for faint uncatalogued sources, is not implemented yet (see [CLAUDE.md](CLAUDE.md) Known Issues).
@@ -408,7 +414,17 @@ QC_FWHM_MAX_ARCSEC=8.0
 QC_ELONGATION_MAX=2.0
 QC_SNR_MIN=5.0
 QC_STARS_MIN=10
+QC_STARS_MIN_NARROWBAND=5     # softer floor for Hα/[OIII]/[SII]/[NII] frames — see below
 QC_SKY_BACKGROUND_MAX=20000.0
+
+# ── Narrowband filters (modules/normalizer.py, modules/qc.py, modules/photometry.py) ──
+NARROWBAND_FILTERS=Ha,OIII,SII,NII
+
+# ── Streak masking (astrometry + qc + subtraction modules) ────────────────────
+STREAK_DETECT_SIGMA=3.0
+STREAK_ELONGATION_MIN=5.0
+STREAK_MIN_LENGTH_ARCSEC=30.0
+STREAK_MASK_DILATE_ARCSEC=3.0
 
 # ── Saturation detection (astrometry + subtraction modules) ───────────────────
 SATURATION_ADU=60000
@@ -464,7 +480,10 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `QC_ELONGATION_MAX` | `2.0` | No | Maximum acceptable PSF elongation ratio (major/minor axis). Values >2.0 indicate star trailing due to tracking issues. |
 | `QC_SNR_MIN` | `5.0` | No | Minimum acceptable median SNR of detected sources. |
 | `QC_STARS_MIN` | `10` | No | Minimum number of detected stars. Frames with fewer stars are rejected as `LOW_STARS`. |
+| `QC_STARS_MIN_NARROWBAND` | `5` | No | Same as `QC_STARS_MIN`, but used instead of it when the frame's own filter is narrowband (see `NARROWBAND_FILTERS` below) — a narrowband frame of the same field genuinely detects far fewer stars than a broadband one. |
 | `QC_SKY_BACKGROUND_MAX` | `20000.0` | No | Maximum acceptable median sky background in ADU. Frames exceeding this are rejected as `HIGH_BACKGROUND` (twilight, moonlight, cloud, stray light). Tune to your own site's typical dark-sky background. |
+| **Narrowband Filters** |
+| `NARROWBAND_FILTERS` | `Ha,OIII,SII,NII` | No | Comma-separated, normalized filter short codes too narrow to carry a representative star sample or a trustworthy Gaia DR3 zero-point. Frames shot in one of these use `QC_STARS_MIN_NARROWBAND` above, and `modules/photometry.py` never attempts magnitude calibration on them (see CLAUDE.md's "Filters — real astronomy context"). |
 | **Star Detection Filtering** |
 | `SEP_DETECT_THRESH` | `10.0` | No | Detection threshold in sigma above background for SEP source extraction. Higher = fewer, more reliable detections. |
 | `SEP_MIN_AREA` | `15` | No | Minimum connected pixels for a valid source detection. Filters out hot pixels and noise. |
@@ -472,6 +491,11 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `STAR_FWHM_MAX_ARCSEC` | `8.0` | No | Maximum FWHM in arcseconds. Sources above this are extended objects (nebulae, galaxies) or badly defocused. |
 | `STAR_ELONGATION_MAX` | `1.5` | No | Maximum elongation for valid star detections. Filters out trails and extended objects. |
 | `STAR_SNR_MIN` | `50.0` | No | Minimum SNR (peak/rms) for valid star detections. Higher = fewer but more reliable. |
+| **Streak Masking** |
+| `STREAK_DETECT_SIGMA` | `3.0` | No | Coarse, non-deblended pre-pass's own detection threshold (sigma above background) — finds satellite/aircraft trails and diffraction-spike arms before the real point-source/diff-image extraction runs, so they can't fragment into false stars (or, on the subtraction diff image, into many separate `SPACE_DEBRIS`-eligible candidates for one trail). Kept lower than `SEP_DETECT_THRESH`/`SUBTRACTION_DETECT_SIGMA` — a faint trail's brightness can otherwise dip below a higher threshold often enough to still fragment. |
+| `STREAK_ELONGATION_MIN` | `5.0` | No | A coarse candidate is masked as a streak only when its elongation is at or above this AND its bounding-box diagonal is at or above `STREAK_MIN_LENGTH_ARCSEC` — an ordinary star, even a deblended close pair, never reaches both. |
+| `STREAK_MIN_LENGTH_ARCSEC` | `30.0` | No | See `STREAK_ELONGATION_MIN` above. |
+| `STREAK_MASK_DILATE_ARCSEC` | `3.0` | No | Small dilation applied to the coarse streak mask before use, so the segmentation boundary doesn't leave a thin rim of trail pixels detectable as their own tiny fragment. |
 | **Saturation Detection** |
 | `SATURATION_ADU` | `60000` | No | Sensor pixel value (ADU) at/above which a pixel is considered saturated. `modules/astrometry.py` flags any source whose peak reaches this as `saturated`; `modules/subtraction.py` masks its vicinity out of difference-image detection. Tune per camera's full-well/bit depth. |
 | `SATURATION_MASK_RADIUS_ARCSEC` | `10.0` | No | Radius in arcseconds around a saturated pixel that `modules/subtraction.py` excludes from diff-image source detection, to suppress astroalign residual artifacts near bright/saturated stars. |
@@ -479,6 +503,10 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `MATCH_CONE_ARCSEC` | `5.0` | No | Cone search radius in arcseconds for point-source catalog matching (Simbad, Gaia, 2MASS, Pan-STARRS). |
 | `MOVING_CONE_ARCSEC` | `120.0` | No | Wider cone radius in arcseconds for moving-object (MPC) detection. Widened from an earlier default of `30.0` because fast movers like Vesta travel ~60"/hr. `.env.example` is up to date with this value — see the note above. |
 | `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
+| **Edge-of-Frame Geometry** |
+| `EDGE_MARGIN_FRAC` | `0.1` | No | Fraction of NAXIS1/NAXIS2 treated as "near the edge" — coma and other off-axis aberrations stretch a star's PSF near the edges/corners of a wide-field frame, inflating its measured elongation. `modules/astrometry.py`/`modules/subtraction.py` flag such sources `near_edge`; tune to your own optics. |
+| `SPACE_DEBRIS_ELONGATION_MIN` | `3.0` | No | Elongation threshold for the "single-exposure trail" `SPACE_DEBRIS` shortcut in `modules/anomaly_detector.py`, for a source not flagged `near_edge`. |
+| `SPACE_DEBRIS_EDGE_ELONGATION_MIN` | `6.0` | No | Same shortcut's threshold for a source flagged `near_edge` — higher, since coma alone can already push an ordinary star's elongation past `SPACE_DEBRIS_ELONGATION_MIN` near the edge of a wide-field frame. |
 | **Image Subtraction** |
 | `SUBTRACTION_MIN_FRAMES` | `3` | No | Minimum number of archived reference frames of the same object required before `modules/subtraction.py` will attempt image subtraction. |
 | `SUBTRACTION_DETECT_SIGMA` | `5.0` | No | Detection threshold on the difference image, in multiples of background RMS. |
@@ -486,6 +514,15 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `CHART_ENABLED` | `true` | No | Enable/disable per-source finder-chart generation (`modules/finder_chart.py`). |
 | `CHART_STAMP_SIZE_ARCSEC` | `60.0` | No | Half-width of the per-epoch crop for the `stamp_strip` style (stationary anomalies), in arcseconds. |
 | `CHART_MAX_EPOCHS` | `12` | No | Cap on the number of epochs drawn on one chart (oldest dropped first). |
+| **Watcher Batching** |
+| `WATCHER_DEBOUNCE_SEC` | `5.0` | No | Quiet period after the most recently arrived FITS file before `watcher.py` submits everything buffered so far as one `ANALYZE` task. |
+| `WATCHER_MAX_BATCH_SIZE` | `200` | No | Flush the pending batch immediately once it reaches this many files, instead of waiting out the full debounce window. |
+| **Catalog Query Cache** |
+| `CATALOG_CACHE_DIR` | `/cache/catalog` | No | On-disk directory for cached Gaia/Simbad/2MASS/Pan-STARRS/MPC query results. Mount from a host path OUTSIDE the container (see `docker-compose.yml`'s `worker` service) so it survives a container rebuild — important since this gets restarted often during testing. |
+| `CACHE_TTL_HOURS` | `1.0` | No | How long a cached catalog query result stays valid, in hours. |
+| **Job Queue Worker** |
+| `TASK_POLL_INTERVAL_SEC` | `10.0` | No | How often `worker.py` polls `GET /tasks?status=PENDING` when idle. |
+| `TASK_POLL_BACKOFF_MAX_SEC` | `60.0` | No | Idle polling backs off exponentially up to this ceiling, resetting the moment a task is found. |
 | **Observatory Site** |
 | `SITE_LAT` | `0.0` | No | Observatory latitude in decimal degrees (positive = North). Used for topocentric ephemeris queries to JPL Horizons. |
 | `SITE_LON` | `0.0` | No | Observatory longitude in decimal degrees (positive = East). |
