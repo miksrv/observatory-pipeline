@@ -185,6 +185,42 @@ def _history_median_mag(history: list[dict]) -> float | None:
     return statistics.median(mags)
 
 
+def _same_filter_history(history: list[dict], filter_name: str | None) -> list[dict]:
+    """
+    Restrict a history list to entries observed through the SAME filter as
+    the current source, for magnitude comparison only.
+
+    Real astronomy background: a star's brightness in filter R differs from
+    its brightness in filter G (or Gaia's broadband G-band) purely because of
+    its color/temperature — a "color term" — independent of any actual
+    change in the object. Comparing today's L-band magnitude against last
+    week's R-band (or Hα) detection of the same object would therefore read
+    as a brightness change that is really just a filter swap, and could
+    misfire VARIABLE_STAR / BINARY_STAR / the brightening branch of
+    SUPERNOVA_CANDIDATE. Every serious survey (ZTF, LSST, ...) keeps its
+    light curves per-filter for exactly this reason.
+
+    Deliberately scoped to the delta_mag computation ONLY — the "does this
+    position have any prior detection at all" existence check (`history`
+    itself, and therefore FIRST_OBSERVATION / UNKNOWN / KNOWN_CATALOG_NEW)
+    must stay filter-agnostic: a normal LRGB sequence re-images the same
+    field in 3-4 different filters within one session, and a position that
+    was only ever detected in, say, L must not be treated as "brand new"
+    the moment an R-filtered frame of the same field comes in.
+
+    A historical entry with no "filter" key at all (the API predates this
+    field, or the frame that produced it was analyzed before pipeline.py
+    started tagging sources with "_filter") never matches — it's excluded
+    rather than optimistically assumed to be the same filter, since a wrong
+    assumption here is exactly the false-positive this function exists to
+    prevent. Returns [] outright when the current source's own filter is
+    unknown (`filter_name is None`), for the same reason.
+    """
+    if filter_name is None:
+        return []
+    return [src for src in history if src.get("filter") == filter_name]
+
+
 def _find_sources_within_radius(
     ra: float,
     dec: float,
@@ -431,6 +467,18 @@ def _classify_source_sync(
     object_type:      str | None = source.get("object_type")
     elongation:       float      = float(source.get("elongation", 0.0))
     from_subtraction: bool       = bool(source.get("_from_subtraction", False))
+    # Set by astrometry.py / subtraction.py from the detection's own pixel
+    # position vs. config.EDGE_MARGIN_FRAC — see the SPACE_DEBRIS branch
+    # below for why this matters (coma inflates elongation near the edge of
+    # a wide-field frame, independent of any real motion). No leading
+    # underscore (unlike "_from_subtraction" above) — persisted on the wire
+    # like "saturated", so a standalone DETECT_ANOMALIES re-run
+    # (pipeline.py's _from_wire_source()) can reconstruct it too.
+    near_edge:        bool       = bool(source.get("near_edge", False))
+    # This frame's own filter (pipeline.py's Step 5.5 / _from_wire_source()),
+    # used below to restrict the Δmag comparison to same-filter history —
+    # see _same_filter_history()'s docstring for why.
+    source_filter:    str | None = source.get("_filter")
     # Resolved sources.id from POST /frames/{id}/sources — see pipeline.py's
     # Step 7, which zips the API's returned `source_ids` back onto each
     # source dict as "_source_id". None if that round-trip failed/mismatched
@@ -507,11 +555,75 @@ def _classify_source_sync(
         # of a mover (docs/ISSUES.md #1).
         wide_history = _find_sources_within_radius(ra, dec, config.MOVING_CONE_ARCSEC, tile_sources)
 
+        # A trail this elongated is, on its own, sufficient evidence of a
+        # fast single-exposure mover (satellite / space debris) — unlike a
+        # slow asteroid-like point source, it never "used to be" anywhere
+        # nearby in an earlier frame, because its entire visible track exists
+        # only within this one exposure. _is_position_shifted()'s "a wide-cone
+        # historical detection's old position has vacated" requirement
+        # (condition 2) structurally can never be satisfied for it, since
+        # there was never a prior detection near either endpoint of the trail
+        # to begin with — so gating SPACE_DEBRIS behind that check meant a
+        # genuine satellite/debris trail always fell through to generic
+        # UNKNOWN instead (real incident, 2026-08-07, C_2020_R4_ATLAS frames:
+        # several frame-spanning trails were reported as UNKNOWN with a
+        # stamp_strip/blink chart rather than SPACE_DEBRIS with a track chart).
+        # Still gated on `history` (condition 1) being empty — a recurring
+        # elongated artifact or extended object sitting at the SAME position
+        # every frame must not be swept in here; that case correctly belongs
+        # to Priority 3 below.
+        #
+        # The elongation bar itself is edge-aware: a source flagged
+        # `near_edge` (see astrometry.py/subtraction.py) uses the much
+        # higher SPACE_DEBRIS_EDGE_ELONGATION_MIN instead of the ordinary
+        # SPACE_DEBRIS_ELONGATION_MIN. Coma and other off-axis aberrations
+        # progressively stretch a perfectly ordinary, non-moving star's PSF
+        # toward the edges/corners of a wide-field frame, inflating its
+        # measured elongation for purely optical reasons — real incident,
+        # 2026-08-07: 4 T_CrB frames produced 305 anomalies, the vast
+        # majority being coma-elongated but otherwise ordinary corner stars
+        # firing this exact shortcut with no real motion at all. A genuine
+        # single-exposure satellite/debris trail is typically far more
+        # elongated than coma alone produces, so raising the bar near the
+        # edge (rather than removing the elongation-alone shortcut there
+        # entirely) keeps real edge-of-frame trails detectable while
+        # filtering out the aberration.
+        trail_elongation_min = (
+            config.SPACE_DEBRIS_EDGE_ELONGATION_MIN if near_edge
+            else config.SPACE_DEBRIS_ELONGATION_MIN
+        )
+        if not history and elongation > trail_elongation_min:
+            anomaly_type = AnomalyType.SPACE_DEBRIS
+
+            logger.warning(
+                "ALERT — %s: unmatched trail-like source, elongation alone is "
+                "sufficient (no position-shift evidence needed) ra=%.4f dec=%.4f "
+                "elongation=%.2f near_edge=%s threshold=%.2f",
+                anomaly_type, ra, dec, elongation, near_edge, trail_elongation_min,
+                extra=extra,
+            )
+
+            return {
+                "anomaly_type":    anomaly_type,
+                "source_id":       source_id,
+                "ra":              ra,
+                "dec":             dec,
+                "magnitude":       mag,
+                "delta_mag":       None,
+                "mpc_designation": None,
+                "ephemeris":       None,
+                "notes": (
+                    f"Elongation={elongation:.2f} exceeds {trail_elongation_min:.2f}"
+                    f"{' (edge-of-frame threshold — coma-affected zone)' if near_edge else ''}"
+                    f" — consistent with a single-exposure trail rather than a "
+                    f"point source. No detection within "
+                    f"{config.MATCH_CONE_ARCSEC:.1f} arcsec of this position; "
+                    f"not matched in MPC."
+                ),
+            }
+
         if _is_position_shifted(history, wide_history, current_frame_positions):
-            if elongation > 3.0:
-                anomaly_type = AnomalyType.SPACE_DEBRIS
-            else:
-                anomaly_type = AnomalyType.MOVING_UNKNOWN
+            anomaly_type = AnomalyType.MOVING_UNKNOWN
 
             logger.warning(
                 "ALERT — %s: unmatched position-shifted source ra=%.4f dec=%.4f elongation=%.2f",
@@ -652,7 +764,10 @@ def _classify_source_sync(
 
     # --- Source HAS prior history from here ---
 
-    median_hist_mag = _history_median_mag(history)
+    # Magnitude comparison uses only same-filter history — see
+    # _same_filter_history()'s docstring. `history` itself (the existence
+    # check above, n_history) stays filter-agnostic on purpose.
+    median_hist_mag = _history_median_mag(_same_filter_history(history, source_filter))
     delta_mag: float | None = None
 
     if mag is not None and median_hist_mag is not None:

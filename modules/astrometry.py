@@ -30,6 +30,128 @@ import config
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Streak masking — see config.STREAK_* and CLAUDE.md's astrometry.py section.
+# ---------------------------------------------------------------------------
+
+def _build_streak_mask(
+    data_sub: np.ndarray,
+    rms: float,
+    pixel_scale_arcsec: float | None,
+) -> np.ndarray | None:
+    """
+    Coarse, low-threshold, non-deblended pre-pass that finds long thin
+    streaks — satellite/aircraft trails crossing a single exposure, and
+    diffraction-spike arms radiating from bright/saturated stars — and
+    returns a boolean pixel mask covering them, or None if none were found.
+
+    Why a *separate* pass rather than tuning the real extraction's own
+    deblend_cont: a trail/spike is frequently too faint along parts of its
+    length to stay connected as one sep object even with deblending fully
+    disabled — real data (2026-08-07, T_CrB test frame with a full-frame
+    satellite trail): the trail split into two disconnected coarse
+    components purely from brightness gaps along its own length, unrelated
+    to deblending. Because of that, this pre-pass's job is only to flag
+    *which* connected components are streak-like and mask them; the real
+    extraction below is completely untouched and stays exactly as capable of
+    splitting a genuinely close double star in a crowded field as before
+    this fix — only pixels belonging to a coarse candidate that is BOTH
+    highly elongated (>= config.STREAK_ELONGATION_MIN) AND far longer than
+    any real stellar PSF footprint (bounding-box diagonal >=
+    config.STREAK_MIN_LENGTH_ARCSEC) get masked, a combination no ordinary
+    star (or deblended star pair) reaches.
+
+    Verified against real data (2026-08-07,
+    T_CrB_Light_L_60_2024-05-28T19-06-10.fits): without this pre-pass, the
+    production extraction (thresh=10σ, deblend_cont=0.005) reported 5
+    separate small, roundish (elongation < 3), unmatched "stars" sitting
+    exactly along the satellite trail. With it, all 5 disappear and the star
+    count elsewhere in the frame is unaffected (757 -> 752 raw detections).
+
+    Parameters
+    ----------
+    data_sub:
+        Background-subtracted image data — the same array the real
+        extraction will run on.
+    rms:
+        Background RMS (bkg.globalrms) — used as this coarse pass's relative
+        detection threshold (config.STREAK_DETECT_SIGMA), same convention as
+        the real extraction below.
+    pixel_scale_arcsec:
+        Plate scale in arcsec/px, used to convert
+        config.STREAK_MIN_LENGTH_ARCSEC/STREAK_MASK_DILATE_ARCSEC into
+        pixels. None or <= 0 (qc.py, when the FITS header carries no
+        XPIXSZ/FOCALLEN/PIXSCALE) falls back to a conservative fixed 200px
+        length floor and a 1px dilation, so this pre-pass still does
+        something rather than silently never firing.
+
+    Returns
+    -------
+    np.ndarray | None
+        Boolean mask, same shape as data_sub, or None when nothing
+        streak-like was found (the common case) or the coarse pass itself
+        failed — callers should treat None as "nothing to mask".
+    """
+    if rms is None or rms <= 0:
+        return None
+
+    try:
+        objs, seg = sep.extract(
+            data_sub,
+            thresh=config.STREAK_DETECT_SIGMA,
+            err=rms,
+            minarea=config.SEP_MIN_AREA,
+            deblend_cont=1.0,  # disabled — see docstring above
+            segmentation_map=True,
+        )
+    except Exception as exc:
+        logger.debug("Streak coarse pass failed: %s", exc)
+        return None
+
+    if len(objs) == 0:
+        return None
+
+    safe_b = np.where(objs["b"] > 0, objs["b"], 1e-6)
+    elongation = objs["a"] / safe_b
+    bbox_diag_px = np.sqrt(
+        (objs["xmax"] - objs["xmin"]).astype(np.float64) ** 2
+        + (objs["ymax"] - objs["ymin"]).astype(np.float64) ** 2
+    )
+
+    if pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        min_len_px = config.STREAK_MIN_LENGTH_ARCSEC / pixel_scale_arcsec
+    else:
+        min_len_px = 200.0
+
+    streak_idx = np.where(
+        (elongation >= config.STREAK_ELONGATION_MIN) & (bbox_diag_px >= min_len_px)
+    )[0]
+    if len(streak_idx) == 0:
+        return None
+
+    # seg is 1-indexed (0 = background), matching objs' row order.
+    mask = np.isin(seg, streak_idx + 1)
+
+    dilate_px = 1
+    if pixel_scale_arcsec and pixel_scale_arcsec > 0:
+        dilate_px = max(1, int(round(config.STREAK_MASK_DILATE_ARCSEC / pixel_scale_arcsec)))
+    try:
+        from scipy.ndimage import binary_dilation
+        structure = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
+        mask = binary_dilation(mask, structure=structure)
+    except Exception as exc:
+        logger.debug(
+            "Streak mask dilation failed (%s) — using un-dilated mask", exc
+        )
+
+    logger.info(
+        "Streak masking: %d streak-like feature(s) found (elongation>=%.1f, "
+        "length>=%.0fpx), masking %d pixel(s)",
+        len(streak_idx), config.STREAK_ELONGATION_MIN, min_len_px, int(mask.sum()),
+    )
+    return mask
+
+
 async def solve(
     fits_path: str,
     psf_fwhm_arcsec: float | None = None,
@@ -79,8 +201,19 @@ async def solve(
         sources     list    – list of source dicts; each has:
                               ra, dec, flux, fwhm (arcsec), elongation (a/b),
                               saturated (bool — peak ADU >= config.SATURATION_ADU;
-                              see docs/ISSUES.md #2)
+                              see docs/ISSUES.md #2),
+                              near_edge (bool — pixel position within
+                              config.EDGE_MARGIN_FRAC of any frame edge; lets
+                              anomaly_detector.py demand stronger elongation
+                              evidence there, since coma inflates it near the
+                              edge of a wide-field frame)
         wcs         WCS     – astropy WCS object for downstream coordinate work
+
+    Before source extraction, a coarse streak-masking pre-pass (see
+    ``_build_streak_mask()`` above and ``config.STREAK_*``) removes satellite/
+    aircraft trails and bright-star diffraction-spike arms from the image so
+    they cannot fragment into spurious point-like "stars" in either
+    ``sources`` or ``sources_all``.
 
     Returns ``{}`` on any failure (astap error, WCS invalid, sep failure).
     """
@@ -334,12 +467,21 @@ async def solve(
 
         bkg = sep.Background(data)
         data_sub: np.ndarray = data - bkg
-        
+
+        # Streak masking — satellite/aircraft trails and diffraction-spike
+        # arms, run BEFORE the real point-source extraction below so they
+        # can never fragment into false stars. See config.STREAK_* and
+        # _build_streak_mask()'s docstring above.
+        streak_mask = _build_streak_mask(data_sub, bkg.globalrms, pixel_scale_arcsec)
+        if streak_mask is not None:
+            data_sub = np.array(data_sub, copy=True)
+            data_sub[streak_mask] = 0.0
+
         # Extract sources using configurable thresholds
         # Higher thresh = fewer detections (more conservative)
         # Higher minarea = reject smaller artifacts
         objects = sep.extract(
-            data_sub, 
+            data_sub,
             thresh=config.SEP_DETECT_THRESH,
             err=bkg.globalrms,
             minarea=config.SEP_MIN_AREA,
@@ -404,6 +546,36 @@ async def solve(
                     n_saturated, len(objects), config.SATURATION_ADU,
                     fits_filename,
                 )
+
+            # ---------------------------------------------------------
+            # Near-edge geometry flag — see config.EDGE_MARGIN_FRAC.
+            #
+            # Coma and other off-axis aberrations progressively distort a
+            # star's PSF toward the edges/corners of a wide-field frame,
+            # inflating its measured elongation for purely optical reasons —
+            # not because it's moving or trailing. Flagged here, once,
+            # geometrically from each detection's own pixel position (no WCS
+            # needed — this is a purely detector-space property), so that
+            # anomaly_detector.py can require stronger elongation evidence
+            # before treating an edge source as a single-exposure trail (real
+            # incident, 2026-08-07: 4 T_CrB frames produced 305 anomalies,
+            # dominated by coma-elongated but otherwise ordinary corner stars
+            # firing the SPACE_DEBRIS shortcut). Deliberately NO leading
+            # underscore (unlike "_source_id"/"_filter" etc.) — mirrors
+            # "saturated" below: it must survive api_client._to_wire_source()
+            # and be persisted on source_observations, since a standalone
+            # DETECT_ANOMALIES re-run (pipeline.py's _from_wire_source())
+            # reconstructs sources purely from stored API data, with no
+            # in-memory pixel position to recompute this from.
+            # ---------------------------------------------------------
+            margin_x = config.EDGE_MARGIN_FRAC * naxis1
+            margin_y = config.EDGE_MARGIN_FRAC * naxis2
+            near_edge_mask: np.ndarray = (
+                (objects["x"] < margin_x)
+                | (objects["x"] > naxis1 - margin_x)
+                | (objects["y"] < margin_y)
+                | (objects["y"] > naxis2 - margin_y)
+            )
 
             # ---------------------------------------------------------
             # Star filtering criteria:
@@ -488,6 +660,7 @@ async def solve(
                     "fwhm":       float(fwhm_arcsec[i]),
                     "elongation": float(elongations[i]),
                     "saturated":  bool(saturated_mask[i]),
+                    "near_edge":  bool(near_edge_mask[i]),
                 }
                 for i in range(len(objects))
                 if star_mask[i]
@@ -526,6 +699,7 @@ async def solve(
                     "fwhm":       float(fwhm_arcsec[i]),
                     "elongation": float(elongations[i]),
                     "saturated":  bool(saturated_mask[i]),
+                    "near_edge":  bool(near_edge_mask[i]),
                 }
                 for i in range(len(objects))
                 if mask_all[i]
