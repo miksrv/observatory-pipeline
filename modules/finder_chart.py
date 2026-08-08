@@ -65,7 +65,13 @@ before:
 Every epoch's own (RA, Dec) is captioned on its "stamp_strip" panel, and
 listed in a small legend under the "track" image (keyed by the same number
 as its marker) — added 2026-08-06 because neither style otherwise told a
-viewer exactly which sky position each mark/crop was at.
+viewer exactly which sky position each mark/crop was at. The "track" legend
+additionally shows each epoch's angular separation from the PREVIOUS epoch
+(arcsec/arcmin/degrees, whichever keeps the number readable — see
+_format_angular_shift()), added 2026-08-07: RA/Dec alone forced a viewer to
+eyeball two coordinates themselves to judge how fast the object was actually
+moving, which matters for telling a genuine mover from mere centroid/seeing
+jitter at a glance.
 
 If the source is catalog-matched (e.g. an MPC-identified asteroid, or a
 Simbad-known variable/binary star), the chart's title also carries that
@@ -222,6 +228,29 @@ def _arcsec_per_pixel(wcs: WCS) -> float:
     return 1.5
 
 
+def _format_angular_shift(sep_arcsec: float) -> str:
+    """
+    Format an angular separation in whichever unit keeps it readable — arcsec
+    below 1', arcmin below 1°, degrees above that. Used for the track chart's
+    per-epoch "moved by" legend line (see _render_track_chart()): a slow
+    asteroid drifts a few arcsec between epochs, but a wide MOVING_UNKNOWN/
+    SPACE_DEBRIS gap between sparse epochs can span arcminutes or more, and a
+    single fixed unit would make one of those two cases unreadable.
+    """
+    if sep_arcsec < 60.0:
+        return f"{sep_arcsec:.2f}″"  # ″
+    if sep_arcsec < 3600.0:
+        return f"{sep_arcsec / 60.0:.2f}′"  # ′
+    return f"{sep_arcsec / 3600.0:.3f}°"  # °
+
+
+def _angular_separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Great-circle separation between two (ra, dec) points, in arcseconds."""
+    c1 = SkyCoord(ra=ra1, dec=dec1, unit="deg")
+    c2 = SkyCoord(ra=ra2, dec=dec2, unit="deg")
+    return float(c1.separation(c2).arcsecond)
+
+
 def _fig_to_png_bytes(fig) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png")
@@ -268,9 +297,10 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
 
     Numbered markers on the image stay bare (adding each epoch's own RA/Dec
     text there would collide for a slow mover whose epochs sit only a few
-    pixels apart — see debug/README.md). Instead every epoch's coordinates
-    are listed in a small monospace legend under the image, keyed by the
-    same number as its marker.
+    pixels apart — see debug/README.md). Instead every epoch's coordinates,
+    plus its angular separation from the previous epoch (arcsec/arcmin/
+    degrees — see _format_angular_shift()), are listed in a small monospace
+    legend under the image, keyed by the same number as its marker.
 
     `label`, if given (e.g. "ASTEROID (4 Vesta)" — the anomaly_type plus its
     resolved catalog designation, see update_charts_for_sources()), is shown
@@ -335,10 +365,22 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
     ax.set_xticks([])
     ax.set_yticks([])
 
-    legend = "\n".join(
-        f"{i}: RA {ep['ra']:.4f}°  Dec {ep['dec']:.4f}°  {ep.get('obs_time', '')}"
-        for i, ep in enumerate(loaded_epochs, start=1)
-    )
+    # Δ from the previous epoch (arcsec/arcmin/degrees — see
+    # _format_angular_shift()) tells a viewer at a glance how fast the object
+    # is actually moving, instead of leaving them to eyeball two RA/Dec
+    # values themselves. loaded_epochs is chronologically ordered (see
+    # _render_chart_for_source()), so "previous" here means "previous in
+    # time", not "previous marker number" — the two coincide since epochs are
+    # never reordered. The first epoch has nothing to compare against.
+    legend_lines = []
+    for i, ep in enumerate(loaded_epochs, start=1):
+        line = f"{i}: RA {ep['ra']:.4f}°  Dec {ep['dec']:.4f}°  {ep.get('obs_time', '')}"
+        if i > 1:
+            prev = loaded_epochs[i - 2]
+            sep_arcsec = _angular_separation_arcsec(prev["ra"], prev["dec"], ep["ra"], ep["dec"])
+            line += f"  (moved {_format_angular_shift(sep_arcsec)} from epoch {i - 1})"
+        legend_lines.append(line)
+    legend = "\n".join(legend_lines)
     fig.text(0.02, 0.01, legend, fontsize=6.5, family="monospace", ha="left", va="bottom")
 
     legend_frac = 0.03 + 0.016 * len(loaded_epochs)

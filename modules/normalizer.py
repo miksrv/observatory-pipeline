@@ -18,6 +18,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,6 +239,25 @@ def normalize_filter_name(raw_filter: Any) -> tuple[str | None, str | None]:
         return (FILTER_MAP[lookup_key], raw_str)
 
     return (raw_str, raw_str)
+
+
+def is_narrowband(raw_filter: Any) -> bool:
+    """
+    Return True if a (possibly raw, un-normalized) filter value is one of
+    config.NARROWBAND_FILTERS — an emission-line filter (Hα/[OIII]/[SII]/
+    [NII] by default) too narrow to carry a representative star sample or a
+    trustworthy Gaia DR3 zero-point (see CLAUDE.md's "Filters — real
+    astronomy context").
+
+    Normalizes *raw_filter* first so this gives the right answer regardless
+    of NORMALIZE_ENABLED or the capture software's own spelling — "H-Alpha",
+    "[OIII]", and "Ha" must all compare equal to config.NARROWBAND_FILTERS'
+    canonical short codes. False for None/unknown/broadband filters.
+    """
+    normalized, _ = normalize_filter_name(raw_filter)
+    if normalized is None:
+        return False
+    return normalized in config.NARROWBAND_FILTERS
 
 
 # ---------------------------------------------------------------------------
