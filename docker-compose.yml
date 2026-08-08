@@ -1,4 +1,8 @@
 services:
+  # Watches FITS_INCOMING and runs analyze_frame() synchronously per file, as
+  # before — not yet wired to submit ANALYZE tasks to the queue (see
+  # CLAUDE.md's Known Issues for that gap). Shares every volume with `worker`
+  # below except the cache dir, which watcher.py never reads/writes itself.
   pipeline:
     build: .
     extra_hosts:
@@ -20,6 +24,36 @@ services:
       - ~/Developer/data/fits/rejected:/fits/rejected
       - ~/Developer/data/fits/debug:/fits/debug
       - ~/Developer/data/astap/catalogs:/astap/catalogs
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  # Polls the observatory-api task queue (ANALYZE / DETECT_ANOMALIES /
+  # GENERATE_CHARTS) and dispatches items to the corresponding pipeline.py
+  # entry point — see worker.py and CLAUDE.md's job-queue section. A separate
+  # service (not a thread inside `pipeline`) so it can be scaled, restarted,
+  # or stopped independently of the filesystem watcher.
+  worker:
+    build: .
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["python", "worker.py"]
+    volumes:
+      - .:/app
+      - ~/Developer/data/fits/incoming:/fits/incoming
+      - ~/Developer/data/fits/archive:/fits/archive
+      - ~/Developer/data/fits/rejected:/fits/rejected
+      - ~/Developer/data/fits/debug:/fits/debug
+      - ~/Developer/data/astap/catalogs:/astap/catalogs
+      # Deliberately a path OUTSIDE the container's own writable layer (a
+      # host directory bind-mounted in, exactly like the /fits/* dirs above)
+      # so the on-disk catalog cache (modules/catalog_matcher.py) survives a
+      # container rebuild/recreate instead of being thrown away with it —
+      # important while iterating during testing, when this gets restarted
+      # often. In a non-Docker production deployment CATALOG_CACHE_DIR is
+      # just a plain directory on the host; this bind mount is a dev/Docker
+      # convenience, not something the cache logic itself depends on.
+      - ~/Developer/data/cache/catalog:/cache/catalog
     env_file:
       - .env
     restart: unless-stopped

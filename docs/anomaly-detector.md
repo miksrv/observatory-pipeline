@@ -20,7 +20,9 @@ Called from `pipeline.py` after `photometry.measure()`, and after
 in `CLAUDE.md`). The input source list has already been through:
 
 - plate solving and source extraction (`astrometry.py`, sources flagged `saturated=True`
-  when their peak ADU reaches `SATURATION_ADU`),
+  when their peak ADU reaches `SATURATION_ADU`, and `near_edge=True` when their pixel
+  position falls within `EDGE_MARGIN_FRAC` of any frame edge — see the `SPACE_DEBRIS`
+  branch below),
 - optional image subtraction (`subtraction.py`, candidates flagged `_from_subtraction=True`;
   the vicinity of any saturated pixel is masked out of diff-image detection before
   candidates are even produced — see docs/ISSUES.md #1, #2),
@@ -57,6 +59,18 @@ permanently unreachable — fixed; see git history if you need the details.)
 If both batch requests come back empty, it's either the very first frame of this sky
 area, or an API failure; a warning is logged.
 
+`POST /sources/near/batch` returns each historical detection's `filter` (see docs/API.md section
+6), resolved server-side from the frame it came from. `_classify_source_sync()` uses this — via
+`_same_filter_history()` — to restrict the **magnitude** comparison (`median_hist_mag`/`delta_mag`)
+to detections observed through the *same* filter as the current source (`source["_filter"]`,
+attached by `pipeline.py`). A star's brightness in one filter isn't directly comparable to another
+(a color term, not real variability — see CLAUDE.md's "Filters — real astronomy context"), so
+comparing across filters would misfire `VARIABLE_STAR`/`BINARY_STAR`/the brightening branch of
+`SUPERNOVA_CANDIDATE` on an ordinary filter change between epochs. This restriction applies ONLY to
+the magnitude comparison — the **existence** check below (`n_history`, `n_coverage`, deciding
+`FIRST_OBSERVATION`/`UNKNOWN`/`KNOWN_CATALOG_NEW`) stays filter-agnostic, since a position already
+detected in a different filter is still a real prior detection, not evidence of a brand-new source.
+
 ---
 
 ## Process diagram
@@ -74,12 +88,14 @@ flowchart TD
 
     P1 -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
     Sat -- yes --> Suppressed(["suppressed — return None\n(bright-star/subtraction artifact,\nnot a real transient)"])
-    Sat -- no --> P2{"catalog_name is None\nAND no history within MATCH_CONE_ARCSEC\nof the CURRENT position\nAND a wide-cone (MOVING_CONE_ARCSEC) historical\nposition has vacated\n(no source in THIS frame near it)?"}
-    P2 -- yes --> Elong{"elongation > 3.0?"}
-    Elong -- yes --> SpaceDebris["🔔 SPACE_DEBRIS"]
-    Elong -- no --> MovingUnknown["🔔 MOVING_UNKNOWN"]
+    Sat -- no --> NoHist{"catalog_name is None\nAND no history within MATCH_CONE_ARCSEC\nof the CURRENT position?"}
+    NoHist -- yes --> Trail{"elongation > trail threshold?\n(SPACE_DEBRIS_ELONGATION_MIN=3.0,\nor the higher SPACE_DEBRIS_EDGE_\nELONGATION_MIN=6.0 if near_edge —\ncoma inflates elongation near the\nframe edge; see below)"}
+    Trail -- yes --> SpaceDebris["🔔 SPACE_DEBRIS"]
+    Trail -- no --> Vacated{"a wide-cone (MOVING_CONE_ARCSEC)\nhistorical position has vacated\n(no source in THIS frame near it)?"}
+    Vacated -- yes --> MovingUnknown["🔔 MOVING_UNKNOWN"]
 
-    P2 -- no --> Coverage{"n_coverage == 0?\n(sky area never\nimaged before)"}
+    NoHist -- no --> Coverage{"n_coverage == 0?\n(sky area never\nimaged before)"}
+    Vacated -- no --> Coverage
     Coverage -- yes --> FromSub{"_from_subtraction\n== True?"}
     FromSub -- no --> FirstObs["FIRST_OBSERVATION\n(not an anomaly, logged only)"]
     FromSub -- yes --> UnkNewArea["🔔 UNKNOWN\n(subtraction already confirmed\nnovelty despite\nno coverage record)"]
@@ -92,7 +108,7 @@ flowchart TD
     InCatalog -- no --> UnkNoCat["🔔 UNKNOWN\n(not found in\nany catalog)"]
     InCatalog -- yes --> KnownNew["KNOWN_CATALOG_NEW\n(known object, was simply\nbelow detection threshold\nbefore; not an anomaly)"]
 
-    History -- no, has\nhistory --> DeltaMag["delta_mag = mag − median(history.mag)"]
+    History -- no, has\nhistory --> DeltaMag["delta_mag = mag − median(\n_same_filter_history(history).mag)\n(only same-filter epochs — see below)"]
     DeltaMag --> Changed{"abs(delta_mag) >\nDELTA_MAG_ALERT?"}
     Changed -- no --> NoAnomaly(["no anomaly"])
     Changed -- yes --> Bright{"delta_mag < 0\n(got brighter)\nAND near a galaxy?"}
@@ -145,24 +161,54 @@ one condition matches, the function returns and no further checks run:
    saturated source that *is* MPC- or Simbad-matched (bullet 1, or the history-based
    branches below) is a legitimate detection and is unaffected — it just never gets a
    usable `magnitude`, since `photometry.py` never measures a saturated source.
-3. **Unmatched position-shifted source** — `catalog_name is None` and **both**: (a) no
-   historical detection within `MATCH_CONE_ARCSEC` (5″) of the source's *current*
-   position, and (b) a historical detection within the wider `MOVING_CONE_ARCSEC`
-   (120″) whose own position is no longer occupied by anything else in *this* frame
-   (`_is_still_occupied()` is `False` for it) → `MOVING_UNKNOWN` (elongation ≤ 3.0) or
-   `SPACE_DEBRIS` (elongation > 3.0, fast trail).
+3. **Unmatched, no detection at the current position** — `catalog_name is None` and (a)
+   no historical detection within `MATCH_CONE_ARCSEC` (5″) of the source's *current*
+   position. From here the branch splits on `elongation` against a threshold that is
+   itself edge-aware — `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default) for an ordinary
+   source, or the higher `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) whenever the
+   source is flagged `near_edge` (set by `modules/astrometry.py`/`modules/subtraction.py`
+   from the detection's own pixel position vs. `EDGE_MARGIN_FRAC` — coma and other
+   off-axis aberrations progressively stretch a perfectly ordinary, non-moving star's PSF
+   toward the edges/corners of a wide-field frame, inflating its measured elongation for
+   purely optical reasons; real incident, 2026-08-07, `T_CrB` frames: 4 frames produced
+   305 anomalies, the vast majority coma-elongated but otherwise ordinary corner stars
+   firing this exact shortcut):
+   - **`elongation` above that threshold** → `SPACE_DEBRIS` immediately, with no further
+     evidence required. A satellite/debris trail's entire visible track — both
+     "endpoints" — exists within this single exposure; it never had a *prior* detection
+     anywhere nearby whose position could be shown to have vacated (see condition (b)
+     below), so requiring that proof meant a genuine trail could never satisfy it and
+     always fell through to generic `UNKNOWN` instead (real incident, 2026-08-07,
+     `C_2020_R4_ATLAS` frames: several frame-spanning trails were reported `UNKNOWN`
+     with a `stamp_strip`/blink chart rather than `SPACE_DEBRIS` with a `track`
+     chart). Elongation alone is treated as sufficient trail evidence here — but a
+     genuine trail is typically far more elongated than coma alone produces, so raising
+     the bar near the edge (rather than removing the elongation-alone shortcut there
+     entirely) keeps real edge-of-frame trails detectable while filtering out the
+     aberration.
+   - **`elongation` at or below that threshold** → also requires (b): a historical
+     detection within the wider `MOVING_CONE_ARCSEC` (120″) whose own position is no
+     longer occupied by anything else in *this* frame (`_is_still_occupied()` is `False`
+     for it) → `MOVING_UNKNOWN`. Otherwise falls through to bullet 4 below.
 
-   Condition (b) alone (an earlier revision's entire check) is true near almost any
-   populated field regardless of real motion: `MOVING_CONE_ARCSEC` covers enough sky
-   that some unrelated historical detection — a neighbouring star, a galaxy smudge,
-   anything ever recorded nearby — is virtually always present there. That made
-   ordinary sub-arcsecond centroid/seeing noise on an otherwise-static source
-   indistinguishable from a real mover, as long as *anything else* happened to be
-   within 120″ (real incident, 2026-08-06 — see docs/ISSUES.md #1). Condition (a)
-   requires the source's *own* current position to be genuinely new, and the
-   "vacated" check in (b) requires the *candidate's* old position to have genuinely
-   emptied out — a persistent neighbour that's still detected at its own spot in this
-   frame no longer counts as evidence that anything moved.
+   Condition (b) alone (an earlier revision's entire check, applied to both
+   `MOVING_UNKNOWN` and `SPACE_DEBRIS`) is true near almost any populated field
+   regardless of real motion: `MOVING_CONE_ARCSEC` covers enough sky that some
+   unrelated historical detection — a neighbouring star, a galaxy smudge, anything
+   ever recorded nearby — is virtually always present there. That made ordinary
+   sub-arcsecond centroid/seeing noise on an otherwise-static source indistinguishable
+   from a real mover, as long as *anything else* happened to be within 120″ (real
+   incident, 2026-08-06 — see docs/ISSUES.md #1). Condition (a) requires the source's
+   *own* current position to be genuinely new, and the "vacated" check in (b) requires
+   the *candidate's* old position to have genuinely emptied out — a persistent
+   neighbour that's still detected at its own spot in this frame no longer counts as
+   evidence that anything moved. This remains the standard for `MOVING_UNKNOWN`
+   (slow, point-source-like movers that persist across multiple frames); `SPACE_DEBRIS`
+   no longer needs it, per the elongation shortcut above — the opposite failure mode
+   (a *recurring* elongated artifact or extended object sitting at the exact same
+   position every frame) is still excluded by condition (a) alone, since such a source
+   fails "no historical detection within `MATCH_CONE_ARCSEC`" and never reaches this
+   branch at all.
 4. **Stationary sources** — decided next by coverage (`coverage`) and local history
    (`history`, `MATCH_CONE_ARCSEC` cone):
    - no coverage at all → `FIRST_OBSERVATION` (not an anomaly), except when
@@ -171,8 +217,11 @@ one condition matches, the function returns and no further checks run:
    - covered, no history, near a galaxy (Simbad OTYPE) → `SUPERNOVA_CANDIDATE`;
    - covered, no history, not in any catalog → `UNKNOWN`;
    - covered, no history, in a catalog (not a galaxy) → `KNOWN_CATALOG_NEW` (not an anomaly);
-   - has history → compare `delta_mag = mag − median(history.mag)` against
-     `DELTA_MAG_ALERT` (default 0.5). If the threshold is exceeded:
+   - has history → compare `delta_mag = mag − median(same_filter_history.mag)` — only
+     history entries observed through the same filter as this source, via
+     `_same_filter_history()` — against `DELTA_MAG_ALERT` (default 0.5). No same-filter
+     history at all → `delta_mag` stays `None`, same as an uncalibrated source. If the
+     threshold is exceeded:
      - a change near a galaxy only counts when the source **brightened**, i.e.
        `delta_mag < 0` → `SUPERNOVA_CANDIDATE` (checked first — takes priority over
        binary/variable stars);
@@ -203,8 +252,8 @@ Table of Simbad OTYPE substrings used by the classifiers:
 | `ASTEROID` | Matched in MPC/SkyBot, type "asteroid" | No (logged + ephemeris) |
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |
 | `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening beyond Δmag | **Yes** |
-| `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation ≤ 3.0 | **Yes** |
-| `SPACE_DEBRIS` | Position-shifted source, not in MPC, elongation > 3.0 | **Yes** |
+| `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold | **Yes** |
+| `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | **Yes** |
 | `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction regardless of coverage | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` and must match
