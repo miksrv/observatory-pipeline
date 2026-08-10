@@ -10,6 +10,12 @@ task's items to the matching pipeline.py stage function:
     PREVIEW_CATALOG_MATCH  -> pipeline.preview_catalog_match(fits_path, task_id, item_id)
     RESTART                -> clean exit (Docker restarts the container with fresh settings)
 
+DETECT_ANOMALIES and GENERATE_CHARTS are decoupled: anomaly detection saves
+its results to the API, and the operator then decides which anomalies need
+charts and creates a GENERATE_CHARTS task from the UI (referencing
+anomaly_ids from the anomalies table). There is no automatic follow-up task
+creation between these two stages.
+
 This is deliberately a SEPARATE process from watcher.py (see docker-compose's
 `worker` service) so it can be scaled, restarted, or stopped independently
 of the filesystem watcher. Tasks reach this worker two ways: watcher.py
@@ -116,17 +122,13 @@ async def _run_detect_task(task: dict, items: list[dict]) -> None:
     """
     Process every PENDING item of one DETECT_ANOMALIES task — reporting each
     frame's outcome immediately after it finishes, same reasoning as
-    _run_analyze_task() above — then submit a SINGLE GENERATE_CHARTS task
-    covering every source_id with a resolved anomaly across the WHOLE task —
-    not one GENERATE_CHARTS task per frame. This is the cross-frame batching
-    the job-queue split exists to enable: a task spanning hundreds of frames
-    still produces just one downstream chart task, and
-    modules/finder_chart.py renders/uploads it in the same
-    one-or-two-HTTP-calls-total batches it already uses for a single frame.
-    """
-    anomaly_type_by_source_id: dict = {}
-    designation_by_source_id: dict = {}
+    _run_analyze_task() above.
 
+    Unlike before, this handler no longer auto-creates a follow-up
+    GENERATE_CHARTS task. The operator decides which anomalies need charts
+    and submits a GENERATE_CHARTS task from the UI, referencing specific
+    anomaly_ids from the anomalies table.
+    """
     for item in items:
         frame_id = item.get("frame_id")
         if not frame_id:
@@ -136,7 +138,7 @@ async def _run_detect_task(task: dict, items: list[dict]) -> None:
             continue
 
         try:
-            anomalies = await pipeline.detect_anomalies_for_frame_id(frame_id)
+            await pipeline.detect_anomalies_for_frame_id(frame_id)
         except Exception as exc:
             logger.exception("DETECT_ANOMALIES item failed for frame_id=%s", frame_id)
             await api_client.post_task_items_progress(
@@ -144,48 +146,8 @@ async def _run_detect_task(task: dict, items: list[dict]) -> None:
             )
             continue
 
-        for anomaly in anomalies:
-            source_id = anomaly.get("source_id")
-            if not source_id:
-                continue
-            anomaly_type_by_source_id[source_id] = anomaly.get("anomaly_type")
-            designation = anomaly.get("_designation")
-            if designation:
-                designation_by_source_id[source_id] = designation
-
         await api_client.post_task_items_progress(task["id"], [{"item_id": item["id"], "status": "DONE"}])
 
-    if not anomaly_type_by_source_id:
-        return
-
-    chart_items = [
-        {
-            "source_id": source_id,
-            "payload": {
-                "anomaly_type": anomaly_type,
-                "designation": designation_by_source_id.get(source_id),
-            },
-        }
-        for source_id, anomaly_type in anomaly_type_by_source_id.items()
-    ]
-    created = await api_client.create_task(
-        "GENERATE_CHARTS",
-        chart_items,
-        scope={"object": task.get("scope_object")} if task.get("scope_object") else None,
-        parent_task_id=task["id"],
-    )
-    if created is None:
-        logger.warning(
-            "Failed to submit follow-up GENERATE_CHARTS task for %d source(s) "
-            "from DETECT_ANOMALIES task_id=%s — charts for this batch will not "
-            "be generated unless resubmitted manually",
-            len(chart_items), task["id"],
-        )
-    else:
-        logger.info(
-            "Submitted GENERATE_CHARTS task_id=%s for %d source(s) (parent task_id=%s)",
-            created.get("id"), len(chart_items), task["id"],
-        )
 
 
 async def _run_charts_task(task: dict, items: list[dict]) -> None:

@@ -71,25 +71,17 @@ class TestHandleAnalyzeItem:
 
 
 class TestRunDetectTask:
-    async def test_aggregates_across_items_and_creates_one_charts_task(self, monkeypatch):
-        """Two frame items, each producing anomalies, must be merged into a
-        SINGLE follow-up GENERATE_CHARTS task — not one per frame."""
+    async def test_processes_all_items_and_reports_progress(self, monkeypatch):
+        """All frame items are processed sequentially, each reporting progress."""
 
         async def fake_detect(frame_id):
-            if frame_id == "frame-1":
-                return [
-                    {"anomaly_type": "UNKNOWN", "source_id": "src-a", "_designation": None},
-                ]
             return [
-                {"anomaly_type": "ASTEROID", "source_id": "src-b", "_designation": "2014 RY1"},
-                {"anomaly_type": "MOVING_UNKNOWN", "source_id": None},  # no source_id -> excluded
+                {"anomaly_type": "UNKNOWN", "source_id": "src-a", "_designation": None},
             ]
 
         monkeypatch.setattr(worker.pipeline, "detect_anomalies_for_frame_id", AsyncMock(side_effect=fake_detect))
         post_progress_mock = AsyncMock()
         monkeypatch.setattr(worker.api_client, "post_task_items_progress", post_progress_mock)
-        create_task_mock = AsyncMock(return_value={"id": "chart-task-1"})
-        monkeypatch.setattr(worker.api_client, "create_task", create_task_mock)
 
         task = {"id": "detect-task-1", "scope_object": "M51"}
         items = [
@@ -111,15 +103,25 @@ class TestRunDetectTask:
             reported[items_arg[0]["item_id"]] = items_arg[0]["status"]
         assert reported == {"item-1": "DONE", "item-2": "DONE"}
 
-        # Exactly one follow-up task created, covering both resolved source_ids.
-        create_task_mock.assert_called_once()
-        call_args = create_task_mock.call_args
-        assert call_args.args[0] == "GENERATE_CHARTS"
-        chart_items = call_args.args[1]
-        by_source = {c["source_id"]: c["payload"] for c in chart_items}
-        assert by_source["src-a"] == {"anomaly_type": "UNKNOWN", "designation": None}
-        assert by_source["src-b"] == {"anomaly_type": "ASTEROID", "designation": "2014 RY1"}
-        assert call_args.kwargs["parent_task_id"] == "detect-task-1"
+    async def test_no_automatic_charts_task_created(self, monkeypatch):
+        """DETECT_ANOMALIES must NOT auto-create a follow-up GENERATE_CHARTS task.
+        The operator creates chart tasks manually from the UI."""
+
+        async def fake_detect(frame_id):
+            return [{"anomaly_type": "UNKNOWN", "source_id": "src-a", "_designation": None}]
+
+        monkeypatch.setattr(worker.pipeline, "detect_anomalies_for_frame_id", AsyncMock(side_effect=fake_detect))
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock())
+        create_task_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "create_task", create_task_mock)
+
+        task = {"id": "detect-task-1", "scope_object": "M51"}
+        items = [{"id": "item-1", "frame_id": "frame-1"}]
+
+        await worker._run_detect_task(task, items)
+
+        # No follow-up task should be created — charts are operator-driven now.
+        create_task_mock.assert_not_called()
 
     async def test_item_failure_does_not_block_others(self, monkeypatch):
         async def fake_detect(frame_id):
@@ -130,8 +132,6 @@ class TestRunDetectTask:
         monkeypatch.setattr(worker.pipeline, "detect_anomalies_for_frame_id", AsyncMock(side_effect=fake_detect))
         post_progress_mock = AsyncMock()
         monkeypatch.setattr(worker.api_client, "post_task_items_progress", post_progress_mock)
-        create_task_mock = AsyncMock(return_value={"id": "chart-task-1"})
-        monkeypatch.setattr(worker.api_client, "create_task", create_task_mock)
 
         task = {"id": "detect-task-1"}
         items = [
@@ -148,18 +148,6 @@ class TestRunDetectTask:
         assert by_id["item-1"]["status"] == "FAILED"
         assert by_id["item-2"]["status"] == "DONE"
 
-        # The one surviving anomaly still produces a follow-up chart task.
-        create_task_mock.assert_called_once()
-
-    async def test_no_anomalies_skips_charts_task_creation(self, monkeypatch):
-        monkeypatch.setattr(worker.pipeline, "detect_anomalies_for_frame_id", AsyncMock(return_value=[]))
-        monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock())
-        create_task_mock = AsyncMock()
-        monkeypatch.setattr(worker.api_client, "create_task", create_task_mock)
-
-        await worker._run_detect_task({"id": "t1"}, [{"id": "item-1", "frame_id": "frame-1"}])
-
-        create_task_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

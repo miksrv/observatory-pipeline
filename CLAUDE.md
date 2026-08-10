@@ -262,7 +262,7 @@ Separate process (own `docker-compose.yml` service) that polls observatory-api's
 |---|---|---|
 | `ANALYZE` | `pipeline.analyze_frame(item["filename"])` | `filename` — the FULL path to the FITS file, not just a basename |
 | `DETECT_ANOMALIES` | `pipeline.detect_anomalies_for_frame_id(item["frame_id"])` | `frame_id` |
-| `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, batched across the WHOLE task | `source_id` + `payload` (`{"anomaly_type", "designation"}`) |
+| `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, batched across the WHOLE task | `source_id` + `anomaly_id` + `payload` (`{"anomaly_type", "designation"}`) |
 | `PREVIEW_CATALOG_MATCH` | `pipeline.preview_catalog_match(item["filename"], task_id, item["id"])` | `filename` — same "full path, not a basename" convention as `ANALYZE` |
 | `RESTART` | Clean process exit → Docker restarts container → re-fetches remote settings | (none — signal task, no items) |
 
@@ -288,12 +288,13 @@ split unlocks; `pipeline.run()` alone can't express it at all — though it's wo
 so in practice `run()` today is mainly a convenience composition for tests and any ad hoc
 single-file invocation, not something on the live ingestion path.
 
-After a `DETECT_ANOMALIES` task finishes all its items, `worker.py` submits **one** follow-up
-`GENERATE_CHARTS` task covering every `source_id` with a resolved anomaly across the **whole**
-task — not one per frame. This is the cross-frame batching the job-queue split exists to enable:
-a task spanning hundreds of frames still produces a single downstream chart task, which
-`modules/finder_chart.py` renders/uploads in the same one-or-two-HTTP-call batches it already uses
-for a single frame (see that module's section below).
+After a `DETECT_ANOMALIES` task finishes all its items, anomalies are saved to the API. The
+operator then decides which anomalies need charts and submits a `GENERATE_CHARTS` task from the
+UI — referencing specific `anomaly_id`s from the `anomalies` table. There is no automatic
+follow-up task creation between these two stages. Each `GENERATE_CHARTS` task item carries
+`anomaly_id` (for traceability), `source_id` (denormalized from the anomaly for pipeline
+convenience), and `payload` with `{"anomaly_type", "designation"}` so the pipeline doesn't need a
+separate fetch.
 
 **`RESTART` is a signal task, not a pipeline stage** — it carries no items and performs no
 astronomical computation. Use case: an operator changes pipeline configuration parameters via the
