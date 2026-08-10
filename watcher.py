@@ -238,12 +238,30 @@ def process_existing_files(directory: str) -> int:
     return count
 
 
+async def _fetch_and_apply_remote_settings() -> None:
+    """Fetch remote config from the API and overlay it onto config globals."""
+    settings = await api_client.get_settings()
+    if settings:
+        applied = config.apply_remote_settings(settings)
+        logger.info("Applied %d remote setting(s) from API", applied)
+    else:
+        logger.info("No remote settings fetched — using local defaults only")
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=getattr(logging, config.LOG_LEVEL, logging.INFO),
         format="%(asctime)s %(levelname)-5s %(module)s — %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # Fetch remote configuration from the API before anything else.
+    # If the API is unreachable or returns an error, all local defaults
+    # from config.py remain in effect — the watcher still starts normally.
+    asyncio.run(_fetch_and_apply_remote_settings())
+
+    # Re-apply log level in case the remote settings changed it.
+    logging.getLogger().setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
 
     logger.info(
         "Starting watcher on %s (log level: %s, debounce: %.1fs, max batch: %d)",

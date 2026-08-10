@@ -336,6 +336,19 @@ async def run_forever() -> None:
     Poll for PENDING tasks forever, one at a time (oldest first), backing
     off when idle. Runs until cancelled (KeyboardInterrupt in __main__).
     """
+    # Fetch remote configuration from the API before entering the poll loop.
+    # If the API is unreachable or returns an error, all local defaults from
+    # config.py remain in effect — the worker still starts normally.
+    settings = await api_client.get_settings()
+    if settings:
+        applied = config.apply_remote_settings(settings)
+        logger.info("Applied %d remote setting(s) from API", applied)
+
+        # Re-apply log level in case the remote settings changed it.
+        logging.getLogger().setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+    else:
+        logger.info("No remote settings fetched — using local defaults only")
+
     base_interval = config.TASK_POLL_INTERVAL_SEC
     max_interval = config.TASK_POLL_BACKOFF_MAX_SEC
     interval = base_interval

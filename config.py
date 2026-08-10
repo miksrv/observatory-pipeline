@@ -293,3 +293,124 @@ TASK_POLL_BACKOFF_MAX_SEC: float = float(_get("TASK_POLL_BACKOFF_MAX_SEC", "60.0
 # Use INFO for normal operation; DEBUG for troubleshooting.
 LOG_LEVEL: str = _get("LOG_LEVEL", "INFO").upper()
 
+
+# ---------------------------------------------------------------------------
+# Remote settings overlay
+# ---------------------------------------------------------------------------
+# Registry of config parameters that the API's GET /settings endpoint can
+# override at startup.  Maps param name → (python type, cast function).
+# Only parameters listed here are accepted from the remote side — API_KEY,
+# paths, and other security-/deployment-sensitive values are deliberately
+# excluded.  Values arrive as strings from the API (the settings table stores
+# everything as text); the cast function converts them to the correct Python
+# type, matching the same conversion each _get() call above already applies.
+_OVERRIDABLE: dict[str, type] = {
+    # QC thresholds
+    "QC_FWHM_MAX_ARCSEC": float,
+    "QC_ELONGATION_MAX": float,
+    "QC_SNR_MIN": float,
+    "QC_STARS_MIN": int,
+    "QC_SKY_BACKGROUND_MAX": float,
+    "QC_STARS_MIN_NARROWBAND": int,
+    # Star detection filtering
+    "STAR_FWHM_MIN_ARCSEC": float,
+    "STAR_FWHM_MAX_ARCSEC": float,
+    "STAR_ELONGATION_MAX": float,
+    "STAR_SNR_MIN": float,
+    # SEP extraction
+    "SEP_DETECT_THRESH": float,
+    "SEP_MIN_AREA": int,
+    # Streak masking
+    "STREAK_DETECT_SIGMA": float,
+    "STREAK_ELONGATION_MIN": float,
+    "STREAK_MIN_LENGTH_ARCSEC": float,
+    "STREAK_MASK_DILATE_ARCSEC": float,
+    # Saturation
+    "SATURATION_ADU": float,
+    "SATURATION_MASK_RADIUS_ARCSEC": float,
+    # Cross-matching
+    "MATCH_CONE_ARCSEC": float,
+    "MOVING_CONE_ARCSEC": float,
+    "DELTA_MAG_ALERT": float,
+    # Edge geometry
+    "EDGE_MARGIN_FRAC": float,
+    "SPACE_DEBRIS_ELONGATION_MIN": float,
+    "SPACE_DEBRIS_EDGE_ELONGATION_MIN": float,
+    # Image subtraction
+    "SUBTRACTION_MIN_FRAMES": int,
+    "SUBTRACTION_DETECT_SIGMA": float,
+    # Observatory site
+    "SITE_LAT": float,
+    "SITE_LON": float,
+    "SITE_ELEV": int,
+    # Finder charts
+    "CHART_ENABLED": None,  # special: bool from string
+    "CHART_STAMP_SIZE_ARCSEC": float,
+    "CHART_MAX_EPOCHS": int,
+    # Normalization
+    "NORMALIZE_ENABLED": None,  # special: bool from string
+    # Catalog cache
+    "CACHE_TTL_HOURS": float,
+    # Watcher batching
+    "WATCHER_DEBOUNCE_SEC": float,
+    "WATCHER_MAX_BATCH_SIZE": int,
+    # Worker polling
+    "TASK_POLL_INTERVAL_SEC": float,
+    "TASK_POLL_BACKOFF_MAX_SEC": float,
+    # Logging
+    "LOG_LEVEL": None,  # special: str.upper()
+    # ASTAP
+    "ASTAP_FOV_HINT": float,
+    # Narrowband filters
+    "NARROWBAND_FILTERS": None,  # special: frozenset from CSV
+}
+
+_BOOL_KEYS = {"CHART_ENABLED", "NORMALIZE_ENABLED"}
+
+
+def _cast_value(name: str, raw: str) -> object:
+    """Convert a raw string value from the API into the correct Python type."""
+    if name in _BOOL_KEYS:
+        return raw.strip().lower() in ("true", "1", "yes")
+    if name == "LOG_LEVEL":
+        return raw.strip().upper()
+    if name == "NARROWBAND_FILTERS":
+        return frozenset(f.strip() for f in raw.split(",") if f.strip())
+    typ = _OVERRIDABLE[name]
+    return typ(raw)
+
+
+def apply_remote_settings(settings: dict[str, str]) -> int:
+    """
+    Override module-level config globals with values from the API.
+
+    Parameters
+    ----------
+    settings:
+        Flat ``{param_name: string_value}`` dict as returned by
+        ``GET /settings`` (the ``data`` field of the response).
+
+    Returns
+    -------
+    int
+        Number of parameters successfully applied.
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    applied = 0
+    for name, raw in settings.items():
+        if name not in _OVERRIDABLE:
+            _logger.debug("Remote setting '%s' is not overridable — skipped", name)
+            continue
+        try:
+            value = _cast_value(name, str(raw))
+            globals()[name] = value
+            _logger.info("Remote setting applied: %s = %r", name, value)
+            applied += 1
+        except (ValueError, TypeError) as exc:
+            _logger.warning(
+                "Remote setting '%s' has invalid value '%s': %s — keeping default",
+                name, raw, exc,
+            )
+    return applied

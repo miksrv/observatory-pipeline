@@ -648,3 +648,145 @@ class TestUploadSourceChartsBatch:
             result = await upload_source_charts_batch(self._CHARTS)
 
         assert result == {}
+
+
+# ===================================================================
+# get_settings
+# ===================================================================
+
+
+class TestGetSettings:
+    """Tests for get_settings() — fetching remote configuration."""
+
+    async def test_returns_settings_on_success(self):
+        resp = _mock_response(
+            status_code=200,
+            json_data={"data": {"QC_FWHM_MAX_ARCSEC": "6.0", "DELTA_MAG_ALERT": "1.0"}},
+        )
+        with _patch_client(get_response=resp):
+            result = await api_client_module.get_settings()
+
+        assert result == {"QC_FWHM_MAX_ARCSEC": "6.0", "DELTA_MAG_ALERT": "1.0"}
+
+    async def test_returns_none_on_http_error(self):
+        resp = _mock_response(status_code=500)
+        with _patch_client(get_response=resp):
+            result = await api_client_module.get_settings()
+
+        assert result is None
+
+    async def test_returns_none_on_4xx(self):
+        resp = _mock_response(status_code=404)
+        with _patch_client(get_response=resp):
+            result = await api_client_module.get_settings()
+
+        assert result is None
+
+    async def test_returns_none_on_transport_error(self):
+        with _patch_client(get_side_effect=httpx.ConnectError("refused")):
+            result = await api_client_module.get_settings()
+
+        assert result is None
+
+    async def test_returns_none_on_unexpected_shape(self):
+        resp = _mock_response(status_code=200, json_data={"unexpected": "shape"})
+        with _patch_client(get_response=resp):
+            result = await api_client_module.get_settings()
+
+        assert result is None
+
+    async def test_returns_none_on_empty_data(self):
+        resp = _mock_response(status_code=200, json_data={"data": "not-a-dict"})
+        with _patch_client(get_response=resp):
+            result = await api_client_module.get_settings()
+
+        assert result is None
+
+
+# ===================================================================
+# config.apply_remote_settings
+# ===================================================================
+
+
+class TestApplyRemoteSettings:
+    """Tests for config.apply_remote_settings()."""
+
+    def test_applies_float_setting(self):
+        import config
+        original = config.QC_FWHM_MAX_ARCSEC
+        try:
+            count = config.apply_remote_settings({"QC_FWHM_MAX_ARCSEC": "6.5"})
+            assert count == 1
+            assert config.QC_FWHM_MAX_ARCSEC == 6.5
+        finally:
+            config.QC_FWHM_MAX_ARCSEC = original
+
+    def test_applies_int_setting(self):
+        import config
+        original = config.QC_STARS_MIN
+        try:
+            count = config.apply_remote_settings({"QC_STARS_MIN": "20"})
+            assert count == 1
+            assert config.QC_STARS_MIN == 20
+        finally:
+            config.QC_STARS_MIN = original
+
+    def test_applies_bool_setting(self):
+        import config
+        original = config.CHART_ENABLED
+        try:
+            count = config.apply_remote_settings({"CHART_ENABLED": "false"})
+            assert count == 1
+            assert config.CHART_ENABLED is False
+        finally:
+            config.CHART_ENABLED = original
+
+    def test_applies_log_level(self):
+        import config
+        original = config.LOG_LEVEL
+        try:
+            count = config.apply_remote_settings({"LOG_LEVEL": "debug"})
+            assert count == 1
+            assert config.LOG_LEVEL == "DEBUG"
+        finally:
+            config.LOG_LEVEL = original
+
+    def test_applies_narrowband_filters(self):
+        import config
+        original = config.NARROWBAND_FILTERS
+        try:
+            count = config.apply_remote_settings({"NARROWBAND_FILTERS": "Ha,OIII"})
+            assert count == 1
+            assert config.NARROWBAND_FILTERS == frozenset({"Ha", "OIII"})
+        finally:
+            config.NARROWBAND_FILTERS = original
+
+    def test_skips_non_overridable(self):
+        import config
+        original_key = config.API_KEY
+        count = config.apply_remote_settings({"API_KEY": "hacked", "UNKNOWN_PARAM": "x"})
+        assert count == 0
+        assert config.API_KEY == original_key
+
+    def test_skips_invalid_value(self):
+        import config
+        original = config.QC_FWHM_MAX_ARCSEC
+        count = config.apply_remote_settings({"QC_FWHM_MAX_ARCSEC": "not_a_number"})
+        assert count == 0
+        assert config.QC_FWHM_MAX_ARCSEC == original
+
+    def test_applies_multiple_settings(self):
+        import config
+        originals = (config.QC_FWHM_MAX_ARCSEC, config.DELTA_MAG_ALERT, config.QC_STARS_MIN)
+        try:
+            count = config.apply_remote_settings({
+                "QC_FWHM_MAX_ARCSEC": "5.0",
+                "DELTA_MAG_ALERT": "0.8",
+                "QC_STARS_MIN": "15",
+            })
+            assert count == 3
+            assert config.QC_FWHM_MAX_ARCSEC == 5.0
+            assert config.DELTA_MAG_ALERT == 0.8
+            assert config.QC_STARS_MIN == 15
+        finally:
+            config.QC_FWHM_MAX_ARCSEC, config.DELTA_MAG_ALERT, config.QC_STARS_MIN = originals
