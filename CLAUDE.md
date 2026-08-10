@@ -264,6 +264,7 @@ Separate process (own `docker-compose.yml` service) that polls observatory-api's
 | `DETECT_ANOMALIES` | `pipeline.detect_anomalies_for_frame_id(item["frame_id"])` | `frame_id` |
 | `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, batched across the WHOLE task | `source_id` + `payload` (`{"anomaly_type", "designation"}`) |
 | `PREVIEW_CATALOG_MATCH` | `pipeline.preview_catalog_match(item["filename"], task_id, item["id"])` | `filename` — same "full path, not a basename" convention as `ANALYZE` |
+| `RESTART` | Clean process exit → Docker restarts container → re-fetches remote settings | (none — signal task, no items) |
 
 A bare basename with no directory component at all (no full path) is not rejected outright: both
 `analyze_frame()` and `preview_catalog_match()` run it through `pipeline._resolve_bare_filename()`
@@ -293,6 +294,18 @@ task — not one per frame. This is the cross-frame batching the job-queue split
 a task spanning hundreds of frames still produces a single downstream chart task, which
 `modules/finder_chart.py` renders/uploads in the same one-or-two-HTTP-call batches it already uses
 for a single frame (see that module's section below).
+
+**`RESTART` is a signal task, not a pipeline stage** — it carries no items and performs no
+astronomical computation. Use case: an operator changes pipeline configuration parameters via the
+API's `settings` table; since `worker.py` only fetches remote settings once at startup
+(`GET /settings` → `config.apply_remote_settings()`), a settings change has no effect until the
+worker restarts. The API (or an operator) submits a `RESTART` task; the worker picks it up on its
+next poll (after the current task, if any, finishes), marks the task `COMPLETED`, and exits with
+code `0`. Docker's `restart: unless-stopped` policy brings the container back up, and the fresh
+process re-fetches settings on startup — the new values take effect without any manual
+`docker compose restart`. The `pipeline` (watcher) service is a separate container that also
+fetches settings at startup; if it also needs the new values, restart it manually
+(`docker compose restart pipeline`) or submit a separate operational mechanism for it.
 
 Politeness ("не нагружать сервер"): polls `GET /tasks?status=PENDING&limit=1&order=asc` (oldest
 queued task first) at `TASK_POLL_INTERVAL_SEC` when idle, backing off exponentially up to

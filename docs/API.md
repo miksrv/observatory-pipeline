@@ -1364,6 +1364,8 @@ The granular pipeline job queue — see CLAUDE.md's job-queue section for the fu
 `detect_anomalies_for_frame_id()`, `GENERATE_CHARTS` → `generate_charts_for_source_ids()`,
 `PREVIEW_CATALOG_MATCH` → `preview_catalog_match()` — a diagnostic tool, not part of the
 ANALYZE/DETECT_ANOMALIES/GENERATE_CHARTS production chain; see CLAUDE.md's job-queue section).
+`RESTART` is a signal task — the worker marks it completed and exits so Docker restarts the
+container with fresh remote settings.
 
 ```
 POST /tasks
@@ -1374,8 +1376,10 @@ POST /tasks/{id}/items/progress
 ```
 
 **`POST /tasks`** — `api_client.create_task(task_type, items, scope=None, parent_task_id=None)`.
-Body: `{"type": "ANALYZE"|"DETECT_ANOMALIES"|"GENERATE_CHARTS"|"PREVIEW_CATALOG_MATCH", "items": [...], "scope": {...}?, "parent_task_id": "..."?}`.
-Each item needs exactly one of `filename` (`ANALYZE` and `PREVIEW_CATALOG_MATCH` — the FULL path
+Body: `{"type": "ANALYZE"|"DETECT_ANOMALIES"|"GENERATE_CHARTS"|"PREVIEW_CATALOG_MATCH"|"RESTART", "items": [...], "scope": {...}?, "parent_task_id": "..."?}`.
+`RESTART` is a signal task — `items` may be omitted or empty; the API ignores any items passed
+for this type. For all other types, `items` must be a non-empty array where each item needs
+exactly one of `filename` (`ANALYZE` and `PREVIEW_CATALOG_MATCH` — the FULL path
 to the FITS file, not just a basename), `frame_id` (`DETECT_ANOMALIES`), or `source_id`
 (`GENERATE_CHARTS`), plus an optional `payload` (arbitrary JSON — a `GENERATE_CHARTS` item's
 `{"anomaly_type": ..., "designation": ...}`, set once by the `DETECT_ANOMALIES` task that produced
@@ -1430,9 +1434,13 @@ replaces the local default (from `.env` or the hardcoded fallback); if absent, t
 stays in effect.
 
 This lets an operator tune thresholds (QC limits, cross-matching radii, chart settings, etc.)
-centrally through the API's database without redeploying `.env` files or restarting containers
-on the observatory server — a single `INSERT` / `UPDATE` in the `settings` table + a container
-restart is enough.
+centrally through the API's database without redeploying `.env` files on the observatory server —
+a single `INSERT` / `UPDATE` in the `settings` table followed by a `RESTART` task submission
+(`POST /tasks {"type": "RESTART"}`) is enough. The worker finishes its current task (if any),
+picks up the `RESTART` task, marks it `COMPLETED`, and exits — Docker's `restart: unless-stopped`
+policy restarts the container, and the fresh process re-fetches settings on startup. The `pipeline`
+(watcher) service is a separate container; restart it manually (`docker compose restart pipeline`)
+if it also needs the updated values.
 
 **Security:** only parameters listed in `config._OVERRIDABLE` are accepted from the remote side.
 Credentials (`API_KEY`), filesystem paths (`FITS_INCOMING`, `FITS_ARCHIVE`, `FITS_REJECTED`,

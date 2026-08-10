@@ -8,6 +8,7 @@ task's items to the matching pipeline.py stage function:
     DETECT_ANOMALIES       -> pipeline.detect_anomalies_for_frame_id(frame_id)
     GENERATE_CHARTS        -> pipeline.generate_charts_for_source_ids(...)
     PREVIEW_CATALOG_MATCH  -> pipeline.preview_catalog_match(fits_path, task_id, item_id)
+    RESTART                -> clean exit (Docker restarts the container with fresh settings)
 
 This is deliberately a SEPARATE process from watcher.py (see docker-compose's
 `worker` service) so it can be scaled, restarted, or stopped independently
@@ -43,12 +44,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 
 import config
 import pipeline
 from api_client import client as api_client
 
 logger = logging.getLogger(__name__)
+
+
+class RestartRequested(Exception):
+    """Raised by the RESTART task handler to signal a clean exit + restart."""
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +282,32 @@ async def _run_preview_task(task: dict, items: list[dict]) -> None:
         )
 
 
+async def _run_restart_task(task: dict, items: list[dict]) -> None:
+    """
+    Handle a RESTART task — a signal from the API that the worker should
+    restart itself (e.g. because remote settings changed).
+
+    RESTART is a signal task with no items. The handler simply raises
+    RestartRequested, which _process_one_task() catches and re-raises after
+    marking the task COMPLETED — the main loop in run_forever() then lets
+    the process exit cleanly. Docker's `restart: unless-stopped` policy
+    restarts the container, which re-fetches settings from the API on
+    startup.
+    """
+    logger.info("RESTART task received — will exit after marking task completed")
+    raise RestartRequested()
+
+
 _HANDLERS = {
     "ANALYZE": _run_analyze_task,
     "DETECT_ANOMALIES": _run_detect_task,
     "GENERATE_CHARTS": _run_charts_task,
     "PREVIEW_CATALOG_MATCH": _run_preview_task,
+    "RESTART": _run_restart_task,
 }
+
+# Task types that carry no items — the task itself is the action.
+_SIGNAL_TASK_TYPES = frozenset({"RESTART"})
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +327,10 @@ async def _process_one_task(task_summary: dict) -> None:
     task = detail["task"]
     items = [i for i in detail["items"] if i["status"] == "PENDING"]
 
-    if not items:
+    # Signal tasks (e.g. RESTART) have no items — the task itself is the action.
+    is_signal_task = task["type"] in _SIGNAL_TASK_TYPES
+
+    if not items and not is_signal_task:
         # Nothing left to do (e.g. every item already resolved by an earlier,
         # interrupted run) — just let the API's own bumpProgress() logic
         # settle its status; nothing for this worker to claim.
@@ -321,6 +350,9 @@ async def _process_one_task(task_summary: dict) -> None:
 
     try:
         await handler(task, items)
+    except RestartRequested:
+        await api_client.update_task(task_id, "COMPLETED")
+        raise
     except Exception as exc:
         logger.exception("Task_id=%s (%s) failed", task_id, task["type"])
         await api_client.update_task(task_id, "FAILED", error=str(exc))
@@ -367,7 +399,11 @@ async def run_forever() -> None:
 
         if tasks:
             interval = base_interval
-            await _process_one_task(tasks[0])
+            try:
+                await _process_one_task(tasks[0])
+            except RestartRequested:
+                logger.info("Restart requested — exiting so the container restarts with fresh settings")
+                sys.exit(0)
             continue  # check again immediately — the queue may have more work
 
         await asyncio.sleep(interval)

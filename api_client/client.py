@@ -1295,7 +1295,7 @@ async def _create_task_with_retry(
 
 async def create_task(
     task_type: str,
-    items: list[dict],
+    items: list[dict] | None = None,
     scope: dict | None = None,
     parent_task_id: str | None = None,
 ) -> dict | None:
@@ -1305,12 +1305,14 @@ async def create_task(
     Parameters
     ----------
     task_type:
-        "ANALYZE", "DETECT_ANOMALIES", or "GENERATE_CHARTS".
+        "ANALYZE", "DETECT_ANOMALIES", "GENERATE_CHARTS",
+        "PREVIEW_CATALOG_MATCH", or "RESTART".
     items:
         List of item dicts, each with exactly one of "filename" (ANALYZE),
         "frame_id" (DETECT_ANOMALIES), or "source_id" (GENERATE_CHARTS) —
         plus an optional "payload" (arbitrary JSON-encodable value, e.g. a
         GENERATE_CHARTS item's {"anomaly_type": ..., "designation": ...}).
+        May be None or empty for signal tasks (RESTART).
     scope:
         Optional descriptive scope ({"object": ..., "date_from": ...,
         "date_to": ...}) — display/filtering only, not authoritative.
@@ -1324,6 +1326,8 @@ async def create_task(
         failure — the caller (worker.py) must handle a None return (log and
         move on; the work that would have been queued is simply not queued).
     """
+    if items is None:
+        items = []
     logger.info(
         "POST /tasks type=%s items=%d",
         task_type, len(items),

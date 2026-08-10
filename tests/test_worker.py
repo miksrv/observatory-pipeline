@@ -281,6 +281,17 @@ class TestRunPreviewTask:
 
 
 # ---------------------------------------------------------------------------
+# _run_restart_task
+# ---------------------------------------------------------------------------
+
+
+class TestRunRestartTask:
+    async def test_raises_restart_requested(self):
+        with pytest.raises(worker.RestartRequested):
+            await worker._run_restart_task({"id": "t1"}, [])
+
+
+# ---------------------------------------------------------------------------
 # _process_one_task — dispatch
 # ---------------------------------------------------------------------------
 
@@ -372,6 +383,25 @@ class TestProcessOneTask:
         await worker._process_one_task({"id": "t1"})
 
         update_mock.assert_not_called()
+
+    async def test_restart_task_marks_completed_and_re_raises(self, monkeypatch):
+        """RESTART is a signal task (no items). _process_one_task() must mark it
+        COMPLETED and re-raise RestartRequested so run_forever() can exit."""
+        detail = {
+            "task": {"id": "t1", "type": "RESTART"},
+            "items": [],  # signal task — no items
+        }
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(return_value=detail))
+        update_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "update_task", update_mock)
+
+        with pytest.raises(worker.RestartRequested):
+            await worker._process_one_task({"id": "t1"})
+
+        # First call: RUNNING, second call: COMPLETED.
+        assert update_mock.call_count == 2
+        assert update_mock.call_args_list[0].args == ("t1", "RUNNING")
+        assert update_mock.call_args_list[1].args == ("t1", "COMPLETED")
 
 
 # ---------------------------------------------------------------------------

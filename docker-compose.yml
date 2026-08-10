@@ -29,10 +29,12 @@ services:
     restart: unless-stopped
 
   # Polls the observatory-api task queue (ANALYZE / DETECT_ANOMALIES /
-  # GENERATE_CHARTS) and dispatches items to the corresponding pipeline.py
-  # entry point — see worker.py and CLAUDE.md's job-queue section. A separate
-  # service (not a thread inside `pipeline`) so it can be scaled, restarted,
-  # or stopped independently of the filesystem watcher.
+  # GENERATE_CHARTS / RESTART) and dispatches items to the corresponding
+  # pipeline.py entry point — see worker.py and CLAUDE.md's job-queue section.
+  # A separate service (not a thread inside `pipeline`) so it can be scaled,
+  # restarted, or stopped independently of the filesystem watcher. RESTART
+  # tasks cause a clean exit — `restart: unless-stopped` below ensures Docker
+  # brings the container back up, which re-fetches remote settings on startup.
   worker:
     build: .
     extra_hosts:
