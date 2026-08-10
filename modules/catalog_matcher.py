@@ -179,7 +179,7 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
     Returns a list of dicts with keys: ra, dec, source_id, phot_g_mean_mag.
     Returns [] on any error so the pipeline can continue with partial results.
     """
-    cache_key = f"gaia:{ra_center:.3f}:{dec_center:.3f}:{fov_deg:.3f}"
+    cache_key = f"gaia:{ra_center:.1f}:{dec_center:.1f}:{fov_deg:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -476,7 +476,7 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
     Returns a list of dicts with keys: ra, dec, main_id, otype.
     Returns [] on any error or when Simbad returns None.
     """
-    cache_key = f"simbad:{ra_center:.3f}:{dec_center:.3f}:{fov_deg:.3f}"
+    cache_key = f"simbad:{ra_center:.1f}:{dec_center:.1f}:{fov_deg:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -592,7 +592,7 @@ def _query_2mass(ra_center: float, dec_center: float, fov_deg: float) -> list[di
 
     Returns [] on any error so the pipeline can continue with partial results.
     """
-    cache_key = f"2mass:{ra_center:.3f}:{dec_center:.3f}:{fov_deg:.3f}"
+    cache_key = f"2mass:{ra_center:.1f}:{dec_center:.1f}:{fov_deg:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -721,7 +721,7 @@ def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> lis
         )
         return []
 
-    cache_key = f"panstarrs:{ra_center:.3f}:{dec_center:.3f}:{fov_deg:.3f}"
+    cache_key = f"panstarrs:{ra_center:.1f}:{dec_center:.1f}:{fov_deg:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -818,7 +818,7 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
 
     Returns a list of dicts with keys: ra, dec, designation, object_type.
     """
-    cache_key = f"mpc:{ra_center:.3f}:{dec_center:.3f}:{obs_time}"
+    cache_key = f"mpc:{ra_center:.1f}:{dec_center:.1f}:{obs_time}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
