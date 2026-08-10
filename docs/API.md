@@ -133,30 +133,24 @@ stops the retry loop first. HTTP 4xx errors are logged immediately and never ret
 
 ---
 
-### 12. Upload Finder Charts for Multiple Sources (Batch)
+### 12. Get the Nearest Earlier Frame of an Object
 
-**[POST /sources/charts/batch](#12-upload-finder-charts-for-multiple-sources-batch)**
-
----
-
-### 13. Get the Nearest Earlier Frame of an Object
-
-**[GET /frames/nearest-before](#13-get-the-nearest-earlier-frame-of-an-object)**
+**[GET /frames/nearest-before](#12-get-the-nearest-earlier-frame-of-an-object)**
 
 ---
 
-### 14. List / Get Frames
+### 13. List / Get Frames
 
-**[GET /frames](#14-list--get-frames)**, **[GET /frames/{id}](#14-list--get-frames)**,
-**[GET /frames/{id}/sources](#14-list--get-frames)**
+**[GET /frames](#13-list--get-frames)**, **[GET /frames/{id}](#13-list--get-frames)**,
+**[GET /frames/{id}/sources](#13-list--get-frames)**
 
 ---
 
-### 15. Task Queue
+### 14. Task Queue
 
-**[POST /tasks](#15-task-queue)**, **[GET /tasks](#15-task-queue)**,
-**[GET /tasks/{id}](#15-task-queue)**, **[PATCH /tasks/{id}](#15-task-queue)**,
-**[POST /tasks/{id}/items/progress](#15-task-queue)**
+**[POST /tasks](#14-task-queue)**, **[GET /tasks](#14-task-queue)**,
+**[GET /tasks/{id}](#14-task-queue)**, **[PATCH /tasks/{id}](#14-task-queue)**,
+**[POST /tasks/{id}/items/progress](#14-task-queue)**
 
 ---
 
@@ -394,8 +388,8 @@ Accept: application/json
 | `sources[].catalog_id` | string\|null | no | Catalog object identifier (Gaia source_id, Simbad MAIN_ID, MPC designation) |
 | `sources[].catalog_mag` | float\|null | no | Reference magnitude from catalog (Gaia G-band), or `null` |
 | `sources[].object_type` | string\|null | no | Object type: `"STAR"`, Simbad OTYPE string, `"ASTEROID"`, `"COMET"`, or `null` |
-| `sources[].saturated` | bool | no | Default `false`. Mirrors `modules/astrometry.py`'s `saturated` flag on the source dict — persisted so a later, decoupled `DETECT_ANOMALIES` task can reconstruct `anomaly_detector.py`'s saturated-suppression rule purely from stored data (see section 15 below) |
-| `sources[].near_edge` | bool | no | Default `false`. Mirrors `modules/astrometry.py`'s (and `modules/subtraction.py`'s) `near_edge` flag — pixel position within `EDGE_MARGIN_FRAC` of any frame edge, where coma inflates a star's measured elongation for purely optical reasons. Persisted for the same reason as `saturated`: a decoupled `DETECT_ANOMALIES` re-run reconstructs `anomaly_detector.py`'s edge-aware `SPACE_DEBRIS` threshold purely from stored data (see section 15 below) |
+| `sources[].saturated` | bool | no | Default `false`. Mirrors `modules/astrometry.py`'s `saturated` flag on the source dict — persisted so a later, decoupled `DETECT_ANOMALIES` task can reconstruct `anomaly_detector.py`'s saturated-suppression rule purely from stored data (see section 14 below) |
+| `sources[].near_edge` | bool | no | Default `false`. Mirrors `modules/astrometry.py`'s (and `modules/subtraction.py`'s) `near_edge` flag — pixel position within `EDGE_MARGIN_FRAC` of any frame edge, where coma inflates a star's measured elongation for purely optical reasons. Persisted for the same reason as `saturated`: a decoupled `DETECT_ANOMALIES` re-run reconstructs `anomaly_detector.py`'s edge-aware `SPACE_DEBRIS` threshold purely from stored data (see section 14 below) |
 | `sources[].from_subtraction` | bool | no | Default `false`. Wire name for `modules/subtraction.py`'s internal `_from_subtraction` flag — `api_client.post_sources()` renames it and strips every other leading-underscore key before sending (see `api_client/client.py`'s `_to_wire_source()`) |
 
 ### Response
@@ -435,7 +429,7 @@ Accept: application/json
 Saves the list of classified anomalies for a previously registered frame. **This call REPLACES the
 frame's entire anomaly set** — any anomalies already stored for this frame are deleted server-side
 before the new batch is inserted. This matters for `pipeline.detect_anomalies_for_frame_id()` /
-worker.py's `DETECT_ANOMALIES` task (section 15): re-running anomaly detection for an
+worker.py's `DETECT_ANOMALIES` task (section 14): re-running anomaly detection for an
 already-classified frame (a fixed classifier, a re-run across an object's whole history) never
 leaves stale anomalies from the previous run sitting alongside the new ones. An empty list is
 valid and correctly represents "re-ran, found nothing this time".
@@ -1005,10 +999,8 @@ Store the finder-chart PNG for a source, fully replacing any previous one —
 not JSON, not multipart — since the body is entirely consumed by the image; `style` and
 `frame_count` travel as query parameters instead.
 
-For a frame with several anomalies, `modules/finder_chart.py` uploads every one of their charts
-in a single call via the batch variant instead (section 12), since the raw-PNG-body shape used
-here can't carry more than one image per request. This single-source endpoint remains available
-for any other consumer that only needs to upload one chart.
+For a frame with several anomalies, `modules/finder_chart.py` uploads each chart individually
+via this endpoint — one `POST /sources/{id}/chart` request per source_id.
 
 ### Request
 
@@ -1156,110 +1148,7 @@ Accept: application/json
 |--------|------|
 | `400` | Missing or non-array `source_ids` |
 | `401` | Invalid or missing `X-API-Key` |
-
----
-
-## 12. Upload Finder Charts for Multiple Sources (Batch)
-
-Batch variant of section 9 — uploads finder-chart PNGs for **multiple** sources in a single
-request. `modules/finder_chart.py` uses this so that a frame with several anomalies uploads
-every one of their charts in one round trip instead of one `POST /sources/{id}/chart` per
-source_id.
-
-Unlike section 9, the request body here is a JSON envelope rather than raw PNG bytes — one
-request can only ever have one raw body, so each PNG travels **base64-encoded** inside the
-`charts` array instead.
-
-### Request
-
-```
-POST /sources/charts/batch
-```
-
-**Headers:**
-
-```
-X-API-Key: <api-key>
-Content-Type: application/json
-Accept: application/json
-```
-
-**Body:**
-
-```json
-{
-  "charts": [
-    {
-      "source_id": "6612f8a5e3b9c9.12345678",
-      "style": "track",
-      "frame_count": 5,
-      "png_base64": "iVBORw0KGgoAAAANSUhEUgAA..."
-    },
-    {
-      "source_id": "6612f8a5e40021.87654321",
-      "style": "stamp_strip",
-      "frame_count": 2,
-      "png_base64": "iVBORw0KGgoAAAANSUhEUgAA..."
-    }
-  ]
-}
-```
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `charts` | array | yes | List of chart objects. `[]` is valid |
-| `charts[].source_id` | string | yes | The source this chart is for |
-| `charts[].style` | string | yes | `track` or `stamp_strip` |
-| `charts[].frame_count` | int | yes | Number of epochs included in the image (positive integer) |
-| `charts[].png_base64` | string | yes | Base64-encoded PNG bytes (validated by the 8-byte PNG signature after decoding, same as section 9) |
-
-### Response
-
-**Status: `200 OK`**
-
-Positionally parallel to the request's `charts` array (same length/order) — one result object
-per chart:
-
-```json
-{
-  "results": [
-    {
-      "source_id": "6612f8a5e3b9c9.12345678",
-      "status": "ok",
-      "style": "track",
-      "frame_count": 5,
-      "updated_at": "2024-03-15T22:05:00Z"
-    },
-    {
-      "source_id": "6612f8a5e40021.87654321",
-      "status": "error",
-      "error": "Source not found"
-    }
-  ]
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `results` | array | One entry per request `charts[]` entry, same order |
-| `results[].source_id` | string or null | Echoes the request entry's `source_id` (`null` if the entry itself was malformed) |
-| `results[].status` | string | `"ok"` or `"error"` |
-| `results[].style`, `.frame_count`, `.updated_at` | — | Present only when `status` is `"ok"` — same meaning as section 9's response |
-| `results[].error` | string | Present only when `status` is `"error"` — human-readable reason |
-
-A bad entry (invalid or unknown `source_id`, bad `style`/`frame_count`, bad PNG) only fails that
-one entry — every other entry in the same batch is still processed and stored.
-
-**Error responses:**
-
-| Status | When |
-|--------|------|
-| `400` | Missing or non-array `charts` (the whole request body is malformed — distinct from a per-entry `status: "error"` above) |
-| `401` | Invalid or missing `X-API-Key` |
-
----
-
-## 13. Get the Nearest Earlier Frame of an Object
+## 12. Get the Nearest Earlier Frame of an Object
 
 The single most recent frame of a given object strictly before a given time. Used by
 `modules/finder_chart.py`'s `"before_after"` chart style: for a source detected on only one frame
@@ -1327,7 +1216,7 @@ GET /frames/nearest-before?object=Vesta_A807_FA&before_time=2021-03-14T18%3A05%3
 
 ---
 
-## 14. List / Get Frames
+## 13. List / Get Frames
 
 `api_client.get_frames()` / `get_frame()` / `get_frame_sources()`. The scope-resolution query
 behind `pipeline.detect_anomalies_for_frame_id()` and any standalone task: turns "object=M51"
@@ -1356,7 +1245,7 @@ of `_to_wire_source()` (section 2).
 
 ---
 
-## 15. Task Queue
+## 14. Task Queue
 
 The granular pipeline job queue — see CLAUDE.md's job-queue section for the full design.
 `worker.py` polls `GET /tasks?status=PENDING` and dispatches each task's items to the matching

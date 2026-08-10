@@ -86,11 +86,9 @@ The single public entry point is:
     ) -> dict[str, bool]
 
 It takes every (source_id -> anomaly_type) pair for one frame at once and
-fetches all their tracks via one GET /sources/tracks/batch call, then
-uploads every rendered chart via one POST /sources/charts/batch call —
-instead of one GET + one POST per source, which is what this module did
-before and what drove up API request volume on frames with several
-anomalies. See api_client.get_source_tracks_batch / upload_source_charts_batch.
+fetches all their tracks via one POST /sources/tracks/batch call, then
+uploads each rendered chart individually via POST /sources/{id}/chart — one
+request per chart. See api_client.get_source_tracks_batch / upload_source_chart.
 `designation_by_source_id` is optional and keyed the same way, built by
 pipeline.py from the already catalog-matched `sources` list (catalog_name/
 catalog_id) — this module never queries a catalog itself. When one or more
@@ -693,10 +691,9 @@ async def update_charts_for_sources(
     reflecting each source's complete track, after a batch of anomalies was
     just detected on one frame.
 
-    Fetches all tracks in a single GET /sources/tracks/batch call and
-    uploads all rendered charts in a single POST /sources/charts/batch
-    call — regardless of how many source_ids are passed — instead of one
-    GET+POST round trip per source_id.
+    Fetches all tracks in a single POST /sources/tracks/batch call, renders
+    each chart locally, then uploads each rendered chart individually via
+    POST /sources/{id}/chart — one request per chart.
 
     Parameters
     ----------
@@ -740,7 +737,6 @@ async def update_charts_for_sources(
         tracks = {}
 
     results: dict[str, bool] = {source_id: False for source_id in source_ids}
-    charts_to_upload: list[dict[str, Any]] = []
     # Shared across every source in this call — see _get_earlier_frame_epoch()
     # for why this collapses to at most one extra API call regardless of how
     # many sources end up needing the "before_after" style.
@@ -761,23 +757,13 @@ async def update_charts_for_sources(
             continue
 
         png_bytes, style, frame_count = rendered
-        charts_to_upload.append({
-            "source_id": source_id,
-            "png_bytes": png_bytes,
-            "style": style,
-            "frame_count": frame_count,
-        })
 
-    if not charts_to_upload:
-        return results
+        try:
+            ok = await api_client.upload_source_chart(source_id, png_bytes, style, frame_count)
+        except Exception as exc:
+            logger.warning("finder_chart: upload failed for source_id=%s: %s", source_id, exc)
+            ok = False
 
-    try:
-        outcomes = await api_client.upload_source_charts_batch(charts_to_upload)
-    except Exception as exc:
-        logger.warning("finder_chart: chart batch upload failed for %d source(s): %s", len(charts_to_upload), exc)
-        outcomes = {}
-
-    for chart in charts_to_upload:
-        results[chart["source_id"]] = bool(outcomes.get(chart["source_id"], False))
+        results[source_id] = ok
 
     return results

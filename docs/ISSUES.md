@@ -176,7 +176,7 @@ with no real motion involved.
 **Known limitation of the fix already shipped for this:** re-running `DETECT_ANOMALIES` for
 an already-processed frame replaces that frame's anomaly set via `POST /frames/{id}/anomalies`
 (a previously false `SPACE_DEBRIS` row disappears), but a finder chart already uploaded for
-that `source_id` is **not** deleted or regenerated — `POST /sources/charts/batch` only touches
+that `source_id` is **not** deleted or regenerated — `POST /sources/{id}/chart` only touches
 `source_id`s that still have a resolved anomaly in the new run (see
 `modules/finder_chart.py` / `worker.py`'s `GENERATE_CHARTS` batching). A stale chart for a
 now-non-anomalous source stays orphaned in `observatory-api` until cleaned up there directly.

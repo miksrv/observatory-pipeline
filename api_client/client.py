@@ -13,7 +13,6 @@ Public functions:
   get_source_track(source_id)                               → list
   get_source_tracks_batch(source_ids)                       → dict
   upload_source_chart(source_id, png_bytes, style, frame_count)  → bool
-  upload_source_charts_batch(charts)                        → dict
 
   get_frames(object_name, date_from, date_to, limit, offset) → list
   get_frame(frame_id)                                        → dict | None
@@ -31,7 +30,6 @@ Public functions:
 
 from __future__ import annotations
 
-import base64
 import logging
 
 import httpx
@@ -950,101 +948,6 @@ async def upload_source_chart(
         )
     return False
 
-
-# ---------------------------------------------------------------------------
-# upload_source_charts_batch (BATCH)
-# ---------------------------------------------------------------------------
-
-@_retry
-async def _upload_source_charts_batch_with_retry(charts: list[dict]) -> dict:
-    """Inner retryable core for upload_source_charts_batch."""
-    payload = {
-        "charts": [
-            {
-                "source_id": chart["source_id"],
-                "style": chart["style"],
-                "frame_count": chart["frame_count"],
-                # Unlike the single-chart endpoint (raw PNG body), the batch
-                # endpoint's request is one JSON envelope for every chart, so
-                # each PNG travels base64-encoded inside it.
-                "png_base64": base64.b64encode(chart["png_bytes"]).decode("ascii"),
-            }
-            for chart in charts
-        ],
-    }
-
-    async with _make_client() as client:
-        response = await client.post("/sources/charts/batch", json=payload)
-
-        if response.status_code >= 500:
-            response.raise_for_status()
-
-        resp_json = response.json()
-
-    # Documented format: {"results": [{"source_id":..., "status": "ok"|"error", ...}, ...]},
-    # positionally parallel to the request's "charts" array.
-    results = resp_json.get("results") if isinstance(resp_json, dict) else None
-    if not isinstance(results, list):
-        return {}
-
-    outcomes: dict = {}
-    for chart, result in zip(charts, results):
-        source_id = chart["source_id"]
-        ok = isinstance(result, dict) and result.get("status") == "ok"
-        if not ok:
-            logger.error(
-                "API rejected chart for source_id=%s: %s",
-                source_id,
-                result.get("error") if isinstance(result, dict) else result,
-                extra={"frame_id": None, "log_filename": None},
-            )
-        outcomes[source_id] = ok
-    return outcomes
-
-
-async def upload_source_charts_batch(charts: list[dict]) -> dict:
-    """
-    Upload finder-chart PNGs for MULTIPLE sources in a single batch request
-    — the batch counterpart of upload_source_chart(), used by
-    modules/finder_chart.py so that a frame with several anomalies uploads
-    every one of their charts in one round trip instead of one POST per
-    source_id.
-
-    Parameters
-    ----------
-    charts:
-        List of dicts, each with keys "source_id", "png_bytes", "style",
-        "frame_count" — the same values upload_source_chart() takes
-        individually.
-
-    Returns
-    -------
-    dict
-        Dictionary mapping source_id -> bool (True on successful upload).
-        A source_id missing from the dict means the batch call failed
-        entirely (network error, 4xx/5xx on the whole request) — as
-        opposed to `False`, which means the API processed the batch but
-        rejected that one entry. Callers should treat both as "not
-        uploaded". Returns {} if `charts` is empty or the whole call failed.
-    """
-    if not charts:
-        return {}
-
-    logger.info(
-        "Uploading %d chart(s) in one batch request",
-        len(charts),
-        extra={"frame_id": None, "log_filename": None},
-    )
-    try:
-        return await _upload_source_charts_batch_with_retry(charts)
-    except _RETRYABLE as exc:
-        logger.error(
-            "All retries exhausted uploading chart batch (%d charts): %s",
-            len(charts),
-            exc,
-            extra={"frame_id": None, "log_filename": None},
-        )
-    return {}
 
 
 # ---------------------------------------------------------------------------

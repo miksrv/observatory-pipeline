@@ -230,15 +230,15 @@ Orchestrates processing of a single FITS file in order:
      — **Module 3**, via `pipeline.generate_charts_for_anomalies()` (in-memory) or
      `pipeline.generate_charts_for_source_ids()` (standalone, task-driven — see "Job queue" below).
      → for every anomaly with a resolved `source_id` (deduped per frame), (re)generates and
-     uploads that source's finder/discovery chart, one call for the whole frame: fetches every
-     source's full position track in a single `POST /sources/tracks/batch` call, renders each
-     against the matching local archive FITS files, then uploads every rendered chart in a single
-     `POST /sources/charts/batch` call — one HTTP round trip each for the whole frame, regardless
-     of how many anomalies it has. `designation_by_source_id` is built here preferring each
-     anomaly's own `mpc_designation` (set by `anomaly_detector.py` from the exact source that
-     produced that classification) over `sources`.`catalog_id` looked up by `source_id` — the
-     latter is a fallback only, since `source_id` is resolved positionally by the API and can end
-     up shared with an unrelated, previously-catalogued object at nearly the same sky position
+     uploads that source's finder/discovery chart: fetches every source's full position track in a
+     single `POST /sources/tracks/batch` call, renders each against the matching local archive
+     FITS files, then uploads each rendered chart individually via
+     `POST /sources/{id}/chart` — one request per chart. `designation_by_source_id` is built here
+     preferring each anomaly's own `mpc_designation` (set by `anomaly_detector.py` from the exact
+     source that produced that classification) over `sources`.`catalog_id` looked up by
+     `source_id` — the latter is a fallback only, since `source_id` is resolved positionally by
+     the API and can end up shared with an unrelated, previously-catalogued object at nearly the
+     same sky position
      (real incident, 2026-08-06, `Vesta_A807_FA` test data: an MPC-matched asteroid's `source_id`
      also carried a `Gaia DR3` star's identity in `sources`, from a different detection sharing
      that row — using the `sources` lookup unconditionally would have shown `ASTEROID
@@ -256,7 +256,7 @@ or API calls are performed.
 ### Job queue: `worker.py`
 
 Separate process (own `docker-compose.yml` service) that polls observatory-api's `tasks` table
-(docs/API.md section 15) and dispatches each task's items to the matching `pipeline.py` stage:
+(docs/API.md section 14) and dispatches each task's items to the matching `pipeline.py` stage:
 
 | Task `type` | Dispatched to | Item carries |
 |---|---|---|
@@ -281,7 +281,7 @@ rather than a confusing resolver-internal one.
 
 Exists so any of the three modules can be re-run independently of the other two — e.g. re-running
 anomaly detection across an object's entire observation history (old and new frames alike, via
-`GET /frames?object=...`, docs/API.md section 14) after fixing the classifier, without re-running
+`GET /frames?object=...`, docs/API.md section 13) after fixing the classifier, without re-running
 astrometry/photometry on every frame again. This is the concrete capability the three-way module
 split unlocks; `pipeline.run()` alone can't express it at all — though it's worth noting
 `watcher.py` no longer calls `run()` either; it submits `ANALYZE` tasks (see `watcher.py` above),
@@ -327,7 +327,7 @@ sources circled green (matched a catalog) or red (didn't). It still calls the re
 from its on-disk cache exactly like a production `ANALYZE` run — only the first frame per sky tile
 actually re-hits Gaia/Simbad/2MASS/Pan-STARRS/MPC. See `modules/catalog_preview.py` below. Its
 result (`{"matched", "total", "quality_flag", "chart_uploaded"}`) is written onto each item's own
-`payload` via `POST /tasks/{id}/items/progress` (see docs/API.md section 15), not just logged —
+`payload` via `POST /tasks/{id}/items/progress` (see docs/API.md section 14), not just logged —
 that endpoint's `payload` field is genuinely bidirectional: `GENERATE_CHARTS` reads it as input at
 task-creation time, this task type writes it as a result at completion time.
 
@@ -786,10 +786,9 @@ Steps:
 4. Per source: renders the PNG (`track` or `stamp_strip`, per that source's anomaly type) using
    `matplotlib` with a zscale + asinh stretch (`astropy.visualization`) — the standard DS9-style
    display stretch.
-5. `api_client.upload_source_charts_batch(charts)` → `POST /sources/charts/batch` — every
-   successfully rendered chart for this frame uploaded in one call (PNGs travel base64-encoded
-   inside the JSON body, since a raw-bytes request body can only ever carry one image), replacing
-   any previous chart for each of those sources.
+5. Per source: `api_client.upload_source_chart(source_id, png_bytes, style, frame_count)` →
+   `POST /sources/{id}/chart` — each chart uploaded individually as raw PNG bytes, replacing
+   any previous chart for that source.
 
 Gated by `CHART_ENABLED` (default `true`). Best-effort throughout: for a given source_id, a
 missing local file, an API error, or a rendering failure is logged and that source_id's own
@@ -805,14 +804,15 @@ on every request. Exact retry parameters and endpoint request/response shapes ar
 once, in **[docs/API.md](docs/API.md)** — not repeated here.
 
 Besides the batched endpoints `anomaly_detector.py` and `finder_chart.py` actually call
-(`/sources/near/batch`, `/frames/covering/batch`, `/sources/tracks/batch`, `/sources/charts/batch`),
+(`/sources/near/batch`, `/frames/covering/batch`, `/sources/tracks/batch`),
 the client still implements/exports their older single-position/single-source counterparts
-(`/sources/near`, `/frames/covering`, `/sources/{id}/track`, `/sources/{id}/chart`) — kept for
-API completeness, no longer called from this codebase.
+(`/sources/near`, `/frames/covering`, `/sources/{id}/track`) — kept for
+API completeness, no longer called from this codebase. `finder_chart.py` uploads each chart
+individually via `POST /sources/{id}/chart` (one request per source_id).
 
 Also implements the frame-listing (`get_frames`, `get_frame`, `get_frame_sources`) and task-queue
 (`create_task`, `get_tasks`, `get_task`, `update_task`, `post_task_items_progress`) functions that
-back `pipeline.detect_anomalies_for_frame_id()` and `worker.py` — see docs/API.md sections 14–15
+back `pipeline.detect_anomalies_for_frame_id()` and `worker.py` — see docs/API.md sections 13–14
 and "Job queue" above.
 
 `post_sources()`'s internal `_to_wire_source()` translates each source dict into the wire shape

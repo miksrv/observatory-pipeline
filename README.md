@@ -269,14 +269,14 @@ per-epoch `WCS.world_to_pixel()` transform (no pixel-level alignment needed); or
 (everything else) — one small crop per epoch centred on that epoch's own detected position, each
 circled and labelled with timestamp/magnitude, for a classic before/after "blink" comparison.
 `update_charts_for_sources()` handles every source_id for one frame in a single call — one
-`POST /sources/tracks/batch` to fetch all their tracks, one `POST /sources/charts/batch` to
-upload all their rendered charts — instead of one GET+POST pair per source_id. Gated by
+`POST /sources/tracks/batch` to fetch all their tracks, then uploads each rendered chart
+individually via `POST /sources/{id}/chart`. Gated by
 `CHART_ENABLED`; best-effort — a missing local archive file, API error, or rendering failure for
 one source_id is logged and only downgrades that source_id's own result, never affecting any
 other source_id in the same call or frame processing overall.
 
 ### `api_client/client.py`
-All HTTP communication with the remote API. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `anomaly_detector.py` actually calls, plus `get_source_tracks_batch`/`upload_source_charts_batch` for `modules/finder_chart.py` (the single-item `get_source_track`/`upload_source_chart` are still implemented/exported, just no longer called by that module). Also provides `get_settings()` for fetching remote configuration from the API at startup (see [Remote Configuration](#remote-configuration-via-api) below).
+All HTTP communication with the remote API. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `anomaly_detector.py` actually calls, plus `get_source_tracks_batch` for `modules/finder_chart.py` (the single-item `get_source_track` is still implemented/exported, just no longer called by that module). Chart uploads use the per-source `upload_source_chart` endpoint — one request per chart. Also provides `get_settings()` for fetching remote configuration from the API at startup (see [Remote Configuration](#remote-configuration-via-api) below).
 
 ---
 
@@ -788,7 +788,6 @@ Full request/response documentation for every endpoint is in **[docs/API.md](doc
 | `POST` | `/sources/{id}/chart` | Upload/replace a source's finder-chart PNG — same caveat as above | [→ docs/API.md](docs/API.md#9-upload-a-sources-finder-chart) |
 | `GET` | `/sources/{id}/chart.png` | Fetch a source's stored finder-chart PNG — not called by the pipeline itself | [→ docs/API.md](docs/API.md#10-get-a-sources-finder-chart) |
 | `POST` | `/sources/tracks/batch` | Get position tracks for **multiple** sources in one call — what `modules/finder_chart.py` actually uses | [→ docs/API.md](docs/API.md#11-get-position-tracks-for-multiple-sources-batch) |
-| `POST` | `/sources/charts/batch` | Upload/replace finder-chart PNGs for **multiple** sources in one call — what `modules/finder_chart.py` actually uses | [→ docs/API.md](docs/API.md#12-upload-finder-charts-for-multiple-sources-batch) |
 | `GET` | `/settings` | Fetch remote pipeline configuration from the API's `settings` table — called once at startup by both `watcher.py` and `worker.py` | [→ docs/API.md](docs/API.md#16-pipeline-configuration-remote-settings) |
 
 **Authentication:** every request sends `X-API-Key: <value>` and `Content-Type: application/json`. The key is read from `API_KEY` in `.env`.

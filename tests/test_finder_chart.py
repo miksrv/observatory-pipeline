@@ -541,11 +541,11 @@ class TestUpdateChartsForSources:
 
         upload_calls = []
 
-        async def fake_upload_batch(charts):
-            upload_calls.extend(charts)
-            return {chart["source_id"]: True for chart in charts}
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"source_id": source_id, "png_bytes": png_bytes, "style": style, "frame_count": frame_count})
+            return True
 
-        monkeypatch.setattr(finder_chart.api_client, "upload_source_charts_batch", fake_upload_batch)
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
         result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID"})
 
@@ -578,11 +578,11 @@ class TestUpdateChartsForSources:
 
         upload_calls = []
 
-        async def fake_upload_batch(charts):
-            upload_calls.extend(charts)
-            return {chart["source_id"]: True for chart in charts}
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"source_id": source_id, "style": style, "frame_count": frame_count})
+            return True
 
-        monkeypatch.setattr(finder_chart.api_client, "upload_source_charts_batch", fake_upload_batch)
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
         result = await finder_chart.update_charts_for_sources({"src2": "SUPERNOVA_CANDIDATE"})
 
@@ -616,10 +616,10 @@ class TestUpdateChartsForSources:
 
         upload_calls = []
 
-        async def fake_upload_batch(charts):
-            upload_calls.extend(charts)
-            return {c["source_id"]: True for c in charts}
-        monkeypatch.setattr(finder_chart.api_client, "upload_source_charts_batch", fake_upload_batch)
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"source_id": source_id, "style": style, "frame_count": frame_count})
+            return True
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
         result = await finder_chart.update_charts_for_sources({"src1": "MOVING_UNKNOWN"})
 
@@ -649,10 +649,10 @@ class TestUpdateChartsForSources:
 
         upload_calls = []
 
-        async def fake_upload_batch(charts):
-            upload_calls.extend(charts)
-            return {c["source_id"]: True for c in charts}
-        monkeypatch.setattr(finder_chart.api_client, "upload_source_charts_batch", fake_upload_batch)
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"source_id": source_id, "style": style, "frame_count": frame_count})
+            return True
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
         result = await finder_chart.update_charts_for_sources({"src1": "MOVING_UNKNOWN"})
 
@@ -682,11 +682,11 @@ class TestUpdateChartsForSources:
 
         upload_calls = []
 
-        async def fake_upload_batch(charts):
-            upload_calls.extend(chart["frame_count"] for chart in charts)
-            return {chart["source_id"]: True for chart in charts}
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append(frame_count)
+            return True
 
-        monkeypatch.setattr(finder_chart.api_client, "upload_source_charts_batch", fake_upload_batch)
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
         result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID"})
 
@@ -708,8 +708,8 @@ class TestUpdateChartsForSources:
             lambda source_ids: _async_return({"src1": epochs}),
         )
         monkeypatch.setattr(
-            finder_chart.api_client, "upload_source_charts_batch",
-            lambda charts: _async_return({chart["source_id"]: False for chart in charts}),
+            finder_chart.api_client, "upload_source_chart",
+            lambda source_id, png_bytes, style, frame_count: _async_return(False),
         )
 
         result = await finder_chart.update_charts_for_sources({"src1": "UNKNOWN"})
@@ -735,8 +735,8 @@ class TestUpdateChartsForSources:
             lambda source_ids: _async_return({"src1": epochs}),
         )
         monkeypatch.setattr(
-            finder_chart.api_client, "upload_source_charts_batch",
-            lambda charts: _async_return({c["source_id"]: True for c in charts}),
+            finder_chart.api_client, "upload_source_chart",
+            lambda source_id, png_bytes, style, frame_count: _async_return(True),
         )
 
         captured_labels = []
@@ -772,8 +772,8 @@ class TestUpdateChartsForSources:
             lambda source_ids: _async_return({"src1": epochs}),
         )
         monkeypatch.setattr(
-            finder_chart.api_client, "upload_source_charts_batch",
-            lambda charts: _async_return({c["source_id"]: True for c in charts}),
+            finder_chart.api_client, "upload_source_chart",
+            lambda source_id, png_bytes, style, frame_count: _async_return(True),
         )
 
         captured_labels = []
@@ -791,8 +791,8 @@ class TestUpdateChartsForSources:
         assert result == {"src1": True}
         assert captured_labels == ["UNKNOWN"]
 
-    async def test_batches_multiple_sources_into_single_track_and_upload_calls(self, monkeypatch, tmp_path):
-        """The whole point of the batch API: N sources, one track call, one upload call."""
+    async def test_batches_multiple_sources_into_single_track_call(self, monkeypatch, tmp_path):
+        """N sources use one track-fetch call; each chart is uploaded individually."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
@@ -816,11 +816,11 @@ class TestUpdateChartsForSources:
 
         upload_calls = []
 
-        async def fake_upload_batch(charts):
-            upload_calls.append(charts)
-            return {chart["source_id"]: True for chart in charts}
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"source_id": source_id, "style": style})
+            return True
 
-        monkeypatch.setattr(finder_chart.api_client, "upload_source_charts_batch", fake_upload_batch)
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
         # Both sources here have exactly one epoch, so both render as
         # STYLE_BEFORE_AFTER — explicitly mocked (rather than relying on a
@@ -839,13 +839,12 @@ class TestUpdateChartsForSources:
         result = await finder_chart.update_charts_for_sources({"src1": "UNKNOWN", "src2": "SUPERNOVA_CANDIDATE"})
 
         assert result == {"src1": True, "src2": True}
-        # Exactly one GET-equivalent call for both sources, one POST-equivalent
-        # call for both charts — not two of each.
+        # Exactly one track-fetch call for both sources.
         assert len(track_calls) == 1
         assert sorted(track_calls[0]) == ["src1", "src2"]
-        assert len(upload_calls) == 1
-        assert len(upload_calls[0]) == 2
-        assert upload_calls[0][0]["style"] == finder_chart.STYLE_BEFORE_AFTER
+        # Each chart uploaded individually — one call per source.
+        assert len(upload_calls) == 2
+        assert upload_calls[0]["style"] == finder_chart.STYLE_BEFORE_AFTER
         assert len(nearest_before_calls) == 1
 
 
