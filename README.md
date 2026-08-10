@@ -19,6 +19,7 @@ Automated Python service for processing astronomical FITS frames from an observa
   - [3. Download ASTAP star catalogs](#3-download-astap-star-catalogs)
   - [4. Configure environment variables](#4-configure-environment-variables)
   - [Configuration Reference](#configuration-reference)
+  - [Remote Configuration via API](#remote-configuration-via-api)
   - [5. Build and start the container](#5-build-and-start-the-container)
   - [External volumes reference](#external-volumes-reference)
   - [What installs automatically](#what-installs-automatically)
@@ -275,7 +276,7 @@ one source_id is logged and only downgrades that source_id's own result, never a
 other source_id in the same call or frame processing overall.
 
 ### `api_client/client.py`
-All HTTP communication with the remote API. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `anomaly_detector.py` actually calls, plus `get_source_tracks_batch`/`upload_source_charts_batch` for `modules/finder_chart.py` (the single-item `get_source_track`/`upload_source_chart` are still implemented/exported, just no longer called by that module).
+All HTTP communication with the remote API. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `anomaly_detector.py` actually calls, plus `get_source_tracks_batch`/`upload_source_charts_batch` for `modules/finder_chart.py` (the single-item `get_source_track`/`upload_source_chart` are still implemented/exported, just no longer called by that module). Also provides `get_settings()` for fetching remote configuration from the API at startup (see [Remote Configuration](#remote-configuration-via-api) below).
 
 ---
 
@@ -532,6 +533,34 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Logging** |
 | `LOG_LEVEL` | `INFO` | No | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Set via `watcher.py`'s `logging.basicConfig()`. |
 
+#### Remote Configuration via API
+
+In addition to `.env` / environment variables, most of the settings above can be overridden
+centrally via the observatory-api's `settings` table — without redeploying `.env` files or
+rebuilding Docker images on the observatory server.
+
+**How it works:**
+
+1. Both `watcher.py` and `worker.py` call `GET /settings` **once at startup** (before any
+   processing begins).
+2. The API returns a flat `{param_name: string_value}` map from its `settings` database table.
+3. `config.apply_remote_settings()` casts each value to its correct Python type and overrides
+   the corresponding module-level global in `config.py`.
+4. If a parameter is **not present** in the API response, its local default (from `.env` or the
+   hardcoded fallback in `config.py`) stays in effect.
+5. If the API is **unreachable or returns an error**, all local defaults are used — the pipeline
+   still starts normally.
+
+**Security:** credentials (`API_KEY`), filesystem paths (`FITS_INCOMING`, `FITS_ARCHIVE`,
+`FITS_REJECTED`, `ASTAP_BINARY`, `ASTAP_CATALOGS`, `CATALOG_CACHE_DIR`), and `API_BASE_URL`
+cannot be overridden remotely — only the tunable thresholds, toggles, and site parameters
+listed in [docs/API.md section 16](docs/API.md#16-pipeline-configuration-remote-settings) are
+accepted.
+
+**To change a setting remotely:** insert or update a row in the `settings` table on the API side
+(e.g. `param = "QC_FWHM_MAX_ARCSEC"`, `value = "6.0"`), then restart the relevant container
+(`docker compose restart pipeline worker`). The new value will be fetched on the next startup.
+
 ---
 
 ### 5. Build and start the container
@@ -760,6 +789,7 @@ Full request/response documentation for every endpoint is in **[docs/API.md](doc
 | `GET` | `/sources/{id}/chart.png` | Fetch a source's stored finder-chart PNG — not called by the pipeline itself | [→ docs/API.md](docs/API.md#10-get-a-sources-finder-chart) |
 | `POST` | `/sources/tracks/batch` | Get position tracks for **multiple** sources in one call — what `modules/finder_chart.py` actually uses | [→ docs/API.md](docs/API.md#11-get-position-tracks-for-multiple-sources-batch) |
 | `POST` | `/sources/charts/batch` | Upload/replace finder-chart PNGs for **multiple** sources in one call — what `modules/finder_chart.py` actually uses | [→ docs/API.md](docs/API.md#12-upload-finder-charts-for-multiple-sources-batch) |
+| `GET` | `/settings` | Fetch remote pipeline configuration from the API's `settings` table — called once at startup by both `watcher.py` and `worker.py` | [→ docs/API.md](docs/API.md#16-pipeline-configuration-remote-settings) |
 
 **Authentication:** every request sends `X-API-Key: <value>` and `Content-Type: application/json`. The key is read from `API_KEY` in `.env`.
 

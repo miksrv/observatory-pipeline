@@ -160,6 +160,12 @@ stops the retry loop first. HTTP 4xx errors are logged immediately and never ret
 
 ---
 
+### 16. Pipeline Configuration (Remote Settings)
+
+**[GET /settings](#16-pipeline-configuration-remote-settings)**
+
+---
+
 ---
 
 ## 1. Register a Frame
@@ -1411,4 +1417,93 @@ Response: `{"task_item_id", "style", "frame_count", "updated_at"}`.
 Not called by the pipeline itself; for a future consumer such as the observatory website/dashboard.
 
 **Errors:** `400` invalid/missing required fields · `404` task not found
+
+---
+
+## 16. Pipeline Configuration (Remote Settings)
+
+Fetches pipeline configuration parameters from the API's `settings` table. Called **once at
+startup** by both `watcher.py` and `worker.py` (each runs as a separate Docker container with its
+own `config` module in memory). Values returned by this endpoint override the corresponding
+module-level globals in `config.py` — if a parameter is present in the response, its value
+replaces the local default (from `.env` or the hardcoded fallback); if absent, the local default
+stays in effect.
+
+This lets an operator tune thresholds (QC limits, cross-matching radii, chart settings, etc.)
+centrally through the API's database without redeploying `.env` files or restarting containers
+on the observatory server — a single `INSERT` / `UPDATE` in the `settings` table + a container
+restart is enough.
+
+**Security:** only parameters listed in `config._OVERRIDABLE` are accepted from the remote side.
+Credentials (`API_KEY`), filesystem paths (`FITS_INCOMING`, `FITS_ARCHIVE`, `FITS_REJECTED`,
+`ASTAP_BINARY`, `ASTAP_CATALOGS`, `CATALOG_CACHE_DIR`), and the API base URL (`API_BASE_URL`)
+are deliberately excluded — they cannot be overridden remotely.
+
+**Graceful degradation:** if the API is unreachable, returns an error, or responds with an
+unexpected shape, both `watcher.py` and `worker.py` log a warning and start normally using
+local defaults only. The settings fetch uses a single attempt with a 10-second timeout (no
+retries) so it never delays startup significantly.
+
+### Request
+
+```
+GET /settings
+```
+
+**Headers:**
+
+```
+X-API-Key: <api-key>
+Accept: application/json
+```
+
+### Response
+
+**Status: `200 OK`**
+
+```json
+{
+  "data": {
+    "QC_FWHM_MAX_ARCSEC": "6.0",
+    "DELTA_MAG_ALERT": "1.0",
+    "CHART_ENABLED": "false",
+    "SITE_LAT": "55.7558"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `data` | object | Flat `{param_name: string_value}` map. All values are strings (the `settings` table stores everything as text); `config.apply_remote_settings()` casts each to its correct Python type (`float`, `int`, `bool`, `frozenset`) using the same conversion `config.py`'s own `_get()` calls apply. An invalid value (e.g. `"not_a_number"` for a float parameter) is logged and skipped — the local default stays in effect for that one parameter |
+
+**Overridable parameters:**
+
+The full list of parameters `config.apply_remote_settings()` accepts (anything not in this list
+is silently ignored):
+
+| Category | Parameters |
+|---|---|
+| QC thresholds | `QC_FWHM_MAX_ARCSEC`, `QC_ELONGATION_MAX`, `QC_SNR_MIN`, `QC_STARS_MIN`, `QC_SKY_BACKGROUND_MAX`, `QC_STARS_MIN_NARROWBAND` |
+| Star detection | `STAR_FWHM_MIN_ARCSEC`, `STAR_FWHM_MAX_ARCSEC`, `STAR_ELONGATION_MAX`, `STAR_SNR_MIN` |
+| SEP extraction | `SEP_DETECT_THRESH`, `SEP_MIN_AREA` |
+| Streak masking | `STREAK_DETECT_SIGMA`, `STREAK_ELONGATION_MIN`, `STREAK_MIN_LENGTH_ARCSEC`, `STREAK_MASK_DILATE_ARCSEC` |
+| Saturation | `SATURATION_ADU`, `SATURATION_MASK_RADIUS_ARCSEC` |
+| Cross-matching | `MATCH_CONE_ARCSEC`, `MOVING_CONE_ARCSEC`, `DELTA_MAG_ALERT` |
+| Edge geometry | `EDGE_MARGIN_FRAC`, `SPACE_DEBRIS_ELONGATION_MIN`, `SPACE_DEBRIS_EDGE_ELONGATION_MIN` |
+| Image subtraction | `SUBTRACTION_MIN_FRAMES`, `SUBTRACTION_DETECT_SIGMA` |
+| Observatory site | `SITE_LAT`, `SITE_LON`, `SITE_ELEV` |
+| Finder charts | `CHART_ENABLED`, `CHART_STAMP_SIZE_ARCSEC`, `CHART_MAX_EPOCHS` |
+| Normalization | `NORMALIZE_ENABLED` |
+| Catalog cache | `CACHE_TTL_HOURS` |
+| Watcher batching | `WATCHER_DEBOUNCE_SEC`, `WATCHER_MAX_BATCH_SIZE` |
+| Worker polling | `TASK_POLL_INTERVAL_SEC`, `TASK_POLL_BACKOFF_MAX_SEC` |
+| Logging | `LOG_LEVEL` |
+| ASTAP | `ASTAP_FOV_HINT` |
+| Narrowband | `NARROWBAND_FILTERS` |
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| `401` | Invalid or missing `X-API-Key` |
 
