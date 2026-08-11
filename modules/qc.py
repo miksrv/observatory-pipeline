@@ -602,6 +602,22 @@ def _result(
     }
 
 
+def _cleanup_empty_incoming_parents(moved_path: str) -> None:
+    """Remove empty parent dirs between *moved_path* and FITS_INCOMING."""
+    incoming_real = os.path.realpath(config.FITS_INCOMING)
+    parent = os.path.dirname(moved_path)
+    while True:
+        parent_real = os.path.realpath(parent)
+        if parent_real == incoming_real or not parent_real.startswith(incoming_real + os.sep):
+            break
+        try:
+            os.rmdir(parent)
+            logger.debug("Removed empty incoming subdirectory: %s", parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+
+
 def _move_rejected(fits_path: str, flag: str, object_name: str) -> str | None:
     """
     Move a rejected FITS file to the configured rejected directory.
@@ -627,6 +643,7 @@ def _move_rejected(fits_path: str, flag: str, object_name: str) -> str | None:
     try:
         shutil.move(fits_path, dest_path)
         logger.info("QC: moved rejected frame to %s", dest_path)
+        _cleanup_empty_incoming_parents(fits_path)
         return dest_path
     except OSError as exc:
         logger.error(

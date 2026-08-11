@@ -200,11 +200,14 @@ def flush_pending_batch() -> None:
 
 def process_existing_files(directory: str) -> int:
     """
-    Scan directory for existing FITS files and enqueue them into the
-    pending batch — the same path a freshly-arrived file takes. Handles the
-    "pipeline was down, files piled up" startup case as one bulk batch
-    (or a few, if WATCHER_MAX_BATCH_SIZE is exceeded) rather than dispatching
-    each file as its own separate event.
+    Recursively scan *directory* for existing FITS files and enqueue them
+    into the pending batch — the same path a freshly-arrived file takes.
+    Handles the "pipeline was down, files piled up" startup case as one bulk
+    batch (or a few, if WATCHER_MAX_BATCH_SIZE is exceeded) rather than
+    dispatching each file as its own separate event.
+
+    Subdirectories are traversed recursively so that FITS files placed inside
+    nested folders (e.g. ``incoming/m31/*.fits``) are discovered too.
 
     Parameters
     ----------
@@ -218,20 +221,16 @@ def process_existing_files(directory: str) -> int:
     """
     count = 0
     try:
-        for filename in os.listdir(directory):
-            filepath = os.path.join(directory, filename)
+        for dirpath, _dirnames, filenames in os.walk(directory):
+            for filename in filenames:
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in FITS_EXTENSIONS:
+                    continue
 
-            # Skip directories
-            if os.path.isdir(filepath):
-                continue
-
-            ext = os.path.splitext(filename)[1].lower()
-            if ext not in FITS_EXTENSIONS:
-                continue
-
-            logger.info("Found existing FITS file: %s", filepath)
-            enqueue_path(filepath)
-            count += 1
+                filepath = os.path.join(dirpath, filename)
+                logger.info("Found existing FITS file: %s", filepath)
+                enqueue_path(filepath)
+                count += 1
     except OSError as exc:
         logger.error("Error scanning directory %s: %s", directory, exc)
 
@@ -276,7 +275,7 @@ if __name__ == "__main__":
     # Now start watching for new files
     event_handler = FitsEventHandler()
     observer = Observer()
-    observer.schedule(event_handler, config.FITS_INCOMING, recursive=False)
+    observer.schedule(event_handler, config.FITS_INCOMING, recursive=True)
     observer.start()
 
     logger.info("Watching for new FITS files in %s", config.FITS_INCOMING)

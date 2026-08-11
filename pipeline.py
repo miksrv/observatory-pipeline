@@ -120,6 +120,37 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_empty_incoming_parents(moved_path: str) -> None:
+    """
+    Remove empty parent directories between *moved_path* and FITS_INCOMING.
+
+    After a file is moved out of the incoming tree (archived or rejected),
+    this walks upward from the file's former parent directory, removing each
+    directory that is now empty, stopping at (and never removing)
+    FITS_INCOMING itself.  Handles the case where FITS files were placed
+    inside subdirectories of FITS_INCOMING (e.g. ``incoming/m31/``).
+
+    Best-effort: any ``OSError`` (directory not empty because another file
+    landed there in the meantime, permission issue, already gone) is silently
+    ignored — the directory will simply stay until the next cleanup
+    opportunity.
+    """
+    incoming_real = os.path.realpath(config.FITS_INCOMING)
+    parent = os.path.dirname(moved_path)
+
+    while True:
+        parent_real = os.path.realpath(parent)
+        # Never remove FITS_INCOMING itself, and stop if we've walked past it.
+        if parent_real == incoming_real or not parent_real.startswith(incoming_real + os.sep):
+            break
+        try:
+            os.rmdir(parent)  # only succeeds if empty
+            logger.debug("Removed empty incoming subdirectory: %s", parent)
+        except OSError:
+            break  # not empty or already gone — stop climbing
+        parent = os.path.dirname(parent)
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 — analyze a single FITS file (Module 1)
 # ---------------------------------------------------------------------------
@@ -232,6 +263,7 @@ async def analyze_frame(fits_path: str) -> dict | None:
         os.makedirs(dest_dir, exist_ok=True)
         shutil.move(fits_path, dest_path)
         _cleanup_astap_files(fits_path)
+        _cleanup_empty_incoming_parents(fits_path)
         logger.info("Archived %s frame: %s → %s", frame_type, basename, dest_path, extra=extra)
         return None
 
@@ -591,6 +623,10 @@ async def analyze_frame(fits_path: str) -> dict | None:
 
         # Clean up astap temporary files (.ini, .wcs) left in incoming directory
         _cleanup_astap_files(fits_path)
+
+        # Remove empty parent directories inside FITS_INCOMING (e.g. after
+        # processing incoming/m31/frame.fits the now-empty m31/ is removed).
+        _cleanup_empty_incoming_parents(fits_path)
 
     except Exception as exc:
         logger.error("Failed to archive file: %s", exc, extra=extra)

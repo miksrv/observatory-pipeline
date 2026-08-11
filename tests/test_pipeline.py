@@ -1313,6 +1313,87 @@ class TestProcessExistingFiles:
         enqueued = {c.args[0] for c in enqueue_mock.call_args_list}
         assert enqueued == {str(tmp_path / "a.fits"), str(tmp_path / "b.fit")}
 
+    def test_enqueues_fits_in_subdirectories_recursively(self, monkeypatch, tmp_path):
+        """FITS files nested inside subdirectories of incoming are discovered."""
+        import watcher
+
+        subdir = tmp_path / "m31"
+        subdir.mkdir()
+        (subdir / "frame1.fits").write_bytes(b"x")
+
+        deep = subdir / "session1"
+        deep.mkdir()
+        (deep / "frame2.fit").write_bytes(b"x")
+
+        (tmp_path / "top.fits").write_bytes(b"x")
+
+        enqueue_mock = MagicMock()
+        monkeypatch.setattr(watcher, "enqueue_path", enqueue_mock)
+
+        count = watcher.process_existing_files(str(tmp_path))
+
+        assert count == 3
+        enqueued = {c.args[0] for c in enqueue_mock.call_args_list}
+        assert str(subdir / "frame1.fits") in enqueued
+        assert str(deep / "frame2.fit") in enqueued
+        assert str(tmp_path / "top.fits") in enqueued
+
+
+class TestCleanupEmptyIncomingParents:
+    """Verify that empty subdirectories inside FITS_INCOMING are removed after
+    a file is moved out."""
+
+    def test_removes_empty_parent_dirs_up_to_incoming(self, monkeypatch, tmp_path):
+        incoming = tmp_path / "incoming"
+        subdir = incoming / "m31"
+        subdir.mkdir(parents=True)
+
+        fits_file = subdir / "frame.fits"
+        fits_file.write_bytes(b"x")
+
+        monkeypatch.setattr(config, "FITS_INCOMING", str(incoming))
+
+        # Simulate the file being moved away (pipeline.py does this via shutil.move)
+        fits_file.unlink()
+
+        pipeline._cleanup_empty_incoming_parents(str(fits_file))
+
+        assert not subdir.exists(), "Empty m31/ subdirectory should have been removed"
+        assert incoming.exists(), "FITS_INCOMING itself must never be removed"
+
+    def test_stops_at_non_empty_parent(self, monkeypatch, tmp_path):
+        incoming = tmp_path / "incoming"
+        subdir = incoming / "m31"
+        subdir.mkdir(parents=True)
+
+        fits_file = subdir / "frame1.fits"
+        fits_file.write_bytes(b"x")
+        (subdir / "frame2.fits").write_bytes(b"x")  # another file still here
+
+        monkeypatch.setattr(config, "FITS_INCOMING", str(incoming))
+        fits_file.unlink()
+
+        pipeline._cleanup_empty_incoming_parents(str(fits_file))
+
+        assert subdir.exists(), "m31/ should NOT be removed because frame2.fits is still there"
+
+    def test_removes_deeply_nested_empty_dirs(self, monkeypatch, tmp_path):
+        incoming = tmp_path / "incoming"
+        deep = incoming / "m31" / "session1"
+        deep.mkdir(parents=True)
+
+        fits_file = deep / "frame.fits"
+        fits_file.write_bytes(b"x")
+
+        monkeypatch.setattr(config, "FITS_INCOMING", str(incoming))
+        fits_file.unlink()
+
+        pipeline._cleanup_empty_incoming_parents(str(fits_file))
+
+        assert not deep.exists(), "session1/ should be removed"
+        assert not (incoming / "m31").exists(), "m31/ should be removed too (now empty)"
+        assert incoming.exists(), "FITS_INCOMING itself must never be removed"
+
 
 # ---------------------------------------------------------------------------
 # preview_catalog_match — Stage 4 (diagnostic tool, uploads the chart itself)
