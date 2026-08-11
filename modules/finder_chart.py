@@ -140,18 +140,26 @@ _BEFORE_AFTER_BEFORE_COLOR = "#999999"
 _BEFORE_AFTER_AFTER_COLOR = "#ff5050"
 
 
-def _style_for_anomaly_type(anomaly_type: str) -> str:
-    """Pick the chart style for the anomaly type that just triggered a chart update."""
+def _style_for_anomaly_type(anomaly_type: Optional[str]) -> str:
+    """
+    Pick the chart style for the anomaly type that just triggered a chart
+    update. `anomaly_type=None` — a chart requested directly for a source
+    with no anomaly at all (observatory-api's `/ui/sources/generate-charts`,
+    which sends only `source_id` — see worker.py's `_run_charts_task()`) —
+    falls through the same way any other non-MOVING_TYPES value does: there
+    is no motion evidence to justify "track", so "stamp_strip" is the
+    correct, conservative default for an object with no known reason to move.
+    """
     return STYLE_TRACK if anomaly_type in MOVING_TYPES else STYLE_STAMP_STRIP
 
 
-def _style_for_source(anomaly_type: str, n_epochs: int) -> str:
+def _style_for_source(anomaly_type: Optional[str], n_epochs: int) -> str:
     """
     Pick the chart style for a source with `n_epochs` loaded epochs. A
     source detected on only one epoch so far gets STYLE_BEFORE_AFTER
     regardless of anomaly_type — there's no track/blink-strip to draw from a
     single point. 2+ epochs use _style_for_anomaly_type()'s existing
-    anomaly_type-based routing, unchanged.
+    anomaly_type-based routing, unchanged (including its None handling).
     """
     if n_epochs <= 1:
         return STYLE_BEFORE_AFTER
@@ -511,7 +519,7 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
                  ha="left", va="bottom", color="#222222")
 
     legend_frac = 0.03 + 0.016 * n
-    top_frac = 0.90 if label else 0.96
+    top_frac = 0.92 if label else 0.96
     fig.subplots_adjust(left=0.02, right=0.98, bottom=legend_frac, top=top_frac)
     if label:
         fig.suptitle(label, fontsize=11)
@@ -620,7 +628,7 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
 
     if label:
         fig.suptitle(label, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.93) if label else (0, 0, 1, 1))
+    fig.tight_layout(rect=(0, 0, 1, 0.96) if label else (0, 0, 1, 1))
     return _fig_to_png_bytes(fig)
 
 
@@ -700,7 +708,7 @@ def _render_before_after_chart(
     fig.suptitle(f"{label}\n{coord_line}" if label else coord_line, fontsize=10)
     if missing_reason:
         fig.text(0.5, 0.01, missing_reason, ha="center", fontsize=7.5, color=_BEFORE_AFTER_BEFORE_COLOR)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.86))
+    fig.tight_layout(rect=(0, 0.04, 1, 0.90))
 
     return _fig_to_png_bytes(fig)
 
@@ -768,18 +776,25 @@ async def _get_earlier_frame_epoch(
 
 
 async def _render_chart_for_source(
-    source_id: str, epochs: list[dict], anomaly_type: str, designation: Optional[str] = None,
+    source_id: str, epochs: list[dict], anomaly_type: Optional[str], designation: Optional[str] = None,
     earlier_frame_cache: Optional[dict] = None,
 ) -> Optional[tuple[bytes, str, int]]:
     """
     Returns (png_bytes, style, frame_count), or None on any failure.
+
+    `anomaly_type`: None for a chart requested directly by source_id, with
+    no anomaly behind it at all (see worker.py's `_run_charts_task()`) —
+    the chart still renders normally (style picked by `_style_for_source()`,
+    same as any other non-MOVING_TYPES value), just with no anomaly_type in
+    its title.
 
     `designation`: the source's catalog identity (e.g. an MPC name for an
     ASTEROID/COMET, or a Simbad main_id for a known VARIABLE_STAR/BINARY_STAR),
     when the underlying source is catalog-matched at all — shown alongside
     anomaly_type as the chart's title, e.g. "ASTEROID (4 Vesta)". None for an
     uncatalogued source, in which case the chart is titled with just
-    anomaly_type.
+    anomaly_type. When both are None (uncatalogued source, no anomaly), the
+    chart has no title at all.
 
     `earlier_frame_cache`: shared across one update_charts_for_sources()
     call — see _get_earlier_frame_epoch(). Only ever read/written when this
@@ -814,7 +829,15 @@ async def _render_chart_for_source(
         return None
 
     style = _style_for_source(anomaly_type, len(loaded))
-    label = f"{anomaly_type} ({designation})" if designation else anomaly_type
+    # anomaly_type is None for a source-only chart request (no anomaly behind
+    # it — see docstring above); build the title from whichever of
+    # anomaly_type/designation is actually present, instead of the naive
+    # f"{anomaly_type} (...)" which would print the literal string "None"
+    # when anomaly_type is missing but designation isn't.
+    if anomaly_type and designation:
+        label = f"{anomaly_type} ({designation})"
+    else:
+        label = anomaly_type or designation
 
     try:
         if style == STYLE_BEFORE_AFTER:
@@ -842,7 +865,7 @@ async def _render_chart_for_source(
 # ---------------------------------------------------------------------------
 
 async def update_charts_for_sources(
-    anomaly_type_by_source_id: dict[str, str],
+    anomaly_type_by_source_id: dict[str, Optional[str]],
     designation_by_source_id: Optional[dict[str, str]] = None,
 ) -> dict[str, bool]:
     """
@@ -863,6 +886,12 @@ async def update_charts_for_sources(
         this decides the chart style — see _style_for_source(): exactly one
         epoch → "before_after" regardless of anomaly_type; 2+ epochs →
         "track" for MOVING_TYPES, "stamp_strip" otherwise.
+        A value of None is valid and means "no anomaly behind this chart at
+        all" — a chart requested directly for a source (worker.py's
+        `_run_charts_task()` passes payload.anomaly_type through verbatim,
+        and observatory-api's `/ui/sources/generate-charts` never sets it).
+        Handled the same as any other non-MOVING_TYPES anomaly_type, just
+        without an anomaly_type in the chart's title.
     designation_by_source_id:
         Optional. Maps a subset of the same source_ids to their resolved
         catalog identity (e.g. the MPC designation for an ASTEROID/COMET, or

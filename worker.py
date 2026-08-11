@@ -154,6 +154,18 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
     """
     Process one GENERATE_CHARTS task — a single batched call covering every
     item's source_id at once, regardless of how many items the task has.
+
+    `payload.anomaly_type` is optional, not required: an item created from
+    an anomaly (observatory-api's AnomaliesController::createTask) carries
+    it, but an item created directly from a source with no anomaly at all
+    (SourcesController::createTask, `/ui/sources/generate-charts`) never
+    does — that endpoint intentionally sends only `source_id`, leaving style
+    selection to the pipeline (see that controller's own docstring). A
+    missing anomaly_type is passed through as None rather than failing the
+    item; modules/finder_chart.py already falls back gracefully for it (see
+    that module's `_style_for_source()`/`_style_for_anomaly_type()`) —
+    "before_after" for a single-epoch source, "stamp_strip" otherwise, with
+    no anomaly_type in the chart title.
     """
     anomaly_type_by_source_id: dict = {}
     designation_by_source_id: dict = {}
@@ -165,10 +177,10 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
         payload = item.get("payload") or {}
         anomaly_type = payload.get("anomaly_type")
 
-        if not source_id or not anomaly_type:
+        if not source_id:
             progress.append({
                 "item_id": item["id"], "status": "FAILED",
-                "error": "Item missing source_id or payload.anomaly_type",
+                "error": "Item missing source_id",
             })
             continue
 

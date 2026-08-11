@@ -288,9 +288,22 @@ Separate process (own `docker-compose.yml` service) that polls observatory-api's
 |---|---|---|
 | `ANALYZE` | `pipeline.analyze_frame(item["filename"])` | `filename` — the FULL path to the FITS file, not just a basename |
 | `DETECT_ANOMALIES` | `pipeline.detect_anomalies_for_frame_id(item["frame_id"])` | `frame_id` |
-| `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, batched across the WHOLE task | `source_id` + `anomaly_id` + `payload` (`{"anomaly_type", "designation"}`) |
+| `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, batched across the WHOLE task | `source_id` (required) + optionally `anomaly_id` + `payload` (`{"anomaly_type", "designation"}`) |
 | `PREVIEW_CATALOG_MATCH` | `pipeline.preview_catalog_match(item["filename"], task_id, item["id"])` | `filename` — same "full path, not a basename" convention as `ANALYZE` |
 | `RESTART` | Clean process exit → Docker restarts container → re-fetches remote settings | (none — signal task, no items) |
+
+`GENERATE_CHARTS` only requires `source_id` — `payload.anomaly_type` is optional, not a second
+required field. An item created from a resolved anomaly (observatory-api's
+`Web\AnomaliesController::createTask()`) carries `anomaly_id` + `payload.anomaly_type`/
+`designation`, and the chart title shows that anomaly_type (e.g. `ASTEROID (4 Vesta)`). An item
+created directly from a source with no anomaly at all
+(`Web\SourcesController::createTask()`, `/ui/sources/generate-charts`) intentionally sends only
+`source_id` — that endpoint's own docstring says the pipeline decides the chart style itself, and
+`worker.py`'s `_run_charts_task()` passes a missing `anomaly_type` through as `None` rather than
+failing the item. `modules/finder_chart.py`'s `_style_for_source()` already has a sensible
+fallback for `None`: "before_after" for a source with exactly one detected epoch (same as any
+other anomaly_type), "stamp_strip" for 2+ epochs (no motion evidence to justify "track"); the
+chart title simply omits the anomaly_type in that case.
 
 A bare basename with no directory component at all (no full path) is not rejected outright: both
 `analyze_frame()` and `preview_catalog_match()` run it through `pipeline._resolve_bare_filename()`

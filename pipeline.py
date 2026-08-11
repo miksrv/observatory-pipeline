@@ -925,6 +925,13 @@ async def generate_charts_for_source_ids(
     GENERATE_CHARTS task covers at once, regardless of how many frames they
     originally came from — one call renders and uploads every one of them.
 
+    A value in `anomaly_type_by_source_id` may be None — a chart requested
+    directly for a source with no anomaly behind it at all (e.g.
+    observatory-api's `/ui/sources/generate-charts`, which never sets
+    payload.anomaly_type — see worker.py's `_run_charts_task()`). That's not
+    a missing/invalid entry; modules/finder_chart.py picks a sensible
+    fallback style for it (see that module's `_style_for_source()`).
+
     Returns
     -------
     dict
