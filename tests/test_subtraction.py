@@ -264,8 +264,11 @@ class TestDetectDiffSources:
         assert len(candidates) >= 1
         assert all(c["near_edge"] is False for c in candidates)
 
-    def test_corner_candidate_is_near_edge(self):
-        """A blob at (5, 5) on a 100x100 diff falls inside the 10px margin."""
+    def test_corner_candidate_is_filtered_out(self):
+        """A blob at (5, 5) on a 100x100 diff falls inside the 10px margin
+        and is now rejected — coma residuals at the edge are not real
+        transients (see EDGE_MARGIN_FRAC filtering in _detect_diff_sources).
+        """
         rng = np.random.default_rng(9)
         diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
         yy, xx = np.mgrid[0:100, 0:100]
@@ -274,9 +277,10 @@ class TestDetectDiffSources:
 
         candidates = subtraction._detect_diff_sources(diff)
 
-        assert len(candidates) >= 1
-        closest = min(candidates, key=lambda c: (c["x"] - 5) ** 2 + (c["y"] - 5) ** 2)
-        assert closest["near_edge"] is True
+        # The corner blob must NOT appear in the output — it was in the
+        # edge zone and should have been filtered.
+        corner_hits = [c for c in candidates if (c["x"] - 5) ** 2 + (c["y"] - 5) ** 2 < 25]
+        assert len(corner_hits) == 0
 
 
 # ---------------------------------------------------------------------------

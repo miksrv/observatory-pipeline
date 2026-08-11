@@ -872,7 +872,9 @@ class TestDetectSpaceDebrisNearEdge:
     """
 
     async def test_near_edge_source_below_edge_threshold_is_not_space_debris(self):
-        """elongation=4.5 clears the ordinary 3.0 bar but not the edge bar (6.0)."""
+        """elongation=4.5 clears the ordinary 3.0 bar but not the edge bar (6.0).
+        Near-edge uncatalogued sources are now suppressed entirely (not even
+        UNKNOWN) — coma shifts the centroid, making them false positives."""
         source = _make_source(catalog_name=None, elongation=4.5, near_edge=True)
 
         with (
@@ -884,8 +886,7 @@ class TestDetectSpaceDebrisNearEdge:
 
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
-        assert len(result) == 1
-        assert result[0]["anomaly_type"] == "UNKNOWN"
+        assert len(result) == 0
 
     async def test_near_edge_source_above_edge_threshold_is_space_debris(self):
         """elongation=6.5 clears even the higher edge bar (6.0)."""

@@ -345,6 +345,7 @@ def _detect_diff_sources(
 
         out: list[dict] = []
         n_rejected_sharp = 0
+        n_rejected_edge = 0
         for obj in objs:
             # `obj` is a numpy.void record (one row of sep.extract()'s
             # structured array) — it supports dict-style bracket access
@@ -383,6 +384,19 @@ def _detect_diff_sources(
                 or obj_y < margin_y or obj_y > height - margin_y
             )
 
+            # Skip candidates in the edge zone — coma and other off-axis
+            # aberrations change the PSF shape between frames (rotation,
+            # guiding drift, focus shift), so the median reference stack
+            # never perfectly cancels an edge star's coma wing.  The
+            # resulting non-zero residual is picked up by sep as a
+            # "new source", but it is a purely optical artifact, not a real
+            # transient.  Real incident, 2026-08-10 analysis: 53 of 80
+            # UNKNOWN alerts were from_subtraction + near_edge — every one
+            # of them a coma residual of an ordinary catalogued star.
+            if near_edge:
+                n_rejected_edge += 1
+                continue
+
             out.append({
                 "x":          obj_x,
                 "y":          obj_y,
@@ -392,6 +406,14 @@ def _detect_diff_sources(
                 "elongation": a_axis / b_axis,
                 "near_edge":  near_edge,
             })
+
+        if n_rejected_edge:
+            logger.info(
+                "Subtraction: rejected %d candidate(s) in the edge zone "
+                "(EDGE_MARGIN_FRAC=%.2f) — likely coma/aberration residuals, "
+                "not real transients",
+                n_rejected_edge, config.EDGE_MARGIN_FRAC,
+            )
 
         if n_rejected_sharp:
             logger.info(

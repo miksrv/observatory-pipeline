@@ -623,6 +623,20 @@ def _classify_source_sync(
             }
 
         if _is_position_shifted(history, wide_history, current_frame_positions):
+            # Near-edge sources get their centroid shifted by coma between
+            # frames (rotation, guiding) — this looks like "position shifted"
+            # but is purely optical. All 7 MOVING_UNKNOWN near_edge=1 in the
+            # 2026-08-10 analysis were ordinary coma-shifted stars.
+            if near_edge:
+                logger.debug(
+                    "Suppressed MOVING_UNKNOWN: near_edge position-shifted "
+                    "source ra=%.4f dec=%.4f elongation=%.2f — likely "
+                    "coma-shifted centroid, not a real mover",
+                    ra, dec, elongation,
+                    extra=extra,
+                )
+                return None
+
             anomaly_type = AnomalyType.MOVING_UNKNOWN
 
             logger.warning(
@@ -676,6 +690,19 @@ def _classify_source_sync(
             return None  # Not an anomaly — do not report to API
         # Subtraction already confirmed this source is new relative to the
         # reference stack, even though the API has no prior coverage record.
+        # However, near-edge subtraction candidates are overwhelmingly coma
+        # residuals, not real transients — suppress them here too (defense
+        # in depth: subtraction.py now filters them at extraction time, but
+        # a standalone DETECT_ANOMALIES re-run may still carry old
+        # near_edge + from_subtraction rows from the API).
+        if near_edge:
+            logger.debug(
+                "Suppressed UNKNOWN (subtraction, new area): near_edge "
+                "ra=%.4f dec=%.4f — likely coma residual",
+                ra, dec,
+                extra=extra,
+            )
+            return None
         logger.info(
             "UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f mag=%s",
             ra, dec, mag,
@@ -730,6 +757,26 @@ def _classify_source_sync(
     #   3. Adding "FAINT_UNCATALOGUED" classification distinct from true UNKNOWN
     # See: https://github.com/users/miksrv/projects/10 for tracking
     if n_history == 0 and catalog_name is None:
+        # Suppress near-edge uncatalogued sources — coma and other off-axis
+        # aberrations shift the measured centroid away from the star's true
+        # catalog position (the WCS offset correction is computed from the
+        # frame median, but local distortion at the edge is larger), so
+        # catalog matching misses it and it arrives here as "not in any
+        # catalog".  These are overwhelmingly ordinary stars with optical
+        # distortion, not real transients.  Real incident, 2026-08-10
+        # analysis: 27 of 80 UNKNOWN alerts were non-subtraction near_edge
+        # sources — every one a normal star whose centroid was coma-shifted
+        # past MATCH_CONE_ARCSEC.
+        if near_edge:
+            logger.debug(
+                "Suppressed UNKNOWN: near_edge uncatalogued source ra=%.4f "
+                "dec=%.4f mag=%s — likely coma-shifted centroid, not a real "
+                "transient",
+                ra, dec, mag,
+                extra=extra,
+            )
+            return None
+
         logger.warning(
             "ALERT — UNKNOWN: new uncatalogued source ra=%.4f dec=%.4f mag=%s "
             "covered_by=%d frames",
