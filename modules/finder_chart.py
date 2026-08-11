@@ -554,20 +554,50 @@ def _stamp_half_size_px(wcs: WCS) -> int:
     return max(10, int(round(config.CHART_STAMP_SIZE_ARCSEC / _arcsec_per_pixel(wcs))))
 
 
+def _grid_layout(n: int) -> tuple[int, int]:
+    """
+    Compute (nrows, ncols) for `n` stamps so the resulting image is as close
+    to square as possible. For n <= 3 a single row is fine; beyond that we
+    pick ncols = ceil(sqrt(n)) and nrows = ceil(n / ncols).
+    """
+    if n <= 3:
+        return 1, n
+    import math
+    ncols = math.ceil(math.sqrt(n))
+    nrows = math.ceil(n / ncols)
+    return nrows, ncols
+
+
 def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) -> bytes:
     """
-    One small labelled crop per epoch, side by side, each circled at its own
-    detected position and captioned with its own RA/Dec.
+    One small labelled crop per epoch, arranged in a roughly square grid,
+    each circled at its own detected position and captioned with its own
+    RA/Dec.
 
     `label`, if given (e.g. "VARIABLE_STAR (TYC 1430-1407-1)" — the
     anomaly_type plus its resolved catalog designation, see
     update_charts_for_sources()), is shown as the figure's overall title.
     """
     n = len(loaded_epochs)
-    fig, axes = plt.subplots(1, n, figsize=(3 * n, 3.6), dpi=120)
-    axes = [axes] if n == 1 else list(axes)
+    nrows, ncols = _grid_layout(n)
+    cell_size = 3.0
+    fig, axes = plt.subplots(nrows, ncols, figsize=(cell_size * ncols, (cell_size + 0.6) * nrows), dpi=120)
 
-    for ax, ep in zip(axes, loaded_epochs):
+    # Normalize axes to a flat list regardless of grid shape.
+    if n == 1:
+        axes_flat = [axes]
+    elif nrows == 1 or ncols == 1:
+        axes_flat = list(axes)
+    else:
+        axes_flat = [ax for row in axes for ax in row]
+
+    for idx, ax in enumerate(axes_flat):
+        if idx >= n:
+            # Hide unused cells in the last row.
+            ax.set_visible(False)
+            continue
+
+        ep = loaded_epochs[idx]
         wcs = ep["wcs"]
         half_px = _stamp_half_size_px(wcs)
         try:
@@ -590,7 +620,7 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
 
     if label:
         fig.suptitle(label, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.90) if label else (0, 0, 1, 1))
+    fig.tight_layout(rect=(0, 0, 1, 0.93) if label else (0, 0, 1, 1))
     return _fig_to_png_bytes(fig)
 
 

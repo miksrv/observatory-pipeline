@@ -161,6 +161,29 @@ class TestArcsecPerPixel:
 
 
 # ---------------------------------------------------------------------------
+# _grid_layout
+# ---------------------------------------------------------------------------
+
+class TestGridLayout:
+
+    @pytest.mark.parametrize("n, expected", [
+        (1, (1, 1)),
+        (2, (1, 2)),
+        (3, (1, 3)),
+        (4, (2, 2)),
+        (5, (2, 3)),
+        (6, (2, 3)),
+        (7, (3, 3)),
+        (8, (3, 3)),
+        (9, (3, 3)),
+        (10, (3, 4)),
+        (16, (4, 4)),
+    ])
+    def test_grid_dimensions(self, n, expected):
+        assert finder_chart._grid_layout(n) == expected
+
+
+# ---------------------------------------------------------------------------
 # _format_angular_shift / _angular_separation_arcsec
 # ---------------------------------------------------------------------------
 
@@ -285,6 +308,17 @@ class TestRendering:
             self._loaded_epoch(tmp_path, "e0.fits", 202.47, 47.20, "2024-01-01T00:00:00Z", mag=15.0),
             self._loaded_epoch(tmp_path, "e1.fits", 202.47, 47.20, "2024-01-02T00:00:00Z", mag=14.2),
             self._loaded_epoch(tmp_path, "e2.fits", 202.47, 47.20, "2024-01-03T00:00:00Z", mag=None),
+        ]
+
+        png_bytes = finder_chart._render_stamp_strip(epochs)
+
+        assert png_bytes[:8] == PNG_SIGNATURE
+
+    def test_render_stamp_strip_grid_layout_for_many_epochs(self, tmp_path):
+        """With many epochs the stamp strip should use a grid layout and still produce valid PNG."""
+        epochs = [
+            self._loaded_epoch(tmp_path, f"e{i}.fits", 202.47, 47.20, f"2024-01-{i+1:02d}T00:00:00Z")
+            for i in range(9)
         ]
 
         png_bytes = finder_chart._render_stamp_strip(epochs)
