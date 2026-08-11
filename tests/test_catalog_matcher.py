@@ -355,6 +355,77 @@ class TestMpcMatching:
         result = cm._query_mpc(_RA, _DEC, "", 1.0)
         assert result == []
 
+    def test_mpc_one_to_one_nearest_wins(self):
+        """
+        Regression test for the 2014 RY1 incident (2026-08-10): when multiple
+        unmatched sources fall within MOVING_CONE_ARCSEC of the same MPC
+        object, only the NEAREST one must get the MPC designation — not the
+        brightest. The old code matched source→MPC (assigning the designation
+        to every source within radius), then _dedupe_by_catalog_identity kept
+        the brightest, which was a background star rather than the real
+        asteroid.
+        """
+        # MPC object predicted at position X
+        mpc_ra, mpc_dec = _RA, _DEC
+
+        # Real asteroid: 10" from MPC predicted position (nearest), but FAINT
+        asteroid_ra, asteroid_dec = _offset_ra_exact(mpc_ra, mpc_dec, 10.0)
+        asteroid = _make_source(ra=asteroid_ra, dec=asteroid_dec)
+        asteroid["catalog_name"] = None
+        asteroid["catalog_id"] = None
+        asteroid["flux"] = 100.0  # faint
+
+        # Background star: 50" from MPC predicted position (further), but BRIGHT
+        star_ra, star_dec = _offset_ra_exact(mpc_ra, mpc_dec, 50.0)
+        star = _make_source(ra=star_ra, dec=star_dec)
+        star["catalog_name"] = None
+        star["catalog_id"] = None
+        star["flux"] = 50000.0  # very bright
+
+        mpc_objects = [{
+            "ra":          mpc_ra,
+            "dec":         mpc_dec,
+            "designation": "2014 RY1",
+            "object_type": "ASTEROID",
+        }]
+
+        cm._match_mpc([asteroid, star], mpc_objects)
+
+        # The nearest source (asteroid) must get the designation
+        assert asteroid["catalog_name"] == "MPC"
+        assert asteroid["catalog_id"] == "2014 RY1"
+
+        # The further source (star) must NOT get the designation
+        assert star["catalog_name"] is None
+        assert star["catalog_id"] is None
+
+    def test_mpc_two_objects_do_not_share_same_source(self):
+        """
+        When two MPC objects are near the same unmatched source, only the
+        closer MPC object claims it — the further one gets no match rather
+        than sharing the same source.
+        """
+        # Source at _RA, _DEC
+        source = _make_source(ra=_RA, dec=_DEC)
+        source["catalog_name"] = None
+        source["catalog_id"] = None
+
+        # MPC object A: 5" away (closer)
+        mpc_a_ra, mpc_a_dec = _offset_ra_exact(_RA, _DEC, 5.0)
+        # MPC object B: 30" away (further)
+        mpc_b_ra, mpc_b_dec = _offset_ra_exact(_RA, _DEC, 30.0)
+
+        mpc_objects = [
+            {"ra": mpc_b_ra, "dec": mpc_b_dec, "designation": "2024 XY", "object_type": "ASTEROID"},
+            {"ra": mpc_a_ra, "dec": mpc_a_dec, "designation": "2024 AB", "object_type": "ASTEROID"},
+        ]
+
+        cm._match_mpc([source], mpc_objects)
+
+        # The closer MPC object (2024 AB at 5") wins
+        assert source["catalog_name"] == "MPC"
+        assert source["catalog_id"] == "2024 AB"
+
 
 # ===========================================================================
 # TestMatchOrchestrator

@@ -605,6 +605,11 @@ Cross-matches the source list against external catalogs using
 Before matching, computes a **WCS offset correction**: an all-pairs vote-accumulator matches
 the source list against Gaia DR3 to estimate a small systematic RA/Dec offset, then applies
 that offset **in-place** to every source's `ra`/`dec` before the remaining catalogs are queried.
+The correction is skipped only when the median source-to-Gaia separation is already ≤ 2″ (the
+vote accumulator's own noise floor — below which it wouldn't apply a correction anyway); any
+median_sep above that triggers the full vote-accumulator computation. After correction, a
+validation pass re-measures median separation and logs it alongside the pre-correction value
+for diagnostic comparison.
 
 Catalogs queried **in this order** (sequential exclusive matching — once matched, a source
 skips the remaining catalogs): **Simbad → Gaia DR3 → 2MASS → Pan-STARRS DR1 → MPC/SkyBot**.

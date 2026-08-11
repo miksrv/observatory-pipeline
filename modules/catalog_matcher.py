@@ -272,7 +272,25 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
         config.MATCH_CONE_ARCSEC,
     )
 
-    if median_sep <= 10.0:
+    # Early exit when the WCS is already accurate enough that no
+    # correction could meaningfully improve source positions.
+    #
+    # This threshold must be at or below the vote accumulator's own noise
+    # floor (the ``total_offset <= 2.0`` guard further down) — the
+    # accumulator never applies a correction smaller than 2″ anyway, so
+    # running it for median_sep < 2″ only wastes CPU. Setting this higher
+    # (the original hard-coded 10″, or even MATCH_CONE_ARCSEC at 5″) leaves
+    # real 3–4″ systematic offsets uncorrected: sources technically still
+    # fall inside the matching cone, but their stored positions in the
+    # database are off by that much, degrading anomaly detector's positional
+    # comparisons, finder chart overlays, and Aladin cross-checks.
+    #
+    # 2.0″ gives maximum correction accuracy: every detectable systematic
+    # shift above the centroiding noise floor gets corrected, while the
+    # accumulator's own significance tests (MIN_PEAK_VOTES, Poisson σ,
+    # total_offset ≤ 2″) still prevent applying noise as a "correction".
+    WCS_OFFSET_MIN_ARCSEC = 2.0
+    if median_sep <= WCS_OFFSET_MIN_ARCSEC:
         # WCS is already accurate — no correction needed
         return 0.0, 0.0
 
@@ -865,6 +883,7 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
         dec_col   = col_map.get("DEC")
         name_col  = col_map.get("NAME") or col_map.get("OBJECT") or col_map.get("DESIGNATION")
         class_col = col_map.get("CLASS") or col_map.get("TYPE") or col_map.get("OBJECTTYPE")
+        mag_col   = col_map.get("V") or col_map.get("MV") or col_map.get("VMAG")
 
         if not ra_col or not dec_col or not name_col:
             logger.warning(
@@ -872,6 +891,9 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
             )
             _cache_set(cache_key, [])
             return []
+
+        mag_limit = config.MPC_MAG_LIMIT
+        n_skipped_faint = 0
 
         objects: list[dict] = []
         for row in result:
@@ -887,9 +909,30 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
 
                 obj_type = "COMET" if "comet" in obj_class.lower() else "ASTEROID"
 
+                # Parse predicted visual magnitude — skip objects too faint to
+                # be detectable by this telescope. Without this filter, SkyBot
+                # returns dozens of mag > 20 asteroids in any field, and the
+                # matching logic assigns each one to its nearest unmatched
+                # background star, producing spurious non-moving "ASTEROID"
+                # anomalies (real incident, 2026-08-10, Vesta field: 130+
+                # asteroids returned, only Vesta at V=6.2 was actually
+                # detectable on 60s exposures; 2014 RY1 at V=21.1 was matched
+                # to a star).
+                v_mag: float | None = None
+                if mag_col:
+                    try:
+                        raw_mag = row[mag_col]
+                        v_mag = float(raw_mag.value) if hasattr(raw_mag, "value") else float(raw_mag)
+                    except (TypeError, ValueError):
+                        pass
+
+                if v_mag is not None and v_mag > mag_limit:
+                    n_skipped_faint += 1
+                    continue
+
                 logger.info(
-                    "SkyBot object: %s  type=%s  ra=%.4f dec=%.4f",
-                    name, obj_type, ra_val, dec_val,
+                    "SkyBot object: %s  type=%s  V=%.1f  ra=%.4f dec=%.4f",
+                    name, obj_type, v_mag if v_mag is not None else -99.0, ra_val, dec_val,
                 )
                 objects.append({
                     "ra":          ra_val,
@@ -900,6 +943,12 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
             except Exception as row_exc:
                 logger.warning("SkyBot: skipping malformed row: %s", row_exc)
                 continue
+
+        if n_skipped_faint:
+            logger.info(
+                "SkyBot: skipped %d object(s) fainter than MPC_MAG_LIMIT=%.1f",
+                n_skipped_faint, mag_limit,
+            )
 
         _cache_set(cache_key, objects)
         return objects
@@ -924,6 +973,19 @@ def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
     Uses a wider cone than Gaia/Simbad matching to account for object motion
     between the MPC ephemeris epoch and the actual observation time.
     Skips sources that already have catalog_name set.
+
+    One-to-one matching: each MPC object is assigned to at most ONE detected
+    source (the nearest unmatched source within the threshold). The previous
+    implementation matched in the opposite direction (for each source, find
+    the nearest MPC object) which allowed multiple sources to claim the same
+    MPC designation — then _dedupe_by_catalog_identity() kept the brightest,
+    which for a faint asteroid (e.g. 2014 RY1 at mag 21) was invariably a
+    nearby uncatalogued background star rather than the real asteroid. The
+    finder chart then showed that star's unchanging position as the
+    "asteroid's track" (real incident, 2026-08-10: 2014 RY1 appeared
+    stationary on its track chart while Vesta on the same frames moved
+    correctly — Vesta is bright enough to always win the dedup, but 2014 RY1
+    is not).
     """
     unmatched = [s for s in sources if s["catalog_name"] is None]
     if not unmatched or not mpc_objects:
@@ -938,16 +1000,41 @@ def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
         dec=[o["dec"] for o in mpc_objects] * u.deg,
     )
 
-    idx, sep2d, _ = unmatched_coords.match_to_catalog_sky(mpc_coords)
     threshold = config.MOVING_CONE_ARCSEC * u.arcsec
 
-    for i, source in enumerate(unmatched):
-        if sep2d[i] < threshold:
-            matched = mpc_objects[idx[i]]
-            source["catalog_name"] = "MPC"
-            source["catalog_id"]   = matched["designation"]
-            source["catalog_mag"]  = None
-            source["object_type"]  = matched["object_type"]
+    # Match in the MPC→source direction: for each MPC object, find its
+    # nearest unmatched source. This ensures each MPC designation is
+    # assigned to at most one source (the closest detection to the
+    # predicted ephemeris position), preventing a faint real asteroid from
+    # being out-competed by a brighter background star that also happened
+    # to fall within MOVING_CONE_ARCSEC.
+    idx, sep2d, _ = mpc_coords.match_to_catalog_sky(unmatched_coords)
+
+    # Track which unmatched sources have already been claimed, so that if
+    # two MPC objects both want the same source, only the closer one wins.
+    claimed: dict[int, int] = {}  # unmatched_index → mpc_index that claimed it
+
+    # Process MPC objects nearest-match-first so a closer match always wins
+    # over a more distant one when two MPC objects compete for the same source.
+    order = sorted(range(len(mpc_objects)), key=lambda k: sep2d[k].arcsec)
+
+    for mpc_idx in order:
+        if sep2d[mpc_idx] >= threshold:
+            continue
+
+        src_idx = int(idx[mpc_idx])
+
+        # If this source was already claimed by a closer MPC object, skip.
+        if src_idx in claimed:
+            continue
+
+        claimed[src_idx] = mpc_idx
+        source = unmatched[src_idx]
+        obj = mpc_objects[mpc_idx]
+        source["catalog_name"] = "MPC"
+        source["catalog_id"]   = obj["designation"]
+        source["catalog_mag"]  = None
+        source["object_type"]  = obj["object_type"]
 
 
 # ---------------------------------------------------------------------------
@@ -1041,6 +1128,34 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
                 "Applied WCS correction dRA=%.2f\" dDec=%.2f\" to %d sources  fits_filename=%s",
                 offset_ra_deg * 3600.0, offset_dec_deg * 3600.0, len(sources), fits_filename,
             )
+
+            # Post-correction validation: re-match corrected coordinates
+            # against Gaia to confirm the correction actually improved
+            # positions.  The pre-correction median_sep was already logged
+            # by _compute_wcs_offset() above ("Gaia match (raw): ..."), so
+            # the operator can compare the two numbers at a glance.
+            if gaia_stars and len(sources) >= 3:
+                try:
+                    corrected_coords = SkyCoord(
+                        ra=[s["ra"] for s in sources] * u.deg,
+                        dec=[s["dec"] for s in sources] * u.deg,
+                    )
+                    gaia_coords_val = SkyCoord(
+                        ra=[g["ra"] for g in gaia_stars] * u.deg,
+                        dec=[g["dec"] for g in gaia_stars] * u.deg,
+                    )
+                    _, sep_post, _ = corrected_coords.match_to_catalog_sky(gaia_coords_val)
+                    sep_post_arcsec = sep_post.to(u.arcsec).value
+                    median_post = float(np.median(sep_post_arcsec))
+                    within_cone = int(np.sum(sep_post_arcsec <= config.MATCH_CONE_ARCSEC))
+                    logger.info(
+                        "WCS offset validation (post-correction): median=%.2f\", "
+                        "within %.1f\"=%d/%d  fits_filename=%s",
+                        median_post, config.MATCH_CONE_ARCSEC,
+                        within_cone, len(sources), fits_filename,
+                    )
+                except Exception:
+                    pass  # validation is best-effort — never block matching
     except Exception as exc:
         logger.warning("WCS offset computation failed for fits_filename=%s: %s", fits_filename, exc)
 

@@ -169,6 +169,17 @@ async def render(fits_path: str) -> dict:
 
         sources = await catalog_matcher.match(sources, frame_meta)
 
+        # Collapse sources sharing the same (catalog_name, catalog_id) into
+        # one — same dedup step pipeline.py applies (Step 8.5). Without this,
+        # a subtraction candidate at the same position as a main-extraction
+        # source both match the same catalog star and render as two overlapping
+        # green circles with identical labels (user-reported, 2026-08-10).
+        from pipeline import _dedupe_by_catalog_identity, _dedupe_unmatched_near_matched
+        sources = _dedupe_by_catalog_identity(sources, extra)
+        # Suppress unmatched sources sitting on top of matched ones
+        # (deblending artifacts near frame edges).
+        sources = _dedupe_unmatched_near_matched(sources, extra)
+
         n_matched = sum(1 for s in sources if s.get("catalog_name"))
         logger.info("Catalog matching: matched=%d/%d", n_matched, len(sources), extra=extra)
 

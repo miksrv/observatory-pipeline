@@ -420,6 +420,12 @@ async def analyze_frame(fits_path: str) -> dict | None:
     sources = _dedupe_by_catalog_identity(sources, extra)
 
     # ------------------------------------------------------------------
+    # Step 4.6 — Positional dedup: suppress unmatched sources sitting on
+    # top of a matched source (deblending artifacts, not real objects).
+    # ------------------------------------------------------------------
+    sources = _dedupe_unmatched_near_matched(sources, extra)
+
+    # ------------------------------------------------------------------
     # Step 5 — Photometry (runs AFTER catalog matching to use Gaia DR3
     #          reference stars for magnitude calibration).
     #
@@ -1110,6 +1116,64 @@ def _dedupe_by_catalog_identity(sources: list, extra: dict) -> list:
         )
 
     return deduped
+
+
+def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
+    """
+    Remove uncatalogued sources that sit within MATCH_CONE_ARCSEC of a
+    catalogue-matched source in the same frame — these are almost always
+    deblending artifacts (sep splitting one elongated/coma-distorted PSF near
+    frame edges into two components, one of which lands just outside the
+    catalog cone) rather than real distinct objects (real incident, 2026-08-10:
+    Vesta frames showed overlapping green+red circles for a single star at the
+    edge of the field — the red circle was an UNKNOWN false-positive waiting to
+    happen). A matched source at that position already accounts for the star's
+    existence, so the duplicate adds no information and would only trigger a
+    spurious UNKNOWN anomaly downstream.
+
+    Only suppresses the UNMATCHED duplicate — a matched source is never
+    removed, and two unmatched sources near each other are left alone (they
+    might genuinely be two faint uncatalogued objects in a crowded field).
+    """
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    matched = [s for s in sources if s.get("catalog_name") is not None]
+    if not matched:
+        return sources
+
+    matched_coords = SkyCoord(
+        ra=[s["ra"] for s in matched] * u.deg,
+        dec=[s["dec"] for s in matched] * u.deg,
+    )
+
+    threshold = config.MATCH_CONE_ARCSEC * u.arcsec
+    kept: list = []
+    n_suppressed = 0
+
+    for src in sources:
+        if src.get("catalog_name") is not None:
+            # Matched sources are always kept
+            kept.append(src)
+            continue
+
+        src_coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg)
+        sep = src_coord.separation(matched_coords).min()
+        if sep < threshold:
+            n_suppressed += 1
+            continue
+
+        kept.append(src)
+
+    if n_suppressed:
+        logger.info(
+            "Suppressed %d unmatched source(s) within %.1f\" of a matched source "
+            "(deblending artifacts) — %d sources remain",
+            n_suppressed, config.MATCH_CONE_ARCSEC, len(kept),
+            extra=extra,
+        )
+
+    return kept
 
 
 def _prefer_candidate(candidate: dict, existing: dict) -> bool:

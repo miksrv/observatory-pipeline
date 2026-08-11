@@ -59,7 +59,7 @@ QC_STARS_MIN: int = int(_get("QC_STARS_MIN", "10"))
 # site's typical dark-sky background (log the actual qc_sky_background
 # values your setup reports on good frames, then set this a comfortable
 # margin above them).
-QC_SKY_BACKGROUND_MAX: float = float(_get("QC_SKY_BACKGROUND_MAX", "20000.0"))
+QC_SKY_BACKGROUND_MAX: float = float(_get("QC_SKY_BACKGROUND_MAX", "50000.0"))
 # Star-count floor applied instead of QC_STARS_MIN when the frame's own
 # filter is narrowband (see NARROWBAND_FILTERS below). A narrowband frame of
 # the exact same field genuinely detects far fewer stars than a broadband one
@@ -162,6 +162,16 @@ MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
 # so 30" was too tight to detect cross-frame position shifts reliably.
 MOVING_CONE_ARCSEC: float = float(_get("MOVING_CONE_ARCSEC", "120.0"))
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
+
+# Faintest predicted visual magnitude (V) for an MPC/SkyBot object to be
+# eligible for source matching. Objects fainter than this are almost certainly
+# below the pipeline's detection threshold and would only ever "match" to an
+# unrelated background star (real incident, 2026-08-10: SkyBot returned 130+
+# asteroids in a 1° Vesta field, most at V > 20; the pipeline matched each one
+# to its nearest unmatched star, producing dozens of spurious ASTEROID
+# anomalies that didn't move between frames). Set to your telescope's
+# approximate detection limit for the typical exposure time.
+MPC_MAG_LIMIT: float = float(_get("MPC_MAG_LIMIT", "19.0"))
 
 # ---------------------------------------------------------------------------
 # Edge-of-frame geometry (astrometry + subtraction + anomaly_detector modules)
@@ -332,6 +342,7 @@ _OVERRIDABLE: dict[str, type] = {
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "DELTA_MAG_ALERT": float,
+    "MPC_MAG_LIMIT": float,
     # Edge geometry
     "EDGE_MARGIN_FRAC": float,
     "SPACE_DEBRIS_ELONGATION_MIN": float,

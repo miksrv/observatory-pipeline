@@ -749,6 +749,7 @@ async def run(
         diff, mask=sat_mask, fwhm_min_px=fwhm_min_px,
         pixel_scale_arcsec=pixel_scale_arcsec,
     )
+
     sky_cands   = _pixel_to_sky(pixel_cands, fits_path, wcs=wcs)
 
     for cand in sky_cands:
