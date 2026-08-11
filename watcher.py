@@ -29,6 +29,17 @@ The flush itself (an HTTP call to observatory-api) always runs via
 threading.Timer — even for the immediate/max-size case (a zero-delay timer)
 — never inline inside the watchdog observer's own event-delivery thread, so
 a slow API call never delays detection of the next arriving file.
+
+In-flight dedup, no API round-trip: once a batch is submitted, its realpaths
+move into `_in_flight_realpaths` (module-level, in-memory — see that name's
+own comment below) instead of being forgotten. If the same still-unprocessed
+file is detected again before worker.py has gotten to it — a duplicate
+filesystem event, or a later process_existing_files() finding it still
+sitting there — it's skipped rather than resubmitted into a second ANALYZE
+task. An entry is dropped the moment its file no longer exists at that path,
+which is exactly when pipeline.py has moved it out of FITS_INCOMING
+(archived or rejected) — a plain, local os.path.exists() check, not a query
+against observatory-api.
 """
 
 import asyncio
@@ -39,6 +50,7 @@ import time
 
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
 
 import config
 from api_client import client as api_client
@@ -60,9 +72,22 @@ FITS_EXTENSIONS: frozenset[str] = frozenset({".fits", ".fit"})
 # original path) because watchdog is known to occasionally deliver two
 # FileCreatedEvents for the same file whose reported path can differ in
 # resolvable ways (e.g. a symlinked bind mount).
+#
+# `_in_flight_realpaths` is a second, longer-lived memory: once a batch is
+# successfully submitted as an ANALYZE task, its realpaths move here instead
+# of being forgotten, so that if the SAME still-unprocessed file is detected
+# again (e.g. a duplicate filesystem event, or a config that periodically
+# re-lists the directory — see PollingObserver in __main__ below) while
+# worker.py hasn't gotten to it yet, it's skipped rather than resubmitted
+# into a second task. An entry is dropped the moment its file no longer
+# exists at that path — pipeline.py always moves a file out of
+# FITS_INCOMING once it's actually been processed (archived or rejected),
+# so "file's gone" is a reliable, purely-local signal that it's safe to
+# forget, with no need to ask observatory-api about task status at all.
 # ---------------------------------------------------------------------------
 _pending_paths: list[str] = []
 _pending_realpaths: set[str] = set()
+_in_flight_realpaths: set[str] = set()
 _pending_lock = threading.Lock()
 _flush_timer: threading.Timer | None = None
 
@@ -95,10 +120,13 @@ def enqueue_path(fits_path: str) -> None:
 
     Skips a path that no longer exists (e.g. a duplicate filesystem event
     delivered after this exact file was already flushed into a task and
-    processed) or one already sitting in the current pending batch
-    (watchdog occasionally delivers two FileCreatedEvents for the same
-    path — e.g. the polling emitter used for Docker Desktop bind mounts on
-    macOS, or a capture program that writes-then-renames the file).
+    fully processed — pipeline.py has since moved it out of FITS_INCOMING),
+    one already sitting in the current pending batch (watchdog occasionally
+    delivers two FileCreatedEvents for the same path — e.g. the polling
+    emitter used for Docker Desktop bind mounts on macOS, or a capture
+    program that writes-then-renames the file), or one already submitted in
+    an earlier ANALYZE task that worker.py hasn't finished with yet (see
+    `_in_flight_realpaths` above).
     """
     if not os.path.exists(fits_path):
         logger.warning(
@@ -111,10 +139,21 @@ def enqueue_path(fits_path: str) -> None:
     real_path = os.path.realpath(fits_path)
 
     with _pending_lock:
+        _prune_in_flight_locked()
+
         if real_path in _pending_realpaths:
             logger.warning(
                 "Skipping %s — already in the pending batch (duplicate "
                 "on_created event for the same file)",
+                fits_path,
+            )
+            return
+
+        if real_path in _in_flight_realpaths:
+            logger.info(
+                "Skipping %s — already submitted in an earlier ANALYZE task "
+                "that worker.py hasn't finished with yet (still sitting in "
+                "FITS_INCOMING)",
                 fits_path,
             )
             return
@@ -133,6 +172,18 @@ def enqueue_path(fits_path: str) -> None:
             _arm_flush_timer_locked(delay=0.0)
         else:
             _arm_flush_timer_locked(delay=config.WATCHER_DEBOUNCE_SEC)
+
+
+def _prune_in_flight_locked() -> None:
+    """
+    Drop every `_in_flight_realpaths` entry whose file no longer sits at its
+    original FITS_INCOMING path — i.e. pipeline.py has since archived or
+    rejected it, so there's nothing left to protect against re-submitting.
+    Purely a local stat() sweep, no API call. Caller must hold `_pending_lock`.
+    """
+    global _in_flight_realpaths
+    if _in_flight_realpaths:
+        _in_flight_realpaths = {p for p in _in_flight_realpaths if os.path.exists(p)}
 
 
 def _cancel_flush_timer_locked() -> None:
@@ -168,6 +219,7 @@ def flush_pending_batch() -> None:
 
     with _pending_lock:
         paths = _pending_paths.copy()
+        realpaths = _pending_realpaths.copy()
         _pending_paths.clear()
         _pending_realpaths.clear()
         _flush_timer = None
@@ -190,6 +242,14 @@ def flush_pending_batch() -> None:
             len(paths),
         )
         return
+
+    # Remember these as in-flight until worker.py actually moves them out of
+    # FITS_INCOMING (see `_in_flight_realpaths` above) — otherwise a
+    # duplicate detection of the same still-unprocessed file (e.g. another
+    # on_created event, or process_existing_files() on a future restart
+    # finding them still there) would submit them into a second ANALYZE task.
+    with _pending_lock:
+        _in_flight_realpaths.update(realpaths)
 
     logger.info(
         "Submitted ANALYZE task_id=%s for %d file(s)",
@@ -272,9 +332,21 @@ if __name__ == "__main__":
     if existing_count > 0:
         logger.info("Enqueued %d existing file(s)", existing_count)
 
-    # Now start watching for new files
+    # Now start watching for new files. WATCHER_USE_POLLING_OBSERVER picks
+    # PollingObserver (periodic directory listing/diff) instead of the
+    # platform-native, inotify-based Observer — see config.py's own comment
+    # for why: on Docker Desktop for macOS, FITS_INCOMING is a bind-mounted
+    # host directory, and host-side changes to it don't reliably generate
+    # inotify events inside the Linux container.
     event_handler = FitsEventHandler()
-    observer = Observer()
+    if config.WATCHER_USE_POLLING_OBSERVER:
+        observer = PollingObserver(timeout=config.WATCHER_POLLING_INTERVAL_SEC)
+        logger.info(
+            "Using PollingObserver (WATCHER_USE_POLLING_OBSERVER=true), polling every %.1fs",
+            config.WATCHER_POLLING_INTERVAL_SEC,
+        )
+    else:
+        observer = Observer()
     observer.schedule(event_handler, config.FITS_INCOMING, recursive=True)
     observer.start()
 

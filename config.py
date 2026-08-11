@@ -327,6 +327,29 @@ WATCHER_DEBOUNCE_SEC: float = float(_get("WATCHER_DEBOUNCE_SEC", "5.0"))
 # progress becomes visible sooner than "one giant task sitting at 0% for a
 # long time" would.
 WATCHER_MAX_BATCH_SIZE: int = int(_get("WATCHER_MAX_BATCH_SIZE", "200"))
+# When true, watcher.py watches FITS_INCOMING with watchdog's PollingObserver
+# (periodic directory listing/diff) instead of the platform-native,
+# inotify-based Observer. Needed on Docker Desktop for macOS: FITS_INCOMING is
+# a bind-mounted host directory there (see docker-compose.yml), and host-side
+# changes to a bind mount don't reliably generate inotify events inside the
+# Linux container — this is most visible for a bulk directory copy, where the
+# new subdirectory's recursive watch can lose the race against files already
+# landing inside it, silently dropping their on_created events (real
+# incident, 2026-08-11: a whole subdirectory of FITS files copied into
+# FITS_INCOMING produced zero "New FITS file detected" log lines and no
+# ANALYZE task, even though process_existing_files()'s plain os.walk() at the
+# next watcher restart found every one of them). PollingObserver doesn't
+# depend on the kernel/FUSE layer delivering change notifications at all, so
+# it isn't subject to either failure mode — at the cost of a periodic
+# directory listing instead of instant event delivery. Leave false on the
+# real observatory server (Linux, local disk, no bind-mount translation
+# layer), where the native Observer is more efficient and has no such gap.
+WATCHER_USE_POLLING_OBSERVER: bool = _get("WATCHER_USE_POLLING_OBSERVER", "false").lower() in ("true", "1", "yes")
+# How often PollingObserver re-lists FITS_INCOMING, in seconds. Only used
+# when WATCHER_USE_POLLING_OBSERVER is true. Independent of
+# WATCHER_DEBOUNCE_SEC — this is how fast a new file is *noticed*, the
+# debounce is how long the watcher then waits before submitting it.
+WATCHER_POLLING_INTERVAL_SEC: float = float(_get("WATCHER_POLLING_INTERVAL_SEC", "2.0"))
 
 # ---------------------------------------------------------------------------
 # Task queue worker (worker.py)
