@@ -217,6 +217,50 @@ SUBTRACTION_MIN_FRAMES: int = int(_get("SUBTRACTION_MIN_FRAMES", "3"))
 SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 
 # ---------------------------------------------------------------------------
+# Forced photometry (modules/forced_photometry.py) — reverse matching
+# ---------------------------------------------------------------------------
+# A second, independent pass run AFTER catalog_matcher.py's forward matching:
+# for every Gaia DR3 star (and every MPC/SkyBot object) within this frame's
+# footprint that has no corresponding entry in sources_all, measure the flux
+# at that exact predicted pixel position anyway, instead of silently treating
+# it as "not detected". Recovers objects too faint for the blind SEP
+# extraction's necessarily-high detection threshold (SEP_DETECT_THRESH),
+# and — just as importantly — catalog stars the blind extractor's own star
+# filter (elongation/FWHM/SNR bounds) or WCS residual happened to miss even
+# though they are bright enough to detect. See modules/forced_photometry.py's
+# own docstring for the full rationale ("forced photometry" / "precovery";
+# originally proposed as ROADMAP.md #1 — see git log for that history).
+#
+# Set false to disable this pass entirely (it adds one aperture-photometry
+# measurement per eligible catalog star/MPC object, on top of the already-
+# fetched Gaia/MPC field lists — no new network queries).
+FORCED_PHOTOMETRY_ENABLED: bool = _get("FORCED_PHOTOMETRY_ENABLED", "true").lower() in ("true", "1", "yes")
+# Faintest Gaia DR3 G-band magnitude eligible for forced photometry. Same
+# rationale as MPC_MAG_LIMIT above: forcing a measurement on literally every
+# Gaia star in the field (down to Gaia's own ~21 mag completeness limit)
+# would mean thousands of uninformative noise measurements in a dense field.
+# No universal default fits every telescope/exposure combination — set this
+# a couple of magnitudes above your own setup's typical detection limit for
+# a representative exposure time (see qc.py's snr_median/sky_background on
+# good frames for a sense of where that limit actually sits for your gear).
+# Not applied to MPC/SkyBot objects — _query_mpc() already filters those by
+# MPC_MAG_LIMIT before they ever reach this module.
+FORCED_PHOTOMETRY_MAG_LIMIT: float = float(_get("FORCED_PHOTOMETRY_MAG_LIMIT", "20.0"))
+# Minimum significance (net_flux / flux_err) for a forced-photometry
+# measurement to be reported at all. Below this, the position is treated as
+# a genuine non-detection and silently dropped — NOT reported with a faint
+# "upper limit" magnitude, since the API's source payload (docs/API.md §2)
+# has no field to distinguish a real magnitude from an upper limit; adding
+# one is a separate, cross-repo change (observatory-api's schema), not made
+# here. A lower bar than blind extraction's SEP_DETECT_THRESH (10.0σ by
+# default) is intentional and statistically justified: forced photometry
+# tests exactly one hypothesis (a specific known position) rather than
+# scanning every independent resolution element in the frame for an unknown
+# number of sources, so the "look-elsewhere effect" that forces blind
+# extraction's threshold up doesn't apply here.
+FORCED_PHOTOMETRY_MIN_SNR: float = float(_get("FORCED_PHOTOMETRY_MIN_SNR", "3.0"))
+
+# ---------------------------------------------------------------------------
 # Observatory site coordinates (used for topocentric Horizons queries)
 # ---------------------------------------------------------------------------
 SITE_LAT: float = float(_get("SITE_LAT", "0.0"))   # degrees, positive = North
@@ -350,6 +394,10 @@ _OVERRIDABLE: dict[str, type] = {
     # Image subtraction
     "SUBTRACTION_MIN_FRAMES": int,
     "SUBTRACTION_DETECT_SIGMA": float,
+    # Forced photometry
+    "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
+    "FORCED_PHOTOMETRY_MAG_LIMIT": float,
+    "FORCED_PHOTOMETRY_MIN_SNR": float,
     # Observatory site
     "SITE_LAT": float,
     "SITE_LON": float,

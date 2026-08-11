@@ -176,7 +176,20 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
     """
     Query Gaia DR3 for all stars within fov_deg/2 of the frame centre.
 
-    Returns a list of dicts with keys: ra, dec, source_id, phot_g_mean_mag.
+    Returns a list of dicts with keys: ra, dec, source_id, phot_g_mean_mag,
+    pmra, pmdec, ref_epoch. The last three are proper motion in RA*cos(dec)
+    and Dec (mas/yr) and the epoch (Julian year, J2016.0 for Gaia DR3) those
+    positions/motions are referenced to — needed by
+    modules/forced_photometry.py to propagate a star's position forward to
+    the actual observation epoch before projecting it to a pixel position
+    (a star can move several arcsec between Gaia's DR3 epoch and "now" for
+    high proper-motion objects). `Gaia.cone_search()`'s default column set
+    includes these; pmra/pmdec/ref_epoch fall back to None/None/2016.0 if a
+    row is missing them (e.g. Gaia has no astrometric solution for that
+    source) or the installed astroquery version returns a narrower column
+    set — callers must treat a None pmra/pmdec as "no proper-motion
+    correction available", not as zero motion.
+
     Returns [] on any error so the pipeline can continue with partial results.
     """
     cache_key = f"gaia:{ra_center:.1f}:{dec_center:.1f}:{fov_deg:.1f}"
@@ -193,6 +206,10 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
         job = Gaia.cone_search(coord, radius=radius)
         table = job.get_results()
 
+        has_pmra      = "pmra"      in table.colnames
+        has_pmdec     = "pmdec"     in table.colnames
+        has_ref_epoch = "ref_epoch" in table.colnames
+
         stars: list[dict] = []
         for row in table:
             mag = row["phot_g_mean_mag"]
@@ -206,11 +223,34 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
             except (TypeError, ValueError):
                 continue
 
+            pmra: float | None = None
+            pmdec: float | None = None
+            if has_pmra and has_pmdec:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        pmra_val  = float(row["pmra"])
+                        pmdec_val = float(row["pmdec"])
+                    if math.isfinite(pmra_val) and math.isfinite(pmdec_val):
+                        pmra, pmdec = pmra_val, pmdec_val
+                except (TypeError, ValueError):
+                    pass
+
+            ref_epoch = 2016.0  # Gaia DR3 reference epoch (J2016.0)
+            if has_ref_epoch:
+                try:
+                    ref_epoch = float(row["ref_epoch"])
+                except (TypeError, ValueError):
+                    pass
+
             stars.append({
-                "ra":             float(row["ra"]),
-                "dec":            float(row["dec"]),
-                "source_id":      str(row["source_id"]),
+                "ra":              float(row["ra"]),
+                "dec":             float(row["dec"]),
+                "source_id":       str(row["source_id"]),
                 "phot_g_mean_mag": mag_float,
+                "pmra":            pmra,
+                "pmdec":           pmdec,
+                "ref_epoch":       ref_epoch,
             })
 
         _cache_set(cache_key, stars)
@@ -963,6 +1003,35 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
             ra_center, dec_center, obs_time, exc,
         )
         return []
+
+
+# ---------------------------------------------------------------------------
+# Public accessors for the already-fetched, region-wide catalog lists
+#
+# modules/forced_photometry.py's reverse-matching pass (ROADMAP.md #1) needs
+# the exact same Gaia DR3 / MPC field lists match() above already queried for
+# forward matching — measuring flux at a catalog star's/MPC object's
+# predicted pixel position is only worth doing for a star this frame's
+# footprint actually covers. Rather than threading that data out through
+# match()'s return value (which would change its signature and the shape
+# every existing caller/test relies on), these thin wrappers just call the
+# same private, cached query functions again: for the same (ra_center,
+# dec_center, fov_deg[, obs_time]) key, this is a cache hit against the
+# in-process dict match() itself just populated a moment earlier in the same
+# frame's processing — no new network round trip. A cache miss (e.g. this is
+# called well after match(), or from a context that never called match() at
+# all) simply re-queries the catalog directly, which is still correct, just
+# not free.
+# ---------------------------------------------------------------------------
+
+def get_gaia_stars(ra_center: float, dec_center: float, fov_deg: float) -> list[dict]:
+    """Return the same Gaia DR3 field list match() uses for WCS-offset correction / matching."""
+    return _query_gaia(ra_center, dec_center, fov_deg)
+
+
+def get_mpc_objects(ra_center: float, dec_center: float, obs_time: str, fov_deg: float = 1.0) -> list[dict]:
+    """Return the same MPC/SkyBot field list match() uses for moving-object matching."""
+    return _query_mpc(ra_center, dec_center, obs_time, fov_deg)
 
 
 def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
