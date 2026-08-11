@@ -590,9 +590,14 @@ entry at all, at any position).
    itself) falls back to reading whatever WCS the file's own header has.
 7. Returns `{"performed": bool, "reference_frame_count": int, "candidates": [...]}`. Every
    candidate is tagged `_from_subtraction=True` so `anomaly_detector.py` can apply looser
-   coverage rules to it (see below), and `near_edge` (same `EDGE_MARGIN_FRAC` geometry as
-   `modules/astrometry.py`'s section above — computed in step 5 from the candidate's own diff-image
-   pixel position before step 6 converts it to sky coordinates and drops the pixel `x`/`y` keys).
+   coverage rules to it (see below). Candidates whose pixel position falls within the
+   `EDGE_MARGIN_FRAC` zone are **rejected outright** (not returned in `candidates` at all) —
+   coma and other off-axis aberrations change the PSF shape between frames (rotation, guiding,
+   focus shift), so the median reference stack never perfectly cancels an edge star's coma wing;
+   the resulting residual is picked up by `sep` as a spurious "new source". Real incident,
+   2026-08-10 analysis: 53 of 80 `UNKNOWN` alerts were `from_subtraction + near_edge` — every
+   one a coma residual of an ordinary catalogued star. Candidates surviving this filter still
+   carry `near_edge=False` (by construction — the only ones left are interior).
 
 Gracefully skipped (`performed=False`) when fewer than `SUBTRACTION_MIN_FRAMES` archived frames
 exist yet — e.g. the very first observations of a new target.
@@ -641,17 +646,21 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | Situation | Classification |
 |---|---|
 | Unmatched (`catalog_name is None`) and `saturated=True` | Suppressed — `return None`, no anomaly record at all (bright-star/subtraction artifact, not a real transient; see docs/ISSUES.md #1, #2) |
+| Unmatched (`catalog_name is None`) and `near_edge=True` | Suppressed — `return None` (coma shifts the measured centroid away from the star's true catalog position, making catalog matching miss it; these are overwhelmingly ordinary stars with optical distortion, not real transients — real incident, 2026-08-10: 27 of 80 UNKNOWN alerts were non-subtraction near_edge sources) |
 | No historical coverage | `FIRST_OBSERVATION` — not an anomaly, just note |
-| No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) | `UNKNOWN` → **ALERT** (subtraction already confirms it's absent from the reference stack, so missing API coverage doesn't downgrade it) |
+| No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction already filters edge candidates at extraction time) |
+| No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=False` | `UNKNOWN` → **ALERT** (subtraction already confirms it's absent from the reference stack, so missing API coverage doesn't downgrade it) |
 | Area covered, source not in history at all, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (new point source, no baseline to compare against) |
 | Area covered, source not in history, found in catalog (not a galaxy) | `KNOWN_CATALOG_NEW` — was below detection threshold |
-| Area covered, source not in history, not in any catalog | `UNKNOWN` → **ALERT** |
+| Area covered, source not in history, not in any catalog, `near_edge=True` | Suppressed — `return None` (same coma-shifted-centroid rationale as above) |
+| Area covered, source not in history, not in any catalog, `near_edge=False` | `UNKNOWN` → **ALERT** |
 | Source **has** prior history, brightened by more than `DELTA_MAG_ALERT`, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (already-known host got brighter) |
 | Source in history, Δmag > DELTA_MAG_ALERT, known binary (Simbad) | `BINARY_STAR` |
 | Source in history, Δmag > DELTA_MAG_ALERT, known variable (Simbad) | `VARIABLE_STAR` |
 | Source present but shifted > MATCH_CONE_ARCSEC, matches MPC | `ASTEROID` or `COMET` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC` of this position, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default), or > `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) when `near_edge=True` | `SPACE_DEBRIS` → **ALERT** (elongation alone is treated as sufficient trail evidence — no "vacated old position" proof required, see below) |
-| Source present but shifted, not in MPC, elongation ≤ 3.0 | `MOVING_UNKNOWN` → **ALERT** |
+| Source present but shifted, not in MPC, `near_edge=True` | Suppressed — `return None` (coma shifts centroid between frames, creating false "position shifted" evidence) |
+| Source present but shifted, not in MPC, `near_edge=False`, elongation ≤ 3.0 | `MOVING_UNKNOWN` → **ALERT** |
 
 "Shifted" (for the unmatched `MOVING_UNKNOWN` branch specifically — MPC matches don't need this
 check, and as of the fix below neither does `SPACE_DEBRIS`) requires **both**: no historical
