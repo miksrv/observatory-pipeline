@@ -196,6 +196,32 @@ Orchestrates processing of a single FITS file in order:
      detection is preferred over a subtraction candidate; among two of the same kind, the
      brighter one (higher flux) is kept.
 9. `photometry.measure(fits_path, sources)` → returns calibrated magnitudes
+9.5. `forced_photometry.run(fits_path, sources, gaia_stars, mpc_objects, wcs=astro_result["wcs"],
+     zero_point=..., obs_time=...)` → a second, independent detection path (**"forced
+     photometry" / "precovery"**, see git log for this feature's design history):
+     for every Gaia DR3 star and MPC/SkyBot object within this frame's footprint that has
+     no corresponding entry in `sources` (i.e. blind detection + step 8's forward matching
+     never caught it — either too faint for `SEP_DETECT_THRESH`, or bright enough but
+     rejected by the star filter/WCS residual/streak masking), measures the flux at that
+     exact predicted pixel position anyway instead of silently treating it as "not
+     detected". `gaia_stars`/`mpc_objects` are **not** re-queried — they're
+     `catalog_matcher.get_gaia_stars()`/`get_mpc_objects()`, thin wrappers that hit the
+     same in-process/on-disk cache step 8's `match()` call just populated for this same
+     field, so this step costs zero extra network round-trips. Results are appended to
+     `sources` in the same shape as an ordinary catalog-matched source (so they flow
+     through steps 10–15 unchanged) and merged in **after** step 10 tags every other
+     source with `mag`/`_filter`, tagging its own new entries the same way rather than
+     running that pass twice. A measurement whose significance falls below
+     `FORCED_PHOTOMETRY_MIN_SNR` is a genuine non-detection and is dropped outright — it is
+     **not** reported as an "upper limit" magnitude, since the wire schema
+     (`POST /frames/{id}/sources`, docs/API.md §2) has no field to distinguish a real
+     magnitude from one; adding that is a separate, cross-repo change to observatory-api's
+     schema, not made here. Scoped to Gaia DR3 + MPC only for now (2MASS/Pan-STARRS are a
+     possible future extension); gated by `FORCED_PHOTOMETRY_ENABLED`, `FORCED_PHOTOMETRY_MAG_LIMIT`
+     caps how faint a Gaia star is worth forcing (MPC objects are already pre-filtered by
+     `MPC_MAG_LIMIT` upstream in step 8, so no separate cutoff applies to them here).
+     Best-effort — any failure here is logged and swallowed; `sources` simply keeps
+     whatever step 9 already gave it. See `modules/forced_photometry.py`'s section below.
 10. Populate each source's unified `mag` field: `mag_calibrated` if `calibrated`, else
     `None` — **never** a fallback to the raw `mag_instrumental`, which has no absolute
     zero-point and is not a real magnitude on its own (see docs/ISSUES.md #2, where an
@@ -630,6 +656,80 @@ Each matched source is enriched **in-place** with `catalog_name`, `catalog_id`, 
 no separate `source_ra`/`source_dec` fields.
 `catalog_mag` is G-band for Gaia, J-band for 2MASS, r-band for Pan-STARRS, `None` for Simbad/MPC.
 Unmatched sources get `catalog_name = None`.
+
+### `modules/forced_photometry.py`
+
+**Forced photometry / reverse matching** (a.k.a. **precovery** for solar-system objects) —
+implements a feature proposed as ROADMAP.md #1 (see git log for the design history). Where `catalog_matcher.py` above asks "what catalog object does this
+detected source match?", this module asks the reverse question: "for every Gaia DR3 star / MPC
+object in this frame's footprint, is there a detected source at its predicted position — and if
+not, what's actually there anyway?" The single public entry point is
+`await forced_photometry.run(fits_path, sources, gaia_stars, mpc_objects, wcs, naxis1, naxis2,
+zero_point, zero_point_err, obs_time, psf_fwhm_arcsec=...) -> list[dict]`, called from
+`pipeline.py`'s step 9.5, right after photometry's own zero-point calibration.
+
+This closes two gaps forward matching alone leaves open:
+- A star/object genuinely too faint for the blind SEP extraction's necessarily-high detection
+  threshold (`SEP_DETECT_THRESH`, ~10σ by default) to have found at all. Forced photometry tests
+  exactly one hypothesis (a specific known position) rather than scanning every independent
+  resolution element in the frame for an unknown number of sources, so a much lower significance
+  (`FORCED_PHOTOMETRY_MIN_SNR`, default 3.0) is statistically justified here — the same
+  "look-elsewhere effect" argument behind why blind extraction's own threshold has to stay high.
+- A star bright enough to detect that blind extraction's own star filter
+  (elongation/FWHM/SNR bounds), a WCS residual, or streak masking happened to miss anyway — this
+  pass recovers those "for free" since it never depends on `sep` having found the source in the
+  first place; it only needs the catalog position and the frame's own WCS.
+
+No new network queries: `gaia_stars`/`mpc_objects` are **not** re-fetched here — they're
+`catalog_matcher.get_gaia_stars()`/`get_mpc_objects()`, thin public wrappers around that module's
+own private, cached `_query_gaia()`/`_query_mpc()` (added specifically for this module to reuse,
+without changing `match()`'s own return contract) — calling them right after `catalog_matcher.match()`
+for the same field is a cache hit, so this pass costs zero extra Gaia/SkyBot round-trips. For each
+eligible catalog entry not already present in `sources` (matched by `catalog_id`, built into a
+lookup set before any pixel work starts):
+- **Gaia DR3**: proper-motion-corrects the star's catalog position from its Gaia `ref_epoch`
+  (`pmra`/`pmdec`, added to `_query_gaia()`'s output specifically for this) to the frame's actual
+  `obs_time` before projecting to a pixel — a high-proper-motion star can have moved several
+  arcsec since Gaia's own reference epoch. Falls back to the uncorrected position when a star has
+  no astrometric proper-motion solution. Only stars within `FORCED_PHOTOMETRY_MAG_LIMIT` (a
+  site-specific depth cutoff, same convention as `MPC_MAG_LIMIT`) are attempted — forcing every
+  Gaia star down to its own ~21 mag completeness limit in a dense field would mean thousands of
+  uninformative noise measurements.
+- **MPC/SkyBot**: no proper-motion correction needed — `_query_mpc()` already returns each
+  object's position computed at the exact observation epoch. No separate depth cutoff either:
+  `_query_mpc()` already filters by `MPC_MAG_LIMIT` before these objects ever reach this module.
+
+Aperture photometry at the predicted pixel reuses the same aperture/annulus-sizing and net-flux/
+flux-error formulas as `modules/photometry.py` — duplicated by hand rather than imported, the same
+convention `modules/qc.py`/`modules/subtraction.py` already use for `astrometry.py`'s streak-mask
+helper. A position is rejected outright (not reported at all) when its aperture would fall outside
+the frame, or any pixel under it is at/above `SATURATION_ADU` — a forced measurement on a saturated
+core is exactly as physically meaningless as it is for a blindly-detected source (see
+`modules/photometry.py`'s section above). **A genuine non-detection (significance below
+`FORCED_PHOTOMETRY_MIN_SNR`) is silently dropped, never reported as an "upper limit" magnitude** —
+the wire schema (`POST /frames/{id}/sources`, docs/API.md §2) has no field to distinguish a real
+magnitude from an upper limit, and adding one is a separate, cross-repo change to
+observatory-api's schema, not made here.
+
+Every recovered position comes back shaped exactly like an ordinary catalog-matched, photometered
+source (`ra`, `dec`, `flux`, `catalog_name`/`catalog_id`/`catalog_mag`/`object_type`,
+`flux_aperture`/`flux_err`/`mag_instrumental`/`mag_calibrated`/`mag_err`/`calibrated`, `zero_point`,
+`near_edge`, `saturated=False`) plus an internal `_forced_photometry=True` marker — leading
+underscore, so `api_client`'s `_to_wire_source()` strips it before the wire the same way it strips
+`_from_subtraction`/`_source_id`; this flag is **not yet persisted** on the wire in this first pass
+(a source recovered this way is currently indistinguishable, after the fact, from a blindly
+detected one — see "Open considerations" in this feature's original ROADMAP.md proposal (see git log) for why this was deferred
+rather than adding a new observatory-api column up front). Because these results already carry
+`catalog_name`/`object_type`, they flow into `anomaly_detector.py`'s existing classification paths
+unchanged — a recovered MPC object becomes an ordinary `ASTEROID`/`COMET` anomaly with ephemeris,
+and a recovered Gaia star's magnitude joins the same historical Δmag comparisons any blindly
+detected star's would, with no code changes needed in that module.
+
+Scoped to Gaia DR3 + MPC/SkyBot only for now — 2MASS/Pan-STARRS forced photometry is a possible
+future extension, not implemented. Gated end-to-end by `FORCED_PHOTOMETRY_ENABLED`. Best-effort
+throughout: any failure (FITS I/O, WCS projection, missing catalog data) is logged and returns
+`[]`, never raising — `pipeline.py`'s step 9.5 treats that identically to "nothing to recover" and
+continues with whatever `sources` already had.
 
 ### `modules/anomaly_detector.py`
 Core logic. For all detected sources in a frame **at once** (batched, not one API round-trip per source):

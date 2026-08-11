@@ -234,6 +234,9 @@ Catalogs, queried in order:
 4. **Pan-STARRS DR1** — fallback for faint optical sources below Gaia's completeness limit (δ > −30° only); r-band magnitude
 5. **MPC** — all known asteroids and comets with orbital elements, at the observation epoch
 
+### `modules/forced_photometry.py`
+**Forced photometry / reverse matching** (precovery) — the reverse of `catalog_matcher.py` above: for every Gaia DR3 star / MPC object in the frame's footprint with no corresponding entry in `sources`, measures the flux at its predicted pixel position anyway, instead of treating it as "not detected". Recovers objects too faint for blind detection's threshold, and bright catalog stars the blind extractor's own filters happened to miss. Reuses the Gaia/MPC field lists `catalog_matcher.py` already fetched (no new network calls) and photometry.py's aperture-photometry math against the frame's already-computed zero-point. A genuine non-detection is dropped, not reported as an "upper limit". Gated by `FORCED_PHOTOMETRY_ENABLED`.
+
 ### `modules/anomaly_detector.py`
 Core science logic. Queries the API in a single batched call per frame (`POST /sources/near/batch`, `POST /frames/covering/batch`) for historical observations near every source at once, then classifies:
 
@@ -440,6 +443,11 @@ DELTA_MAG_ALERT=0.5
 SUBTRACTION_MIN_FRAMES=3
 SUBTRACTION_DETECT_SIGMA=5.0
 
+# ── Forced photometry / reverse matching (modules/forced_photometry.py) ───────
+FORCED_PHOTOMETRY_ENABLED=true
+FORCED_PHOTOMETRY_MAG_LIMIT=20.0
+FORCED_PHOTOMETRY_MIN_SNR=3.0
+
 # ── Finder charts (modules/finder_chart.py) ────────────────────────────────────
 CHART_ENABLED=true
 CHART_STAMP_SIZE_ARCSEC=60.0
@@ -457,7 +465,9 @@ LOG_LEVEL=INFO                 # DEBUG, INFO, WARNING, or ERROR
 > `.env.example` is kept in sync with `config.py`'s real defaults: `MOVING_CONE_ARCSEC=120.0`
 > (widened because fast movers like Vesta travel ~60"/hr and 30" was too tight to reliably catch
 > cross-frame shifts), `SUBTRACTION_MIN_FRAMES=3`, `SUBTRACTION_DETECT_SIGMA=5.0`,
-> `CHART_ENABLED=true`, `CHART_STAMP_SIZE_ARCSEC=60.0`, `CHART_MAX_EPOCHS=12`.
+> `FORCED_PHOTOMETRY_ENABLED=true`, `FORCED_PHOTOMETRY_MAG_LIMIT=20.0`,
+> `FORCED_PHOTOMETRY_MIN_SNR=3.0`, `CHART_ENABLED=true`, `CHART_STAMP_SIZE_ARCSEC=60.0`,
+> `CHART_MAX_EPOCHS=12`.
 
 #### Configuration Reference
 
@@ -511,6 +521,10 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Image Subtraction** |
 | `SUBTRACTION_MIN_FRAMES` | `3` | No | Minimum number of archived reference frames of the same object required before `modules/subtraction.py` will attempt image subtraction. |
 | `SUBTRACTION_DETECT_SIGMA` | `5.0` | No | Detection threshold on the difference image, in multiples of background RMS. |
+| **Forced Photometry / Reverse Matching** |
+| `FORCED_PHOTOMETRY_ENABLED` | `true` | No | Enable/disable the forced-photometry pass (`modules/forced_photometry.py`) entirely. |
+| `FORCED_PHOTOMETRY_MAG_LIMIT` | `20.0` | No | Faintest Gaia DR3 G-band magnitude eligible for forced photometry — tune to a couple of magnitudes above your own setup's typical detection limit. Not applied to MPC objects (already filtered by `MPC_MAG_LIMIT`). |
+| `FORCED_PHOTOMETRY_MIN_SNR` | `3.0` | No | Minimum significance (net_flux / flux_err) for a forced measurement to be reported; below this it's a genuine non-detection and is dropped. |
 | **Finder Charts** |
 | `CHART_ENABLED` | `true` | No | Enable/disable per-source finder-chart generation (`modules/finder_chart.py`). |
 | `CHART_STAMP_SIZE_ARCSEC` | `60.0` | No | Half-width of the per-epoch crop for the `stamp_strip` style (stationary anomalies), in arcseconds. |
