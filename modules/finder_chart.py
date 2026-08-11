@@ -39,21 +39,18 @@ before:
                     object, not this source's own history.
   - "track"       — ASTEROID / COMET / MOVING_UNKNOWN / SPACE_DEBRIS, 2+
                     epochs. One background image (the most recent epoch's
-                    own frame) with a small marker at every epoch's true
-                    position, connected by a faint line in chronological
-                    order. Every epoch's (ra, dec) is converted into the
-                    *background* epoch's WCS pixel grid via
-                    WCS.world_to_pixel() — no pixel-level alignment between
-                    frames is needed, only a per-epoch coordinate transform,
-                    since all that matters is where each epoch's position
-                    falls on the one displayed image. Each marker's epoch
-                    number sits at the end of a short leader line, spread
-                    evenly around the point cluster's centroid rather than
-                    stacked directly on the marker — epochs are frequently
-                    only a few pixels apart (e.g. a slow-moving asteroid on
-                    a wide-field frame), and a label placed right on top of
-                    the point would both obscure it and collide with its
-                    neighbours' labels.
+                    own frame) with a colored filled marker at every epoch's
+                    true position, using a color gradient from cool (oldest)
+                    to warm (newest) so time progression is visible at a
+                    glance. Markers are connected by a gradient-colored
+                    track line with a direction arrowhead on the last
+                    segment. Each marker carries a compact date+time label
+                    (and magnitude when available) placed at the end of a
+                    thin leader line, spread evenly around the point
+                    cluster's centroid to avoid collision. Every epoch's
+                    (ra, dec) is converted into the *background* epoch's
+                    WCS pixel grid via WCS.world_to_pixel() — no
+                    pixel-level alignment between frames is needed.
   - "stamp_strip" — everything else (SUPERNOVA_CANDIDATE, UNKNOWN,
                     VARIABLE_STAR, BINARY_STAR, KNOWN_CATALOG_NEW,
                     FIRST_OBSERVATION), 2+ epochs. One small crop per epoch,
@@ -63,15 +60,16 @@ before:
                     source that isn't expected to move.
 
 Every epoch's own (RA, Dec) is captioned on its "stamp_strip" panel, and
-listed in a small legend under the "track" image (keyed by the same number
-as its marker) — added 2026-08-06 because neither style otherwise told a
-viewer exactly which sky position each mark/crop was at. The "track" legend
-additionally shows each epoch's angular separation from the PREVIOUS epoch
-(arcsec/arcmin/degrees, whichever keeps the number readable — see
-_format_angular_shift()), added 2026-08-07: RA/Dec alone forced a viewer to
-eyeball two coordinates themselves to judge how fast the object was actually
-moving, which matters for telling a genuine mover from mere centroid/seeing
-jitter at a glance.
+listed in a small legend under the "track" image — added 2026-08-06 because
+neither style otherwise told a viewer exactly which sky position each
+mark/crop was at. The "track" legend additionally shows each epoch's angular
+separation, time gap, and angular velocity (arcsec/hr) from the PREVIOUS
+epoch — the single most useful number for judging whether a mover is an
+asteroid (~tens ″/hr), a fast NEO, or mere centroid jitter (<1 ″/hr) at a
+glance. The "track" style uses a color gradient (plasma colormap) from cool
+(oldest) to warm (newest) for both markers and track-line segments, with a
+direction arrowhead on the final segment, so time progression and motion
+direction are immediately visible without reading any text.
 
 If the source is catalog-matched (e.g. an MPC-identified asteroid, or a
 Simbad-known variable/binary star), the chart's title also carries that
@@ -260,45 +258,130 @@ def _fig_to_png_bytes(fig) -> bytes:
 # Track chart (moving objects)
 # ---------------------------------------------------------------------------
 
-def _label_positions(xs: list[float], ys: list[float], clearance_px: float) -> list[tuple[float, float]]:
+def _label_positions(
+    xs: list[float], ys: list[float], clearance_px: float,
+    img_w: float = 0.0, img_h: float = 0.0,
+    label_h_px: float = 12.0,
+) -> list[tuple[float, float]]:
     """
-    Anchor point for each epoch's number label: spread evenly around the
-    point cluster's centroid, at a radius clear of every marker in the
-    cluster — not just its centroid — so labels don't collide with each
-    other even when epochs sit only a few pixels apart (the common case for
-    a slow-moving object on a wide-field background frame). Angular order
-    around the centroid is preserved when assigning label angles, so leader
-    lines fan out without crossing one another.
+    Place each label close to its own marker with a short offset, then
+    nudge any overlapping labels apart so they don't collide. Labels stay
+    near their markers rather than being pushed to the image edges.
+
+    Each label starts at (x + clearance_px, y + clearance_px) — slightly
+    above-right of its dot. Then a simple iterative pass pushes any pair
+    that's vertically too close apart by the minimum needed distance,
+    keeping leader lines short.
     """
     n = len(xs)
-    cx, cy = float(np.mean(xs)), float(np.mean(ys))
-    cluster_radius = max((float(np.hypot(x - cx, y - cy)) for x, y in zip(xs, ys)), default=0.0)
-    label_radius = cluster_radius + clearance_px
+    if n == 0:
+        return []
 
-    order = sorted(range(n), key=lambda i: float(np.arctan2(ys[i] - cy, xs[i] - cx)))
-    angle_by_index = {idx: 2 * np.pi * rank / n for rank, idx in enumerate(order)}
+    min_gap = label_h_px * 1.1  # minimum vertical gap between label centres
 
+    # Initial placement: each label slightly above-right of its own dot.
+    positions = [(x + clearance_px, y + clearance_px) for x, y in zip(xs, ys)]
+
+    # Sort indices by y-position so we can resolve overlaps bottom-to-top
+    # (matplotlib "lower" origin: higher y = higher on screen).
+    order = sorted(range(n), key=lambda i: positions[i][1])
+
+    # Push overlapping labels apart (3 passes is enough for typical counts).
+    pos_list = list(positions)
+    for _ in range(5):
+        changed = False
+        for k in range(1, n):
+            i_below = order[k - 1]
+            i_above = order[k]
+            dy = pos_list[i_above][1] - pos_list[i_below][1]
+            if dy < min_gap:
+                shift = (min_gap - dy) / 2.0 + 0.5
+                pos_list[i_below] = (pos_list[i_below][0], pos_list[i_below][1] - shift)
+                pos_list[i_above] = (pos_list[i_above][0], pos_list[i_above][1] + shift)
+                changed = True
+        if not changed:
+            break
+        order = sorted(range(n), key=lambda i: pos_list[i][1])
+
+    return pos_list
+
+
+def _format_short_time(obs_time: str) -> str:
+    """
+    Extract a full date-time label from an ISO-ish obs_time string.
+
+    E.g. "2024-05-28T19:06:10" → "28/05/2024 19:06",
+         "2024-05-28 19:06:10" → "28/05/2024 19:06".
+    Falls back to the first 16 characters if parsing fails.
+    """
+    if not obs_time:
+        return ""
+    # Handle both "T" and " " separator between date and time, strip trailing Z
+    clean = obs_time.replace("T", " ").rstrip("Z").strip()
+    parts = clean.split(" ")
+    if len(parts) >= 2:
+        date_part = parts[0]   # "2024-05-28"
+        time_part = parts[1]   # "19:06:10"
+        date_tokens = date_part.split("-")
+        time_tokens = time_part.split(":")
+        if len(date_tokens) == 3 and len(time_tokens) >= 2:
+            # DD/MM/YYYY HH:MM
+            return f"{date_tokens[2]}/{date_tokens[1]}/{date_tokens[0]} {time_tokens[0]}:{time_tokens[1]}"
+    return obs_time[:16]
+
+
+def _parse_delta_hours(obs_time1: str, obs_time2: str) -> Optional[float]:
+    """
+    Time difference in hours between two ISO-ish obs_time strings.
+    Returns None if either string can't be parsed.
+    """
+    from datetime import datetime
+    fmts = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%SZ"]
+    def _parse(s: str) -> Optional[datetime]:
+        for fmt in fmts:
+            try:
+                return datetime.strptime(s.strip(), fmt)
+            except (ValueError, TypeError):
+                continue
+        return None
+    t1, t2 = _parse(obs_time1), _parse(obs_time2)
+    if t1 is None or t2 is None:
+        return None
+    return abs((t2 - t1).total_seconds()) / 3600.0
+
+
+def _epoch_colors(n: int) -> list[str]:
+    """
+    Return a list of n hex color strings forming a gradient from cool
+    (oldest epoch) to warm (newest epoch). Uses a blue→cyan→yellow→red
+    progression so early/late epochs are visually distinct at a glance.
+    """
+    if n <= 1:
+        return ["#ff5050"]
+    cmap = matplotlib.colormaps["plasma"]
     return [
-        (cx + label_radius * np.cos(angle_by_index[i]), cy + label_radius * np.sin(angle_by_index[i]))
-        for i in range(n)
+        "#{:02x}{:02x}{:02x}".format(
+            int(c[0] * 255), int(c[1] * 255), int(c[2] * 255),
+        )
+        for c in (cmap(i / (n - 1)) for i in range(n))
     ]
 
 
 def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) -> bytes:
     """
     A crop around the epoch cluster (the most recent epoch's own frame,
-    zoomed to where the epochs actually are — see below) with a small marker
-    at every epoch's true position, converted into the background frame's own
-    WCS, connected by a faint line in chronological order. Each marker's
-    number is placed at the far end of a short leader line rather than on
-    top of the marker itself — see _label_positions().
-
-    Numbered markers on the image stay bare (adding each epoch's own RA/Dec
-    text there would collide for a slow mover whose epochs sit only a few
-    pixels apart — see debug/README.md). Instead every epoch's coordinates,
-    plus its angular separation from the previous epoch (arcsec/arcmin/
-    degrees — see _format_angular_shift()), are listed in a small monospace
-    legend under the image, keyed by the same number as its marker.
+    zoomed to where the epochs actually are) with a colored marker at every
+    epoch's true position, converted into the background frame's own WCS,
+    connected by a track line with a direction arrowhead. Each marker
+    carries a small numbered badge (1, 2, 3…) placed close to its dot with
+    a minimal leader line; overlapping badges are nudged apart just enough
+    to stay readable. Markers use a color gradient from cool (oldest) to
+    warm (newest) so time progression is visible at a glance. The detailed
+    legend below the image shows full date, coordinates, magnitude, angular
+    separation, time gap, and angular velocity — keyed by the same colored
+    frame number as the badge on the chart.
 
     `label`, if given (e.g. "ASTEROID (4 Vesta)" — the anomaly_type plus its
     resolved catalog designation, see update_charts_for_sources()), is shown
@@ -306,9 +389,6 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
     """
     background = loaded_epochs[-1]
     wcs = background["wcs"]
-    # Smaller and fixed-ish vs. the old 8"-derived radius: this only needs to
-    # mark a point, not represent an angular tolerance, so it should stay
-    # small enough to not itself obscure a nearby star.
     marker_radius_px = max(3.0, 4.0 / _arcsec_per_pixel(wcs))
 
     xs: list[float] = []
@@ -318,15 +398,8 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
         xs.append(float(x))
         ys.append(float(y))
 
-    # Crop to the epoch cluster instead of showing the whole (often
-    # thousands-of-pixels-wide) frame: a slow mover's few dozen pixels of
-    # drift between epochs is otherwise invisible once the full frame is
-    # scaled down to fit the figure — the markers end up on top of each
-    # other with no visible motion. Half-size is whichever is bigger: a
-    # generous fixed context window (3x the stamp_strip crop size), or the
-    # cluster's own footprint plus margin, so a genuinely wide multi-epoch
-    # trail across most of the frame still renders in full rather than
-    # getting clipped.
+    # Crop to the epoch cluster (same logic as before — see the detailed
+    # comment in the previous revision of this function).
     cluster_cx, cluster_cy = float(np.mean(xs)), float(np.mean(ys))
     cluster_half_span = max(
         (max(abs(x - cluster_cx), abs(y - cluster_cy)) for x, y in zip(xs, ys)), default=0.0,
@@ -342,46 +415,102 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
     xs = [x - x0 for x in xs]
     ys = [y - y0 for y in ys]
 
-    label_positions = _label_positions(xs, ys, clearance_px=6.0 * marker_radius_px)
+    n = len(loaded_epochs)
+    colors = _epoch_colors(n)
 
-    # Reserve extra height for the coordinate legend below the image —
-    # scales with epoch count so it doesn't get cramped for a long history.
-    fig_height = 6.0 + 0.16 * len(loaded_epochs)
+    # Labels placed near their markers, nudged apart to avoid overlap.
+    label_positions = _label_positions(
+        xs, ys, clearance_px=max(6.0, marker_radius_px + 4.0),
+    )
+
+    # Reserve extra height for the coordinate legend below the image.
+    fig_height = 6.0 + 0.18 * n
     fig, ax = plt.subplots(figsize=(6, fig_height), dpi=120)
     ax.imshow(image, cmap="gray", origin="lower")
-    ax.plot(xs, ys, "-", color="#ff5050", linewidth=1.0, alpha=0.6, zorder=2)
-    for i, ((x, y), (lx, ly)) in enumerate(zip(zip(xs, ys), label_positions), start=1):
-        ax.add_patch(plt.Circle((x, y), radius=marker_radius_px,
-                                 edgecolor="#ff5050", facecolor="none", linewidth=1.3, zorder=3))
+
+    # Track line: draw per-segment with gradient color so older segments are
+    # cooler and newer ones warmer — matches the markers' own gradient.
+    for i in range(1, n):
+        ax.plot([xs[i - 1], xs[i]], [ys[i - 1], ys[i]], "-",
+                color=colors[i], linewidth=1.2, alpha=0.6, zorder=2)
+
+    # Direction arrowhead on the last segment — immediately shows which way
+    # the object is moving without reading any label.
+    if n >= 2:
+        ax.annotate(
+            "", xy=(xs[-1], ys[-1]), xytext=(xs[-2], ys[-2]),
+            arrowprops=dict(arrowstyle="-|>", color=colors[-1],
+                            lw=1.5, mutation_scale=12),
+            zorder=2,
+        )
+
+    # Colored markers + compact number labels near each dot.
+    for i, ((x, y), (lx, ly), ep, color) in enumerate(
+        zip(zip(xs, ys), label_positions, loaded_epochs, colors),
+        start=1,
+    ):
+        # Filled dot — color encodes chronological position.
+        ax.plot(x, y, "o", color=color, markeredgecolor="white",
+                markeredgewidth=0.5, markersize=6, zorder=5)
+
+        # Label: just the frame number — date/mag details are in the legend.
         ax.annotate(
             str(i), xy=(x, y), xytext=(lx, ly),
-            color="#ff5050", fontsize=9, fontweight="bold", ha="center", va="center", zorder=4,
-            arrowprops=dict(arrowstyle="-", color="#ff5050", linewidth=1.0, alpha=0.9,
-                             shrinkA=2.0, shrinkB=marker_radius_px + 2.0),
+            fontsize=6, fontweight="bold", color="white",
+            ha="center", va="center", zorder=6,
+            bbox=dict(boxstyle="round,pad=0.12", fc=color, ec="none", alpha=0.85),
+            arrowprops=dict(arrowstyle="-", color=color, linewidth=0.6,
+                            alpha=0.6, shrinkA=0.5, shrinkB=marker_radius_px + 0.5),
         )
-    ax.set_title(f"{len(loaded_epochs)} epoch(s) — background: {background.get('obs_time', '')}", fontsize=9)
+
+    ax.set_title(
+        f"{n} epoch(s) — background: {background.get('obs_time', '')}",
+        fontsize=9,
+    )
     ax.set_xticks([])
     ax.set_yticks([])
 
-    # Δ from the previous epoch (arcsec/arcmin/degrees — see
-    # _format_angular_shift()) tells a viewer at a glance how fast the object
-    # is actually moving, instead of leaving them to eyeball two RA/Dec
-    # values themselves. loaded_epochs is chronologically ordered (see
-    # _render_chart_for_source()), so "previous" here means "previous in
-    # time", not "previous marker number" — the two coincide since epochs are
-    # never reordered. The first epoch has nothing to compare against.
-    legend_lines = []
+    # Detailed legend below the image: each epoch's number is colored to
+    # match the marker on the chart. Full date, coordinates, and movement
+    # details are here since on-chart labels show only the frame number.
+    legend_lines: list[tuple[str, str, str]] = []  # (number_prefix, rest_of_line, color)
     for i, ep in enumerate(loaded_epochs, start=1):
-        line = f"{i}: RA {ep['ra']:.4f}°  Dec {ep['dec']:.4f}°  {ep.get('obs_time', '')}"
+        prefix = f"({i})"
+        full_time = _format_short_time(ep.get("obs_time", ""))
+        rest = f" {full_time}  RA {ep['ra']:.4f}°  Dec {ep['dec']:.4f}°"
+        if ep.get("mag") is not None:
+            rest += f"  {ep['mag']:.1f}m"
         if i > 1:
             prev = loaded_epochs[i - 2]
             sep_arcsec = _angular_separation_arcsec(prev["ra"], prev["dec"], ep["ra"], ep["dec"])
-            line += f"  (moved {_format_angular_shift(sep_arcsec)} from epoch {i - 1})"
-        legend_lines.append(line)
-    legend = "\n".join(legend_lines)
-    fig.text(0.02, 0.01, legend, fontsize=6.5, family="monospace", ha="left", va="bottom")
+            delta_h = _parse_delta_hours(prev.get("obs_time", ""), ep.get("obs_time", ""))
+            shift_str = _format_angular_shift(sep_arcsec)
+            if delta_h and delta_h > 0:
+                velocity = sep_arcsec / delta_h
+                # Format Δt readably
+                if delta_h < 1.0:
+                    dt_str = f"{delta_h * 60:.0f}min"
+                elif delta_h < 24.0:
+                    dt_str = f"{delta_h:.1f}hr"
+                else:
+                    dt_str = f"{delta_h / 24:.1f}d"
+                rest += f"  Δ{shift_str} in {dt_str} ({velocity:.1f}″/hr)"
+            else:
+                rest += f"  Δ{shift_str}"
+        legend_lines.append((prefix, rest, colors[i - 1]))
 
-    legend_frac = 0.03 + 0.016 * len(loaded_epochs)
+    # Render legend lines bottom-up so the first epoch is at the top.
+    line_height_frac = 0.014
+    for idx, (prefix, rest, color) in enumerate(reversed(legend_lines)):
+        y_pos = 0.01 + idx * line_height_frac
+        # Colored number prefix
+        fig.text(0.02, y_pos, prefix, fontsize=6.5, family="monospace",
+                 ha="left", va="bottom", color=color, fontweight="bold")
+        # Rest of line in default color
+        fig.text(0.02 + 0.035, y_pos, rest, fontsize=6.5, family="monospace",
+                 ha="left", va="bottom", color="#222222")
+
+    legend_frac = 0.03 + 0.016 * n
     top_frac = 0.90 if label else 0.96
     fig.subplots_adjust(left=0.02, right=0.98, bottom=legend_frac, top=top_frac)
     if label:
