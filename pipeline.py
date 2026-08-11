@@ -108,6 +108,11 @@ except ImportError:
     subtraction = None  # type: ignore[assignment]
 
 try:
+    from modules import forced_photometry
+except ImportError:
+    forced_photometry = None  # type: ignore[assignment]
+
+try:
     from modules import finder_chart
 except ImportError:
     finder_chart = None  # type: ignore[assignment]
@@ -159,8 +164,9 @@ def _cleanup_empty_incoming_parents(moved_path: str) -> None:
 async def analyze_frame(fits_path: str) -> dict | None:
     """
     Process a single FITS file through header extraction, QC, astrometry,
-    subtraction, catalog matching, photometry, and register it (+ its
-    sources) with the API. Archives the file before returning.
+    subtraction, catalog matching, photometry, forced photometry, and
+    register it (+ its sources) with the API. Archives the file before
+    returning.
 
     Steps:
         1. Extract FITS headers
@@ -168,6 +174,8 @@ async def analyze_frame(fits_path: str) -> dict | None:
         3. Astrometry (optional)
         4. Catalog matching (optional) — enriches sources with Gaia/Simbad/MPC IDs
         5. Photometry (optional) — uses Gaia DR3 matches for zero-point calibration
+        5.6. Forced photometry / reverse matching (optional) — measures flux at
+             every catalog/MPC position not already caught by blind detection
         6. POST frame to API — stop on failure
         7. POST sources to API
         8. Move file to archive
@@ -530,9 +538,82 @@ async def analyze_frame(fits_path: str) -> dict | None:
     # artifact, not real variability (see that module's section in
     # CLAUDE.md's "Filters — real astronomy context").
     frame_filter = header.get("observation", {}).get("filter")
-    for _src in sources:
-        _src["mag"] = _src.get("mag_calibrated") if _src.get("calibrated") else None
-        _src["_filter"] = frame_filter
+
+    def _tag_mag_and_filter(source_list: list) -> None:
+        for _src in source_list:
+            _src["mag"] = _src.get("mag_calibrated") if _src.get("calibrated") else None
+            _src["_filter"] = frame_filter
+
+    _tag_mag_and_filter(sources)
+
+    # ------------------------------------------------------------------
+    # Step 5.6 — Forced photometry / reverse matching (see
+    # modules/forced_photometry.py; originally proposed as ROADMAP.md #1,
+    # see git log for that history).
+    #
+    # A second, independent pass: for every Gaia DR3 star / MPC object in
+    # this frame's footprint with no corresponding entry in `sources`,
+    # measure the flux at its predicted pixel position anyway instead of
+    # silently treating it as "not detected". Runs AFTER Step 5 because it
+    # needs this frame's own zero_point (read off any already-measured
+    # source — photometry.measure() sets the same "zero_point" on every
+    # source it returns) to calibrate its own measurements the same way.
+    # Runs AFTER Step 5.5 above rather than before it, so the numbering
+    # stays in execution order; its own results are tagged with "mag"/
+    # "_filter" via the same _tag_mag_and_filter() helper instead of by a
+    # second pass over the whole (by-then-larger) `sources` list.
+    #
+    # gaia_stars/mpc_objects are NOT re-queried: catalog_matcher.get_gaia_stars()/
+    # get_mpc_objects() are cache hits against the exact query Step 4's
+    # catalog_matcher.match() already made for this same field a moment ago
+    # — see that module's section in CLAUDE.md.
+    # ------------------------------------------------------------------
+    if forced_photometry is not None and astro_result and catalog_matcher is not None:
+        try:
+            zero_point = next((s.get("zero_point") for s in sources if s.get("zero_point") is not None), None)
+            zero_point_err = next((s.get("zero_point_err") for s in sources if s.get("zero_point_err") is not None), None)
+            gaia_stars = catalog_matcher.get_gaia_stars(
+                astro_result.get("ra_center") or header.get("ra") or 0.0,
+                astro_result.get("dec_center") or header.get("dec") or 0.0,
+                astro_result.get("fov_deg") or 1.0,
+            )
+            mpc_objects = catalog_matcher.get_mpc_objects(
+                astro_result.get("ra_center") or header.get("ra") or 0.0,
+                astro_result.get("dec_center") or header.get("dec") or 0.0,
+                header.get("obs_time") or "",
+                astro_result.get("fov_deg") or 1.0,
+            )
+            forced_sources = await forced_photometry.run(
+                fits_path,
+                sources,
+                gaia_stars=gaia_stars,
+                mpc_objects=mpc_objects,
+                wcs=astro_result.get("wcs"),
+                naxis1=astro_result.get("naxis1"),
+                naxis2=astro_result.get("naxis2"),
+                zero_point=zero_point,
+                zero_point_err=zero_point_err,
+                obs_time=header.get("obs_time"),
+                psf_fwhm_arcsec=psf_fwhm_arcsec,
+            )
+            if forced_sources:
+                _tag_mag_and_filter(forced_sources)
+                sources = sources + forced_sources
+                logger.info(
+                    "Forced photometry recovered %d catalog position(s) not caught by blind "
+                    "detection; total sources: %d",
+                    len(forced_sources), len(sources),
+                    extra=extra,
+                )
+        except Exception as exc:
+            logger.error(
+                "Forced photometry failed: %s — continuing without it",
+                exc,
+                extra=extra,
+            )
+    else:
+        if forced_photometry is None:
+            logger.debug("Forced photometry module not available — skipping", extra=extra)
 
     # ------------------------------------------------------------------
     # Step 6 — Post frame to API
