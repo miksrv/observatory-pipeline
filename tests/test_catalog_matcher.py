@@ -695,3 +695,116 @@ class TestComputeWcsOffset:
         offset_ra_deg, offset_dec_deg = cm._compute_wcs_offset(sources, gaia_stars)
 
         assert (offset_ra_deg, offset_dec_deg) == (0.0, 0.0)
+
+
+# ===========================================================================
+# TestGaiaProperMotionFields — forced-photometry support (originally proposed as ROADMAP.md #1)
+# ===========================================================================
+
+
+class TestGaiaProperMotionFields:
+    """
+    _query_gaia() must also return pmra/pmdec/ref_epoch — needed by
+    modules/forced_photometry.py to propagate a Gaia star's position to the
+    observation epoch before projecting it to a pixel. Degrades gracefully
+    (None/None/2016.0) when the queried table doesn't carry those columns at
+    all, rather than raising — see that function's docstring.
+    """
+
+    def test_pmra_pmdec_ref_epoch_extracted_when_present(self):
+        table = Table({
+            "ra":              [_RA],
+            "dec":             [_DEC],
+            "source_id":       [123456],
+            "phot_g_mean_mag": [14.5],
+            "pmra":            [12.3],
+            "pmdec":           [-4.5],
+            "ref_epoch":       [2016.0],
+        })
+        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            result = cm._query_gaia(_RA, _DEC, 1.0)
+
+        assert len(result) == 1
+        assert result[0]["pmra"]  == pytest.approx(12.3)
+        assert result[0]["pmdec"] == pytest.approx(-4.5)
+        assert result[0]["ref_epoch"] == pytest.approx(2016.0)
+
+    def test_missing_pm_columns_fall_back_to_none(self):
+        """The existing 4-column mock table (no pmra/pmdec/ref_epoch) must
+        still work — pmra/pmdec fall back to None, ref_epoch to 2016.0."""
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            result = cm._query_gaia(_RA, _DEC, 1.0)
+
+        assert len(result) == 1
+        assert result[0]["pmra"] is None
+        assert result[0]["pmdec"] is None
+        assert result[0]["ref_epoch"] == pytest.approx(2016.0)
+
+    def test_nan_pm_values_fall_back_to_none(self):
+        table = Table({
+            "ra":              [_RA],
+            "dec":             [_DEC],
+            "source_id":       [123456],
+            "phot_g_mean_mag": [14.5],
+            "pmra":            [float("nan")],
+            "pmdec":           [float("nan")],
+            "ref_epoch":       [2016.0],
+        })
+        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            result = cm._query_gaia(_RA, _DEC, 1.0)
+
+        assert result[0]["pmra"] is None
+        assert result[0]["pmdec"] is None
+
+
+# ===========================================================================
+# TestPublicCatalogAccessors — get_gaia_stars() / get_mpc_objects()
+#
+# Thin, cache-reusing wrappers modules/forced_photometry.py calls to reuse
+# the exact field lists match() already fetched for forward matching — see
+# catalog_matcher.py's own comment above their definition for why they exist
+# instead of changing match()'s return contract.
+# ===========================================================================
+
+
+class TestPublicCatalogAccessors:
+    def test_get_gaia_stars_delegates_to_query_gaia(self):
+        table = _gaia_table(_RA, _DEC, source_id=42, mag=12.3)
+        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            result = cm.get_gaia_stars(_RA, _DEC, 1.0)
+
+        assert len(result) == 1
+        assert result[0]["source_id"] == "42"
+
+    async def test_get_gaia_stars_reuses_matchs_own_cache(self):
+        """
+        Calling get_gaia_stars() right after match() for the same field must
+        NOT re-hit the network — it's the whole point of these accessors.
+        """
+        table = _gaia_table(_RA + 10, _DEC + 10)  # far — no matches, just count calls
+        mock_gaia = MagicMock()
+        mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+
+        with (
+            patch("modules.catalog_matcher.Gaia", mock_gaia),
+            patch("modules.catalog_matcher._query_simbad", return_value=[]),
+            patch("modules.catalog_matcher._query_2mass", return_value=[]),
+            patch("modules.catalog_matcher._query_panstarrs", return_value=[]),
+            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+        ):
+            await cm.match([_make_source()], _FRAME_META)
+            cm.get_gaia_stars(_FRAME_META["ra_center"], _FRAME_META["dec_center"], _FRAME_META["fov_deg"])
+
+        assert mock_gaia.cone_search.call_count == 1
+
+    def test_get_mpc_objects_delegates_to_query_mpc(self):
+        with patch("modules.catalog_matcher._query_mpc", return_value=[{"designation": "2019 XY3"}]) as mock_query:
+            result = cm.get_mpc_objects(_RA, _DEC, _FRAME_META["obs_time"], 1.0)
+
+        mock_query.assert_called_once_with(_RA, _DEC, _FRAME_META["obs_time"], 1.0)
+        assert result == [{"designation": "2019 XY3"}]

@@ -135,7 +135,21 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
             s.setdefault("object_type", "STAR")
         return sources
     cat_mock.match = AsyncMock(side_effect=mock_match)
+    # get_gaia_stars/get_mpc_objects — used by pipeline.py's forced-photometry
+    # step (Step 5.6) to reuse the field lists match() already fetched. Empty
+    # by default so forced_photometry.run() below has nothing eligible to
+    # force in the common case; individual tests override these to exercise
+    # the merge path.
+    cat_mock.get_gaia_stars = MagicMock(return_value=[])
+    cat_mock.get_mpc_objects = MagicMock(return_value=[])
     monkeypatch.setattr("pipeline.catalog_matcher", cat_mock)
+
+    # forced_photometry — no recovered sources by default (mirrors
+    # subtraction's sub_mock above; individual tests override this to
+    # exercise the Step 5.6 merge path)
+    forced_phot_mock = MagicMock()
+    forced_phot_mock.run = AsyncMock(return_value=[])
+    monkeypatch.setattr("pipeline.forced_photometry", forced_phot_mock)
 
     # photometry — returns sources with photometry fields added
     phot_mock = MagicMock()
@@ -145,6 +159,11 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
             s.setdefault("mag_instrumental", -7.5)
             s.setdefault("mag_calibrated", 14.5)
             s.setdefault("calibrated", True)
+            # zero_point/zero_point_err — same value on every source, mirroring
+            # the real photometry.measure(); pipeline.py's Step 5.6 reads this
+            # back off any source to calibrate its own forced measurements.
+            s.setdefault("zero_point", 14.5)
+            s.setdefault("zero_point_err", 0.05)
         return sources
     phot_mock.measure = AsyncMock(side_effect=mock_measure)
     monkeypatch.setattr("pipeline.photometry", phot_mock)
@@ -764,6 +783,76 @@ async def test_subtraction_candidates_merged_without_crashing(mock_modules):
     posted_sources = pipeline.api_client.post_sources.call_args.args[2]
     assert len(posted_sources) == 3
     assert any(s.get("_from_subtraction") for s in posted_sources)
+
+
+# ---------------------------------------------------------------------------
+# Step 5.6 — forced photometry / reverse matching (originally proposed as ROADMAP.md #1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_forced_photometry_results_merged_into_sources(mock_modules):
+    """
+    A source recovered by forced_photometry.run() must be merged into
+    `sources` and reach both the "mag"/"_filter" tagging loop (Step 5.5) and
+    the final POST /frames/{id}/sources call — same merge contract as
+    subtraction candidates above.
+    """
+    forced_source = {
+        "ra": 202.55, "dec": 47.30,
+        "flux": 300.0, "fwhm": 3.1, "elongation": 1.0,
+        "saturated": False, "near_edge": False,
+        "catalog_name": "Gaia DR3", "catalog_id": "999888777",
+        "catalog_mag": 18.9, "object_type": "STAR",
+        "flux_aperture": 300.0, "flux_err": 40.0,
+        "mag_instrumental": -6.2, "mag_calibrated": 18.7, "mag_err": 0.15,
+        "calibrated": True, "edge_flag": False,
+        "zero_point": 24.9, "zero_point_err": 0.05,
+        "_from_subtraction": False, "_forced_photometry": True,
+    }
+    pipeline.forced_photometry.run.return_value = [forced_source]
+
+    await pipeline.run(str(mock_modules))
+
+    # The 2 astrometry sources PLUS the 1 forced-photometry recovery.
+    posted_sources = pipeline.api_client.post_sources.call_args.args[2]
+    assert len(posted_sources) == 3
+    recovered = [s for s in posted_sources if s.get("_forced_photometry")]
+    assert len(recovered) == 1
+    # Step 5.5 must have tagged it with "mag"/"_filter" like every other source.
+    assert recovered[0]["mag"] == pytest.approx(18.7)
+    assert recovered[0]["_filter"] == "V"
+
+
+@pytest.mark.asyncio
+async def test_forced_photometry_reuses_cached_catalog_lists(mock_modules):
+    """
+    forced_photometry.run() must be called with the Gaia/MPC field lists from
+    catalog_matcher.get_gaia_stars()/get_mpc_objects() — never from a fresh
+    network query of its own (see modules/forced_photometry.py's docstring).
+    """
+    gaia_stars = [{"ra": 202.5, "dec": 47.3, "source_id": "1", "phot_g_mean_mag": 15.0}]
+    mpc_objects = [{"ra": 202.6, "dec": 47.4, "designation": "2014 RY1", "object_type": "ASTEROID"}]
+    pipeline.catalog_matcher.get_gaia_stars.return_value = gaia_stars
+    pipeline.catalog_matcher.get_mpc_objects.return_value = mpc_objects
+
+    await pipeline.run(str(mock_modules))
+
+    _, kwargs = pipeline.forced_photometry.run.call_args
+    assert kwargs["gaia_stars"] == gaia_stars
+    assert kwargs["mpc_objects"] == mpc_objects
+    assert kwargs["zero_point"] == pytest.approx(14.5)  # from mock_measure's mag_calibrated fixture
+
+
+@pytest.mark.asyncio
+async def test_forced_photometry_failure_does_not_abort_pipeline(mock_modules):
+    """A crash in forced_photometry.run() must not abort the pipeline."""
+    pipeline.forced_photometry.run.side_effect = RuntimeError("aperture photometry blew up")
+
+    await pipeline.run(str(mock_modules))
+
+    pipeline.api_client.post_sources.assert_called_once()
+    pipeline.api_client.post_anomalies.assert_called_once()
 
 
 @pytest.mark.asyncio
