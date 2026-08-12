@@ -180,7 +180,7 @@ MPC_MAG_LIMIT: float = float(_get("MPC_MAG_LIMIT", "19.0"))
 # edge". Coma and other off-axis optical aberrations progressively stretch a
 # star's PSF toward the corners/edges of a wide-field frame — a perfectly
 # ordinary, non-moving star there can measure an inflated `elongation` for
-# purely optical reasons, not because it's a trail. modules/astrometry.py
+# purely optical reasons, not because it's a trail. modules/astrometry/_extraction.py
 # (and modules/subtraction.py, for diff-image candidates) flags any source
 # whose pixel position falls within this fraction of NAXIS1/NAXIS2 from any
 # edge as `near_edge` — see SPACE_DEBRIS_EDGE_ELONGATION_MIN below for how

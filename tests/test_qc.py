@@ -778,7 +778,7 @@ class TestPlateScale:
 # ---------------------------------------------------------------------------
 # Test 13 — Streak masking (satellite trails / diffraction spikes)
 #
-# Mirrors modules/astrometry.py's TestStreakMasking — see that module's
+# Mirrors tests/test_astrometry.py's TestStreakMasking — see that module's
 # _build_streak_mask() docstring for the real-data motivation
 # (2026-08-07, T_CrB test frame).
 # ---------------------------------------------------------------------------

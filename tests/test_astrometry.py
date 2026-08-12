@@ -1,12 +1,16 @@
 """
-tests/test_astrometry.py — Unit tests for modules/astrometry.py
+tests/test_astrometry.py — Unit tests for the modules/astrometry/ package
 
-All external I/O is mocked:
+All external I/O is mocked, on the top-level package for everything
+accessed as a module-attribute chain (safe regardless of which submodule
+under modules/astrometry/ actually makes the call), except WCS, which is
+patched on the specific submodule that imports it as a bare name
+(_wcs.py) — see that package's __init__.py docstring for why:
   - modules.astrometry.subprocess.run  → controlled CompletedProcess
   - modules.astrometry.fits.open       → context manager returning fake HDU
   - modules.astrometry.sep.Background  → _FakeBackground with fixed globalrms
   - modules.astrometry.sep.extract     → structured numpy array of fake sources
-  - modules.astrometry.WCS             → astropy WCS built from known parameters
+  - modules.astrometry._wcs.WCS        → astropy WCS built from known parameters
 
 All tests are async because astrometry.solve() is declared async.
 asyncio_mode = auto is set in pytest.ini, so no @pytest.mark.asyncio required.
@@ -284,12 +288,13 @@ def _patch_astrometry(
             raise RuntimeError("sep.Background intentional failure")
         return fake_bkg
 
-    # WCS is imported at module level as `from astropy.wcs import WCS`, so we
-    # patch the name in the astrometry module's namespace directly.
+    # WCS is imported in _wcs.py as `from astropy.wcs import WCS` (a bare
+    # name, not a module-attribute chain), so we patch it on that specific
+    # submodule rather than on the top-level astrometry package.
     with (
         patch("modules.astrometry.subprocess.run", side_effect=_subprocess_run),
         patch("modules.astrometry.fits.open", return_value=hdul),
-        patch("modules.astrometry.WCS", return_value=wcs),
+        patch("modules.astrometry._wcs.WCS", return_value=wcs),
         patch("modules.astrometry.sep.Background", side_effect=_sep_background),
         patch("modules.astrometry.sep.extract", side_effect=_make_sep_extract_side_effect(sources)),
     ):
@@ -642,7 +647,7 @@ class TestPrefersFreshWcsSidecarOverStaleHeader:
             ),
             patch("modules.astrometry.fits.open", side_effect=_fits_open),
             patch("modules.astrometry.os.path.exists", return_value=True),
-            patch("modules.astrometry.WCS", side_effect=_wcs_ctor),
+            patch("modules.astrometry._wcs.WCS", side_effect=_wcs_ctor),
             patch("modules.astrometry.sep.Background", return_value=fake_bkg),
             patch("modules.astrometry.sep.extract", return_value=_make_sources()),
         ):

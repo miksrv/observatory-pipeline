@@ -850,7 +850,7 @@ def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict
         "elongation": api_source.get("elongation") or 0.0,
         "saturated": bool(api_source.get("saturated")),
         # No leading underscore on the wire, same as "saturated" — see
-        # astrometry.py's near_edge docstring for why it must survive here.
+        # astrometry/_extraction.py's near_edge comment for why it must survive here.
         "near_edge": bool(api_source.get("near_edge")),
         "_from_subtraction": bool(api_source.get("from_subtraction")),
         "_source_id": api_source.get("source_id"),
@@ -1419,7 +1419,7 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
     """
     Write astap's verified, freshly-solved WCS into fits_path's own header.
 
-    astap runs without ``-update`` (see modules/astrometry.py), so it never
+    astap runs without ``-update`` (see modules/astrometry/_astap.py), so it never
     writes its solution into the FITS file itself — only into a `.wcs` side
     file that _cleanup_astap_files() below deletes right after this frame's
     processing finishes. If nothing here corrected the header first, the
@@ -1428,7 +1428,7 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
     plate solve — forever. modules/finder_chart.py (and any future code)
     reads WCS straight back out of the archived file's own header when
     rendering a source's history, so every consumer downstream would
-    silently re-inherit the same stale-coordinate problem astrometry.py was
+    silently re-inherit the same stale-coordinate problem astrometry/_wcs.py was
     just fixed to stop trusting.
 
     Real incident (2026-08-06, "UGC_6930" test frame): the header's own WCS

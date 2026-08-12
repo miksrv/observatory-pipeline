@@ -421,7 +421,7 @@ class TestPixelScaleArcsec:
         subtraction.run() forwards astrometry.solve()'s already-solved WCS
         specifically so this candidate's pixel scale doesn't come from
         fits_path's own (possibly still-stale, not yet corrected) header —
-        see run()'s docstring and modules/astrometry.py's fix history.
+        see run()'s docstring and modules/astrometry/_wcs.py's fix history.
         """
         path = TestPixelToSky._make_wcs_fits(tmp_path, scale_deg=0.000278)
 
@@ -500,7 +500,7 @@ class TestPixelToSky:
         """
         A passed-in wcs must win over fits_path's own header WCS entirely.
         Regression test for the class of bug fixed alongside the 2026-08-06
-        UGC_6930 incident (modules/astrometry.py): without this, subtraction
+        UGC_6930 incident (modules/astrometry/_wcs.py): without this, subtraction
         candidates would get a different systematic sky-position offset
         than every other source in the same frame, since fits_path's own
         header isn't corrected until pipeline.py archives the frame — well
