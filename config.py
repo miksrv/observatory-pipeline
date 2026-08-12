@@ -188,7 +188,7 @@ MPC_MAG_LIMIT: float = float(_get("MPC_MAG_LIMIT", "19.0"))
 # telescope/corrector combination — a well-corrected wide-field refractor
 # needs a much smaller margin than a fast Newtonian; tune to how far coma
 # actually reaches into your own frames.
-EDGE_MARGIN_FRAC: float = float(_get("EDGE_MARGIN_FRAC", "0.1"))
+EDGE_MARGIN_FRAC: float = float(_get("EDGE_MARGIN_FRAC", "0.05"))
 # Elongation threshold for the "single-exposure trail" SPACE_DEBRIS shortcut
 # in modules/anomaly_detector.py (an unmatched source with no history at its
 # current position needs no further evidence beyond this to be classified
