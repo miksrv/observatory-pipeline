@@ -166,6 +166,15 @@ stops the retry loop first. HTTP 4xx errors are logged immediately and never ret
 
 Registers a newly processed FITS frame with the API. Returns a `frame_id` that is used as a key for all subsequent calls for this frame (sources, anomalies).
 
+**Idempotent by `filename`:** if a frame with this exact `filename` was already registered — e.g.
+an operator re-runs an `ANALYZE` task on a file already sitting in the archive, such as after
+improving the detection algorithm — the API updates that existing row in place and returns its
+existing `id` instead of creating a duplicate. `pipeline.py`'s `analyze_frame()` itself has no
+notion of "this frame already exists" and calls this endpoint unconditionally every time (the API
+is a black box to the pipeline — see CLAUDE.md, "Architecture: Two Repositories"); this upsert is
+what makes that safe. See section 2 below for how `POST /frames/{id}/sources` reconciles the
+sources side of the same re-analysis.
+
 ### Request
 
 ```
@@ -282,7 +291,8 @@ Accept: application/json
 
 ### Response
 
-**Status: `201 Created`**
+**Status: `201 Created`** for a genuinely new frame, **`200 OK`** when `filename` matched an
+existing frame and that row was updated in place instead.
 
 ```json
 {
@@ -290,10 +300,16 @@ Accept: application/json
   "message": "Frame registered successfully"
 }
 ```
+```json
+{
+  "id": "42",
+  "message": "Frame updated successfully"
+}
+```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | string | Frame ID assigned by the API — used in all subsequent calls for this frame |
+| `id` | string | Frame ID assigned by the API — used in all subsequent calls for this frame. Same value on both the original registration and every later re-analysis of the same `filename`. |
 | `message` | string | Human-readable confirmation |
 
 **Error responses:**
@@ -309,6 +325,16 @@ Accept: application/json
 ## 2. Save Sources for a Frame
 
 Saves the list of detected and catalog-matched sources for a previously registered frame.
+
+**Reconciles by `frame_id` (idempotent re-analysis):** safe to call again for the same `frame_id`
+— each source in the batch upserts its observation (keyed by `(frame_id, source_id)`) rather than
+always inserting. Any source that was linked to this `frame_id` before the call but is **not**
+present in this batch is retracted (its observation/link for this frame is deleted); if that leaves
+the source with zero observations on any frame, the source itself — plus its entire anomaly
+history and finder charts — is purged outright. A source still observed on some other frame is
+left alone. An empty `sources: []` is a valid "found nothing this time" statement and retracts
+everything previously linked to this `frame_id`, the same way section 3's `POST
+/frames/{id}/anomalies` replaces a frame's whole anomaly set on every call.
 
 ### Request
 
@@ -405,7 +431,9 @@ Accept: application/json
   "count": 3,
   "new_sources": 2,
   "matched_sources": 1,
-  "source_ids": ["6a7415c324e514.28790200", "6a7415c3211cd4.36871892", null]
+  "source_ids": ["6a7415c324e514.28790200", "6a7415c3211cd4.36871892", null],
+  "retracted_sources": 0,
+  "purged_sources": 0
 }
 ```
 
@@ -416,6 +444,8 @@ Accept: application/json
 | `new_sources` | integer | Number of sources that created a new `sources` catalog row |
 | `matched_sources` | integer | Number of sources that matched an existing `sources` catalog row |
 | `source_ids` | array | Positionally parallel to the request's `sources[]` (same length, same order) — each entry is the resolved `sources.id` for that source, or `null` if the entry was skipped (invalid `ra`/`dec`, or an insert failure). The pipeline uses this to attach `source_id` to the corresponding anomaly before calling `POST /frames/{id}/anomalies` (see below). |
+| `retracted_sources` | integer | Number of sources that were linked to this `frame_id` before this call but weren't reconfirmed by it (retracted — see the reconciliation note above). `0` on a frame's first-ever call. |
+| `purged_sources` | integer | Of the retracted sources, how many had zero observations left on any frame afterwards and were therefore deleted outright, along with their anomaly history and finder charts. Always `<= retracted_sources`. |
 
 **Error responses:**
 
