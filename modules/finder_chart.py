@@ -80,13 +80,13 @@ with just its anomaly_type, as before.
 The single public entry point is:
 
     await finder_chart.update_charts_for_sources(
-        anomaly_type_by_source_id, designation_by_source_id=None,
-    ) -> dict[str, bool]
+        anomaly_types_by_source_id, designation_by_source_id=None,
+    ) -> dict[str, dict[Optional[str], bool]]
 
-It takes every (source_id -> anomaly_type) pair for one frame at once and
-fetches all their tracks via one POST /sources/tracks/batch call, then
-uploads each rendered chart individually via POST /sources/{id}/chart — one
-request per chart. See api_client.get_source_tracks_batch / upload_source_chart.
+It takes every (source_id -> [anomaly_type, ...]) pair at once and fetches
+all their tracks via one POST /sources/tracks/batch call, then uploads each
+rendered chart individually via POST /sources/{id}/chart — one request per
+chart. See api_client.get_source_tracks_batch / upload_source_chart.
 `designation_by_source_id` is optional and keyed the same way, built by
 pipeline.py from the already catalog-matched `sources` list (catalog_name/
 catalog_id) — this module never queries a catalog itself. When one or more
@@ -96,6 +96,23 @@ update_charts_for_sources() call — every single-occurrence source in one
 call shares the exact same object and current obs_time (they're all
 anomalies from the one frame just processed), so this never grows past one
 extra request regardless of how many such sources there are.
+
+A source's list of anomaly_types can (and, over its lifetime, often does)
+contain more than one distinct value — modules/anomaly_detector.py
+classifies a source independently on every frame it appears on, so the same
+source_id can collect e.g. an UNKNOWN anomaly on the frame it was first
+seen and a MOVING_UNKNOWN once it had moved (real incident, 2026-08-11:
+source_id 6a7be36b4d7578.98132403, 12 MOVING_UNKNOWN + 1 UNKNOWN anomalies —
+see observatory-api's SourceChartModel/AnomaliesController for the other
+half of this fix). Rather than collapsing that list down to a single style
+and silently dropping the other classification's evidence, this module
+renders and uploads ONE CHART PER DISTINCT STYLE the list implies — see
+_group_types_by_style() — so a source with both types gets both its "track"
+(motion) and "stamp_strip" (blink) charts, each keyed by its own `style` on
+observatory-api's source_charts table (see 2026-08-11-000001_
+SourceChartsUniqueByStyle.php there). A source whose types all map to the
+same style (the common case — most sources only ever get one) still
+produces exactly one chart, same as before this change.
 
 Best-effort throughout: every failure (missing local archive file, API
 error, rendering error) is caught and logged, and only ever downgrades that
@@ -164,6 +181,45 @@ def _style_for_source(anomaly_type: Optional[str], n_epochs: int) -> str:
     if n_epochs <= 1:
         return STYLE_BEFORE_AFTER
     return _style_for_anomaly_type(anomaly_type)
+
+
+def _dedupe_preserve_order(values: list[Optional[str]]) -> list[Optional[str]]:
+    """Deduplicate a list, keeping only the first occurrence of each value."""
+    seen: set[Optional[str]] = set()
+    out: list[Optional[str]] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _group_types_by_style(
+    anomaly_types: list[Optional[str]], n_epochs: int,
+) -> dict[str, list[Optional[str]]]:
+    """
+    Partition a source's (already deduplicated) anomaly_types into the
+    distinct chart styles they imply, so update_charts_for_sources() can
+    render one chart per style rather than collapsing everything down to a
+    single arbitrary one.
+
+    With only 1 loaded epoch every type collapses to STYLE_BEFORE_AFTER
+    regardless (see _style_for_source()) — a single group holding every
+    input type. With 2+ epochs, each type is routed independently via
+    _style_for_anomaly_type(), so e.g. ["MOVING_UNKNOWN", "UNKNOWN"]
+    produces two groups: {"track": ["MOVING_UNKNOWN"], "stamp_strip":
+    ["UNKNOWN"]}. Preserves `anomaly_types`' own order within each group's
+    list, and returns groups in first-encountered order — both matter for
+    picking a deterministic, informative representative type for the chart
+    title (see _render_charts_for_source()).
+    """
+    if n_epochs <= 1:
+        return {STYLE_BEFORE_AFTER: list(anomaly_types)}
+
+    groups: dict[str, list[Optional[str]]] = {}
+    for t in anomaly_types:
+        groups.setdefault(_style_for_anomaly_type(t), []).append(t)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -775,26 +831,37 @@ async def _get_earlier_frame_epoch(
     return cache[cache_key]
 
 
-async def _render_chart_for_source(
-    source_id: str, epochs: list[dict], anomaly_type: Optional[str], designation: Optional[str] = None,
+async def _render_charts_for_source(
+    source_id: str, epochs: list[dict], anomaly_types: list[Optional[str]], designation: Optional[str] = None,
     earlier_frame_cache: Optional[dict] = None,
-) -> Optional[tuple[bytes, str, int]]:
+) -> list[tuple[str, list[Optional[str]], bytes, int]]:
     """
-    Returns (png_bytes, style, frame_count), or None on any failure.
+    Renders one chart PER DISTINCT STYLE implied by `anomaly_types` — see
+    _group_types_by_style(). Most sources only ever have one style's worth
+    of anomaly_types and get exactly one chart back, same as before this
+    function supported more than one; a source with e.g. both a
+    MOVING_UNKNOWN and an UNKNOWN anomaly gets two.
 
-    `anomaly_type`: None for a chart requested directly by source_id, with
-    no anomaly behind it at all (see worker.py's `_run_charts_task()`) —
-    the chart still renders normally (style picked by `_style_for_source()`,
-    same as any other non-MOVING_TYPES value), just with no anomaly_type in
-    its title.
+    Returns a list of (style, anomaly_types_covered_by_this_style,
+    png_bytes, frame_count) — one entry per distinct style, in
+    first-encountered order. Empty list if no epoch could be loaded from the
+    local archive at all (mirrors the old function's `None` return for that
+    case — the epoch-loading failure is source-wide, not per-style).
+
+    `anomaly_types`: the (already deduplicated) anomaly_types requesting a
+    chart for this source. `None` is a valid entry — a chart requested
+    directly by source_id, with no anomaly behind it at all (see worker.py's
+    `_run_charts_task()`) — handled by _style_for_anomaly_type() the same as
+    any other non-MOVING_TYPES value, just without an anomaly_type in that
+    chart's title.
 
     `designation`: the source's catalog identity (e.g. an MPC name for an
     ASTEROID/COMET, or a Simbad main_id for a known VARIABLE_STAR/BINARY_STAR),
     when the underlying source is catalog-matched at all — shown alongside
-    anomaly_type as the chart's title, e.g. "ASTEROID (4 Vesta)". None for an
-    uncatalogued source, in which case the chart is titled with just
-    anomaly_type. When both are None (uncatalogued source, no anomaly), the
-    chart has no title at all.
+    each chart's own representative anomaly_type as its title, e.g.
+    "ASTEROID (4 Vesta)". None for an uncatalogued source, in which case the
+    chart is titled with just its representative anomaly_type. When both are
+    None (uncatalogued source, no anomaly), the chart has no title at all.
 
     `earlier_frame_cache`: shared across one update_charts_for_sources()
     call — see _get_earlier_frame_epoch(). Only ever read/written when this
@@ -826,38 +893,45 @@ async def _render_chart_for_source(
             "finder_chart: none of %d epoch(s) for source_id=%s could be loaded from the local archive",
             len(epochs), source_id,
         )
-        return None
+        return []
 
-    style = _style_for_source(anomaly_type, len(loaded))
-    # anomaly_type is None for a source-only chart request (no anomaly behind
-    # it — see docstring above); build the title from whichever of
-    # anomaly_type/designation is actually present, instead of the naive
-    # f"{anomaly_type} (...)" which would print the literal string "None"
-    # when anomaly_type is missing but designation isn't.
-    if anomaly_type and designation:
-        label = f"{anomaly_type} ({designation})"
-    else:
-        label = anomaly_type or designation
+    style_groups = _group_types_by_style(anomaly_types, len(loaded))
 
-    try:
-        if style == STYLE_BEFORE_AFTER:
-            current_ep = loaded[-1]
-            before_ep, missing_reason = await _get_earlier_frame_epoch(
-                current_ep, earlier_frame_cache if earlier_frame_cache is not None else {},
-            )
-            png_bytes = _render_before_after_chart(current_ep, before_ep, label=label, missing_reason=missing_reason)
-            frame_count = 1 + (1 if before_ep else 0)
-        elif style == STYLE_TRACK:
-            png_bytes = _render_track_chart(loaded, label=label)
-            frame_count = len(loaded)
+    rendered: list[tuple[str, list[Optional[str]], bytes, int]] = []
+    for style, types_in_group in style_groups.items():
+        # Prefer a non-None type as the chart's representative/title — a
+        # None mixed in with a real type (unusual, but possible if the same
+        # source is ever requested both via an anomaly and via the
+        # source-only /ui/sources/generate-charts path in one task) should
+        # still show the real classification, not fall back to the bare
+        # designation.
+        representative = next((t for t in types_in_group if t), types_in_group[0] if types_in_group else None)
+        if representative and designation:
+            label = f"{representative} ({designation})"
         else:
-            png_bytes = _render_stamp_strip(loaded, label=label)
-            frame_count = len(loaded)
-    except Exception as exc:
-        logger.warning("finder_chart: rendering (%s) failed for source_id=%s: %s", style, source_id, exc)
-        return None
+            label = representative or designation
 
-    return png_bytes, style, frame_count
+        try:
+            if style == STYLE_BEFORE_AFTER:
+                current_ep = loaded[-1]
+                before_ep, missing_reason = await _get_earlier_frame_epoch(
+                    current_ep, earlier_frame_cache if earlier_frame_cache is not None else {},
+                )
+                png_bytes = _render_before_after_chart(current_ep, before_ep, label=label, missing_reason=missing_reason)
+                frame_count = 1 + (1 if before_ep else 0)
+            elif style == STYLE_TRACK:
+                png_bytes = _render_track_chart(loaded, label=label)
+                frame_count = len(loaded)
+            else:
+                png_bytes = _render_stamp_strip(loaded, label=label)
+                frame_count = len(loaded)
+        except Exception as exc:
+            logger.warning("finder_chart: rendering (%s) failed for source_id=%s: %s", style, source_id, exc)
+            continue
+
+        rendered.append((style, types_in_group, png_bytes, frame_count))
+
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -865,13 +939,13 @@ async def _render_chart_for_source(
 # ---------------------------------------------------------------------------
 
 async def update_charts_for_sources(
-    anomaly_type_by_source_id: dict[str, Optional[str]],
+    anomaly_types_by_source_id: dict[str, list[Optional[str]]],
     designation_by_source_id: Optional[dict[str, str]] = None,
-) -> dict[str, bool]:
+) -> dict[str, dict[Optional[str], bool]]:
     """
     (Re)generate and upload finder charts for every given source_id,
     reflecting each source's complete track, after a batch of anomalies was
-    just detected on one frame.
+    just detected/selected.
 
     Fetches all tracks in a single POST /sources/tracks/batch call, renders
     each chart locally, then uploads each rendered chart individually via
@@ -879,44 +953,63 @@ async def update_charts_for_sources(
 
     Parameters
     ----------
-    anomaly_type_by_source_id:
-        Maps each `sources.id` with a just-detected anomaly (from
-        `_source_id` — see pipeline.py Step 7) to that anomaly's
-        anomaly_type. Together with how many epochs the source actually has,
-        this decides the chart style — see _style_for_source(): exactly one
-        epoch → "before_after" regardless of anomaly_type; 2+ epochs →
-        "track" for MOVING_TYPES, "stamp_strip" otherwise.
-        A value of None is valid and means "no anomaly behind this chart at
-        all" — a chart requested directly for a source (worker.py's
+    anomaly_types_by_source_id:
+        Maps each `sources.id` with a just-detected/selected anomaly (from
+        `_source_id` — see pipeline.py Step 7) to the list of anomaly_types
+        requesting a chart for it. Together with how many epochs the source
+        actually has, this decides which chart style(s) get rendered — see
+        _group_types_by_style(): exactly one epoch → a single "before_after"
+        chart regardless of anomaly_type; 2+ epochs → one "track" chart if
+        any type is a MOVING_TYPES member, one "stamp_strip" chart if any
+        isn't, or both if the list has a mix of the two (see this module's
+        docstring for why a source can legitimately have both).
+        A list entry of None is valid and means "no anomaly behind this
+        chart at all" — a chart requested directly for a source (worker.py's
         `_run_charts_task()` passes payload.anomaly_type through verbatim,
         and observatory-api's `/ui/sources/generate-charts` never sets it).
         Handled the same as any other non-MOVING_TYPES anomaly_type, just
-        without an anomaly_type in the chart's title.
+        without an anomaly_type in that chart's title. Duplicate entries in
+        a source's list are harmless (deduplicated internally) — callers
+        don't need to pre-deduplicate.
     designation_by_source_id:
         Optional. Maps a subset of the same source_ids to their resolved
         catalog identity (e.g. the MPC designation for an ASTEROID/COMET, or
         a Simbad main_id for a known VARIABLE_STAR/BINARY_STAR) — shown next
-        to anomaly_type as the chart's title, e.g. "ASTEROID (4 Vesta)". A
-        source_id absent from this dict (including when the dict itself is
-        omitted) gets a chart titled with just its anomaly_type — the normal
-        case for an uncatalogued source, which has no designation to show.
+        to each chart's own representative anomaly_type as its title, e.g.
+        "ASTEROID (4 Vesta)". A source_id absent from this dict (including
+        when the dict itself is omitted) gets charts titled with just their
+        representative anomaly_type — the normal case for an uncatalogued
+        source, which has no designation to show.
 
     Returns
     -------
-    dict[str, bool]
-        One entry per key in `anomaly_type_by_source_id`: True if that
-        source's chart was rendered and uploaded, False if disabled, no
-        usable epochs were found, rendering failed, or the upload was
-        rejected/failed. Never raises.
+    dict[str, dict[Optional[str], bool]]
+        One outer entry per key in `anomaly_types_by_source_id`, one inner
+        entry per (deduplicated) anomaly_type in that source's list: True if
+        the chart covering that type's style was rendered and uploaded,
+        False if disabled, no usable epochs were found, rendering failed, or
+        the upload was rejected/failed. Two types that resolve to the SAME
+        style (e.g. two different MOVING_TYPES members) share that style's
+        single upload result. Never raises.
     """
-    if not anomaly_type_by_source_id:
+    if not anomaly_types_by_source_id:
         return {}
 
+    # Deduplicate each source's own type list up front — every downstream
+    # step (grouping, results dict) assumes no repeats.
+    types_by_source_id: dict[str, list[Optional[str]]] = {
+        source_id: _dedupe_preserve_order(types)
+        for source_id, types in anomaly_types_by_source_id.items()
+    }
+
     if not config.CHART_ENABLED:
-        return {source_id: False for source_id in anomaly_type_by_source_id}
+        return {
+            source_id: {t: False for t in types}
+            for source_id, types in types_by_source_id.items()
+        }
 
     designation_by_source_id = designation_by_source_id or {}
-    source_ids = list(anomaly_type_by_source_id.keys())
+    source_ids = list(types_by_source_id.keys())
 
     try:
         tracks = await api_client.get_source_tracks_batch(source_ids)
@@ -924,7 +1017,10 @@ async def update_charts_for_sources(
         logger.warning("finder_chart: could not fetch tracks batch for %d source(s): %s", len(source_ids), exc)
         tracks = {}
 
-    results: dict[str, bool] = {source_id: False for source_id in source_ids}
+    results: dict[str, dict[Optional[str], bool]] = {
+        source_id: {t: False for t in types}
+        for source_id, types in types_by_source_id.items()
+    }
     # Shared across every source in this call — see _get_earlier_frame_epoch()
     # for why this collapses to at most one extra API call regardless of how
     # many sources end up needing the "before_after" style.
@@ -936,22 +1032,22 @@ async def update_charts_for_sources(
             logger.debug("finder_chart: no epochs for source_id=%s — skipping", source_id)
             continue
 
-        rendered = await _render_chart_for_source(
-            source_id, epochs, anomaly_type_by_source_id[source_id],
+        rendered = await _render_charts_for_source(
+            source_id, epochs, types_by_source_id[source_id],
             designation_by_source_id.get(source_id),
             earlier_frame_cache,
         )
-        if rendered is None:
-            continue
 
-        png_bytes, style, frame_count = rendered
+        for style, types_in_group, png_bytes, frame_count in rendered:
+            try:
+                ok = await api_client.upload_source_chart(source_id, png_bytes, style, frame_count)
+            except Exception as exc:
+                logger.warning(
+                    "finder_chart: upload failed for source_id=%s style=%s: %s", source_id, style, exc,
+                )
+                ok = False
 
-        try:
-            ok = await api_client.upload_source_chart(source_id, png_bytes, style, frame_count)
-        except Exception as exc:
-            logger.warning("finder_chart: upload failed for source_id=%s: %s", source_id, exc)
-            ok = False
-
-        results[source_id] = ok
+            for t in types_in_group:
+                results[source_id][t] = ok
 
     return results
