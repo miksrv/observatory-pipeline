@@ -98,7 +98,7 @@ anomalies from the one frame just processed), so this never grows past one
 extra request regardless of how many such sources there are.
 
 A source's list of anomaly_types can (and, over its lifetime, often does)
-contain more than one distinct value — modules/anomaly_detector.py
+contain more than one distinct value — modules/anomaly_detector/
 classifies a source independently on every frame it appears on, so the same
 source_id can collect e.g. an UNKNOWN anomaly on the frame it was first
 seen and a MOVING_UNKNOWN once it had moved (real incident, 2026-08-11:
@@ -168,7 +168,7 @@ import api_client
 logger = logging.getLogger(__name__)
 
 # Anomaly types for which the source is expected to have moved between
-# epochs — see modules/anomaly_detector.py's classification table.
+# epochs — see modules/anomaly_detector/'s classification table.
 MOVING_TYPES = frozenset({"ASTEROID", "COMET", "MOVING_UNKNOWN", "SPACE_DEBRIS"})
 
 STYLE_TRACK = "track"
