@@ -120,6 +120,30 @@ one source_id's own result to False — it never raises and never prevents
 the other source_ids in the same call from being processed. See
 pipeline.py's Step 9.5, which calls this unconditionally for every anomaly
 with a source_id and must not have chart generation affect frame processing.
+
+Animated GIF companions (config.CHART_GIF_ENABLED, default true): whenever a
+source's chart style is "track" or "stamp_strip" — i.e. it has 2+ loaded
+epochs, so there's actual motion/change across frames to animate — an
+animated GIF is also rendered and uploaded right alongside the static PNG,
+as its own chart with its own `style` value: "track_gif" (a cumulative
+reveal of the motion trail, one more epoch's marker per frame — see
+_render_track_gif()) or "stamp_strip_gif" (each epoch's own crop shown in
+sequence — an actual "blink" instead of the static side-by-side grid — see
+_render_stamp_strip_gif()). Both reuse the existing static renderer as their
+own per-frame renderer (no separate drawing code) and are assembled via
+Pillow in _pngs_to_gif(). There is no GIF for "before_after" — a
+single-occurrence source has at most two still images, which the existing
+side-by-side panels already show better than a 1-2 frame animation could.
+The GIF is a bonus asset: update_charts_for_sources()'s own return value
+reports only the static chart's outcome, and a GIF render/upload failure is
+logged and otherwise ignored — see that function's docstring. On the
+observatory-api side this needs `style` to also accept "track_gif"/
+"stamp_strip_gif" (currently ENUM('track','stamp_strip','before_after',
+'catalog_preview') — see SourceChartModel::ALLOWED_STYLES there) and the
+chart-serving endpoint to stop hardcoding `Content-Type: image/png` on the
+way back out; api_client.upload_source_chart() already sends the correct
+Content-Type on the way in by sniffing the image's own magic bytes (see
+api_client/client.py's _content_type_for_image_bytes()).
 """
 from __future__ import annotations
 
@@ -136,6 +160,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
 from astropy.wcs import WCS
+from PIL import Image
 
 import config
 from api_client import client as api_client
@@ -149,6 +174,15 @@ MOVING_TYPES = frozenset({"ASTEROID", "COMET", "MOVING_UNKNOWN", "SPACE_DEBRIS"}
 STYLE_TRACK = "track"
 STYLE_STAMP_STRIP = "stamp_strip"
 STYLE_BEFORE_AFTER = "before_after"
+
+# Animated counterparts of STYLE_TRACK / STYLE_STAMP_STRIP — see
+# _render_track_gif() / _render_stamp_strip_gif() below. There is no "_gif"
+# style for STYLE_BEFORE_AFTER: a single-occurrence source has only one (or
+# two, counting the earlier-frame lookup) still image to show, and a 1-2
+# frame "animation" carries no more information than the static side-by-side
+# panels already do.
+STYLE_TRACK_GIF = "track_gif"
+STYLE_STAMP_STRIP_GIF = "stamp_strip_gif"
 
 # Colors for the "before_after" style — the dashed grey BEFORE circle marks
 # "look here, nothing expected"; the solid red AFTER circle matches the
@@ -315,6 +349,28 @@ def _fig_to_png_bytes(fig) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png")
     plt.close(fig)
+    return buf.getvalue()
+
+
+def _pngs_to_gif(png_frames: list[bytes], duration_ms: int) -> bytes:
+    """
+    Assemble already-rendered PNG frames (each from _fig_to_png_bytes(), one
+    matplotlib figure per epoch) into a single looping animated GIF.
+
+    Frames are decoded and converted to RGB — GIF has no native support for
+    matplotlib's RGBA figure output, and every frame here is an opaque
+    astronomical image on a solid figure background anyway, so the alpha
+    channel carries no information worth keeping. Pillow palettizes each
+    frame internally when saving as GIF; some banding on the grayscale
+    stretch is an acceptable trade-off for a "does it move" animation, not a
+    replacement for the full-precision static PNG uploaded alongside it.
+    """
+    images = [Image.open(io.BytesIO(png)).convert("RGB") for png in png_frames]
+    buf = io.BytesIO()
+    images[0].save(
+        buf, format="GIF", save_all=True, append_images=images[1:],
+        duration=duration_ms, loop=0,
+    )
     return buf.getvalue()
 
 
@@ -689,6 +745,47 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
 
 
 # ---------------------------------------------------------------------------
+# Animated GIF counterparts of "track" / "stamp_strip" — both reuse the
+# existing static renderers as their own per-frame renderer rather than
+# duplicating any drawing code; see _pngs_to_gif() above.
+# ---------------------------------------------------------------------------
+
+def _render_track_gif(loaded_epochs: list[dict], label: Optional[str] = None) -> bytes:
+    """
+    Cumulative-reveal animation for a moving source: frame k re-renders the
+    ordinary "track" chart using only the first k epochs (loaded_epochs[:k]),
+    so the marker trail grows one point per frame and the final frame is
+    exactly the same image update_charts_for_sources() also uploads as the
+    static "track" PNG.
+
+    Each frame's own background is that frame's own most-recent epoch (i.e.
+    _render_track_chart()'s own choice of `loaded_epochs[-1]` for whatever
+    subset it's given) — the background image genuinely is a different
+    single exposure at each step, exactly as it would be if this chart had
+    been (re)generated right after each epoch arrived historically, so a
+    background that changes between animation frames is the accurate
+    picture rather than an artifact to avoid.
+    """
+    frames = [
+        _render_track_chart(loaded_epochs[:k], label=label)
+        for k in range(1, len(loaded_epochs) + 1)
+    ]
+    return _pngs_to_gif(frames, config.CHART_GIF_FRAME_DURATION_MS)
+
+
+def _render_stamp_strip_gif(loaded_epochs: list[dict], label: Optional[str] = None) -> bytes:
+    """
+    "Blink" animation for a stationary source: one frame per epoch, each
+    simply _render_stamp_strip() called with a single-epoch list — the exact
+    same crop/circle/caption a "stamp_strip" chart already draws for one
+    cell of its grid, just returned as its own standalone frame instead of
+    being laid out next to the others.
+    """
+    frames = [_render_stamp_strip([ep], label=label) for ep in loaded_epochs]
+    return _pngs_to_gif(frames, config.CHART_GIF_FRAME_DURATION_MS)
+
+
+# ---------------------------------------------------------------------------
 # Before/after (single-epoch sources)
 # ---------------------------------------------------------------------------
 
@@ -834,7 +931,7 @@ async def _get_earlier_frame_epoch(
 async def _render_charts_for_source(
     source_id: str, epochs: list[dict], anomaly_types: list[Optional[str]], designation: Optional[str] = None,
     earlier_frame_cache: Optional[dict] = None,
-) -> list[tuple[str, list[Optional[str]], bytes, int]]:
+) -> list[tuple[str, list[Optional[str]], bytes, int, Optional[tuple[str, bytes]]]]:
     """
     Renders one chart PER DISTINCT STYLE implied by `anomaly_types` — see
     _group_types_by_style(). Most sources only ever have one style's worth
@@ -843,10 +940,15 @@ async def _render_charts_for_source(
     MOVING_UNKNOWN and an UNKNOWN anomaly gets two.
 
     Returns a list of (style, anomaly_types_covered_by_this_style,
-    png_bytes, frame_count) — one entry per distinct style, in
-    first-encountered order. Empty list if no epoch could be loaded from the
-    local archive at all (mirrors the old function's `None` return for that
-    case — the epoch-loading failure is source-wide, not per-style).
+    png_bytes, frame_count, gif) — one entry per distinct style, in
+    first-encountered order. `gif` is `(gif_style, gif_bytes)` when
+    CHART_GIF_ENABLED and this style is STYLE_TRACK/STYLE_STAMP_STRIP (2+
+    loaded epochs — see _render_track_gif()/_render_stamp_strip_gif()), else
+    `None`: disabled, STYLE_BEFORE_AFTER (nothing to animate), or the GIF
+    render itself failed (logged, not fatal to the style's own PNG entry).
+    Empty list if no epoch could be loaded from the local archive at all
+    (mirrors the old function's `None` return for that case — the
+    epoch-loading failure is source-wide, not per-style).
 
     `anomaly_types`: the (already deduplicated) anomaly_types requesting a
     chart for this source. `None` is a valid entry — a chart requested
@@ -897,7 +999,7 @@ async def _render_charts_for_source(
 
     style_groups = _group_types_by_style(anomaly_types, len(loaded))
 
-    rendered: list[tuple[str, list[Optional[str]], bytes, int]] = []
+    rendered: list[tuple[str, list[Optional[str]], bytes, int, Optional[tuple[str, bytes]]]] = []
     for style, types_in_group in style_groups.items():
         # Prefer a non-None type as the chart's representative/title — a
         # None mixed in with a real type (unusual, but possible if the same
@@ -929,7 +1031,25 @@ async def _render_charts_for_source(
             logger.warning("finder_chart: rendering (%s) failed for source_id=%s: %s", style, source_id, exc)
             continue
 
-        rendered.append((style, types_in_group, png_bytes, frame_count))
+        # Animated counterpart, best-effort: a GIF rendering failure only
+        # drops the GIF (`gif` stays None below) — it never invalidates the
+        # static chart already rendered above. STYLE_BEFORE_AFTER never
+        # reaches here (see this function's docstring).
+        gif: Optional[tuple[str, bytes]] = None
+        if config.CHART_GIF_ENABLED and style in (STYLE_TRACK, STYLE_STAMP_STRIP):
+            gif_style = STYLE_TRACK_GIF if style == STYLE_TRACK else STYLE_STAMP_STRIP_GIF
+            try:
+                gif_bytes = (
+                    _render_track_gif(loaded, label=label) if style == STYLE_TRACK
+                    else _render_stamp_strip_gif(loaded, label=label)
+                )
+                gif = (gif_style, gif_bytes)
+            except Exception as exc:
+                logger.warning(
+                    "finder_chart: GIF rendering (%s) failed for source_id=%s: %s", gif_style, source_id, exc,
+                )
+
+        rendered.append((style, types_in_group, png_bytes, frame_count, gif))
 
     return rendered
 
@@ -991,6 +1111,14 @@ async def update_charts_for_sources(
         the upload was rejected/failed. Two types that resolve to the SAME
         style (e.g. two different MOVING_TYPES members) share that style's
         single upload result. Never raises.
+
+        When CHART_GIF_ENABLED and a style is STYLE_TRACK/STYLE_STAMP_STRIP,
+        an animated GIF ("track_gif"/"stamp_strip_gif") is also rendered and
+        uploaded alongside that style's static PNG — but this return value
+        deliberately reports only the static chart's own outcome. The GIF is
+        a bonus asset: its own render/upload failure is logged and otherwise
+        ignored, and must never downgrade a `True` this function already has
+        for that anomaly_type's real (PNG) chart.
     """
     if not anomaly_types_by_source_id:
         return {}
@@ -1038,7 +1166,7 @@ async def update_charts_for_sources(
             earlier_frame_cache,
         )
 
-        for style, types_in_group, png_bytes, frame_count in rendered:
+        for style, types_in_group, png_bytes, frame_count, gif in rendered:
             try:
                 ok = await api_client.upload_source_chart(source_id, png_bytes, style, frame_count)
             except Exception as exc:
@@ -1049,5 +1177,23 @@ async def update_charts_for_sources(
 
             for t in types_in_group:
                 results[source_id][t] = ok
+
+            if gif is not None:
+                gif_style, gif_bytes = gif
+                try:
+                    gif_ok = await api_client.upload_source_chart(source_id, gif_bytes, gif_style, frame_count)
+                except Exception as exc:
+                    logger.warning(
+                        "finder_chart: GIF upload failed for source_id=%s style=%s: %s",
+                        source_id, gif_style, exc,
+                    )
+                    gif_ok = False
+                if not gif_ok:
+                    # Deliberately not reflected in `results` — see this
+                    # function's docstring: the GIF is a bonus asset and its
+                    # failure must not downgrade the PNG's own outcome above.
+                    logger.warning(
+                        "finder_chart: GIF chart (%s) not uploaded for source_id=%s", gif_style, source_id,
+                    )
 
     return results

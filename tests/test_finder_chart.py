@@ -18,10 +18,13 @@ asyncio_mode = auto is set in pytest.ini, so async tests need no decorator.
 
 from __future__ import annotations
 
+import io
+
 import numpy as np
 import pytest
 from astropy.io import fits
 from astropy.wcs import WCS as AstropyWCS
+from PIL import Image
 
 import config
 from modules import finder_chart
@@ -364,6 +367,31 @@ class TestRendering:
 
         assert png_bytes[:8] == PNG_SIGNATURE
 
+    def test_render_track_gif_produces_valid_gif_with_one_frame_per_epoch(self, tmp_path):
+        epochs = [
+            self._loaded_epoch(tmp_path, "e0.fits", 202.47, 47.20, "2024-01-01T00:00:00Z"),
+            self._loaded_epoch(tmp_path, "e1.fits", 202.48, 47.21, "2024-01-01T01:00:00Z"),
+            self._loaded_epoch(tmp_path, "e2.fits", 202.49, 47.22, "2024-01-01T02:00:00Z"),
+        ]
+
+        gif_bytes = finder_chart._render_track_gif(epochs, label="ASTEROID (4 Vesta)")
+
+        assert gif_bytes[:6] in (b"GIF87a", b"GIF89a")
+        with Image.open(io.BytesIO(gif_bytes)) as img:
+            assert img.n_frames == len(epochs)
+
+    def test_render_stamp_strip_gif_produces_valid_gif_with_one_frame_per_epoch(self, tmp_path):
+        epochs = [
+            self._loaded_epoch(tmp_path, "e0.fits", 202.47, 47.20, "2024-01-01T00:00:00Z", mag=15.0),
+            self._loaded_epoch(tmp_path, "e1.fits", 202.47, 47.20, "2024-01-02T00:00:00Z", mag=14.2),
+        ]
+
+        gif_bytes = finder_chart._render_stamp_strip_gif(epochs, label="VARIABLE_STAR")
+
+        assert gif_bytes[:6] in (b"GIF87a", b"GIF89a")
+        with Image.open(io.BytesIO(gif_bytes)) as img:
+            assert img.n_frames == len(epochs)
+
 
 # ---------------------------------------------------------------------------
 # _fetch_and_load_earlier_frame / _get_earlier_frame_epoch
@@ -506,6 +534,10 @@ class TestUpdateChartsForSources:
 
     async def test_empty_input_returns_empty_dict_without_calling_api(self, monkeypatch):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         called = False
 
         async def fake_get_tracks_batch(source_ids):
@@ -522,6 +554,10 @@ class TestUpdateChartsForSources:
 
     async def test_no_epochs_returns_false(self, monkeypatch):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(
             finder_chart.api_client, "get_source_tracks_batch", lambda source_ids: _async_return({})
         )
@@ -532,6 +568,10 @@ class TestUpdateChartsForSources:
 
     async def test_tracks_batch_fetch_error_returns_false_for_all(self, monkeypatch):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
 
         async def raising(source_ids):
             raise RuntimeError("boom")
@@ -544,6 +584,10 @@ class TestUpdateChartsForSources:
 
     async def test_all_epochs_missing_locally_returns_false(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))  # empty — nothing archived
         epochs = [self._epoch("missing.fits", "Vesta_A807_FA", 202.47, 47.20)]
         monkeypatch.setattr(
@@ -557,6 +601,10 @@ class TestUpdateChartsForSources:
 
     async def test_happy_path_moving_type_uploads_track_style(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "Vesta_A807_FA"
@@ -594,6 +642,10 @@ class TestUpdateChartsForSources:
     async def test_happy_path_stationary_type_uploads_stamp_strip_style(self, monkeypatch, tmp_path):
         """2+ epochs — a single epoch instead gets STYLE_BEFORE_AFTER, see TestBeforeAfterStyle."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "M51"
@@ -628,6 +680,10 @@ class TestUpdateChartsForSources:
         """A source with exactly one epoch AND a real earlier frame of the object
         renders the 2-panel before_after style, frame_count=2."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "Vesta_A807_FA"
@@ -665,6 +721,10 @@ class TestUpdateChartsForSources:
         """No earlier frame exists (this object's first-ever frame) — falls back to a
         1-panel before_after chart, frame_count=1, but still uploads successfully."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "Vesta_A807_FA"
@@ -696,6 +756,10 @@ class TestUpdateChartsForSources:
 
     async def test_epoch_count_capped_at_chart_max_epochs(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
         monkeypatch.setattr(config, "CHART_MAX_EPOCHS", 2)
 
@@ -731,6 +795,10 @@ class TestUpdateChartsForSources:
 
     async def test_upload_failure_propagates_false(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "M51"
@@ -754,6 +822,10 @@ class TestUpdateChartsForSources:
         """A catalog-matched source's designation must reach the renderer as
         "{anomaly_type} ({designation})" — e.g. "ASTEROID (4 Vesta)"."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "Vesta_A807_FA"
@@ -791,6 +863,10 @@ class TestUpdateChartsForSources:
     async def test_uncatalogued_source_labels_with_anomaly_type_only(self, monkeypatch, tmp_path):
         """No designation_by_source_id entry (or param omitted entirely) —> bare anomaly_type label."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "M51"
@@ -828,6 +904,10 @@ class TestUpdateChartsForSources:
     async def test_batches_multiple_sources_into_single_track_call(self, monkeypatch, tmp_path):
         """N sources use one track-fetch call; each chart is uploaded individually."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "M51"
@@ -890,6 +970,10 @@ class TestUpdateChartsForSources:
         (re)generated — not just whichever type an upstream caller happened
         to pick."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "C_2020_R4_ATLAS"
@@ -925,6 +1009,10 @@ class TestUpdateChartsForSources:
         two GENERATE_CHARTS task items referencing different anomaly_ids of
         the same type) must not upload the same "track" chart twice."""
         monkeypatch.setattr(config, "CHART_ENABLED", True)
+        # GIF companions are covered by their own tests (TestUpdateChartsForSourcesGif)
+        # — disabled here so every pre-existing assertion about a single
+        # upload_source_chart() call per style stays exactly as it was.
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
 
         obj_dir = tmp_path / "M51"
@@ -952,6 +1040,232 @@ class TestUpdateChartsForSources:
         result = await finder_chart.update_charts_for_sources({"src1": ["MOVING_UNKNOWN", "MOVING_UNKNOWN"]})
 
         assert result == {"src1": {"MOVING_UNKNOWN": True}}
+        assert upload_calls == [finder_chart.STYLE_TRACK]
+
+
+# ---------------------------------------------------------------------------
+# update_charts_for_sources — animated GIF companions (CHART_GIF_ENABLED)
+# ---------------------------------------------------------------------------
+
+class TestUpdateChartsForSourcesGif:
+
+    @staticmethod
+    def _epoch(filename, obj, ra, dec, obs_time="2024-01-01T00:00:00Z", mag=15.0):
+        return {
+            "frame_id": filename, "filename": filename, "object": obj,
+            "obs_time": obs_time, "ra": ra, "dec": dec, "mag": mag,
+        }
+
+    async def test_track_style_also_uploads_track_gif(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", True)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "Vesta_A807_FA"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "e0.fits", ra=202.47, dec=47.20)
+        _make_wcs_fits(obj_dir / "e1.fits", ra=202.48, dec=47.21)
+
+        epochs = [
+            self._epoch("e0.fits", "Vesta_A807_FA", 202.47, 47.20, "2024-01-01T00:00:00Z"),
+            self._epoch("e1.fits", "Vesta_A807_FA", 202.48, 47.21, "2024-01-01T01:00:00Z"),
+        ]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src1": epochs}),
+        )
+
+        upload_calls = []
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"source_id": source_id, "png_bytes": png_bytes, "style": style, "frame_count": frame_count})
+            return True
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
+
+        # The public result only ever reflects the static chart's outcome.
+        assert result == {"src1": {"ASTEROID": True}}
+        assert len(upload_calls) == 2
+        styles = {c["style"] for c in upload_calls}
+        assert styles == {finder_chart.STYLE_TRACK, finder_chart.STYLE_TRACK_GIF}
+        gif_call = next(c for c in upload_calls if c["style"] == finder_chart.STYLE_TRACK_GIF)
+        assert gif_call["png_bytes"][:6] in (b"GIF87a", b"GIF89a")
+        assert gif_call["frame_count"] == 2
+
+    async def test_stamp_strip_style_also_uploads_stamp_strip_gif(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", True)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "M51"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "e0.fits", ra=202.47, dec=47.20)
+        _make_wcs_fits(obj_dir / "e1.fits", ra=202.47, dec=47.20)
+
+        epochs = [
+            self._epoch("e0.fits", "M51", 202.47, 47.20, "2024-01-01T00:00:00Z"),
+            self._epoch("e1.fits", "M51", 202.47, 47.20, "2024-02-01T00:00:00Z"),
+        ]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src2": epochs}),
+        )
+
+        upload_calls = []
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"style": style, "png_bytes": png_bytes})
+            return True
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src2": ["SUPERNOVA_CANDIDATE"]})
+
+        assert result == {"src2": {"SUPERNOVA_CANDIDATE": True}}
+        styles = {c["style"] for c in upload_calls}
+        assert styles == {finder_chart.STYLE_STAMP_STRIP, finder_chart.STYLE_STAMP_STRIP_GIF}
+        gif_call = next(c for c in upload_calls if c["style"] == finder_chart.STYLE_STAMP_STRIP_GIF)
+        assert gif_call["png_bytes"][:6] in (b"GIF87a", b"GIF89a")
+
+    async def test_before_after_style_never_uploads_a_gif(self, monkeypatch, tmp_path):
+        """A single-epoch source (STYLE_BEFORE_AFTER) has no animated
+        counterpart at all, regardless of CHART_GIF_ENABLED."""
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", True)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "Vesta_A807_FA"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "current.fits", ra=167.55, dec=17.28)
+
+        epochs = [self._epoch("current.fits", "Vesta_A807_FA", 167.55, 17.28, "2021-03-14T18:05:44Z")]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src1": epochs}),
+        )
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_nearest_frame_before",
+            lambda object_name, before_time: _async_return(None),
+        )
+
+        upload_calls = []
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append(style)
+            return True
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src1": ["MOVING_UNKNOWN"]})
+
+        assert result == {"src1": {"MOVING_UNKNOWN": True}}
+        assert upload_calls == [finder_chart.STYLE_BEFORE_AFTER]
+
+    async def test_gif_disabled_uploads_only_the_static_chart(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", False)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "Vesta_A807_FA"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "e0.fits", ra=202.47, dec=47.20)
+        _make_wcs_fits(obj_dir / "e1.fits", ra=202.48, dec=47.21)
+
+        epochs = [
+            self._epoch("e0.fits", "Vesta_A807_FA", 202.47, 47.20, "2024-01-01T00:00:00Z"),
+            self._epoch("e1.fits", "Vesta_A807_FA", 202.48, 47.21, "2024-01-01T01:00:00Z"),
+        ]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src1": epochs}),
+        )
+
+        upload_calls = []
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append(style)
+            return True
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
+
+        assert result == {"src1": {"ASTEROID": True}}
+        assert upload_calls == [finder_chart.STYLE_TRACK]
+
+    async def test_gif_upload_failure_does_not_affect_reported_result(self, monkeypatch, tmp_path):
+        """The GIF is a bonus asset — its own upload failing must not flip
+        the already-successful static chart's own True result to False."""
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", True)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "Vesta_A807_FA"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "e0.fits", ra=202.47, dec=47.20)
+        _make_wcs_fits(obj_dir / "e1.fits", ra=202.48, dec=47.21)
+
+        epochs = [
+            self._epoch("e0.fits", "Vesta_A807_FA", 202.47, 47.20, "2024-01-01T00:00:00Z"),
+            self._epoch("e1.fits", "Vesta_A807_FA", 202.48, 47.21, "2024-01-01T01:00:00Z"),
+        ]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src1": epochs}),
+        )
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            # Fail only the GIF upload; the static chart still succeeds.
+            return style != finder_chart.STYLE_TRACK_GIF
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
+
+        assert result == {"src1": {"ASTEROID": True}}
+
+    async def test_gif_render_failure_does_not_affect_reported_result(self, monkeypatch, tmp_path):
+        """A GIF rendering exception (e.g. Pillow choking on a degenerate
+        frame) is caught inside _render_charts_for_source() and must not
+        prevent the static chart from being rendered/uploaded/reported."""
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "CHART_GIF_ENABLED", True)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "Vesta_A807_FA"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "e0.fits", ra=202.47, dec=47.20)
+        _make_wcs_fits(obj_dir / "e1.fits", ra=202.48, dec=47.21)
+
+        epochs = [
+            self._epoch("e0.fits", "Vesta_A807_FA", 202.47, 47.20, "2024-01-01T00:00:00Z"),
+            self._epoch("e1.fits", "Vesta_A807_FA", 202.48, 47.21, "2024-01-01T01:00:00Z"),
+        ]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src1": epochs}),
+        )
+
+        def raising_render_track_gif(loaded_epochs, label=None):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(finder_chart, "_render_track_gif", raising_render_track_gif)
+
+        upload_calls = []
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append(style)
+            return True
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
+
+        assert result == {"src1": {"ASTEROID": True}}
+        # Only the static chart was uploaded — the GIF render failed before
+        # ever reaching the upload step.
         assert upload_calls == [finder_chart.STYLE_TRACK]
 
 
