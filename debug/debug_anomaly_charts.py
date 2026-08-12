@@ -66,7 +66,7 @@ import pymysql.cursors
 import config
 # Reuse the production rendering code (and its exact visual style) instead
 # of re-implementing it — same reasoning as debug_catalog_match.py reusing
-# modules/catalog_matcher.py etc. Underscore names are "internal to the
+# modules/catalog_matcher/ etc. Underscore names are "internal to the
 # module", not "off limits to a debug tool in the same repo" — see
 # debug/README.md. Since debug/debug_anomaly_charts.py now calls the exact
 # same _render_track_chart() / _render_stamp_strip() / _render_before_after_chart()

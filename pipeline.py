@@ -1112,7 +1112,7 @@ async def preview_catalog_match(fits_path: str, task_id: str, item_id: str) -> d
     observatory-api's SourceChartModel). No local copy of the PNG is kept;
     it lives only in the API's storage once this returns.
 
-    Reuses modules/catalog_matcher.py directly (not a separate copy of the
+    Reuses modules/catalog_matcher/ directly (not a separate copy of the
     matching logic), so repeated frames of the same object/session within
     one task benefit from its on-disk cache exactly like a production
     ANALYZE run would — only the first frame per sky tile actually re-hits

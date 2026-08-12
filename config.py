@@ -304,7 +304,7 @@ CHART_GIF_FRAME_DURATION_MS: int = int(_get("CHART_GIF_FRAME_DURATION_MS", "700"
 NORMALIZE_ENABLED: bool = _get("NORMALIZE_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # ---------------------------------------------------------------------------
-# Catalog query cache (modules/catalog_matcher.py)
+# Catalog query cache (modules/catalog_matcher/)
 # ---------------------------------------------------------------------------
 # On-disk cache directory for external catalog query results (Gaia/Simbad/
 # 2MASS/Pan-STARRS/MPC), keyed by catalog + sky tile. Backs the in-process

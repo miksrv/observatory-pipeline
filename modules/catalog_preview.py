@@ -30,7 +30,7 @@ PREVIEW_CATALOG_MATCH task type's whole point is a result you look at via
 the API, not a local file to go hunt for on the observatory server.
 
 Backs the PREVIEW_CATALOG_MATCH task type (see pipeline.preview_catalog_match()
-and worker.py). Calling modules/catalog_matcher.py directly (not a separate
+and worker.py). Calling modules/catalog_matcher/ directly (not a separate
 copy of the matching logic) means repeated frames of the same object/session
 benefit from its on-disk cache exactly the same way a production ANALYZE run
 would — re-running this on many frames of one field re-hits Gaia/Simbad/

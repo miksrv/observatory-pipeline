@@ -1,10 +1,21 @@
 """
-tests/test_catalog_matcher.py — Unit tests for modules/catalog_matcher.py
+tests/test_catalog_matcher.py — Unit tests for the modules/catalog_matcher/ package
 
-All external catalog calls are mocked at the module namespace level:
-    patch("modules.catalog_matcher.Gaia")
-    patch("modules.catalog_matcher.Simbad")
-    patch("modules.catalog_matcher.MPC")
+All external catalog calls are mocked on the specific per-catalog submodule
+they're imported/defined in — never on the top-level package — since
+_match.py's own match() calls each catalog through a qualified submodule
+reference (see that module's docstring):
+    patch("modules.catalog_matcher._gaia.Gaia")
+    patch("modules.catalog_matcher._simbad.Simbad")
+    patch("modules.catalog_matcher._mpc._query_mpc", ...)
+    patch("modules.catalog_matcher._simbad._query_simbad", ...)
+    patch("modules.catalog_matcher._2mass._query_2mass", ...)
+    patch("modules.catalog_matcher._panstarrs._query_panstarrs", ...)
+
+MPC/SkyBot has no importable client class to patch (astroquery.imcce.Skybot
+is imported locally inside _mpc._query_mpc() itself) — tests instead patch
+_query_mpc() as a whole function, or exercise its real error handling via an
+invalid obs_time.
 
 Real astropy SkyCoord arithmetic runs for all coordinate-matching tests so
 that angular-distance logic is exercised without network access.
@@ -198,7 +209,7 @@ class TestGaiaMatching:
 
     def test_gaia_error_returns_empty_list(self):
         """If the Gaia query raises, _query_gaia returns []."""
-        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
             mock_gaia.cone_search.side_effect = RuntimeError("network timeout")
             result = cm._query_gaia(_RA, _DEC, 1.0)
 
@@ -213,7 +224,7 @@ class TestGaiaMatching:
             "source_id":       [1,     2],
             "phot_g_mean_mag": [14.0,  float("nan")],
         })
-        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
             mock_gaia.cone_search.return_value = _mock_gaia_job(table)
             result = cm._query_gaia(_RA, _DEC, 1.0)
 
@@ -271,7 +282,7 @@ class TestSimbadMatching:
 
     def test_simbad_none_result_handled(self):
         """_query_simbad returns [] when Simbad.query_region() returns None."""
-        with patch("modules.catalog_matcher.Simbad") as mock_simbad_cls:
+        with patch("modules.catalog_matcher._simbad.Simbad") as mock_simbad_cls:
             instance = MagicMock()
             instance.query_region.return_value = None
             mock_simbad_cls.return_value = instance
@@ -282,7 +293,7 @@ class TestSimbadMatching:
 
     def test_simbad_error_returns_empty_list(self):
         """If Simbad query raises, _query_simbad returns [] with no crash."""
-        with patch("modules.catalog_matcher.Simbad") as mock_simbad_cls:
+        with patch("modules.catalog_matcher._simbad.Simbad") as mock_simbad_cls:
             instance = MagicMock()
             instance.query_region.side_effect = ConnectionError("timeout")
             mock_simbad_cls.return_value = instance
@@ -452,9 +463,9 @@ class TestMatchOrchestrator:
 
         gaia_t = _gaia_table(_RA + 10, _DEC + 10)   # far away — no matches
         with (
-            patch("modules.catalog_matcher.Gaia", self._make_gaia_mock(gaia_t)),
-            patch("modules.catalog_matcher.Simbad", self._make_simbad_mock(None)),
-            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+            patch("modules.catalog_matcher._gaia.Gaia", self._make_gaia_mock(gaia_t)),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
         ):
             result = await cm.match(sources, _FRAME_META)
 
@@ -466,9 +477,9 @@ class TestMatchOrchestrator:
 
         gaia_t = _gaia_table(_RA + 10, _DEC + 10)
         with (
-            patch("modules.catalog_matcher.Gaia", self._make_gaia_mock(gaia_t)),
-            patch("modules.catalog_matcher.Simbad", self._make_simbad_mock(None)),
-            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+            patch("modules.catalog_matcher._gaia.Gaia", self._make_gaia_mock(gaia_t)),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
         ):
             result = await cm.match(sources, _FRAME_META)
 
@@ -496,9 +507,9 @@ class TestMatchOrchestrator:
         mock_simbad_cls.return_value = mock_simbad_instance
 
         with (
-            patch("modules.catalog_matcher.Gaia", mock_gaia),
-            patch("modules.catalog_matcher.Simbad", mock_simbad_cls),
-            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+            patch("modules.catalog_matcher._gaia.Gaia", mock_gaia),
+            patch("modules.catalog_matcher._simbad.Simbad", mock_simbad_cls),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
         ):
             result = await cm.match([source], _FRAME_META)
 
@@ -521,9 +532,9 @@ class TestMatchOrchestrator:
         mock_gaia.cone_search.return_value = _mock_gaia_job(gaia_t)
 
         with (
-            patch("modules.catalog_matcher.Gaia", mock_gaia),
-            patch("modules.catalog_matcher.Simbad", self._make_simbad_mock(None)),
-            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+            patch("modules.catalog_matcher._gaia.Gaia", mock_gaia),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
         ):
             await cm.match(sources_run1, _FRAME_META)
             await cm.match(sources_run2, _FRAME_META)
@@ -537,9 +548,9 @@ class TestMatchOrchestrator:
         mock_gaia.cone_search.return_value = _mock_gaia_job(_gaia_table(_RA, _DEC))
 
         with (
-            patch("modules.catalog_matcher.Gaia", mock_gaia),
-            patch("modules.catalog_matcher.Simbad", self._make_simbad_mock(None)),
-            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+            patch("modules.catalog_matcher._gaia.Gaia", mock_gaia),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
         ):
             result = await cm.match([], _FRAME_META)
 
@@ -551,9 +562,9 @@ class TestMatchOrchestrator:
         gaia_t = _gaia_table(ra=_RA, dec=_DEC, source_id=42, mag=12.3)
 
         with (
-            patch("modules.catalog_matcher.Gaia", self._make_gaia_mock(gaia_t)),
-            patch("modules.catalog_matcher.Simbad", self._make_simbad_mock(None)),
-            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+            patch("modules.catalog_matcher._gaia.Gaia", self._make_gaia_mock(gaia_t)),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
         ):
             result = await cm.match([source], _FRAME_META)
 
@@ -574,7 +585,7 @@ class TestMatchOrchestrator:
 # scattered by a few arcsec of centroid noise around the systematic bias,
 # spread across several adjacent bins and never reached the vote floor,
 # while an unrelated 2-vote noise bin passed the (too permissive at low
-# background) significance check. See modules/catalog_matcher.py for the
+# background) significance check. See modules/catalog_matcher/_wcs_offset.py for the
 # fixed algorithm (coarser bins, Poisson-margin significance test with an
 # absolute vote floor, iterative median refinement).
 # ===========================================================================
@@ -721,7 +732,7 @@ class TestGaiaProperMotionFields:
             "pmdec":           [-4.5],
             "ref_epoch":       [2016.0],
         })
-        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
             mock_gaia.cone_search.return_value = _mock_gaia_job(table)
             result = cm._query_gaia(_RA, _DEC, 1.0)
 
@@ -734,7 +745,7 @@ class TestGaiaProperMotionFields:
         """The existing 4-column mock table (no pmra/pmdec/ref_epoch) must
         still work — pmra/pmdec fall back to None, ref_epoch to 2016.0."""
         table = _gaia_table(_RA, _DEC)
-        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
             mock_gaia.cone_search.return_value = _mock_gaia_job(table)
             result = cm._query_gaia(_RA, _DEC, 1.0)
 
@@ -753,7 +764,7 @@ class TestGaiaProperMotionFields:
             "pmdec":           [float("nan")],
             "ref_epoch":       [2016.0],
         })
-        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
             mock_gaia.cone_search.return_value = _mock_gaia_job(table)
             result = cm._query_gaia(_RA, _DEC, 1.0)
 
@@ -774,7 +785,7 @@ class TestGaiaProperMotionFields:
 class TestPublicCatalogAccessors:
     def test_get_gaia_stars_delegates_to_query_gaia(self):
         table = _gaia_table(_RA, _DEC, source_id=42, mag=12.3)
-        with patch("modules.catalog_matcher.Gaia") as mock_gaia:
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
             mock_gaia.cone_search.return_value = _mock_gaia_job(table)
             result = cm.get_gaia_stars(_RA, _DEC, 1.0)
 
@@ -791,11 +802,11 @@ class TestPublicCatalogAccessors:
         mock_gaia.cone_search.return_value = _mock_gaia_job(table)
 
         with (
-            patch("modules.catalog_matcher.Gaia", mock_gaia),
-            patch("modules.catalog_matcher._query_simbad", return_value=[]),
-            patch("modules.catalog_matcher._query_2mass", return_value=[]),
-            patch("modules.catalog_matcher._query_panstarrs", return_value=[]),
-            patch("modules.catalog_matcher._query_mpc", return_value=[]),
+            patch("modules.catalog_matcher._gaia.Gaia", mock_gaia),
+            patch("modules.catalog_matcher._simbad._query_simbad", return_value=[]),
+            patch("modules.catalog_matcher._2mass._query_2mass", return_value=[]),
+            patch("modules.catalog_matcher._panstarrs._query_panstarrs", return_value=[]),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
         ):
             await cm.match([_make_source()], _FRAME_META)
             cm.get_gaia_stars(_FRAME_META["ra_center"], _FRAME_META["dec_center"], _FRAME_META["fov_deg"])
@@ -803,7 +814,7 @@ class TestPublicCatalogAccessors:
         assert mock_gaia.cone_search.call_count == 1
 
     def test_get_mpc_objects_delegates_to_query_mpc(self):
-        with patch("modules.catalog_matcher._query_mpc", return_value=[{"designation": "2019 XY3"}]) as mock_query:
+        with patch("modules.catalog_matcher._mpc._query_mpc", return_value=[{"designation": "2019 XY3"}]) as mock_query:
             result = cm.get_mpc_objects(_RA, _DEC, _FRAME_META["obs_time"], 1.0)
 
         mock_query.assert_called_once_with(_RA, _DEC, _FRAME_META["obs_time"], 1.0)
