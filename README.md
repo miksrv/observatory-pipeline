@@ -133,7 +133,7 @@ observatory-pipeline/
 ├── docs/
 │   ├── API.md                 ← REST API endpoint reference
 │   ├── ISSUES.md              ← open data-quality questions for observatory-api
-│   └── anomaly-detector.md    ← deep-dive into modules/anomaly_detector.py
+│   └── anomaly-detector.md    ← deep-dive into modules/anomaly_detector/
 │
 ├── modules/
 │   ├── fits_header.py         ← extract FITS headers into structured dict
@@ -237,10 +237,10 @@ Catalogs, queried in order:
 ### `modules/forced_photometry.py`
 **Forced photometry / reverse matching** (precovery) — the reverse of `catalog_matcher.py` above: for every Gaia DR3 star / MPC object in the frame's footprint with no corresponding entry in `sources`, measures the flux at its predicted pixel position anyway, instead of treating it as "not detected". Recovers objects too faint for blind detection's threshold, and bright catalog stars the blind extractor's own filters happened to miss. Reuses the Gaia/MPC field lists `catalog_matcher.py` already fetched (no new network calls) and photometry.py's aperture-photometry math against the frame's already-computed zero-point. A genuine non-detection is dropped, not reported as an "upper limit". Gated by `FORCED_PHOTOMETRY_ENABLED`.
 
-### `modules/anomaly_detector.py`
-Core science logic. Queries the API in a single batched call per frame (`POST /sources/near/batch`, `POST /frames/covering/batch`) for historical observations near every source at once, then classifies:
+### `modules/anomaly_detector/`
+Core science logic. A package split by concern (`types.py`, `_classify.py`, `_prefetch.py`, etc. — see CLAUDE.md for the exact map), with `__init__.py` re-exporting `detect()`/`AnomalyType` so it's still imported and called the same way everywhere else in this codebase. Queries the API in a single batched call per frame (`POST /sources/near/batch`, `POST /frames/covering/batch`) for historical observations near every source at once, then classifies:
 
-`anomaly_type` is a fixed enum of 10 values — `AnomalyType(str, Enum)` in `modules/anomaly_detector.py`, mirrored by `AnomalyModel::ALLOWED_TYPES` and an `ENUM` column constraint on the `observatory-api` side:
+`anomaly_type` is a fixed enum of 10 values — `AnomalyType(str, Enum)` in `modules/anomaly_detector/types.py`, mirrored by `AnomalyModel::ALLOWED_TYPES` and an `ENUM` column constraint on the `observatory-api` side:
 
 | `anomaly_type` | When assigned | Alert? |
 |---|---|---|
@@ -516,7 +516,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
 | **Edge-of-Frame Geometry** |
 | `EDGE_MARGIN_FRAC` | `0.1` | No | Fraction of NAXIS1/NAXIS2 treated as "near the edge" — coma and other off-axis aberrations stretch a star's PSF near the edges/corners of a wide-field frame, inflating its measured elongation. `modules/astrometry.py`/`modules/subtraction.py` flag such sources `near_edge`; tune to your own optics. |
-| `SPACE_DEBRIS_ELONGATION_MIN` | `3.0` | No | Elongation threshold for the "single-exposure trail" `SPACE_DEBRIS` shortcut in `modules/anomaly_detector.py`, for a source not flagged `near_edge`. |
+| `SPACE_DEBRIS_ELONGATION_MIN` | `3.0` | No | Elongation threshold for the "single-exposure trail" `SPACE_DEBRIS` shortcut in `modules/anomaly_detector/`, for a source not flagged `near_edge`. |
 | `SPACE_DEBRIS_EDGE_ELONGATION_MIN` | `6.0` | No | Same shortcut's threshold for a source flagged `near_edge` — higher, since coma alone can already push an ordinary star's elongation past `SPACE_DEBRIS_ELONGATION_MIN` near the edge of a wide-field frame. |
 | **Image Subtraction** |
 | `SUBTRACTION_MIN_FRAMES` | `3` | No | Minimum number of archived reference frames of the same object required before `modules/subtraction.py` will attempt image subtraction. |

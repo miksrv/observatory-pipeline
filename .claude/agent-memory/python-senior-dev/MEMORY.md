@@ -12,3 +12,4 @@
 - [feedback_api_client_patterns.md](feedback_api_client_patterns.md) — httpx.AsyncClient mock pattern and inner/outer retry design for api_client tests
 - [feedback_catalog_matcher_patterns.md](feedback_catalog_matcher_patterns.md) — Simbad sexagesimal format, MPC instability, Simbad class-mock pattern, UTC datetime for cache
 - [feedback_ephemeris_patterns.md](feedback_ephemeris_patterns.md) — Horizons mock chain, numpy.ma.masked for masked columns, KeyError injection, elevation unit (m→km)
+- [feedback_module_to_package_split.md](feedback_module_to_package_split.md) — Three compatibility rules (attribute-chain patches, bare-name patches, direct-call re-exports) for splitting a modules/*.py file into a package without breaking tests

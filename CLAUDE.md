@@ -8,7 +8,7 @@ what's already documented elsewhere; each of those facts has exactly one home:
 |---|---|
 | Deployment, Docker setup, environment variables, project structure, dependencies | [README.md](README.md) |
 | REST API endpoint contracts (full request/response JSON) | [docs/API.md](docs/API.md) |
-| `modules/anomaly_detector.py` internals (batch prefetch, classification flowchart) | [docs/anomaly-detector.md](docs/anomaly-detector.md) |
+| `modules/anomaly_detector/` internals (batch prefetch, classification flowchart) | [docs/anomaly-detector.md](docs/anomaly-detector.md) |
 | Open data-quality questions under investigation | [docs/ISSUES.md](docs/ISSUES.md) |
 
 When something changes, update it in that one place — don't copy it here too.
@@ -238,7 +238,7 @@ Orchestrates processing of a single FITS file in order:
      after anomaly detection (an earlier revision of this file ran it later, between steps 14 and
      15) — anomaly detection never touches the local file at all, so there was no reason to delay
      archiving behind it, and doing so would have blocked decoupling anomaly detection into a task
-     that might run much later (see `modules/anomaly_detector.py` below). Must still run **before**
+     that might run much later (see `modules/anomaly_detector/` below). Must still run **before**
      step 15: that step looks up this same frame's own file at its archive path, so moving it any
      later than this would mean the current epoch is never found there. This is where
      **Module 1** ends — steps 1–12.5 are `pipeline.analyze_frame(fits_path)`'s entire body,
@@ -563,7 +563,7 @@ When normalization is enabled, the API receives only normalized values (no dupli
     `EDGE_MARGIN_FRAC` of any frame edge (computed straight from `sep`'s own `x`/`y`, no WCS
     needed). Coma and other off-axis aberrations progressively stretch a star's PSF toward the
     edges/corners of a wide-field frame, inflating its measured `elongation` for purely optical
-    reasons rather than real motion or trailing — `modules/anomaly_detector.py` reads this flag to
+    reasons rather than real motion or trailing — `modules/anomaly_detector/` reads this flag to
     demand a higher elongation bar before classifying such a source `SPACE_DEBRIS` (real incident,
     2026-08-07, `T_CrB` frames: 305 anomalies out of 4 frames, the vast majority coma-elongated but
     otherwise ordinary corner stars). Deliberately no leading underscore, same as `saturated` above
@@ -771,8 +771,14 @@ throughout: any failure (FITS I/O, WCS projection, missing catalog data) is logg
 `[]`, never raising — `pipeline.py`'s step 9.5 treats that identically to "nothing to recover" and
 continues with whatever `sources` already had.
 
-### `modules/anomaly_detector.py`
-Core logic. For all detected sources in a frame **at once** (batched, not one API round-trip per source):
+### `modules/anomaly_detector/`
+Core logic. A package, not a single file — split by concern (`types.py`, `_otypes.py`,
+`_geometry.py`, `_history.py`, `_movement.py`, `_prefetch.py`, `_classify.py`,
+`_ephemeris_resolution.py`, `_detect.py`; see that package's own `__init__.py` docstring
+for the exact map and [docs/anomaly-detector.md](docs/anomaly-detector.md) for the mechanics).
+`__init__.py` re-exports `detect()`/`AnomalyType`, so every call site elsewhere in this
+codebase still does `from modules import anomaly_detector; anomaly_detector.detect(...)`
+unchanged. For all detected sources in a frame **at once** (batched, not one API round-trip per source):
 
 Every returned anomaly dict includes `source_id` — the resolved `sources.id` read off the
 source's `_source_id` key, which `pipeline.py`'s Step 12 attaches from the `source_ids` array
@@ -915,7 +921,7 @@ catalog-matched — `anomaly_type` plus its resolved catalog designation in pare
 `ASTEROID (Vesta)` or `VARIABLE_STAR (TYC 1430-1407-1)`. An uncatalogued source's chart keeps the
 bare `anomaly_type` title.
 
-**A source can hold both charts at once.** `modules/anomaly_detector.py` classifies a source
+**A source can hold both charts at once.** `modules/anomaly_detector/` classifies a source
 independently on every frame it appears on, so the same `source_id` can accumulate anomalies of
 more than one `anomaly_type` over its lifetime — e.g. `UNKNOWN` on the frame it was first seen (no
 history yet), `MOVING_UNKNOWN` on a later frame once it had moved. Real incident, 2026-08-11:
@@ -1116,7 +1122,7 @@ handling looks different at each pipeline stage rather than a single global gate
 | Catalog matching (by RA/Dec) | No | Position-based cross-matching doesn't care what filter produced the position |
 | Gaia zero-point calibration | Yes | `modules/photometry.py`'s `skip_calibration` (set by `pipeline.py` from `is_narrowband()`) skips it unconditionally on a narrowband frame — too few Gaia-bright stars pass through the bandpass, and even a zero-point computed from the few that do is systematically biased relative to Gaia's broadband G, regardless of match count |
 | Subtraction (differencing) | Yes, and already filter-aware | `modules/subtraction.py` matches its reference stack by filter (see that module's section above) — same-filter differencing is valid and is in fact the *best* transient signal available on a narrowband frame, since it needs no cross-filter magnitude comparison at all |
-| Anomaly Δmag comparison | Yes | `modules/anomaly_detector.py`'s `_same_filter_history()` restricts the historical magnitude used for `VARIABLE_STAR`/`BINARY_STAR`/the brightening branch of `SUPERNOVA_CANDIDATE` to detections carrying the *same* filter as the current source (via each source's `_filter`, and each historical detection's `filter` — see `POST /sources/near/batch` in docs/API.md). The **existence** check (whether this position has ever been detected before, at any point in `FIRST_OBSERVATION`/`UNKNOWN`/`KNOWN_CATALOG_NEW`) stays filter-agnostic on purpose — an ordinary LRGB sequence re-images the same field in 3-4 different filters per session, and a position already seen in R must not look "brand new" the moment an L-filtered frame comes in |
+| Anomaly Δmag comparison | Yes | `modules/anomaly_detector/_history.py`'s `_same_filter_history()` restricts the historical magnitude used for `VARIABLE_STAR`/`BINARY_STAR`/the brightening branch of `SUPERNOVA_CANDIDATE` to detections carrying the *same* filter as the current source (via each source's `_filter`, and each historical detection's `filter` — see `POST /sources/near/batch` in docs/API.md). The **existence** check (whether this position has ever been detected before, at any point in `FIRST_OBSERVATION`/`UNKNOWN`/`KNOWN_CATALOG_NEW`) stays filter-agnostic on purpose — an ordinary LRGB sequence re-images the same field in 3-4 different filters per session, and a position already seen in R must not look "brand new" the moment an L-filtered frame comes in |
 
 Position-only classifications (`ASTEROID`/`COMET`/`MOVING_UNKNOWN`/`SPACE_DEBRIS`, and `UNKNOWN`
 via subtraction) never depend on magnitude at all, so they are unaffected by any of this — a
@@ -1321,7 +1327,7 @@ it is.
 - Query SDSS DR17 (~22 mag, ~35% sky coverage) as a further fallback — not implemented
 - Add a new classification `FAINT_UNCATALOGUED` distinct from true `UNKNOWN` — not implemented (still just a `TODO` comment)
 
-**Location:** `modules/anomaly_detector.py`, the `UNKNOWN` classification branch.
+**Location:** `modules/anomaly_detector/_classify.py`, the `UNKNOWN` classification branch.
 
 ### 2. `QC_SNR_MIN` is configured but not enforced
 
