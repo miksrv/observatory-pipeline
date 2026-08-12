@@ -243,7 +243,7 @@ Orchestrates processing of a single FITS file in order:
      later than this would mean the current epoch is never found there. This is where
      **Module 1** ends — steps 1–12.5 are `pipeline.analyze_frame(fits_path)`'s entire body,
      independently callable as a task item (see "Job queue" below).
-13. `anomaly_detector.detect(frame_id, sources, catalog_matches, frame_meta)` → finds anomalies, using the batched history/coverage API calls (see `api_client/client.py` below)
+13. `anomaly_detector.detect(frame_id, sources, catalog_matches, frame_meta)` → finds anomalies, using the batched history/coverage API calls (see `api_client/` below)
 14. `api_client.post_anomalies(frame_id, filename, anomalies)` → saves anomalies. Steps 13–14 are
      **Module 2** — `pipeline.detect_anomalies_for_frame_data()` (in-memory `sources`, used right
      after step 12.5 above) or its standalone counterpart
@@ -328,7 +328,7 @@ first, which searches every `FITS_ARCHIVE/{object}/` subdirectory for an exact f
 substitutes the full path if it finds exactly one. This exists because observatory-api's
 `Web\FramesController::createTask()` debug page builds `ANALYZE`/`PREVIEW_CATALOG_MATCH` task
 items straight from an already-registered frame's `frames.filename` column (a basename — see
-`api_client/client.py`'s section below), and the API has no way to supply a real full path itself:
+`api_client/`'s section below), and the API has no way to supply a real full path itself:
 it has no filesystem access to `/fits/...` at all (see "Architecture: Two Repositories"), so it
 can't know `FITS_ARCHIVE`'s actual value for this deployment. Only the pipeline process can
 resolve it, hence the fallback lives here rather than on the API side. Zero or more than one match
@@ -992,12 +992,19 @@ repo's `CLAUDE.md`. `api_client.upload_source_chart()` sets the outgoing `Conten
 image bytes' own magic number (`_content_type_for_image_bytes()`), not from `style`, so it needs
 no signature change to carry either format.
 
-### `api_client/client.py`
-All communication with the remote `observatory-api`. Uses `httpx` with async support and
-`tenacity` for automatic retry on transient failures (HTTP 5xx and transport/timeout errors —
-never on HTTP 4xx). Sends `X-API-Key`, `Content-Type: application/json`, `Accept: application/json`
-on every request. Exact retry parameters and endpoint request/response shapes are documented
-once, in **[docs/API.md](docs/API.md)** — not repeated here.
+### `api_client/`
+All communication with the remote `observatory-api`. A package, not a single file — split by
+REST resource, mirroring docs/API.md's own section grouping: `frames.py` (§1, 5, 7, 12, 13),
+`sources.py` (§2, 4, 6, 8, 9, 11), `anomalies.py` (§3), `tasks.py` (§14), `settings.py` (§16), and
+an internal `_shared.py` for the retry decorator, `AsyncClient` factory, and batch-response
+normalization every one of those files uses. `__init__.py` re-exports every public function, so
+every call site elsewhere in this codebase does a plain `import api_client;
+api_client.post_frame(...)` — the split into several files is invisible outside this package.
+Uses `httpx` with async support and `tenacity` for automatic retry on transient failures
+(HTTP 5xx and transport/timeout errors — never on HTTP 4xx). Sends `X-API-Key`,
+`Content-Type: application/json`, `Accept: application/json` on every request. Exact retry
+parameters and endpoint request/response shapes are documented once, in
+**[docs/API.md](docs/API.md)** — not repeated here.
 
 Besides the batched endpoints `anomaly_detector.py` and `finder_chart.py` actually call
 (`/sources/near/batch`, `/frames/covering/batch`, `/sources/tracks/batch`),
@@ -1180,7 +1187,7 @@ the faint-`UNKNOWN` problem, see Known Issues #1.
 - Errors in external catalog queries (network timeout, rate limit) must be caught and logged —
   they must NOT crash the pipeline. The frame should still be processed with partial results.
 - Errors in the observatory API calls: retry up to 3 attempts total (2 retries) with exponential
-  backoff (see `api_client/client.py` above and docs/API.md for the exact parameters), then log
+  backoff (see `api_client/` above and docs/API.md for the exact parameters), then log
   and continue — do not lose the frame
 - Unit tests in `tests/` use `pytest` and mock all external calls (API, catalogs, astap subprocess)
 - **All Markdown documents in this project are written in English** — this applies to every
