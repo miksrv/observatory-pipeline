@@ -928,7 +928,7 @@ async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
 
 
 async def generate_charts_for_source_ids(
-    anomaly_type_by_source_id: dict,
+    anomaly_types_by_source_id: dict,
     designation_by_source_id: dict | None = None,
 ) -> dict:
     """
@@ -938,7 +938,12 @@ async def generate_charts_for_source_ids(
     GENERATE_CHARTS task covers at once, regardless of how many frames they
     originally came from — one call renders and uploads every one of them.
 
-    A value in `anomaly_type_by_source_id` may be None — a chart requested
+    `anomaly_types_by_source_id` maps each source_id to a LIST of
+    anomaly_types requesting a chart for it (not a single value) — a source
+    can legitimately be classified more than one way over its lifetime (see
+    modules/finder_chart.py's module docstring), and each distinct style
+    those types imply gets its own chart rather than one arbitrarily
+    overwriting the rest. A list entry of None is valid — a chart requested
     directly for a source with no anomaly behind it at all (e.g.
     observatory-api's `/ui/sources/generate-charts`, which never sets
     payload.anomaly_type — see worker.py's `_run_charts_task()`). That's not
@@ -948,27 +953,34 @@ async def generate_charts_for_source_ids(
     Returns
     -------
     dict
-        source_id -> bool (True on successful chart update). {} if the
-        module is unavailable, charting is disabled (CHART_ENABLED=false),
-        or `anomaly_type_by_source_id` is empty.
+        source_id -> {anomaly_type: bool} (True on successful chart update
+        for that type's style). {} if the module is unavailable, charting is
+        disabled (CHART_ENABLED=false), or `anomaly_types_by_source_id` is
+        empty.
     """
-    if finder_chart is None or not config.CHART_ENABLED or not anomaly_type_by_source_id:
+    if finder_chart is None or not config.CHART_ENABLED or not anomaly_types_by_source_id:
         return {}
-    return await finder_chart.update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id)
+    return await finder_chart.update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id)
 
 
 async def generate_charts_for_anomalies(sources: list, anomalies: list) -> dict:
     """
-    Build the (source_id -> anomaly_type) / (source_id -> designation) maps
-    from an in-memory `sources` + `anomalies` pair and update every affected
-    source's finder chart in one batch. This is what `run()` uses right
-    after `detect_anomalies_for_frame_data()`, in the same process.
+    Build the (source_id -> [anomaly_type, ...]) / (source_id -> designation)
+    maps from an in-memory `sources` + `anomalies` pair and update every
+    affected source's finder chart(s) in one batch. This is what `run()`
+    uses right after `detect_anomalies_for_frame_data()`, in the same
+    process.
 
-    Deduped by source_id — in practice pipeline.py's dedup-by-catalog-
-    identity step already collapses multiple detections of the same catalog
-    identity within one frame down to a single source, so seeing more than
-    one anomaly per source_id here would be unusual; this dict-based dedup
-    is defensive rather than the expected common case.
+    Grouped by source_id, collecting every anomaly_type seen for it (not
+    just the first) — a source can, in principle, end up with more than one
+    anomaly on the very same frame (e.g. the API resolving "_source_id"
+    positionally onto the same row for two different detections — see the
+    designation-resolution caveat below), and modules/finder_chart.py needs
+    every one of those types to render each distinct chart style they imply
+    (see that module's docstring). In practice this is usually a
+    single-element list per source_id, since pipeline.py's
+    dedup-by-catalog-identity step already collapses multiple detections of
+    the same catalog identity within one frame down to a single source.
 
     Designation resolution prefers each anomaly's OWN "mpc_designation" (set
     by anomaly_detector.py straight from the one `source` dict that produced
@@ -990,21 +1002,22 @@ async def generate_charts_for_anomalies(sources: list, anomalies: list) -> dict:
     Returns
     -------
     dict
-        source_id -> bool, or {} if there was nothing to chart (no anomaly
-        had a resolved source_id) or charting is disabled/unavailable.
+        source_id -> {anomaly_type: bool}, or {} if there was nothing to
+        chart (no anomaly had a resolved source_id) or charting is
+        disabled/unavailable.
     """
     if finder_chart is None or not config.CHART_ENABLED:
         if finder_chart is None:
             logger.debug("Finder chart module not available — skipping")
         return {}
 
-    anomaly_type_by_source: dict = {}
+    anomaly_types_by_source: dict = {}
     for anomaly in anomalies:
         source_id = anomaly.get("source_id")
-        if source_id and source_id not in anomaly_type_by_source:
-            anomaly_type_by_source[source_id] = anomaly.get("anomaly_type")
+        if source_id:
+            anomaly_types_by_source.setdefault(source_id, []).append(anomaly.get("anomaly_type"))
 
-    if not anomaly_type_by_source:
+    if not anomaly_types_by_source:
         return {}
 
     designation_by_source: dict = {}
@@ -1021,25 +1034,26 @@ async def generate_charts_for_anomalies(sources: list, anomalies: list) -> dict:
         if src.get("_source_id") and src.get("catalog_name") and src.get("catalog_id")
     }
 
-    for source_id in anomaly_type_by_source:
+    for source_id in anomaly_types_by_source:
         designation = mpc_designation_by_source.get(source_id) or catalog_id_by_source_id.get(source_id)
         if designation:
             designation_by_source[source_id] = designation
 
     try:
-        chart_results = await generate_charts_for_source_ids(anomaly_type_by_source, designation_by_source)
-        for source_id, anomaly_type in anomaly_type_by_source.items():
+        chart_results = await generate_charts_for_source_ids(anomaly_types_by_source, designation_by_source)
+        for source_id, anomaly_types in anomaly_types_by_source.items():
+            source_results = chart_results.get(source_id) or {}
             logger.debug(
-                "Finder chart %s for source_id=%s (%s)",
-                "updated" if chart_results.get(source_id) else "skipped",
+                "Finder chart(s) for source_id=%s (%s): %s",
                 source_id,
-                anomaly_type,
+                anomaly_types,
+                source_results,
             )
         return chart_results
     except Exception as exc:
         logger.warning(
             "Finder chart batch update failed for %d source(s): %s — continuing",
-            len(anomaly_type_by_source),
+            len(anomaly_types_by_source),
             exc,
         )
         return {}

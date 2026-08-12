@@ -166,8 +166,21 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
     that module's `_style_for_source()`/`_style_for_anomaly_type()`) —
     "before_after" for a single-epoch source, "stamp_strip" otherwise, with
     no anomaly_type in the chart title.
+
+    A task can carry MORE THAN ONE item for the same source_id, each with a
+    different anomaly_type — observatory-api's AnomaliesController now
+    submits one item per distinct anomaly_type within a source's group
+    rather than collapsing them to one (see that controller's createTask()
+    docstring), since a source classified more than one way over its
+    lifetime (e.g. UNKNOWN then MOVING_UNKNOWN once it moved) needs both
+    its "track" and "stamp_strip" charts, not just whichever type was
+    arbitrarily picked. All of a source_id's items are therefore collected
+    into one list before the batched call, and each item's own outcome is
+    looked up by (source_id, anomaly_type) afterwards, not by source_id
+    alone — see modules/finder_chart.py's update_charts_for_sources() for
+    why the result dict is nested that way.
     """
-    anomaly_type_by_source_id: dict = {}
+    anomaly_types_by_source_id: dict = {}
     designation_by_source_id: dict = {}
     valid_items: list[dict] = []
 
@@ -184,16 +197,16 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
             })
             continue
 
-        anomaly_type_by_source_id[source_id] = anomaly_type
+        anomaly_types_by_source_id.setdefault(source_id, []).append(anomaly_type)
         if payload.get("designation"):
             designation_by_source_id[source_id] = payload["designation"]
         valid_items.append(item)
 
     results: dict = {}
-    if anomaly_type_by_source_id:
+    if anomaly_types_by_source_id:
         try:
             results = await pipeline.generate_charts_for_source_ids(
-                anomaly_type_by_source_id, designation_by_source_id,
+                anomaly_types_by_source_id, designation_by_source_id,
             )
         except Exception as exc:
             logger.exception("GENERATE_CHARTS task_id=%s failed", task["id"])
@@ -202,7 +215,9 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
             valid_items = []  # already recorded above — don't record twice below
 
     for item in valid_items:
-        ok = results.get(item.get("source_id"))
+        payload = item.get("payload") or {}
+        source_results = results.get(item.get("source_id")) or {}
+        ok = source_results.get(payload.get("anomaly_type"))
         progress.append({
             "item_id": item["id"],
             "status": "DONE" if ok else "FAILED",
