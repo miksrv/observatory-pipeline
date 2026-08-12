@@ -383,6 +383,9 @@ Accept: application/json
 | `sources[].dec` | float | yes | Source declination in decimal degrees |
 | `sources[].mag` | float\|null | no | Gaia-calibrated magnitude, or `null` when the frame couldn't be photometrically calibrated (fewer than 3 Gaia DR3 references) — the pipeline never sends the raw uncalibrated instrumental magnitude here, since it has no absolute zero-point (see observatory-pipeline's docs/ISSUES.md #2) |
 | `sources[].flux` | float | no | Raw aperture flux in ADU |
+| `sources[].flux_err` | float\|null | no | Flux uncertainty (Poisson + sky noise in quadrature) from `modules/photometry.py`'s aperture photometry, or `null` when the source wasn't measured (saturated, out of bounds, or a frame-level photometry failure) |
+| `sources[].mag_err` | float\|null | no | `1.0857 * flux_err / flux_aperture` — magnitude uncertainty from `modules/photometry.py`; `null` under the same conditions as `flux_err` |
+| `sources[].snr` | float\|null | no | `flux_aperture / flux_err` from `modules/photometry.py` — signal-to-noise of this source's aperture flux measurement, the same flux/noise convention as `qc.snr_median` (section 1). `null` under the same conditions as `flux_err`. Not gated on a positive flux — a low/negative value is itself meaningful (consistent with noise, not a real detection) |
 | `sources[].fwhm` | float | no | FWHM of the source PSF in arcseconds |
 | `sources[].catalog_name` | string\|null | no | Matched catalog: `"Gaia DR3"`, `"Simbad"`, `"MPC"`, or `null` if unmatched |
 | `sources[].catalog_id` | string\|null | no | Catalog object identifier (Gaia source_id, Simbad MAIN_ID, MPC designation) |

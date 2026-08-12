@@ -557,7 +557,17 @@ When normalization is enabled, the API receives only normalized values (no dupli
 ### `modules/photometry.py`
 - Aperture photometry via `photutils.aperture`
 - Differential photometry against Gaia reference stars in the field (requires ≥3 Gaia DR3 matches to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations
-- Adds the following fields to each source: `flux_aperture`, `flux_err`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `calibrated` (bool), `edge_flag`, `zero_point`, `zero_point_err`
+- Adds the following fields to each source: `flux_aperture`, `flux_err`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `snr`, `calibrated` (bool), `edge_flag`, `zero_point`, `zero_point_err`
+- `snr` is `flux_aperture / flux_err` — the same flux/noise convention already used by
+  `modules/qc.py`'s `snr_median` and (as a cruder pixel-space proxy, before real aperture
+  photometry has run) `modules/subtraction.py`'s own candidate `snr`. Computed here rather than
+  reused from `astrometry.py`'s detection-time `peak / bkg.globalrms` significance, since that
+  metric is tuned for star-vs-noise filtering (`STAR_SNR_MIN`), not for reporting the actual
+  significance of the flux a source is ultimately photometered at. This step **overwrites** any
+  provisional `snr` a source already carried — in practice, only an image-subtraction candidate
+  merged in at `pipeline.py` step 7 carries one before this step runs — with the real
+  aperture-photometry-derived value, so every source's `snr` in the API payload is computed the
+  same way regardless of origin.
 - A source carrying `saturated=True` (set by `astrometry.solve()`) is never measured — all of the
   fields above stay `None` for it, exactly as for an out-of-bounds source. Saturated sources are
   also excluded from the Gaia DR3 reference set used to compute the frame's zero-point, so one

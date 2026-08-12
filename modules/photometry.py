@@ -47,6 +47,7 @@ _PHOT_KEYS: tuple[str, ...] = (
     "mag_instrumental",
     "mag_calibrated",
     "mag_err",
+    "snr",
     "calibrated",
     "edge_flag",
     "zero_point",
@@ -66,6 +67,7 @@ def _null_phot_fields(calibrated: bool = False) -> dict[str, Any]:
         "mag_instrumental": None,
         "mag_calibrated":   None,
         "mag_err":          None,
+        "snr":              None,
         "calibrated":       calibrated,
         "edge_flag":        False,
         "zero_point":       None,
@@ -214,6 +216,16 @@ async def measure(
         mag_instrumental    float | None   -2.5 * log10(flux_aperture)
         mag_calibrated      float | None   mag_instrumental + zero_point
         mag_err             float | None   1.0857 * flux_err / flux_aperture
+        snr                 float | None   flux_aperture / flux_err — same
+                                            flux/noise convention as
+                                            qc.py's snr_median and
+                                            subtraction.py's candidate snr;
+                                            overwrites any provisional value
+                                            a source already carried (e.g.
+                                            subtraction.py's own cruder
+                                            pixel-space estimate) with this
+                                            frame's real aperture-photometry
+                                            measurement
         calibrated          bool           True when zero_point was applied
         edge_flag           bool           True when centroid is within 10 px of edge
         zero_point          float | None   frame-level ZP (same for all sources)
@@ -434,6 +446,20 @@ async def measure(
             out["flux_aperture"] = net_flux
             out["flux_err"]      = flux_err
 
+            # SNR of this aperture flux measurement — same "flux / flux_err"
+            # convention already used by qc.py's snr_median and (as a cruder
+            # pixel-space proxy) subtraction.py's own candidate snr. Computed
+            # here rather than reused from astrometry.py's detection-time
+            # peak/globalrms significance, since that metric is tuned for
+            # star-vs-noise filtering (STAR_SNR_MIN), not for reporting the
+            # actual significance of the flux this source is photometered
+            # at. Not gated on net_flux > 0.0 — a low/negative net_flux with
+            # a well-defined flux_err correctly yields a low/negative snr,
+            # which is itself meaningful (non-detection), rather than a
+            # missing value.
+            if math.isfinite(flux_err) and flux_err > 0.0:
+                out["snr"] = net_flux / flux_err
+
             # Instrumental magnitude
             if net_flux > 0.0:
                 out["mag_instrumental"] = -2.5 * math.log10(net_flux)
@@ -464,7 +490,7 @@ async def measure(
                 fits_filename,
                 exc,
             )
-            # flux_aperture, flux_err, mag_instrumental, mag_err stay None
+            # flux_aperture, flux_err, mag_instrumental, mag_err, snr stay None
 
         output.append(out)
 
