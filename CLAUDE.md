@@ -252,14 +252,20 @@ Orchestrates processing of a single FITS file in order:
      section 14 and "Job queue" below). This call **replaces** the frame's anomaly set rather than
      appending to it (docs/API.md section 3), so a re-run under a different classifier doesn't
      leave stale anomalies from the previous run behind.
-15. `finder_chart.update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id)`
+15. `finder_chart.update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id)`
      — **Module 3**, via `pipeline.generate_charts_for_anomalies()` (in-memory) or
      `pipeline.generate_charts_for_source_ids()` (standalone, task-driven — see "Job queue" below).
      → for every anomaly with a resolved `source_id` (deduped per frame), (re)generates and
-     uploads that source's finder/discovery chart: fetches every source's full position track in a
-     single `POST /sources/tracks/batch` call, renders each against the matching local archive
+     uploads that source's finder/discovery chart(s): fetches every source's full position track in
+     a single `POST /sources/tracks/batch` call, renders each against the matching local archive
      FITS files, then uploads each rendered chart individually via
-     `POST /sources/{id}/chart` — one request per chart. `designation_by_source_id` is built here
+     `POST /sources/{id}/chart` — one request per (source_id, style) pair. `anomaly_types_by_source_id`
+     maps each source_id to a *list* of anomaly_types, not a single value — a source classified more
+     than one way over its lifetime (e.g. `UNKNOWN` on the frame it was first seen, `MOVING_UNKNOWN`
+     once it had moved) needs both its "track" and "stamp_strip" charts rendered, not just one
+     arbitrarily overwriting the other (real incident, 2026-08-11, source_id
+     `6a7be36b4d7578.98132403`: 12 `MOVING_UNKNOWN` + 1 `UNKNOWN` anomalies produced only a single
+     chart before this fix — see `modules/finder_chart.py`'s module docstring). `designation_by_source_id` is built here
      preferring each anomaly's own `mpc_designation` (set by `anomaly_detector.py` from the exact
      source that produced that classification) over `sources`.`catalog_id` looked up by
      `source_id` — the latter is a fallback only, since `source_id` is resolved positionally by
@@ -304,6 +310,17 @@ failing the item. `modules/finder_chart.py`'s `_style_for_source()` already has 
 fallback for `None`: "before_after" for a source with exactly one detected epoch (same as any
 other anomaly_type), "stamp_strip" for 2+ epochs (no motion evidence to justify "track"); the
 chart title simply omits the anomaly_type in that case.
+
+A single task can carry **more than one item for the same `source_id`**, each with a different
+`anomaly_type` — observatory-api's `Web\AnomaliesController::createTask()` submits one item per
+distinct `anomaly_type` within a selected group, rather than collapsing a source's whole anomaly
+history down to one arbitrary type (see that controller's own docstring). `worker.py`'s
+`_run_charts_task()` collects all of a source_id's items into one list before the batched
+`generate_charts_for_source_ids()` call, and looks up each item's own outcome afterwards by
+`(source_id, anomaly_type)` — not by `source_id` alone — since `modules/finder_chart.py` renders
+one chart per distinct *style* those types imply (see that module's section below), and two items
+of the same source_id can resolve to two different styles that must both succeed or fail
+independently.
 
 A bare basename with no directory component at all (no full path) is not rejected outright: both
 `analyze_frame()` and `preview_catalog_match()` run it through `pipeline._resolve_bare_filename()`
@@ -898,14 +915,32 @@ catalog-matched — `anomaly_type` plus its resolved catalog designation in pare
 `ASTEROID (Vesta)` or `VARIABLE_STAR (TYC 1430-1407-1)`. An uncatalogued source's chart keeps the
 bare `anomaly_type` title.
 
+**A source can hold both charts at once.** `modules/anomaly_detector.py` classifies a source
+independently on every frame it appears on, so the same `source_id` can accumulate anomalies of
+more than one `anomaly_type` over its lifetime — e.g. `UNKNOWN` on the frame it was first seen (no
+history yet), `MOVING_UNKNOWN` on a later frame once it had moved. Real incident, 2026-08-11:
+source_id `6a7be36b4d7578.98132403` had 12 `MOVING_UNKNOWN` + 1 `UNKNOWN` anomalies, but
+`GENERATE_CHARTS` only ever produced a single chart, because both the API's task-creation logic
+and this module collapsed a source down to one arbitrary `anomaly_type` before rendering. Fixed on
+both sides: observatory-api's `Web\AnomaliesController::createTask()` now submits one task item
+per distinct `anomaly_type` within a group (see "Job queue" above), and this module renders one
+chart per distinct *style* those types resolve to — `_group_types_by_style()` partitions a
+source's (deduplicated) `anomaly_types` list into style groups, and each group gets its own
+render + upload, sharing the same already-loaded epochs. `observatory-api`'s `source_charts` table
+was migrated to match: `UNIQUE(source_id, style)` instead of `UNIQUE(source_id)`
+(`2026-08-11-000001_SourceChartsUniqueByStyle.php`), so a "track" and a "stamp_strip" chart for the
+same source_id coexist rather than one overwriting the other.
+
 The single public entry point,
-`update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None)`, takes every
-(source_id → anomaly_type) pair for one frame at once (see pipeline.py Step 15), so it can fetch
-every source's track and upload every chart in one HTTP round trip each, regardless of how many
-anomalies the frame has. `designation_by_source_id` is optional and keyed the same way — built by
-pipeline.py from `sources`' own `catalog_name`/`catalog_id` (already resolved by catalog matching,
-Step 8), not queried by this module itself; a source_id absent from it gets the bare-`anomaly_type`
-title.
+`update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id=None)`, takes every
+(source_id → [anomaly_type, ...]) pair for one call at once (see pipeline.py Step 15), so it can
+fetch every source's track and upload every chart in one HTTP round trip each, regardless of how
+many anomalies/styles are involved. A list entry of `None` is valid (a chart requested directly by
+source_id, with no anomaly at all — see "Job queue" above); duplicate entries in a source's list
+are harmless, deduplicated internally. `designation_by_source_id` is optional and keyed by plain
+source_id (not by type) — built by pipeline.py from `sources`' own `catalog_name`/`catalog_id`
+(already resolved by catalog matching, Step 8), not queried by this module itself; a source_id
+absent from it gets the bare-`anomaly_type` title on every one of its charts.
 
 Steps:
 1. `api_client.get_source_tracks_batch(source_ids)` → `POST /sources/tracks/batch` — every
@@ -919,19 +954,25 @@ Steps:
    loads its pixel data + WCS. Epochs whose file is missing locally (e.g. archive rotated/pruned)
    are skipped rather than failing that source's whole chart. This is why `pipeline.py`'s archive
    move (step 14.5) must run *before* this step: the current frame's own epoch is looked up at
-   this same path.
-4. Per source: renders the PNG (`track` or `stamp_strip`, per that source's anomaly type) using
-   `matplotlib` with a zscale + asinh stretch (`astropy.visualization`) — the standard DS9-style
-   display stretch.
-5. Per source: `api_client.upload_source_chart(source_id, png_bytes, style, frame_count)` →
-   `POST /sources/{id}/chart` — each chart uploaded individually as raw PNG bytes, replacing
-   any previous chart for that source.
+   this same path. The loaded epochs are shared across every style this source ends up rendering —
+   loaded once, not once per style.
+4. Per source, per distinct style implied by its `anomaly_types`: renders the PNG (`track` or
+   `stamp_strip`, per that group's representative anomaly type — the first non-`None` entry in the
+   group) using `matplotlib` with a zscale + asinh stretch (`astropy.visualization`) — the standard
+   DS9-style display stretch.
+5. Per rendered chart: `api_client.upload_source_chart(source_id, png_bytes, style, frame_count)`
+   → `POST /sources/{id}/chart` — uploaded individually as raw PNG bytes, replacing any previous
+   chart of that SAME style for that source (a different style already stored for the same
+   source_id is left untouched — see observatory-api's `SourceChartModel` docblock).
 
 Gated by `CHART_ENABLED` (default `true`). Best-effort throughout: for a given source_id, a
-missing local file, an API error, or a rendering failure is logged and that source_id's own
-result is `False` in the returned dict — it never raises, and it never affects any other
-source_id in the same call (pipeline.py's Step 15 calls this once per frame with every
-anomaly's source_id, deduped per frame, unconditionally) or frame processing overall.
+missing local file, an API error, or a rendering failure is logged and downgrades to `False` only
+the specific `anomaly_type` entries covered by that failed style — returned as a nested
+`dict[str, dict[Optional[str], bool]]` (source_id → anomaly_type → success), not a flat
+`dict[str, bool]`, since two anomaly_types for the same source can now resolve to two independent
+upload outcomes. Never raises, and a failure never affects any other source_id or style in the
+same call (pipeline.py's Step 15 calls this once per frame with every anomaly's source_id, deduped
+per frame, unconditionally) or frame processing overall.
 
 ### `api_client/client.py`
 All communication with the remote `observatory-api`. Uses `httpx` with async support and
@@ -1207,7 +1248,9 @@ downstream automation, but hard for a person to sanity-check without re-running 
 own plate-solved FITS files by hand. `modules/finder_chart.py` closes that gap: for a source with
 a resolved `source_id`, it always regenerates a small PNG from that source's *complete* track
 (every frame it has ever been detected on), so the very next anomaly for the same object simply
-produces an updated image with one more epoch on it.
+produces an updated image with one more epoch on it — one PNG per style the source's anomaly
+history actually calls for (usually one, but both at once when the source's history spans both
+categories — see this module's section above).
 
 The two styles are deliberately different because "did this move?" and "did this change?" are
 different questions:

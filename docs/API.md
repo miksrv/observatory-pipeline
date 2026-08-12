@@ -996,14 +996,23 @@ Accept: application/json
 
 ## 9. Upload a Source's Finder Chart
 
-Store the finder-chart PNG for a source, fully replacing any previous one —
-`modules/finder_chart.py` always regenerates the whole image from the source's current track
-(section 8) rather than patching an existing file. The request body is the **raw PNG bytes** —
-not JSON, not multipart — since the body is entirely consumed by the image; `style` and
-`frame_count` travel as query parameters instead.
+Store the finder-chart PNG for a source, fully replacing any previous chart of the **same style**
+for that source — `modules/finder_chart.py` always regenerates the whole image from the source's
+current track (section 8) rather than patching an existing file. The request body is the **raw
+PNG bytes** — not JSON, not multipart — since the body is entirely consumed by the image; `style`
+and `frame_count` travel as query parameters instead.
+
+A source can hold **one chart per style** (`track`, `stamp_strip`, `before_after`) at once, not
+just one chart total: `modules/anomaly_detector.py` classifies a source independently on every
+frame it appears on, so the same source_id can legitimately collect anomalies of more than one
+`anomaly_type` over its lifetime (e.g. `UNKNOWN` on the frame it was first seen, `MOVING_UNKNOWN`
+once it had moved) — see `modules/finder_chart.py`'s module docstring for the real incident this
+was fixed for. A second style uploaded for a source that already has a chart of a *different*
+style leaves that other style's chart untouched; uploading the *same* style again still fully
+replaces it, same as before.
 
 For a frame with several anomalies, `modules/finder_chart.py` uploads each chart individually
-via this endpoint — one `POST /sources/{id}/chart` request per source_id.
+via this endpoint — one `POST /sources/{id}/chart` request per (source_id, style) pair.
 
 ### Request
 
@@ -1022,7 +1031,7 @@ Content-Type: image/png
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `style` | string | yes | `track` or `stamp_strip` |
+| `style` | string | yes | `track`, `stamp_strip`, or `before_after` |
 | `frame_count` | int | yes | Number of epochs included in the image (positive integer) |
 
 **Body:** raw PNG bytes. Validated by the 8-byte PNG signature (`\x89PNG\r\n\x1a\n`) rather than
@@ -1056,10 +1065,16 @@ fully decoded — the API does not otherwise inspect the image.
 Serve the stored finder-chart PNG for a source as raw image bytes. Not called by the pipeline
 itself — served for a future consumer such as the observatory website.
 
+Since a source can hold one chart per style (see section 9), `style` is an **optional** query
+parameter: when given, only a chart of that exact style is served (`404` if none exists). When
+omitted, the most informative available style wins — `track` (motion evidence) over
+`stamp_strip`/`before_after` (no motion evidence) — so a caller that predates multi-style charts,
+or one that genuinely doesn't care which, still gets a sensible single result.
+
 ### Request
 
 ```
-GET /sources/{id}/chart.png
+GET /sources/{id}/chart.png?style=track
 ```
 
 **Headers:**
@@ -1067,6 +1082,12 @@ GET /sources/{id}/chart.png
 ```
 X-API-Key: <api-key>
 ```
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `style` | string | no | `track`, `stamp_strip`, or `before_after` — exact style to fetch. Omit to get the highest-priority style the source actually has. |
 
 ### Response
 
@@ -1080,7 +1101,7 @@ Raw PNG bytes, `Content-Type: image/png`.
 |--------|------|
 | `400` | Malformed `{id}` segment |
 | `401` | Invalid or missing `X-API-Key` |
-| `404` | No chart has been uploaded yet for this source |
+| `404` | No chart of the requested style (or, if `style` was omitted, no chart at all) has been uploaded yet for this source |
 
 ---
 
