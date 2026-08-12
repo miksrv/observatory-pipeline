@@ -460,6 +460,19 @@ async def analyze_frame(fits_path: str) -> dict | None:
     sources = _dedupe_by_catalog_identity(sources, extra)
 
     # ------------------------------------------------------------------
+    # Step 4.5b — Collapse an uncatalogued object's own normal-detection /
+    # subtraction-candidate pair. _dedupe_by_catalog_identity() above only
+    # catches this when both sides share a catalog identity; an
+    # uncatalogued object (e.g. a comet MPC/SkyBot has no ephemeris data
+    # for — see docs/ISSUES.md) has none, so its ordinary sep detection and
+    # its own subtraction candidate both survived as separate `sources`
+    # entries (real incident, 2026-08-11, C_2020_R4_ATLAS frames: every
+    # frame produced two MOVING_UNKNOWN anomalies — one per detection path —
+    # for what was physically one comet seen once per frame).
+    # ------------------------------------------------------------------
+    sources = _dedupe_uncatalogued_subtraction_pair(sources, extra)
+
+    # ------------------------------------------------------------------
     # Step 4.6 — Positional dedup: suppress unmatched sources sitting on
     # top of a matched source (deblending artifacts, not real objects).
     # ------------------------------------------------------------------
@@ -1240,6 +1253,85 @@ def _dedupe_by_catalog_identity(sources: list, extra: dict) -> list:
         )
 
     return deduped
+
+
+def _dedupe_uncatalogued_subtraction_pair(sources: list, extra: dict) -> list:
+    """
+    Collapse an uncatalogued source's own normal-extraction detection with
+    its own image-subtraction candidate, within this one frame, when both
+    refer to the same physical object.
+
+    _dedupe_by_catalog_identity() above only collapses duplicates that share
+    a catalog identity (catalog_name, catalog_id) — an uncatalogued object
+    has none, so a normal detection and a nearby subtraction candidate of
+    the very same object both survive as two separate `sources` entries.
+    Each is later posted as its own source_observations row (inflating
+    sources.observation_count for one real observation) and independently
+    classified by anomaly_detector.py — two anomalies in `anomalies` for
+    what is physically one detection (real incident, 2026-08-11,
+    C_2020_R4_ATLAS: every frame produced two MOVING_UNKNOWN anomalies,
+    positions ~1" apart, one from the ordinary extractor and one from
+    modules/subtraction.py).
+
+    Deliberately scoped narrower than a general "merge any two nearby
+    uncatalogued sources" — that would risk collapsing two genuinely
+    different faint objects sitting close together in a crowded field. This
+    only pairs an entry carrying `_from_subtraction=True` with one that
+    doesn't, within MATCH_CONE_ARCSEC — exactly the shape this specific bug
+    produces — and reuses the same _prefer_candidate() preference already
+    used for the catalogued case above (non-subtraction wins; ties broken
+    by flux).
+    """
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    candidate_positions = [i for i, s in enumerate(sources) if s.get("catalog_name") is None]
+    if len(candidate_positions) < 2:
+        return sources
+
+    threshold = config.MATCH_CONE_ARCSEC * u.arcsec
+    dropped: set[int] = set()
+    n_merged = 0
+
+    for a_pos, idx_a in enumerate(candidate_positions):
+        if idx_a in dropped:
+            continue
+        src_a = sources[idx_a]
+        is_sub_a = bool(src_a.get("_from_subtraction"))
+
+        for idx_b in candidate_positions[a_pos + 1:]:
+            if idx_b in dropped:
+                continue
+            src_b = sources[idx_b]
+
+            # Only pair a subtraction candidate with a non-subtraction
+            # detection — two ordinary uncatalogued detections that happen
+            # to sit close together are left alone (might be two real faint
+            # objects in a crowded field, not a duplicate).
+            if is_sub_a == bool(src_b.get("_from_subtraction")):
+                continue
+
+            sep = SkyCoord(ra=src_a["ra"] * u.deg, dec=src_a["dec"] * u.deg).separation(
+                SkyCoord(ra=src_b["ra"] * u.deg, dec=src_b["dec"] * u.deg)
+            )
+            if sep >= threshold:
+                continue
+
+            n_merged += 1
+            if _prefer_candidate(src_b, src_a):
+                dropped.add(idx_a)
+                break  # src_a lost; stop pairing it against further candidates
+            dropped.add(idx_b)
+
+    if n_merged:
+        logger.info(
+            "Deduplicated %d uncatalogued normal-detection/subtraction-candidate "
+            "pair(s) of the same object (%d sources remain)",
+            n_merged, len(sources) - len(dropped),
+            extra=extra,
+        )
+
+    return [s for i, s in enumerate(sources) if i not in dropped]
 
 
 def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:

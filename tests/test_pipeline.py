@@ -1073,6 +1073,139 @@ class TestDedupeByCatalogIdentity:
         assert pipeline._dedupe_by_catalog_identity([], {}) == []
 
 
+# ---------------------------------------------------------------------------
+# _dedupe_uncatalogued_subtraction_pair — unit tests
+#
+# Regression coverage for the C_2020_R4_ATLAS incident (2026-08-11): an
+# uncatalogued object (MPC/SkyBot carries no ephemeris data for this comet at
+# all — see docs/ISSUES.md) has no catalog identity for
+# _dedupe_by_catalog_identity() to key on, so its normal sep detection and its
+# own image-subtraction candidate both survived as separate `sources` entries
+# — inflating observation_count and producing two MOVING_UNKNOWN anomalies
+# per frame for one physical detection.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupeUncataloguedSubtractionPair:
+
+    def test_no_sources_or_single_source_returns_unchanged(self):
+        assert pipeline._dedupe_uncatalogued_subtraction_pair([], {}) == []
+
+        one = [{"ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 1.0}]
+        assert pipeline._dedupe_uncatalogued_subtraction_pair(one, {}) == one
+
+    def test_normal_and_subtraction_detection_of_same_comet_collapse_to_one(self):
+        """Regression: the C_2020_R4_ATLAS case — one comet detected twice
+        within one frame (once by the ordinary extractor, once by
+        subtraction.py), ~1" apart, neither carrying a catalog identity."""
+        normal_detection = {
+            "ra": 222.65332, "dec": 32.62380, "catalog_name": None, "catalog_id": None,
+            "flux": 2846890.0, "fwhm": 10.13, "_from_subtraction": False,
+        }
+        subtraction_candidate = {
+            "ra": 222.65327, "dec": 32.62347, "catalog_name": None, "catalog_id": None,
+            "flux": 4002950.0, "fwhm": 17.90, "_from_subtraction": True,
+        }
+
+        result = pipeline._dedupe_uncatalogued_subtraction_pair(
+            [normal_detection, subtraction_candidate], {}
+        )
+
+        assert len(result) == 1
+        # Non-subtraction detection wins even though the subtraction
+        # candidate has higher flux — same _prefer_candidate() rule as the
+        # catalogued case above.
+        assert result[0] is normal_detection
+
+    def test_prefers_non_subtraction_regardless_of_order(self):
+        subtraction_candidate = {
+            "ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 9000.0,
+            "_from_subtraction": True,
+        }
+        normal_detection = {
+            "ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 500.0,
+            "_from_subtraction": False,
+        }
+
+        result = pipeline._dedupe_uncatalogued_subtraction_pair(
+            [subtraction_candidate, normal_detection], {}
+        )
+
+        assert len(result) == 1
+        assert result[0] is normal_detection
+
+    def test_far_apart_normal_and_subtraction_detections_are_not_merged(self):
+        """Separation well beyond MATCH_CONE_ARCSEC (5" default) — these are
+        two different objects, not a duplicate of the same one."""
+        normal_detection = {
+            "ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 100.0,
+            "_from_subtraction": False,
+        }
+        far_subtraction_candidate = {
+            "ra": 1.0, "dec": 1.5, "catalog_name": None, "flux": 100.0,  # 1800" away
+            "_from_subtraction": True,
+        }
+
+        result = pipeline._dedupe_uncatalogued_subtraction_pair(
+            [normal_detection, far_subtraction_candidate], {}
+        )
+
+        assert len(result) == 2
+
+    def test_two_ordinary_detections_close_together_are_not_merged(self):
+        """Two non-subtraction uncatalogued detections sitting close
+        together might genuinely be two faint objects in a crowded field —
+        this dedup only pairs a subtraction candidate with a non-subtraction
+        detection, never two of the same kind."""
+        a = {"ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 100.0, "_from_subtraction": False}
+        b = {"ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 200.0, "_from_subtraction": False}
+
+        result = pipeline._dedupe_uncatalogued_subtraction_pair([a, b], {})
+
+        assert len(result) == 2
+
+    def test_two_subtraction_candidates_close_together_are_not_merged(self):
+        a = {"ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 100.0, "_from_subtraction": True}
+        b = {"ra": 1.0, "dec": 1.0, "catalog_name": None, "flux": 200.0, "_from_subtraction": True}
+
+        result = pipeline._dedupe_uncatalogued_subtraction_pair([a, b], {})
+
+        assert len(result) == 2
+
+    def test_catalogued_sources_are_left_untouched(self):
+        """This dedup only ever considers catalog_name is None entries — a
+        catalogued pair is _dedupe_by_catalog_identity()'s job, not this
+        one's, even if it also carries a subtraction/non-subtraction split."""
+        normal_detection = {
+            "ra": 222.65332, "dec": 32.62380, "catalog_name": None, "catalog_id": None,
+            "flux": 2846890.0, "_from_subtraction": False,
+        }
+        subtraction_candidate = {
+            "ra": 222.65327, "dec": 32.62347, "catalog_name": None, "catalog_id": None,
+            "flux": 4002950.0, "_from_subtraction": True,
+        }
+        catalogued_normal = {
+            "ra": 10.0, "dec": 10.0, "catalog_name": "MPC", "catalog_id": "Vesta",
+            "flux": 500.0, "_from_subtraction": False,
+        }
+        catalogued_subtraction = {
+            "ra": 10.0, "dec": 10.0, "catalog_name": "MPC", "catalog_id": "Vesta",
+            "flux": 9000.0, "_from_subtraction": True,
+        }
+
+        result = pipeline._dedupe_uncatalogued_subtraction_pair(
+            [normal_detection, subtraction_candidate, catalogued_normal, catalogued_subtraction], {}
+        )
+
+        # The uncatalogued pair collapses to 1; the catalogued pair (this
+        # function's job is explicitly NOT to touch it) passes through as 2
+        # separate entries — that's _dedupe_by_catalog_identity()'s job,
+        # which normally runs before this step in analyze_frame().
+        assert len(result) == 3
+        assert catalogued_normal in result
+        assert catalogued_subtraction in result
+
+
 @pytest.mark.asyncio
 async def test_pipeline_dedupes_duplicate_catalog_matches_before_posting(mock_modules):
     """
