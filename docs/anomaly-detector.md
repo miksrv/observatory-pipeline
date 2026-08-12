@@ -173,7 +173,7 @@ one condition matches, the function returns and no further checks run:
    position. From here the branch splits on `elongation` against a threshold that is
    itself edge-aware — `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default) for an ordinary
    source, or the higher `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) whenever the
-   source is flagged `near_edge` (set by `modules/astrometry.py`/`modules/subtraction.py`
+   source is flagged `near_edge` (set by `modules/astrometry/_extraction.py`/`modules/subtraction.py`
    from the detection's own pixel position vs. `EDGE_MARGIN_FRAC` — coma and other
    off-axis aberrations progressively stretch a perfectly ordinary, non-moving star's PSF
    toward the edges/corners of a wide-field frame, inflating its measured elongation for

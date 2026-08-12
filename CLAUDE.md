@@ -86,7 +86,7 @@ environment-variable reference live in README.md, not here):
   not fetched at build time — this keeps builds offline and reproducible. Default is the amd64
   archive; swap in `astap_aarch64.tar.gz` for ARM64 / Apple Silicon.
 - `xvfb` and the GTK/Pango system packages are required because `astap` needs a (virtual) display
-  even when invoked headless — `modules/astrometry.py` runs it via `xvfb-run`.
+  even when invoked headless — `modules/astrometry/_astap.py` runs it via `xvfb-run`.
 - The source tree itself is bind-mounted to `/app` in `docker-compose.yml`, so code edits take
   effect on `docker compose restart pipeline` without a rebuild. A rebuild is only needed after
   changing `requirements.txt` or the Dockerfile itself.
@@ -184,7 +184,7 @@ Orchestrates processing of a single FITS file in order:
 4. `qc.analyze(fits_path)` → returns metrics + quality flag
 5. If `quality_flag != OK` → move file to `/fits/rejected/{object_name}/` → **STOP** (no API call)
 6. `astrometry.solve(fits_path, psf_fwhm_arcsec=...)` → returns WCS + two source lists: `sources` (strict star filter) and `sources_all` (loose filter — also keeps bright/saturated and faint detections, used for matching). This selection is made *before* step 7's merge below — `sources`/`sources_all` must already exist as names before anything tries to extend them. `psf_fwhm_arcsec` is step 4's `qc_result["fwhm_median"]`, forwarded only when `qc_result["fwhm_unit"] == "arcsec"` (see step 7 below for why).
-7. `subtraction.run(fits_path, archive_dir, filter_name, wcs=astro_result["wcs"], psf_fwhm_arcsec=...)` → if ≥`SUBTRACTION_MIN_FRAMES` archived frames of the same object exist, aligns them (via `astroalign`), builds a median reference, subtracts, and returns candidate sources found only in the difference image. These are merged into the source list and flagged `_from_subtraction=True`. Skipped gracefully otherwise. The `wcs` passed here is step 6's already-solved WCS, not re-derived from `fits_path`'s own header — that header isn't corrected until step 14.5 archives the frame (see `modules/astrometry.py`'s section below), so re-deriving it here would give subtraction's candidates a different systematic sky-position offset than every other source in the frame. `psf_fwhm_arcsec` is `qc_result["fwhm_median"]` from step 4 — passed only when `qc_result["fwhm_unit"] == "arcsec"` (it can instead be a raw pixel count when the frame's headers don't carry enough to derive a plate scale; see `modules/qc.py` below), since `astrometry.solve()`'s call in step 6 uses the same guard. See `modules/subtraction.py`'s section below for what this enables.
+7. `subtraction.run(fits_path, archive_dir, filter_name, wcs=astro_result["wcs"], psf_fwhm_arcsec=...)` → if ≥`SUBTRACTION_MIN_FRAMES` archived frames of the same object exist, aligns them (via `astroalign`), builds a median reference, subtracts, and returns candidate sources found only in the difference image. These are merged into the source list and flagged `_from_subtraction=True`. Skipped gracefully otherwise. The `wcs` passed here is step 6's already-solved WCS, not re-derived from `fits_path`'s own header — that header isn't corrected until step 14.5 archives the frame (see `modules/astrometry/`'s section below), so re-deriving it here would give subtraction's candidates a different systematic sky-position offset than every other source in the frame. `psf_fwhm_arcsec` is `qc_result["fwhm_median"]` from step 4 — passed only when `qc_result["fwhm_unit"] == "arcsec"` (it can instead be a raw pixel count when the frame's headers don't carry enough to derive a plate scale; see `modules/qc.py` below), since `astrometry.solve()`'s call in step 6 uses the same guard. See `modules/subtraction.py`'s section below for what this enables.
 8. `catalog_matcher.match(sources, frame_meta)` → identifies known objects. **Runs before photometry** so matched Gaia DR3 stars can serve as the photometric zero-point reference.
 8.5. `_dedupe_by_catalog_identity(sources, extra)` → collapses sources that share the same
      `(catalog_name, catalog_id)` within this one frame into a single representative source —
@@ -501,7 +501,13 @@ Examples:
 
 When normalization is enabled, the API receives only normalized values (no duplicates).
 
-### `modules/astrometry.py`
+### `modules/astrometry/`
+A package, not a single file — split one file per step of `solve()`'s own pipeline
+(`_astap.py` runs the binary, `_wcs.py` reads/validates the resulting WCS,
+`_frame_geometry.py` derives centre/FOV/pixel scale from it, `_extraction.py` runs
+sep + star filtering, `_streak.py` is the pre-pass `_extraction.py` calls before its
+own `sep.extract()`). `__init__.py` holds `solve()` itself as the orchestrator and
+re-exports it, so every call site elsewhere in this codebase is unchanged.
 - Before running `sep` for point-source extraction, a coarse, low-threshold, non-deblended
   pre-pass (`_build_streak_mask()`, `config.STREAK_*`) finds long thin streaks — satellite/
   aircraft trails crossing a single exposure, and diffraction-spike arms radiating from bright/
@@ -619,7 +625,7 @@ entry at all, at any position).
    registration, which `sep` would otherwise report as spurious bright "transients". Masked pixels
    are zeroed in the background-subtracted diff image before extraction, so no candidate can be
    detected there. See docs/ISSUES.md #1, #2.
-4.5. Also masks any streak-like feature found by the same coarse pre-pass `modules/astrometry.py`
+4.5. Also masks any streak-like feature found by the same coarse pre-pass `modules/astrometry/_streak.py`
    uses (`_build_streak_mask()`, duplicated here — `config.STREAK_*`), run over the diff image
    itself rather than the raw frame. A satellite trail present in the new frame but absent from the
    reference stack shows up in the diff image as a strong positive residual just like any other
@@ -628,16 +634,16 @@ entry at all, at any position).
    anomaly (real incident, 2026-08-07, `T_CrB` test frames: 42 elongation>3 candidates strung along
    a single trail). This pre-pass's own `minarea` is hardcoded to `5` here — matching this module's
    own final detection pass below, **not** `config.SEP_MIN_AREA` (15, the main-frame extraction
-   context in `modules/astrometry.py`/`modules/qc.py`) — a coarser coarse-pass `minarea` than the
+   context in `modules/astrometry/_extraction.py`/`modules/qc.py`) — a coarser coarse-pass `minarea` than the
    real detection left small trail fragments invisible to the pre-pass while the real, more
    sensitive pass still detected them individually. Reduced the 42 false candidates to 21.
    `STREAK_DETECT_SIGMA`'s default (`3.0`, lower than `SUBTRACTION_DETECT_SIGMA`'s `5.0`) was tuned
    against this same real frame: at `5.0σ` the coarse pass still couldn't connect the (very faint)
    trail's brighter knots into long-enough coarse features, leaving 21 of the 42 candidates
    unmasked; at `3.0σ` only 1 remained.
-5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry.py`), since `sep.extract()` doesn't return a native `fwhm` field.
+5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry/_extraction.py`), since `sep.extract()` doesn't return a native `fwhm` field.
 5.5. Rejects any candidate whose `fwhm` is below `psf_fwhm_arcsec / 1.5` (converted to pixels via
-   the frame's plate scale — same ratio `modules/astrometry.py` uses for its own lower FWHM bound;
+   the frame's plate scale — same ratio `modules/astrometry/_extraction.py` uses for its own lower FWHM bound;
    see that module's section above), where `psf_fwhm_arcsec` is `pipeline.py`'s forwarded
    `qc.analyze()` measurement of this frame's actual stellar PSF. This exists because step 3's
    median reference stack only removes reference-frame artifacts that move between frames when
@@ -646,13 +652,13 @@ entry at all, at any position).
    pixel and gets averaged away, while the **new** frame's own hot pixel sits untouched at its
    native position and survives the subtraction as a sharp, undiffused positive residual with no
    real-star-like PSF profile at all (real incident, 2026-08-06, Vesta test frames — see
-   `modules/astrometry.py`'s section above for the same underlying failure mode). Skipped
+   `modules/astrometry/`'s section above for the same underlying failure mode). Skipped
    (behavior unchanged) when `psf_fwhm_arcsec` or the frame's plate scale isn't available.
 6. Converts detected pixel positions back to (RA, Dec) using the frame's WCS — preferring the
    already-solved `wcs` passed in from `astrometry.solve()` (see `pipeline.py` step 7 above) over
    re-deriving one from the new frame's own header, which can still carry a stale/mount-pointing
    WCS at this point (`pipeline.py` only corrects the header at archive time, step 14.5 — see
-   `modules/astrometry.py`'s section below). `wcs=None` (e.g. a caller that never ran astrometry
+   `modules/astrometry/`'s section below). `wcs=None` (e.g. a caller that never ran astrometry
    itself) falls back to reading whatever WCS the file's own header has.
 7. Returns `{"performed": bool, "reference_frame_count": int, "candidates": [...]}`. Every
    candidate is tagged `_from_subtraction=True` so `anomaly_detector.py` can apply looser

@@ -213,8 +213,8 @@ Quality flags:
 
 Bad frames are never sent to the API — this keeps the remote database clean.
 
-### `modules/astrometry.py`
-Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
+### `modules/astrometry/`
+A package split one file per step of `solve()` (`_astap.py`, `_wcs.py`, `_frame_geometry.py`, `_extraction.py`, `_streak.py` — see CLAUDE.md for the exact map), with `solve()` itself living in `__init__.py` as the orchestrator, so it's still imported and called the same way everywhere else in this codebase. Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
 
 Returns a dict with `ra_center`, `dec_center`, `fov_deg`, `naxis1`/`naxis2`, the `wcs` object itself, and two source lists: `sources` (strict star filter) and `sources_all` (a looser filter that also keeps bright/saturated and faint detections, used for catalog matching and WCS offset correction so moving/transient objects aren't lost). Every source also carries a `saturated` bool (peak ADU ≥ `SATURATION_ADU`) and a `near_edge` bool (pixel position within `EDGE_MARGIN_FRAC` of any frame edge — see the anomaly detector's `SPACE_DEBRIS` classification below).
 
@@ -508,14 +508,14 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `STREAK_MIN_LENGTH_ARCSEC` | `30.0` | No | See `STREAK_ELONGATION_MIN` above. |
 | `STREAK_MASK_DILATE_ARCSEC` | `3.0` | No | Small dilation applied to the coarse streak mask before use, so the segmentation boundary doesn't leave a thin rim of trail pixels detectable as their own tiny fragment. |
 | **Saturation Detection** |
-| `SATURATION_ADU` | `60000` | No | Sensor pixel value (ADU) at/above which a pixel is considered saturated. `modules/astrometry.py` flags any source whose peak reaches this as `saturated`; `modules/subtraction.py` masks its vicinity out of difference-image detection. Tune per camera's full-well/bit depth. |
+| `SATURATION_ADU` | `60000` | No | Sensor pixel value (ADU) at/above which a pixel is considered saturated. `modules/astrometry/_extraction.py` flags any source whose peak reaches this as `saturated`; `modules/subtraction.py` masks its vicinity out of difference-image detection. Tune per camera's full-well/bit depth. |
 | `SATURATION_MASK_RADIUS_ARCSEC` | `10.0` | No | Radius in arcseconds around a saturated pixel that `modules/subtraction.py` excludes from diff-image source detection, to suppress astroalign residual artifacts near bright/saturated stars. |
 | **Cross-Matching** |
 | `MATCH_CONE_ARCSEC` | `5.0` | No | Cone search radius in arcseconds for point-source catalog matching (Simbad, Gaia, 2MASS, Pan-STARRS). |
 | `MOVING_CONE_ARCSEC` | `120.0` | No | Wider cone radius in arcseconds for moving-object (MPC) detection. Widened from an earlier default of `30.0` because fast movers like Vesta travel ~60"/hr. `.env.example` is up to date with this value — see the note above. |
 | `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
 | **Edge-of-Frame Geometry** |
-| `EDGE_MARGIN_FRAC` | `0.1` | No | Fraction of NAXIS1/NAXIS2 treated as "near the edge" — coma and other off-axis aberrations stretch a star's PSF near the edges/corners of a wide-field frame, inflating its measured elongation. `modules/astrometry.py`/`modules/subtraction.py` flag such sources `near_edge`; tune to your own optics. |
+| `EDGE_MARGIN_FRAC` | `0.1` | No | Fraction of NAXIS1/NAXIS2 treated as "near the edge" — coma and other off-axis aberrations stretch a star's PSF near the edges/corners of a wide-field frame, inflating its measured elongation. `modules/astrometry/_extraction.py`/`modules/subtraction.py` flag such sources `near_edge`; tune to your own optics. |
 | `SPACE_DEBRIS_ELONGATION_MIN` | `3.0` | No | Elongation threshold for the "single-exposure trail" `SPACE_DEBRIS` shortcut in `modules/anomaly_detector/`, for a source not flagged `near_edge`. |
 | `SPACE_DEBRIS_EDGE_ELONGATION_MIN` | `6.0` | No | Same shortcut's threshold for a source flagged `near_edge` — higher, since coma alone can already push an ordinary star's elongation past `SPACE_DEBRIS_ELONGATION_MIN` near the edge of a wide-field frame. |
 | **Image Subtraction** |

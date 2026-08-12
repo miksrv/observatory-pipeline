@@ -115,7 +115,7 @@ field of the same real WCS quality would correctly apply. The vote accumulator's
 background-pair count (`expected_bg`) also scales with source density, which could weaken
 its significance test in the same regime.
 
-This is **not** an issue with `modules/astrometry.py`'s astap invocation — astap receives
+This is **not** an issue with `modules/astrometry/_astap.py`'s astap invocation — astap receives
 only the raw FITS file and does its own internal star detection/matching; it never sees
 `sources`/`sources_all`, so limiting the sep-detected source count would not change
 astap's own WCS solve at all. Any fix belongs in `catalog_matcher.py`'s offset-correction
