@@ -135,3 +135,33 @@ class TestRender:
         assert frame_meta["ra_center"] == 202.47
         assert frame_meta["dec_center"] == 47.2
         assert frame_meta["fov_deg"] == 1.0
+
+
+class TestRenderQcRejected:
+    async def test_qc_rejected_skips_matching_and_renders_raw_frame(self, mock_stages, fits_file):
+        """
+        A QC-rejected frame must skip astrometry/subtraction/catalog matching
+        entirely (a BLUR/TRAIL frame frequently can't even be plate-solved)
+        and instead render just the raw stretched frame annotated with the QC
+        numbers, returning matched=0/total=0 and the QC's own quality_flag.
+        """
+        mock_stages["qc"].return_value = {
+            "quality_flag": "BLUR",
+            "fwhm_median": 9.5,
+            "elongation_median": 1.1,
+            "sky_background": 900.0,
+            "star_count": 4,
+        }
+
+        result = await catalog_preview.render(fits_file)
+
+        mock_stages["astro"].assert_not_called()
+        mock_stages["sub"].assert_not_called()
+        mock_stages["match"].assert_not_called()
+
+        assert result["matched"] == 0
+        assert result["total"] == 0
+        assert result["quality_flag"] == "BLUR"
+        # A real PNG was still rendered — just with no source markers.
+        assert isinstance(result["png_bytes"], bytes)
+        assert result["png_bytes"][:8] == b"\x89PNG\r\n\x1a\n"

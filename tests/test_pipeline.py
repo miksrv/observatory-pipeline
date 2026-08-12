@@ -337,37 +337,151 @@ async def test_detect_anomalies_for_frame_id_propagates_frame_filter(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_qc_rejected_stops_pipeline(monkeypatch, fits_file, tmp_path):
-    """When QC returns a non-OK flag, no downstream steps should be called."""
-    monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path / "archive"))
-    monkeypatch.setattr(
-        "pipeline.fits_header.extract_headers", lambda p: _GOOD_HEADER
-    )
-    monkeypatch.setattr(
-        "pipeline.qc.analyze",
-        AsyncMock(
-            return_value={**_GOOD_QC, "quality_flag": "BLUR", "rejected_path": None}
-        ),
+async def test_qc_rejected_registers_frame_with_empty_sources_and_archives(mock_modules, tmp_path):
+    """
+    When QC returns a non-OK flag, analyze_frame() no longer stops early:
+    astrometry/subtraction/catalog matching/photometry/forced photometry are
+    all skipped, but the frame IS still registered (with its QC metrics and
+    the non-"OK" quality_flag), POST /frames/{id}/sources IS still called
+    with an empty list (retracting any previously-linked sources), and the
+    file is still archived — there is no separate "rejected" move for a QC
+    failure anymore.
+    """
+    fits_path = str(mock_modules)
+    pipeline.qc.analyze.return_value = {**_GOOD_QC, "quality_flag": "BLUR", "rejected_path": None}
+
+    result = await pipeline.analyze_frame(fits_path)
+
+    assert result is not None
+    assert result["quality_flag"] == "BLUR"
+    assert result["sources"] == []
+
+    # Every downstream detection/measurement step must be skipped.
+    pipeline.astrometry.solve.assert_not_called()
+    pipeline.subtraction.run.assert_not_called()
+    pipeline.catalog_matcher.match.assert_not_called()
+    pipeline.photometry.measure.assert_not_called()
+    pipeline.forced_photometry.run.assert_not_called()
+
+    # The frame IS still registered, and its (empty) source list IS still
+    # posted — this is what retracts/purges a re-analysis "downgrade".
+    pipeline.api_client.post_frame.assert_called_once()
+    pipeline.api_client.post_sources.assert_called_once_with(
+        result["frame_id"], os.path.basename(fits_path), [],
     )
 
-    api_mock = MagicMock()
-    api_mock.post_frame = AsyncMock(return_value="frame-99")
-    monkeypatch.setattr("pipeline.api_client", api_mock)
+    # The file is still archived — no separate "rejected" move for a QC
+    # failure anymore.
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    assert os.path.exists(archive_path), f"Expected archived file at {archive_path}"
 
-    astro_mock = MagicMock()
-    # A fresh deep copy per call — pipeline.py mutates source dicts in place
-    # (catalog fields, "mag", "_source_id", ...); returning the same shared
-    # _GOOD_ASTRO object across tests would leak state between them.
-    astro_mock.solve = AsyncMock(side_effect=lambda *a, **kw: copy.deepcopy(_GOOD_ASTRO))
-    monkeypatch.setattr("pipeline.astrometry", astro_mock)
+
+@pytest.mark.asyncio
+async def test_reanalysis_downgrade_retracts_sources_without_move_crash(mock_modules, tmp_path):
+    """
+    Re-analyzing an already-archived frame that now fails QC (e.g. after
+    tightening a threshold) must retract its previously-posted sources via
+    an empty POST /frames/{id}/sources call, and the same-path shutil.move
+    guard (Step 8) must not raise even though fits_path already equals
+    dest_path for this second pass.
+    """
+    fits_path = str(mock_modules)
+
+    # First pass: QC passes, frame is archived normally.
+    first_result = await pipeline.analyze_frame(fits_path)
+    assert first_result["quality_flag"] == "OK"
+    archived_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    assert os.path.exists(archived_path)
+
+    # Reset call counters so the second pass's assertions are unambiguous.
+    pipeline.astrometry.solve.reset_mock()
+    pipeline.subtraction.run.reset_mock()
+    pipeline.catalog_matcher.match.reset_mock()
+    pipeline.photometry.measure.reset_mock()
+    pipeline.forced_photometry.run.reset_mock()
+    pipeline.api_client.post_frame.reset_mock()
+    pipeline.api_client.post_sources.reset_mock()
+
+    # Second pass: re-analyze the now-archived file (a bare-path re-run, same
+    # convention as _resolve_bare_filename()'s target) — QC now rejects it.
+    pipeline.qc.analyze.return_value = {**_GOOD_QC, "quality_flag": "BLUR", "rejected_path": None}
+
+    second_result = await pipeline.analyze_frame(archived_path)
+
+    assert second_result["quality_flag"] == "BLUR"
+    assert second_result["sources"] == []
+    pipeline.astrometry.solve.assert_not_called()
+    pipeline.subtraction.run.assert_not_called()
+    pipeline.catalog_matcher.match.assert_not_called()
+    pipeline.photometry.measure.assert_not_called()
+    pipeline.forced_photometry.run.assert_not_called()
+
+    pipeline.api_client.post_frame.assert_called_once()
+    pipeline.api_client.post_sources.assert_called_once_with(
+        second_result["frame_id"], os.path.basename(archived_path), [],
+    )
+
+    # The same-path shutil.move guard must have skipped the move (fits_path
+    # already equals dest_path here) rather than raising — the file must
+    # still be sitting at the archive path afterwards.
+    assert os.path.exists(archived_path)
+
+
+@pytest.mark.asyncio
+async def test_run_skips_anomaly_detection_and_charts_when_qc_rejected(monkeypatch, fits_file):
+    """
+    pipeline.run()'s new quality_flag gate: when analyze_frame()'s result
+    carries a non-"OK" quality_flag, anomaly detection and chart generation
+    must not run at all (mirrors detect_anomalies_for_frame_id()'s own
+    skip-on-non-OK guard for the standalone task path).
+    """
+    analyze_mock = AsyncMock(return_value={
+        "frame_id": "frame-99",
+        "filename": _NORMALIZED_FILENAME,
+        "basename": "frame.fits",
+        "sources": [],
+        "object_name": "M51",
+        "obs_time": "2024-03-15T22:01:34",
+        "subtraction_performed": False,
+        "quality_flag": "BLUR",
+    })
+    monkeypatch.setattr(pipeline, "analyze_frame", analyze_mock)
+    detect_mock = AsyncMock()
+    monkeypatch.setattr(pipeline, "detect_anomalies_for_frame_data", detect_mock)
+    charts_mock = AsyncMock()
+    monkeypatch.setattr(pipeline, "generate_charts_for_anomalies", charts_mock)
 
     await pipeline.run(str(fits_file))
 
-    astro_mock.solve.assert_not_called()
-    api_mock.post_frame.assert_not_called()
+    analyze_mock.assert_called_once()
+    detect_mock.assert_not_called()
+    charts_mock.assert_not_called()
 
-    # No archive directory should have been created
-    assert not os.path.exists(os.path.join(config.FITS_ARCHIVE, "M51"))
+
+@pytest.mark.asyncio
+async def test_detect_anomalies_for_frame_id_skips_when_quality_flag_not_ok(monkeypatch):
+    """
+    detect_anomalies_for_frame_id()'s new guard: a frame whose quality_flag
+    is neither None nor "OK" has no sources at all (see analyze_frame()) —
+    skip straight to [] with no GET /frames/{id}/sources call and no
+    POST /frames/{id}/anomalies call.
+    """
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(return_value={
+        "filename": "M51_L_V_120_2024-03-15T22-01-34.fits",
+        "obs_time": "2024-03-15T22:01:34",
+        "filter": "V",
+        "quality_flag": "BLUR",
+    })
+    api_mock.get_frame_sources = AsyncMock()
+    api_mock.post_anomalies = AsyncMock()
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+
+    result = await pipeline.detect_anomalies_for_frame_id("frame-1")
+
+    assert result == []
+    api_mock.get_frame_sources.assert_not_called()
+    api_mock.post_anomalies.assert_not_called()
 
 
 @pytest.mark.asyncio

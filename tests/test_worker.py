@@ -32,14 +32,31 @@ class TestHandleAnalyzeItem:
         assert result == {"item_id": "item-1", "status": "DONE", "frame_id": "frame-1"}
 
     async def test_none_result_is_still_done_without_frame_id(self, monkeypatch):
-        """analyze_frame() returning None (QC-rejected, calibration frame) is
-        a normal successful outcome, not a failure."""
+        """analyze_frame() returning None (a calibration frame, no API client
+        configured, or POST /frames itself failing) is a normal successful
+        outcome, not a failure. QC rejection is no longer one of these cases
+        — see test_qc_rejected_dict_result_reports_done_with_frame_id below."""
         monkeypatch.setattr(worker.pipeline, "analyze_frame", AsyncMock(return_value=None))
         item = {"id": "item-1", "filename": "/fits/incoming/a.fits"}
 
         result = await worker._handle_analyze_item(item)
 
         assert result == {"item_id": "item-1", "status": "DONE"}
+
+    async def test_qc_rejected_dict_result_reports_done_with_frame_id(self, monkeypatch):
+        """A QC-rejected frame is no longer a None result — analyze_frame()
+        now returns a dict with a frame_id and a non-"OK" quality_flag, and
+        that frame_id must still be reported (see pipeline.py's Step 6-8
+        changes: a QC-rejected frame is still registered with the API)."""
+        monkeypatch.setattr(
+            worker.pipeline, "analyze_frame",
+            AsyncMock(return_value={"frame_id": "frame-7", "quality_flag": "BLUR", "sources": []}),
+        )
+        item = {"id": "item-1", "filename": "/fits/incoming/a.fits"}
+
+        result = await worker._handle_analyze_item(item)
+
+        assert result == {"item_id": "item-1", "status": "DONE", "frame_id": "frame-7"}
 
     async def test_exception_reports_failed(self, monkeypatch):
         monkeypatch.setattr(
@@ -307,6 +324,77 @@ class TestRunRestartTask:
     async def test_raises_restart_requested(self):
         with pytest.raises(worker.RestartRequested):
             await worker._run_restart_task({"id": "t1"}, [])
+
+
+# ---------------------------------------------------------------------------
+# _run_delete_frame_task
+# ---------------------------------------------------------------------------
+
+
+class TestRunDeleteFrameTask:
+    async def test_happy_path_moves_file_and_reports_done(self, monkeypatch):
+        get_frame_mock = AsyncMock(return_value={"filename": "M51_L_V_120.fits", "object": "M51"})
+        monkeypatch.setattr(worker.api_client, "get_frame", get_frame_mock)
+        move_mock = MagicMock(return_value="/fits/rejected/M51/M51_L_V_120.fits")
+        monkeypatch.setattr(worker.pipeline, "move_archived_file_to_rejected", move_mock)
+        post_progress_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", post_progress_mock)
+
+        task = {"id": "del-task-1"}
+        items = [{"id": "item-1", "frame_id": "frame-1"}]
+
+        await worker._run_delete_frame_task(task, items)
+
+        get_frame_mock.assert_called_once_with("frame-1")
+        move_mock.assert_called_once_with("M51_L_V_120.fits", "M51")
+        reported = post_progress_mock.call_args.args[1][0]
+        assert reported == {"item_id": "item-1", "status": "DONE"}
+
+    async def test_missing_file_is_still_done_best_effort(self, monkeypatch):
+        """move_archived_file_to_rejected() returning None (file not found at
+        its expected archive path) is best-effort — the item still reports
+        DONE, since the actual goal (the API's DB-side cascade delete) does
+        not depend on the physical file still being there."""
+        monkeypatch.setattr(
+            worker.api_client, "get_frame",
+            AsyncMock(return_value={"filename": "gone.fits", "object": "M51"}),
+        )
+        monkeypatch.setattr(worker.pipeline, "move_archived_file_to_rejected", MagicMock(return_value=None))
+        post_progress_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", post_progress_mock)
+
+        await worker._run_delete_frame_task({"id": "del-task-1"}, [{"id": "item-1", "frame_id": "frame-1"}])
+
+        reported = post_progress_mock.call_args.args[1][0]
+        assert reported == {"item_id": "item-1", "status": "DONE"}
+
+    async def test_missing_frame_id_reports_failed_without_calling_api(self, monkeypatch):
+        get_frame_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "get_frame", get_frame_mock)
+        post_progress_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", post_progress_mock)
+
+        await worker._run_delete_frame_task({"id": "del-task-1"}, [{"id": "item-1"}])
+
+        get_frame_mock.assert_not_called()
+        reported = post_progress_mock.call_args.args[1][0]
+        assert reported["item_id"] == "item-1"
+        assert reported["status"] == "FAILED"
+
+    async def test_frame_not_found_reports_failed(self, monkeypatch):
+        monkeypatch.setattr(worker.api_client, "get_frame", AsyncMock(return_value=None))
+        move_mock = MagicMock()
+        monkeypatch.setattr(worker.pipeline, "move_archived_file_to_rejected", move_mock)
+        post_progress_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", post_progress_mock)
+
+        await worker._run_delete_frame_task(
+            {"id": "del-task-1"}, [{"id": "item-1", "frame_id": "frame-missing"}],
+        )
+
+        move_mock.assert_not_called()
+        reported = post_progress_mock.call_args.args[1][0]
+        assert reported["status"] == "FAILED"
 
 
 # ---------------------------------------------------------------------------

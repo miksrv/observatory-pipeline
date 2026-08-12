@@ -731,3 +731,49 @@ class TestRun:
 
         assert captured["pixel_scale_wcs"] is sentinel_wcs
         assert captured["pixel_to_sky_wcs"] is sentinel_wcs
+
+    async def test_new_frame_path_excluded_from_own_reference_stack(self, monkeypatch, tmp_path):
+        """
+        Re-analyzing an already-archived frame (see pipeline.py's
+        _resolve_bare_filename()) can pass a fits_path that already sits
+        inside archive_dir; _find_archive_frames() globs the whole directory
+        with no idea which file is "the new one", so run() itself must
+        filter the new frame's own (realpath-equal) path out of its
+        candidate reference stack before it's ever aligned/averaged into the
+        median reference — otherwise a re-analyzed frame would subtract a
+        resampled copy of itself as part of its own reference.
+        """
+        new_path = str(tmp_path / "new.fits")
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f: [new_path, "ref1.fits", "ref2.fits", "ref3.fits"],
+        )
+
+        loaded_paths: list[str] = []
+
+        def fake_load(path):
+            loaded_paths.append(path)
+            return np.ones((10, 10), dtype=np.float32)
+
+        monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones((10, 10), dtype=np.float32))
+        monkeypatch.setattr(
+            subtraction, "_detect_diff_sources",
+            lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [],
+        )
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
+
+        result = await subtraction.run(new_path, str(tmp_path), None)
+
+        assert result["performed"] is True
+        # Only the 3 genuinely-different reference frames were aligned — the
+        # new frame's own path was excluded from the reference stack, not
+        # counted as a 4th reference.
+        assert result["reference_frame_count"] == 3
+        # The new frame's own path is loaded exactly once — as the new frame
+        # itself (run()'s own `_load_frame_data(fits_path)` call) — never a
+        # second time as one of its own references.
+        assert loaded_paths.count(new_path) == 1
+        assert loaded_paths.count("ref1.fits") == 1
+        assert loaded_paths.count("ref2.fits") == 1
+        assert loaded_paths.count("ref3.fits") == 1
