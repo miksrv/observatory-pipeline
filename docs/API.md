@@ -826,7 +826,7 @@ Accept: application/json
 Each source in the results has the same fields as the single-position endpoint (see section 4)
 **plus `filter`** (string\|null — the normalized filter of the frame that produced this
 detection, resolved server-side via a join against `frames.filter`; `source_observations` itself
-has no filter column). `modules/anomaly_detector.py`'s `_same_filter_history()` uses this to
+has no filter column). `modules/anomaly_detector/_history.py`'s `_same_filter_history()` uses this to
 restrict Δmag comparisons to same-filter epochs only (see CLAUDE.md's "Filters — real astronomy
 context") — this is the one field that differs between the batch and single-position response
 shapes; the single-position `GET /sources/near` (section 4) predates it and does not return it.
@@ -1003,7 +1003,7 @@ PNG bytes** — not JSON, not multipart — since the body is entirely consumed 
 and `frame_count` travel as query parameters instead.
 
 A source can hold **one chart per style** (`track`, `stamp_strip`, `before_after`) at once, not
-just one chart total: `modules/anomaly_detector.py` classifies a source independently on every
+just one chart total: `modules/anomaly_detector/` classifies a source independently on every
 frame it appears on, so the same source_id can legitimately collect anomalies of more than one
 `anomaly_type` over its lifetime (e.g. `UNKNOWN` on the frame it was first seen, `MOVING_UNKNOWN`
 once it had moved) — see `modules/finder_chart.py`'s module docstring for the real incident this
@@ -1261,7 +1261,7 @@ same flattened field set `POST /frames` accepted (no nested `observation`/`instr
 measured values for that source (`ra`, `dec`, `mag`, `elongation`, `saturated`, `near_edge`,
 `from_subtraction`, ...) plus its catalog identity (`catalog_name`, `catalog_id`, `catalog_mag`,
 `object_type`) and its resolved `source_id`. `pipeline._from_wire_source()` translates one entry
-of this response back into the internal shape `modules/anomaly_detector.py` expects — the inverse
+of this response back into the internal shape `modules/anomaly_detector/` expects — the inverse
 of `_to_wire_source()` (section 2).
 
 **Errors:** `400` unparseable `date_from`/`date_to` on the list endpoint · `404` frame not found

@@ -16,7 +16,7 @@ markdown-документов в CLAUDE.md). Уже реализованные �
 
 **Разбор:**
 - Отсутствие порога по магнитуде в `UNKNOWN`-ветке — уже задокументированный
-  Known Issues #1 в CLAUDE.md (`modules/anomaly_detector.py`, TODO ~строки 541–546).
+  Known Issues #1 в CLAUDE.md (`modules/anomaly_detector/_classify.py`, TODO ~строка 335).
   Это единственная из трёх причин ниже, которая **до сих пор не устранена**.
 - `MOVING_CONE_ARCSEC=120″` — широкий конус, из-за которого почти любой мелкий шум
   около предыдущей позиции детекции трактовался как «сдвиг» → `MOVING_UNKNOWN`.
@@ -24,7 +24,7 @@ markdown-документов в CLAUDE.md). Уже реализованные �
   «опустела»), уже в коде.
 - Мусорные кандидаты из `modules/subtraction.py` возле ярких/насыщенных звёзд,
   не матчащиеся ни в один каталог. Устранено saturation-флагом +
-  near_edge-подавлением (`modules/anomaly_detector.py`), уже в коде.
+  near_edge-подавлением (`modules/anomaly_detector/_classify.py`), уже в коде.
 
 **Что осталось сделать** (требует доступа к БД на проде — вне возможностей
 этой сессии, поскольку `observatory-pipeline` не имеет прямого доступа к БД
@@ -64,7 +64,7 @@ investigated further:
 
 **Background:** the original observation — 4 `T_CrB` frames producing 305 anomalies,
 almost all false `SPACE_DEBRIS` from coma-elongated corner stars — has been root-caused
-and fixed: `modules/anomaly_detector.py`'s `SPACE_DEBRIS` shortcut now uses a higher,
+and fixed: `modules/anomaly_detector/`'s `SPACE_DEBRIS` shortcut now uses a higher,
 edge-aware elongation threshold (`SPACE_DEBRIS_EDGE_ELONGATION_MIN`) for sources flagged
 `near_edge`. That part is closed.
 

@@ -1,8 +1,15 @@
-# Anomaly Detector Mechanics (`modules/anomaly_detector.py`)
+# Anomaly Detector Mechanics (`modules/anomaly_detector/`)
 
-This document explains in detail how `modules/anomaly_detector.py` works — the
+This document explains in detail how `modules/anomaly_detector/` works — the
 pipeline's central "science" component, which compares sources detected in a frame
 against observation history and classifies them into anomaly types.
+
+A package, not a single file — split by concern (`types.py`, `_otypes.py`,
+`_geometry.py`, `_history.py`, `_movement.py`, `_prefetch.py`, `_classify.py`,
+`_ephemeris_resolution.py`, `_detect.py`; see that package's own `__init__.py`
+docstring for the exact map). This document describes the mechanics function-by-function
+regardless of which of those files each one lives in — the public surface
+(`detect()`, `AnomalyType`) is unaffected by the split.
 
 For the overall pipeline context and the full module list, see
 [../CLAUDE.md](../CLAUDE.md) and [../README.md](../README.md).
@@ -256,9 +263,9 @@ Table of Simbad OTYPE substrings used by the classifiers:
 | `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | **Yes** |
 | `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction regardless of coverage | **Yes** |
 
-The list is fixed as `AnomalyType(str, Enum)` and must match
+The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match
 `AnomalyModel::ALLOWED_TYPES`/the `ENUM` constraint on the `observatory-api` side — the
-two lists are kept in sync by hand (see `CLAUDE.md`, `modules/anomaly_detector.py` section).
+two lists are kept in sync by hand (see `CLAUDE.md`, `modules/anomaly_detector/` section).
 
 ---
 
@@ -318,4 +325,6 @@ dicts before they're returned.
 
 Resolved issues in this module (history not queried for catalog-matched sources,
 `source_id` not propagated to anomalies, etc.) are no longer tracked in the docs — see
-`git log -- modules/anomaly_detector.py` for that history.
+`git log -- modules/anomaly_detector.py modules/anomaly_detector/` for that history
+(the first path covers commits before the file was split into a package, the second
+everything since).
