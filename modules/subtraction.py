@@ -141,10 +141,10 @@ def _align_frame(source: np.ndarray, target: np.ndarray) -> Optional[np.ndarray]
 
 
 # ---------------------------------------------------------------------------
-# Streak masking — see config.STREAK_* and modules/astrometry.py's identical
-# pre-pass (duplicated here rather than imported, mirroring how this module
-# already keeps its own independent copy of the FWHM-floor/near-edge logic
-# used by modules/astrometry.py).
+# Streak masking — see config.STREAK_* and modules/astrometry/_streak.py's
+# identical pre-pass (duplicated here rather than imported, mirroring how
+# this module already keeps its own independent copy of the FWHM-floor/
+# near-edge logic used by modules/astrometry/_extraction.py).
 # ---------------------------------------------------------------------------
 
 def _build_streak_mask(
@@ -164,7 +164,7 @@ def _build_streak_mask(
     than one (real data, 2026-08-07, T_CrB test frames: 42 candidates with
     elongation > 3 along a single trail — each individually classifiable by
     anomaly_detector.py as its own SPACE_DEBRIS anomaly). See
-    modules/astrometry.py's identical helper for the full rationale; this
+    modules/astrometry/_streak.py's identical helper for the full rationale; this
     module's own `fwhm_min_px` floor in _detect_diff_sources() below already
     rejects candidates far SHARPER than the stellar PSF (hot pixels) — it
     has no equivalent protection against a genuine, coherent, but heavily
@@ -304,7 +304,7 @@ def _detect_diff_sources(
     list[dict]
         Pixel-space candidate dicts with keys: x, y, flux, snr, fwhm,
         elongation, near_edge (bool — see config.EDGE_MARGIN_FRAC and
-        modules/astrometry.py's identical flag; no leading underscore, same
+        modules/astrometry/_extraction.py's identical flag; no leading underscore, same
         as "saturated" there, since it must survive to the API for
         pipeline.py's standalone DETECT_ANOMALIES reconstruction — see
         run()'s own docstring below. Survives _pixel_to_sky()'s conversion
@@ -332,7 +332,7 @@ def _detect_diff_sources(
             return []
 
         # Near-edge geometry flag — see config.EDGE_MARGIN_FRAC and
-        # modules/astrometry.py's identical computation for ordinary
+        # modules/astrometry/_extraction.py's identical computation for ordinary
         # detections. Coma distorts the PSF (and therefore astroalign's own
         # resampling residuals) most strongly toward the frame's edges, so a
         # diff-image candidate born there needs the same "demand stronger
@@ -356,7 +356,7 @@ def _detect_diff_sources(
             # actually found anything on the difference image.
             # "fwhm" is also not a native sep.extract() field — it is
             # derived from the "a"/"b" second-moment axes, the same
-            # Gaussian approximation used in modules/astrometry.py.
+            # Gaussian approximation used in modules/astrometry/_extraction.py.
             flux = float(obj["flux"])
             npix = int(obj["npix"])
             snr = flux / (rms * math.sqrt(npix)) if npix > 0 else 0.0

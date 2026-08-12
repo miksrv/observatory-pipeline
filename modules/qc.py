@@ -100,12 +100,12 @@ def _build_streak_mask(
     arms — and returns a boolean pixel mask covering them, or None if none
     were found.
 
-    Duplicated from modules/astrometry.py's identical helper rather than
-    imported, mirroring how this module already duplicates the FWHM/
+    Duplicated from modules/astrometry/_streak.py's identical helper rather
+    than imported, mirroring how this module already duplicates the FWHM/
     elongation star-filtering formulas above/below it (both cross-reference
     each other in comments) — see that module's docstring for the full
     rationale and real-data verification (2026-08-07, T_CrB test frame).
-    Kept in sync by hand with astrometry.py's version.
+    Kept in sync by hand with astrometry/_streak.py's version.
 
     pixel_scale_arcsec may be None here (this module runs before plate
     solving, so it only has whatever XPIXSZ/FOCALLEN/PIXSCALE the FITS
@@ -279,9 +279,9 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         data_sub: np.ndarray = np.ascontiguousarray(data - bkg)
 
         # Streak masking — see _build_streak_mask()'s docstring and
-        # modules/astrometry.py's identical pre-pass. Keeps this module's own
+        # modules/astrometry/_streak.py's identical pre-pass. Keeps this module's own
         # fwhm_median/elongation_median/star_count consistent with what
-        # astrometry.py will end up extracting from the same frame (a trail
+        # astrometry/_extraction.py will end up extracting from the same frame (a trail
         # fragmenting into several roundish "stars" would otherwise inflate
         # star_count here too).
         streak_mask = _build_streak_mask(data_sub, sky_sigma, plate_scale)
