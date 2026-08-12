@@ -157,7 +157,9 @@ class TestRunDetectTask:
 
 class TestRunChartsTask:
     async def test_batches_all_items_into_one_call(self, monkeypatch):
-        generate_mock = AsyncMock(return_value={"src-a": True, "src-b": False})
+        generate_mock = AsyncMock(return_value={
+            "src-a": {"UNKNOWN": True}, "src-b": {"ASTEROID": False},
+        })
         monkeypatch.setattr(worker.pipeline, "generate_charts_for_source_ids", generate_mock)
         monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock())
 
@@ -170,9 +172,37 @@ class TestRunChartsTask:
 
         # One call covering both source_ids at once — not one call per item.
         generate_mock.assert_called_once()
-        anomaly_type_by_source_id, designation_by_source_id = generate_mock.call_args.args
-        assert anomaly_type_by_source_id == {"src-a": "UNKNOWN", "src-b": "ASTEROID"}
+        anomaly_types_by_source_id, designation_by_source_id = generate_mock.call_args.args
+        assert anomaly_types_by_source_id == {"src-a": ["UNKNOWN"], "src-b": ["ASTEROID"]}
         assert designation_by_source_id == {"src-b": "Vesta"}
+
+        progress = worker.api_client.post_task_items_progress.call_args.args[1]
+        by_id = {p["item_id"]: p["status"] for p in progress}
+        assert by_id == {"item-1": "DONE", "item-2": "FAILED"}
+
+    async def test_two_items_same_source_different_type_both_reported_from_nested_result(self, monkeypatch):
+        """Regression for the 2026-08-11 UI report: a task with two items for
+        the SAME source_id (one MOVING_UNKNOWN, one UNKNOWN — observatory-api's
+        AnomaliesController now submits one item per distinct anomaly_type
+        within a source's group) must collect both types into one call and
+        report each item's own outcome from the nested per-type result, not
+        collapse to a single bool keyed by source_id alone."""
+        generate_mock = AsyncMock(return_value={
+            "src-a": {"MOVING_UNKNOWN": True, "UNKNOWN": False},
+        })
+        monkeypatch.setattr(worker.pipeline, "generate_charts_for_source_ids", generate_mock)
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock())
+
+        items = [
+            {"id": "item-1", "source_id": "src-a", "payload": {"anomaly_type": "MOVING_UNKNOWN", "designation": None}},
+            {"id": "item-2", "source_id": "src-a", "payload": {"anomaly_type": "UNKNOWN", "designation": None}},
+        ]
+
+        await worker._run_charts_task({"id": "chart-task-1"}, items)
+
+        generate_mock.assert_called_once()
+        anomaly_types_by_source_id, _ = generate_mock.call_args.args
+        assert anomaly_types_by_source_id == {"src-a": ["MOVING_UNKNOWN", "UNKNOWN"]}
 
         progress = worker.api_client.post_task_items_progress.call_args.args[1]
         by_id = {p["item_id"]: p["status"] for p in progress}

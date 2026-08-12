@@ -499,9 +499,9 @@ class TestUpdateChartsForSources:
 
         monkeypatch.setattr(finder_chart.api_client, "get_source_tracks_batch", fake_get_tracks_batch)
 
-        result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
 
-        assert result == {"src1": False}
+        assert result == {"src1": {"ASTEROID": False}}
         assert called is False
 
     async def test_empty_input_returns_empty_dict_without_calling_api(self, monkeypatch):
@@ -526,9 +526,9 @@ class TestUpdateChartsForSources:
             finder_chart.api_client, "get_source_tracks_batch", lambda source_ids: _async_return({})
         )
 
-        result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
 
-        assert result == {"src1": False}
+        assert result == {"src1": {"ASTEROID": False}}
 
     async def test_tracks_batch_fetch_error_returns_false_for_all(self, monkeypatch):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
@@ -538,9 +538,9 @@ class TestUpdateChartsForSources:
 
         monkeypatch.setattr(finder_chart.api_client, "get_source_tracks_batch", raising)
 
-        result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID", "src2": "UNKNOWN"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"], "src2": ["UNKNOWN"]})
 
-        assert result == {"src1": False, "src2": False}
+        assert result == {"src1": {"ASTEROID": False}, "src2": {"UNKNOWN": False}}
 
     async def test_all_epochs_missing_locally_returns_false(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
@@ -551,9 +551,9 @@ class TestUpdateChartsForSources:
             lambda source_ids: _async_return({"src1": epochs}),
         )
 
-        result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
 
-        assert result == {"src1": False}
+        assert result == {"src1": {"ASTEROID": False}}
 
     async def test_happy_path_moving_type_uploads_track_style(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
@@ -581,9 +581,9 @@ class TestUpdateChartsForSources:
 
         monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
-        result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
 
-        assert result == {"src1": True}
+        assert result == {"src1": {"ASTEROID": True}}
         assert len(upload_calls) == 1
         chart = upload_calls[0]
         assert chart["source_id"] == "src1"
@@ -618,9 +618,9 @@ class TestUpdateChartsForSources:
 
         monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
-        result = await finder_chart.update_charts_for_sources({"src2": "SUPERNOVA_CANDIDATE"})
+        result = await finder_chart.update_charts_for_sources({"src2": ["SUPERNOVA_CANDIDATE"]})
 
-        assert result == {"src2": True}
+        assert result == {"src2": {"SUPERNOVA_CANDIDATE": True}}
         assert upload_calls[0]["style"] == finder_chart.STYLE_STAMP_STRIP
         assert upload_calls[0]["frame_count"] == 2
 
@@ -655,9 +655,9 @@ class TestUpdateChartsForSources:
             return True
         monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
-        result = await finder_chart.update_charts_for_sources({"src1": "MOVING_UNKNOWN"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["MOVING_UNKNOWN"]})
 
-        assert result == {"src1": True}
+        assert result == {"src1": {"MOVING_UNKNOWN": True}}
         assert upload_calls[0]["style"] == finder_chart.STYLE_BEFORE_AFTER
         assert upload_calls[0]["frame_count"] == 2
 
@@ -688,9 +688,9 @@ class TestUpdateChartsForSources:
             return True
         monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
-        result = await finder_chart.update_charts_for_sources({"src1": "MOVING_UNKNOWN"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["MOVING_UNKNOWN"]})
 
-        assert result == {"src1": True}
+        assert result == {"src1": {"MOVING_UNKNOWN": True}}
         assert upload_calls[0]["style"] == finder_chart.STYLE_BEFORE_AFTER
         assert upload_calls[0]["frame_count"] == 1
 
@@ -722,9 +722,9 @@ class TestUpdateChartsForSources:
 
         monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
-        result = await finder_chart.update_charts_for_sources({"src1": "ASTEROID"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
 
-        assert result == {"src1": True}
+        assert result == {"src1": {"ASTEROID": True}}
         # Only the most recent CHART_MAX_EPOCHS=2 epochs (e2, e3) should have
         # been loaded and included — e0/e1 dropped as the oldest.
         assert upload_calls == [2]
@@ -746,9 +746,9 @@ class TestUpdateChartsForSources:
             lambda source_id, png_bytes, style, frame_count: _async_return(False),
         )
 
-        result = await finder_chart.update_charts_for_sources({"src1": "UNKNOWN"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["UNKNOWN"]})
 
-        assert result == {"src1": False}
+        assert result == {"src1": {"UNKNOWN": False}}
 
     async def test_designation_shown_next_to_anomaly_type_in_chart_label(self, monkeypatch, tmp_path):
         """A catalog-matched source's designation must reach the renderer as
@@ -782,10 +782,10 @@ class TestUpdateChartsForSources:
         monkeypatch.setattr(finder_chart, "_render_track_chart", spy_render_track_chart)
 
         result = await finder_chart.update_charts_for_sources(
-            {"src1": "ASTEROID"}, {"src1": "4 Vesta"},
+            {"src1": ["ASTEROID"]}, {"src1": "4 Vesta"},
         )
 
-        assert result == {"src1": True}
+        assert result == {"src1": {"ASTEROID": True}}
         assert captured_labels == ["ASTEROID (4 Vesta)"]
 
     async def test_uncatalogued_source_labels_with_anomaly_type_only(self, monkeypatch, tmp_path):
@@ -820,9 +820,9 @@ class TestUpdateChartsForSources:
 
         # No designation_by_source_id argument at all — must not raise, and
         # must not invent a designation out of nowhere.
-        result = await finder_chart.update_charts_for_sources({"src1": "UNKNOWN"})
+        result = await finder_chart.update_charts_for_sources({"src1": ["UNKNOWN"]})
 
-        assert result == {"src1": True}
+        assert result == {"src1": {"UNKNOWN": True}}
         assert captured_labels == ["UNKNOWN"]
 
     async def test_batches_multiple_sources_into_single_track_call(self, monkeypatch, tmp_path):
@@ -870,9 +870,11 @@ class TestUpdateChartsForSources:
 
         monkeypatch.setattr(finder_chart.api_client, "get_nearest_frame_before", fake_get_nearest_frame_before)
 
-        result = await finder_chart.update_charts_for_sources({"src1": "UNKNOWN", "src2": "SUPERNOVA_CANDIDATE"})
+        result = await finder_chart.update_charts_for_sources(
+            {"src1": ["UNKNOWN"], "src2": ["SUPERNOVA_CANDIDATE"]}
+        )
 
-        assert result == {"src1": True, "src2": True}
+        assert result == {"src1": {"UNKNOWN": True}, "src2": {"SUPERNOVA_CANDIDATE": True}}
         # Exactly one track-fetch call for both sources.
         assert len(track_calls) == 1
         assert sorted(track_calls[0]) == ["src1", "src2"]
@@ -880,6 +882,77 @@ class TestUpdateChartsForSources:
         assert len(upload_calls) == 2
         assert upload_calls[0]["style"] == finder_chart.STYLE_BEFORE_AFTER
         assert len(nearest_before_calls) == 1
+
+    async def test_source_with_two_anomaly_types_gets_one_chart_per_style(self, monkeypatch, tmp_path):
+        """Regression for the 2026-08-11 UI report: a source classified both
+        MOVING_UNKNOWN (on one frame) and UNKNOWN (on another) over its
+        lifetime must get BOTH its "track" and "stamp_strip" charts
+        (re)generated — not just whichever type an upstream caller happened
+        to pick."""
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "C_2020_R4_ATLAS"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "e0.fits", ra=222.65, dec=32.62)
+        _make_wcs_fits(obj_dir / "e1.fits", ra=222.66, dec=32.63)
+
+        epochs = [
+            self._epoch("e0.fits", "C_2020_R4_ATLAS", 222.65, 32.62, "2024-01-01T00:00:00Z"),
+            self._epoch("e1.fits", "C_2020_R4_ATLAS", 222.66, 32.63, "2024-01-01T01:00:00Z"),
+        ]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src1": epochs}),
+        )
+
+        upload_calls = []
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append({"source_id": source_id, "style": style})
+            return True
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src1": ["MOVING_UNKNOWN", "UNKNOWN"]})
+
+        assert result == {"src1": {"MOVING_UNKNOWN": True, "UNKNOWN": True}}
+        assert len(upload_calls) == 2
+        assert {c["style"] for c in upload_calls} == {finder_chart.STYLE_TRACK, finder_chart.STYLE_STAMP_STRIP}
+
+    async def test_duplicate_anomaly_types_in_one_source_render_only_once(self, monkeypatch, tmp_path):
+        """Two items for the same source_id both carrying MOVING_UNKNOWN (e.g.
+        two GENERATE_CHARTS task items referencing different anomaly_ids of
+        the same type) must not upload the same "track" chart twice."""
+        monkeypatch.setattr(config, "CHART_ENABLED", True)
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+
+        obj_dir = tmp_path / "M51"
+        obj_dir.mkdir()
+        _make_wcs_fits(obj_dir / "e0.fits", ra=202.47, dec=47.20)
+        _make_wcs_fits(obj_dir / "e1.fits", ra=202.48, dec=47.21)
+
+        epochs = [
+            self._epoch("e0.fits", "M51", 202.47, 47.20, "2024-01-01T00:00:00Z"),
+            self._epoch("e1.fits", "M51", 202.48, 47.21, "2024-01-01T01:00:00Z"),
+        ]
+        monkeypatch.setattr(
+            finder_chart.api_client, "get_source_tracks_batch",
+            lambda source_ids: _async_return({"src1": epochs}),
+        )
+
+        upload_calls = []
+
+        async def fake_upload_chart(source_id, png_bytes, style, frame_count):
+            upload_calls.append(style)
+            return True
+
+        monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
+
+        result = await finder_chart.update_charts_for_sources({"src1": ["MOVING_UNKNOWN", "MOVING_UNKNOWN"]})
+
+        assert result == {"src1": {"MOVING_UNKNOWN": True}}
+        assert upload_calls == [finder_chart.STYLE_TRACK]
 
 
 async def _async_return(value):

@@ -460,9 +460,9 @@ async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
     expected_archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
     archive_existed_at_chart_time = {}
 
-    async def fake_update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None):
+    async def fake_update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id=None):
         archive_existed_at_chart_time["exists"] = os.path.exists(expected_archive_path)
-        return {sid: True for sid in anomaly_type_by_source_id}
+        return {sid: {t: True for t in types} for sid, types in anomaly_types_by_source_id.items()}
 
     finder_chart_mock = MagicMock()
     finder_chart_mock.update_charts_for_sources = AsyncMock(
@@ -477,7 +477,7 @@ async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
     # returns None by default, so no source ever gets "_source_id" attached
     # (see pipeline.py Step 7) and the designation lookup has nothing to key on.
     finder_chart_mock.update_charts_for_sources.assert_called_once_with(
-        {"src-1": "UNKNOWN"}, {}
+        {"src-1": ["UNKNOWN"]}, {}
     )
     assert archive_existed_at_chart_time.get("exists") is True, (
         "finder_chart.update_charts_for_sources() ran before the archive move — "
@@ -515,10 +515,10 @@ async def test_finder_chart_receives_catalog_designation(mock_modules, monkeypat
 
     captured = {}
 
-    async def fake_update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None):
-        captured["anomaly_type_by_source_id"] = anomaly_type_by_source_id
+    async def fake_update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id=None):
+        captured["anomaly_types_by_source_id"] = anomaly_types_by_source_id
         captured["designation_by_source_id"] = designation_by_source_id
-        return {sid: True for sid in anomaly_type_by_source_id}
+        return {sid: {t: True for t in types} for sid, types in anomaly_types_by_source_id.items()}
 
     finder_chart_mock = MagicMock()
     finder_chart_mock.update_charts_for_sources = AsyncMock(side_effect=fake_update_charts_for_sources)
@@ -527,7 +527,7 @@ async def test_finder_chart_receives_catalog_designation(mock_modules, monkeypat
 
     await pipeline.run(fits_path)
 
-    assert captured["anomaly_type_by_source_id"] == {"src-vesta": "ASTEROID", "src-uncat": "UNKNOWN"}
+    assert captured["anomaly_types_by_source_id"] == {"src-vesta": ["ASTEROID"], "src-uncat": ["UNKNOWN"]}
     assert captured["designation_by_source_id"] == {"src-vesta": "4 Vesta"}
     assert "src-uncat" not in captured["designation_by_source_id"]
 
@@ -567,9 +567,9 @@ async def test_finder_chart_designation_prefers_mpc_designation_over_stale_sourc
 
     captured = {}
 
-    async def fake_update_charts_for_sources(anomaly_type_by_source_id, designation_by_source_id=None):
+    async def fake_update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id=None):
         captured["designation_by_source_id"] = designation_by_source_id
-        return {sid: True for sid in anomaly_type_by_source_id}
+        return {sid: {t: True for t in types} for sid, types in anomaly_types_by_source_id.items()}
 
     finder_chart_mock = MagicMock()
     finder_chart_mock.update_charts_for_sources = AsyncMock(side_effect=fake_update_charts_for_sources)
@@ -579,6 +579,41 @@ async def test_finder_chart_designation_prefers_mpc_designation_over_stale_sourc
     await pipeline.run(fits_path)
 
     assert captured["designation_by_source_id"] == {"src-shared": "2014 RY1"}
+
+
+@pytest.mark.asyncio
+async def test_generate_charts_for_anomalies_collects_multiple_types_per_source(monkeypatch):
+    """
+    Regression for the 2026-08-11 UI report: two anomalies resolving to the
+    SAME source_id but carrying DIFFERENT anomaly_types (e.g. the API
+    resolving "_source_id" positionally onto one row for two detections in
+    the same frame) must both reach finder_chart.update_charts_for_sources()
+    as a list, not have the second one silently dropped by a "first wins"
+    dict assignment.
+    """
+    sources = [
+        {"_source_id": "src-1", "catalog_name": None, "catalog_id": None},
+    ]
+    anomalies = [
+        {"anomaly_type": "MOVING_UNKNOWN", "source_id": "src-1"},
+        {"anomaly_type": "UNKNOWN", "source_id": "src-1"},
+    ]
+
+    captured = {}
+
+    async def fake_update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id=None):
+        captured["anomaly_types_by_source_id"] = anomaly_types_by_source_id
+        return {sid: {t: True for t in types} for sid, types in anomaly_types_by_source_id.items()}
+
+    finder_chart_mock = MagicMock()
+    finder_chart_mock.update_charts_for_sources = AsyncMock(side_effect=fake_update_charts_for_sources)
+    monkeypatch.setattr("pipeline.finder_chart", finder_chart_mock)
+    monkeypatch.setattr(config, "CHART_ENABLED", True)
+
+    result = await pipeline.generate_charts_for_anomalies(sources, anomalies)
+
+    assert captured["anomaly_types_by_source_id"] == {"src-1": ["MOVING_UNKNOWN", "UNKNOWN"]}
+    assert result == {"src-1": {"MOVING_UNKNOWN": True, "UNKNOWN": True}}
 
 
 @pytest.mark.asyncio
