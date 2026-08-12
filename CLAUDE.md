@@ -974,6 +974,24 @@ upload outcomes. Never raises, and a failure never affects any other source_id o
 same call (pipeline.py's Step 15 calls this once per frame with every anomaly's source_id, deduped
 per frame, unconditionally) or frame processing overall.
 
+**Animated GIF companions** (`CHART_GIF_ENABLED`, default `true`): whenever a source's chart style
+is `track` or `stamp_strip` (2+ epochs — `before_after` has no animated counterpart, since a
+single-occurrence source has at most two still images to begin with), a matching animated GIF is
+also rendered and uploaded as its own chart, keyed by its own style: `track_gif` (cumulative
+reveal — frame *k* re-renders the `track` chart using only its first *k* epochs, so the trail grows
+one marker per frame) or `stamp_strip_gif` (one epoch's own crop per frame — an actual "blink"
+instead of the static side-by-side grid). Both reuse `_render_track_chart()`/`_render_stamp_strip()`
+as their own per-frame renderer (no separate drawing code) and are assembled into a looping GIF via
+Pillow (`_pngs_to_gif()`, `CHART_GIF_FRAME_DURATION_MS` per frame). The GIF is a bonus asset:
+`update_charts_for_sources()`'s return value reports only the static chart's own outcome, and a
+GIF render/upload failure is logged and otherwise ignored — it never downgrades an anomaly_type's
+already-successful result. On observatory-api's side this needed `source_charts.style` to accept
+`track_gif`/`stamp_strip_gif` (`2026-08-11-000002_AddGifStylesToSourceCharts.php`) and
+`SourcesController::uploadChart()`/`chart()` to stop hardcoding `.png`/`image/png` — see that
+repo's `CLAUDE.md`. `api_client.upload_source_chart()` sets the outgoing `Content-Type` from the
+image bytes' own magic number (`_content_type_for_image_bytes()`), not from `style`, so it needs
+no signature change to carry either format.
+
 ### `api_client/client.py`
 All communication with the remote `observatory-api`. Uses `httpx` with async support and
 `tenacity` for automatic retry on transient failures (HTTP 5xx and transport/timeout errors —
