@@ -682,6 +682,15 @@ async def run(
     empty: dict = {"performed": False, "reference_frame_count": 0, "candidates": []}
 
     archive_files = _find_archive_frames(archive_dir, filter_name)
+    # Exclude the new frame's own file from its candidate reference stack —
+    # re-analyzing an already-archived frame (see pipeline.py's
+    # _resolve_bare_filename()) passes a fits_path that may already be
+    # sitting inside archive_dir itself, and _find_archive_frames() globs the
+    # whole directory with no idea which file is "the new one". Without this,
+    # a re-analyzed frame would subtract a resampled copy of itself as part
+    # of its own reference median.
+    fits_path_real = os.path.realpath(fits_path)
+    archive_files = [f for f in archive_files if os.path.realpath(f) != fits_path_real]
     if len(archive_files) < config.SUBTRACTION_MIN_FRAMES:
         logger.info(
             "Subtraction skipped: %d archive frame(s) in %s (need %d)",

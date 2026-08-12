@@ -181,8 +181,20 @@ Orchestrates processing of a single FITS file in order:
 3. **Check frame type** (`IMAGETYP` header):
    - If `Dark`, `Flat`, or `Bias` → rename file (if normalization enabled) → move to `/fits/archive/{object}/` → **STOP** (no analysis needed)
    - If `Light` → continue processing
-4. `qc.analyze(fits_path)` → returns metrics + quality flag
-5. If `quality_flag != OK` → move file to `/fits/rejected/{object_name}/` → **STOP** (no API call)
+4. `qc.analyze(fits_path, move_on_reject=False)` → returns metrics + quality flag. The pipeline
+   itself owns the file's fate from here (not `qc.py` — see that module's section below), so it
+   passes `move_on_reject=False` rather than letting `qc.analyze()` move the file out from under
+   it before the frame can be registered.
+5. If `quality_flag != OK` → steps 6–9.5 below (astrometry, subtraction, catalog matching,
+   photometry, forced photometry) are all **skipped** — there is nothing to detect sources
+   against, and each of those steps' own existing guard (e.g. catalog matching's `if
+   catalog_matcher is not None and sources:`) already no-ops once `sources` stays empty. Processing
+   does **not** stop here anymore: the frame is still registered (step 10 below) with its QC
+   metrics and non-`OK` `quality_flag`, `sources` is posted as an empty list (step 12 — this is
+   also the exact mechanism a re-analysis "downgrade" relies on, see below), and the file is still
+   archived (step 12.5) exactly like an `OK` frame, so a later re-analysis (after tuning QC
+   thresholds) can find it again. This is a deliberate change from silently dropping a QC-rejected
+   frame — see "Why QC-failed frames are registered, not dropped" below.
 6. `astrometry.solve(fits_path, psf_fwhm_arcsec=...)` → returns WCS + two source lists: `sources` (strict star filter) and `sources_all` (loose filter — also keeps bright/saturated and faint detections, used for matching). This selection is made *before* step 7's merge below — `sources`/`sources_all` must already exist as names before anything tries to extend them. `psf_fwhm_arcsec` is step 4's `qc_result["fwhm_median"]`, forwarded only when `qc_result["fwhm_unit"] == "arcsec"` (see step 7 below for why).
 7. `subtraction.run(fits_path, archive_dir, filter_name, wcs=astro_result["wcs"], psf_fwhm_arcsec=...)` → if ≥`SUBTRACTION_MIN_FRAMES` archived frames of the same object exist, aligns them (via `astroalign`), builds a median reference, subtracts, and returns candidate sources found only in the difference image. These are merged into the source list and flagged `_from_subtraction=True`. Skipped gracefully otherwise. The `wcs` passed here is step 6's already-solved WCS, not re-derived from `fits_path`'s own header — that header isn't corrected until step 14.5 archives the frame (see `modules/astrometry/`'s section below), so re-deriving it here would give subtraction's candidates a different systematic sky-position offset than every other source in the frame. `psf_fwhm_arcsec` is `qc_result["fwhm_median"]` from step 4 — passed only when `qc_result["fwhm_unit"] == "arcsec"` (it can instead be a raw pixel count when the frame's headers don't carry enough to derive a plate scale; see `modules/qc.py` below), since `astrometry.solve()`'s call in step 6 uses the same guard. See `modules/subtraction.py`'s section below for what this enables.
 8. `catalog_matcher.match(sources, frame_meta)` → identifies known objects. **Runs before photometry** so matched Gaia DR3 stars can serve as the photometric zero-point reference.
@@ -429,15 +441,27 @@ Computes quality metrics from a FITS file without plate solving:
   floor of 3 raw detections is also enforced independently, before either threshold is even applied)
 - **Cosmic ray fraction** (via astroscrappy)
 
-Quality flags and handling:
-| Condition | Flag | Action |
-|---|---|---|
-| FWHM > QC_FWHM_MAX_ARCSEC | `BLUR` | Move to `/fits/rejected/{object}/BLUR_filename.fits` |
-| Elongation > QC_ELONGATION_MAX | `TRAIL` | Move to `/fits/rejected/{object}/TRAIL_filename.fits` |
-| Sky background > QC_SKY_BACKGROUND_MAX | `HIGH_BACKGROUND` | Move to `/fits/rejected/{object}/HIGH_BACKGROUND_filename.fits` |
-| Star count < QC_STARS_MIN (or < 3 raw detections) | `LOW_STARS` | Move to `/fits/rejected/{object}/LOW_STARS_filename.fits` |
-| Multiple issues, or a FITS read / background-estimation / extraction failure | `BAD` | Move to `/fits/rejected/{object}/BAD_filename.fits` |
-| All good | `OK` | Continue processing |
+Quality flags and classification:
+| Condition | Flag |
+|---|---|
+| FWHM > QC_FWHM_MAX_ARCSEC | `BLUR` |
+| Elongation > QC_ELONGATION_MAX | `TRAIL` |
+| Sky background > QC_SKY_BACKGROUND_MAX | `HIGH_BACKGROUND` |
+| Star count < QC_STARS_MIN (or < 3 raw detections) | `LOW_STARS` |
+| Multiple issues, or a FITS read / background-estimation / extraction failure | `BAD` |
+| All good | `OK` |
+
+The "Action" a non-`OK` flag triggers depends entirely on the caller's `move_on_reject` argument
+(default `True`) — `analyze()` itself never decides this. `pipeline.py`'s `analyze_frame()` passes
+`move_on_reject=False` and handles the file/registration itself (see that module's section above
+and "Why QC-failed frames are registered, not dropped" below) — a non-`OK` flag no longer means
+the file gets moved to `/fits/rejected/` at all in the production pipeline; it means the frame is
+registered with that flag and archived normally. `move_on_reject=True` (the default `analyze()` itself falls back to when no argument is given)
+still does move the file straight to `/fits/rejected/{object}/{FLAG}_filename.fits` — kept for any
+ad hoc/test caller that invokes `qc.analyze()` directly rather than through `pipeline.py`.
+`modules/catalog_preview.py` (the `PREVIEW_CATALOG_MATCH` task type) also always passes
+`move_on_reject=False`, for the same reason as `pipeline.py`: it must never move/touch its input
+frame — see that module's section below.
 
 `LOW_STARS` only fires when `BLUR`, `TRAIL`, and `HIGH_BACKGROUND` are all false — a low star
 count is treated as a *consequence* of one of those three (sources filtered out, or too faint
@@ -446,9 +470,12 @@ actually explains it. `QC_SKY_BACKGROUND_MAX` has no universal default that fits
 site/instrument (same as `QC_FWHM_MAX_ARCSEC`) — tune it to your own site's typical dark-sky
 `sky_background` reading on good frames.
 
-**Important:** Bad frames are NOT sent to the API. They are moved to the `rejected` folder
-with a prefix indicating the rejection reason. This saves bandwidth, storage, and keeps the
-database clean from unusable data.
+**Important:** As of the QC-failed-frame registration change (see "Why QC-failed frames are
+registered, not dropped" below), a bad frame **is** sent to the API — just with no sources,
+astrometry, or photometry, since there's nothing to detect against. What this saves bandwidth/
+storage/database-cleanliness on is the (much larger) source/photometry/catalog-matching payload a
+bad frame would otherwise generate, not the frame registration itself — the operator needs the
+frame + its QC metrics to see *why* it was rejected without SSHing into the observatory server.
 
 ### `modules/normalizer.py`
 Normalizes FITS header values and filenames for consistency across different capture software:

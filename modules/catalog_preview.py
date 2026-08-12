@@ -14,6 +14,14 @@ anomaly_detector actually use) as a circle on the frame:
   - Green circle + label "CatalogName: id" for a matched source
   - Red circle, no label, for an unmatched source
 
+If the frame's own QC (qc.analyze()) already rejected it, none of the above
+runs at all — astrometry/subtraction/catalog matching are skipped (a BLUR/
+TRAIL frame frequently can't even be plate-solved), and the PNG is just the
+raw stretched frame with no markers, annotated with the QC numbers that
+explain the rejection. This mirrors pipeline.py's own analyze_frame(): a
+QC-failed frame never reaches source detection, so there is nothing to
+circle here either.
+
 Circles are drawn at each source's ORIGINALLY DETECTED (ra, dec) — i.e.
 before catalog_matcher's WCS-offset correction shifts source["ra"]/["dec"]
 in-place for cross-matching purposes — so they line up with what's actually
@@ -79,7 +87,9 @@ async def render(fits_path: str) -> dict:
     dict
         {"png_bytes": bytes, "matched": int, "total": int,
          "quality_flag": str} — `matched`/`total` are the diagnostic's
-        headline numbers (also captioned on the image itself).
+        headline numbers (also captioned on the image itself). Both are 0
+        when the frame's own QC rejected it (no detection/matching ever
+        ran — see module docstring).
 
     Raises
     ------
@@ -88,7 +98,8 @@ async def render(fits_path: str) -> dict:
         useful image to render circles onto without one. The caller (see
         pipeline.preview_catalog_match()) is expected to catch this and
         report the item as FAILED, same as any other stage's per-item
-        failure handling.
+        failure handling. Never raised for a QC-rejected frame, since
+        astrometry is never attempted for one.
     """
     filename = os.path.basename(fits_path)
     extra = {"fits_filename": filename}
@@ -113,6 +124,50 @@ async def render(fits_path: str) -> dict:
         qc_result.get("star_count"),
         extra=extra,
     )
+
+    if quality_flag != "OK":
+        # QC already rejected this frame — astrometry/subtraction/catalog
+        # matching would either fail outright (a BLUR/TRAIL frame is
+        # frequently one astap can't plate-solve at all) or produce nothing
+        # meaningful. Render the raw frame (same zscale/asinh stretch) with
+        # no source markers, annotated with the QC numbers that explain the
+        # rejection — a "why was this rejected" quick look, not a
+        # catalog-match diagnostic.
+        with fits.open(fits_path) as hdul:
+            data = hdul[0].data.astype(np.float32)
+
+        fig, ax = plt.subplots(figsize=(14, 11), dpi=130)
+        try:
+            ax.imshow(_stretch(data), cmap="gray", origin="lower")
+            ax.set_title(
+                f"{filename}\n"
+                f"QC REJECTED: {quality_flag}\n"
+                f"fwhm={qc_result.get('fwhm_median')} elongation={qc_result.get('elongation_median')} "
+                f"sky_background={qc_result.get('sky_background')} stars={qc_result.get('star_count')}",
+                fontsize=10,
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
+            png_bytes = buf.getvalue()
+        finally:
+            plt.close(fig)
+
+        logger.info(
+            "Rendered QC-reject diagnostic PNG (%d bytes) for %s (flag=%s)",
+            len(png_bytes), filename, quality_flag,
+            extra=extra,
+        )
+
+        return {
+            "png_bytes": png_bytes,
+            "matched": 0,
+            "total": 0,
+            "quality_flag": quality_flag,
+        }
 
     # astap's .ini/.wcs/.log side files need SOME directory to land in
     # (output_base below) — a throwaway temp dir that's removed on the way
