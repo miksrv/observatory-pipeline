@@ -676,6 +676,24 @@ class TestApplyRemoteSettings:
         finally:
             config.CHART_ENABLED = original
 
+    @pytest.mark.parametrize(
+        "name", ["CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED", "FORCED_PHOTOMETRY_ENABLED"]
+    )
+    def test_applies_every_bool_setting(self, name):
+        # Regression test: every key documented in _OVERRIDABLE as "special:
+        # bool from string" must also be listed in _BOOL_KEYS, or
+        # _cast_value() falls through to `None(raw)` and raises TypeError
+        # (real incident, 2026-08-12: FORCED_PHOTOMETRY_ENABLED was missing
+        # from _BOOL_KEYS, so it could never be toggled remotely).
+        import config
+        original = getattr(config, name)
+        try:
+            count = config.apply_remote_settings({name: "false"})
+            assert count == 1
+            assert getattr(config, name) is False
+        finally:
+            setattr(config, name, original)
+
     def test_applies_log_level(self):
         import config
         original = config.LOG_LEVEL

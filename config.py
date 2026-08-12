@@ -462,7 +462,7 @@ _OVERRIDABLE: dict[str, type] = {
     "NARROWBAND_FILTERS": None,  # special: frozenset from CSV
 }
 
-_BOOL_KEYS = {"CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED"}
+_BOOL_KEYS = {"CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED", "FORCED_PHOTOMETRY_ENABLED"}
 
 
 def _cast_value(name: str, raw: str) -> object:
