@@ -860,6 +860,28 @@ async def get_source_tracks_batch(source_ids: list[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Chart image Content-Type sniffing
+#
+# Every chart upload endpoint (upload_source_chart, upload_task_item_chart)
+# used to hardcode "Content-Type: image/png" unconditionally — true for
+# every chart modules/finder_chart.py produced until it grew a "_gif"-suffixed
+# style (see that module's _pngs_to_gif()). Sniffing the image's own magic
+# bytes, rather than switching on the `style` string, keeps this decoupled
+# from any particular style-naming convention and matches observatory-api's
+# own upload validation (SourcesController::uploadChart(), which checks the
+# same PNG signature rather than trusting a client-supplied header).
+# ---------------------------------------------------------------------------
+
+_GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
+
+
+def _content_type_for_image_bytes(image_bytes: bytes) -> str:
+    if image_bytes[:6] in _GIF_SIGNATURES:
+        return "image/gif"
+    return "image/png"
+
+
+# ---------------------------------------------------------------------------
 # upload_source_chart
 # ---------------------------------------------------------------------------
 
@@ -883,7 +905,7 @@ async def _upload_source_chart_with_retry(
             f"/sources/{source_id}/chart",
             params={"style": style, "frame_count": frame_count},
             content=png_bytes,
-            headers={"Content-Type": "image/png"},
+            headers={"Content-Type": _content_type_for_image_bytes(png_bytes)},
         )
 
         if 400 <= response.status_code < 500:
@@ -909,16 +931,23 @@ async def upload_source_chart(
     frame_count: int,
 ) -> bool:
     """
-    Upload the finder-chart PNG for a source, replacing any previous one.
+    Upload the finder-chart image for a source, replacing any previous chart
+    of the same `style` for that source.
 
     Parameters
     ----------
     source_id:
         The `sources.id` this chart is for.
     png_bytes:
-        Encoded PNG image bytes (the full request body — no JSON envelope).
+        The full request body — no JSON envelope. Despite the name, this can
+        be either encoded PNG bytes (styles "track", "stamp_strip",
+        "before_after") or an animated GIF (styles "track_gif",
+        "stamp_strip_gif" — see modules/finder_chart.py's _pngs_to_gif()).
+        The Content-Type header is set from the bytes' own magic number, not
+        from `style` — see _content_type_for_image_bytes() above.
     style:
-        "track" (moving objects) or "stamp_strip" (stationary anomalies).
+        "track" / "stamp_strip" / "before_after", or their animated "_gif"
+        counterparts (see modules/finder_chart.py).
     frame_count:
         Number of epochs actually included in the image (may be less than
         the full track if some archived FITS files were missing locally).
@@ -1504,12 +1533,14 @@ async def _upload_task_item_chart_with_retry(
 
     async with _make_client() as client:
         # The request body IS the image — not JSON — same override as
-        # upload_source_chart() needs, for the same reason.
+        # upload_source_chart() needs, for the same reason. Content-Type is
+        # sniffed the same way too, for consistency, though every caller of
+        # this function today only ever sends PNG bytes.
         response = await client.post(
             f"/tasks/{task_id}/items/{item_id}/chart",
             params={"style": style, "frame_count": frame_count},
             content=png_bytes,
-            headers={"Content-Type": "image/png"},
+            headers={"Content-Type": _content_type_for_image_bytes(png_bytes)},
         )
 
         if 400 <= response.status_code < 500:
