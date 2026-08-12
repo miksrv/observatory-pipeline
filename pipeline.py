@@ -762,7 +762,7 @@ async def detect_anomalies_for_frame_data(
     sources:
         Enriched source dicts (ra, dec, mag, catalog_name, catalog_id,
         object_type, elongation, saturated, near_edge, "_from_subtraction",
-        "_source_id" — see modules/anomaly_detector.py's `detect()`).
+        "_source_id" — see modules/anomaly_detector/'s `detect()`).
     frame_meta:
         Dict with at least "filename" and "obs_time" — the two fields
         anomaly_detector.py actually reads (used for logging and the
@@ -826,7 +826,7 @@ async def detect_anomalies_for_frame_data(
 def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict:
     """
     Translate one entry of GET /frames/{id}/sources' response into the
-    internal shape modules/anomaly_detector.py expects — the inverse of
+    internal shape modules/anomaly_detector/ expects — the inverse of
     api_client._to_wire_source(). Used by detect_anomalies_for_frame_id()
     below to reconstruct a frame's `sources` list purely from API data, with
     no in-memory state carried over from when the frame was first analyzed.

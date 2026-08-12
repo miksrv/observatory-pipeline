@@ -253,7 +253,7 @@ async def test_sources_are_tagged_with_frame_filter(mock_modules):
     """
     Every source reaching anomaly_detector.detect() must carry "_filter" —
     needed to restrict its historical Δmag comparison to same-filter epochs
-    (see modules/anomaly_detector.py's _same_filter_history()).
+    (see modules/anomaly_detector/_history.py's _same_filter_history()).
     """
     await pipeline.run(str(mock_modules))
 

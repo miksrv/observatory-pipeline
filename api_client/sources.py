@@ -33,7 +33,7 @@ def _to_wire_source(source: dict) -> dict:
 
     Two things happen here, not before:
       - Rename "_from_subtraction" (modules/subtraction.py's internal flag,
-        also read by modules/anomaly_detector.py and pipeline.py's Step 4.5
+        also read by modules/anomaly_detector/ and pipeline.py's Step 4.5
         dedup) to the wire field name "from_subtraction" the API persists on
         source_observations — see that migration's docblock for why this is
         persisted at all: a standalone DETECT_ANOMALIES task re-run later,

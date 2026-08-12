@@ -1,5 +1,5 @@
 """
-tests/test_anomaly_detector.py — Unit tests for modules/anomaly_detector.py
+tests/test_anomaly_detector.py — Unit tests for the modules/anomaly_detector/ package
 
 All API and ephemeris calls are mocked at the module namespace level:
     patch("modules.anomaly_detector.api_client.get_sources_near_batch")
@@ -543,7 +543,7 @@ class TestDetectSameFilterDeltaMag:
     restriction: a magnitude comparison against a DIFFERENT filter's history
     must never fire VARIABLE_STAR/BINARY_STAR/the brightening branch of
     SUPERNOVA_CANDIDATE — see TestSameFilterHistory for the unit-level tests
-    and modules/anomaly_detector.py's _same_filter_history() docstring.
+    and modules/anomaly_detector/_history.py's _same_filter_history() docstring.
     """
 
     async def test_cross_filter_brightening_does_not_fire_variable_star(self):

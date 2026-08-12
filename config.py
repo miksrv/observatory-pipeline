@@ -184,13 +184,13 @@ MPC_MAG_LIMIT: float = float(_get("MPC_MAG_LIMIT", "19.0"))
 # (and modules/subtraction.py, for diff-image candidates) flags any source
 # whose pixel position falls within this fraction of NAXIS1/NAXIS2 from any
 # edge as `near_edge` — see SPACE_DEBRIS_EDGE_ELONGATION_MIN below for how
-# modules/anomaly_detector.py uses it. No universal default fits every
+# modules/anomaly_detector/ uses it. No universal default fits every
 # telescope/corrector combination — a well-corrected wide-field refractor
 # needs a much smaller margin than a fast Newtonian; tune to how far coma
 # actually reaches into your own frames.
 EDGE_MARGIN_FRAC: float = float(_get("EDGE_MARGIN_FRAC", "0.05"))
 # Elongation threshold for the "single-exposure trail" SPACE_DEBRIS shortcut
-# in modules/anomaly_detector.py (an unmatched source with no history at its
+# in modules/anomaly_detector/ (an unmatched source with no history at its
 # current position needs no further evidence beyond this to be classified
 # SPACE_DEBRIS — see that module's docstring). Extracted to config instead of
 # staying hardcoded so the edge-aware variant below has a documented
