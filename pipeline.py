@@ -11,6 +11,7 @@ section for the pipeline-side design this backs):
     await pipeline.generate_charts_for_source_ids(...)                 -> dict
     await pipeline.run(fits_path)                                     -> None
     await pipeline.preview_catalog_match(fits_path, task_id, item_id)  -> dict
+    pipeline.move_archived_file_to_rejected(filename, object_name)     -> str | None
 
 `analyze_frame()` is "Module 1": header extraction, normalization, QC,
 astrometry, subtraction, catalog matching, photometry, POST /frames +
@@ -55,6 +56,12 @@ archives its input file, and its only API call is uploading the rendered
 chart (`POST /tasks/{task_id}/items/{item_id}/chart`) — no frame or source
 is ever registered. See modules/catalog_preview.py for what it actually
 renders; nothing from this stage is kept locally, on disk, after it returns.
+
+`move_archived_file_to_rejected()` backs the `DELETE_FRAME` task type (see
+worker.py's `_run_delete_frame_task()`) — the operator-initiated deletion
+flow. It only relocates the file (FITS_ARCHIVE/{object}/ -> FITS_REJECTED/{object}/,
+never deletes it); observatory-api performs the actual DB-side cascade
+delete once the move is reported done.
 """
 
 from __future__ import annotations
@@ -170,7 +177,9 @@ async def analyze_frame(fits_path: str) -> dict | None:
 
     Steps:
         1. Extract FITS headers
-        2. Quality control — stop on rejection
+        2. Quality control — a rejection skips steps 3-5.6 (nothing to
+           detect sources against) but no longer stops the frame from being
+           registered (steps 6-8 below still run)
         3. Astrometry (optional)
         4. Catalog matching (optional) — enriches sources with Gaia/Simbad/MPC IDs
         5. Photometry (optional) — uses Gaia DR3 matches for zero-point calibration
@@ -192,16 +201,24 @@ async def analyze_frame(fits_path: str) -> dict | None:
     -------
     dict | None
         `None` if processing stopped early — a Dark/Flat/Bias calibration
-        frame (archived with no analysis), a QC rejection, no `api_client`
-        configured, or `POST /frames` itself failing. Otherwise:
+        frame (archived with no analysis), no `api_client` configured, or
+        `POST /frames` itself failing. A QC rejection is **not** one of
+        these cases anymore: the frame is still registered (with its QC
+        metrics and a non-"OK" `quality_flag`) and the file is still
+        archived — just with astrometry/subtraction/catalog matching/
+        photometry/forced photometry all skipped, so `sources` comes back
+        empty and any previously-linked sources (a re-analysis "downgrade")
+        are retracted/purged via an empty `POST /frames/{id}/sources` call.
+        Otherwise:
             {
                 "frame_id": str,
                 "filename": str,      # normalized filename actually archived
                 "basename": str,      # original incoming filename
-                "sources": list[dict],  # enriched; "_source_id" attached where resolved
+                "sources": list[dict],  # enriched; "_source_id" attached where resolved; [] if QC rejected
                 "object_name": str,
                 "obs_time": str | None,
                 "subtraction_performed": bool,
+                "quality_flag": str,  # "OK" or the QC rejection flag
             }
         A failure in any individual downstream step (catalog matching,
         photometry, posting sources, the archive move itself) is caught and
@@ -269,7 +286,8 @@ async def analyze_frame(fits_path: str) -> dict | None:
         dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
         dest_path = os.path.join(dest_dir, normalized_filename)
         os.makedirs(dest_dir, exist_ok=True)
-        shutil.move(fits_path, dest_path)
+        if os.path.abspath(fits_path) != os.path.abspath(dest_path):
+            shutil.move(fits_path, dest_path)
         _cleanup_astap_files(fits_path)
         _cleanup_empty_incoming_parents(fits_path)
         logger.info("Archived %s frame: %s → %s", frame_type, basename, dest_path, extra=extra)
@@ -277,8 +295,16 @@ async def analyze_frame(fits_path: str) -> dict | None:
 
     # ------------------------------------------------------------------
     # Step 2 — Quality control
+    #
+    # move_on_reject=False: the pipeline itself now owns this file's fate
+    # (see Step 8 below) instead of letting qc.py move it out from under us
+    # before the frame + its QC metrics can be registered with the API. A
+    # QC-failed frame is no longer silently dropped — it's still archived
+    # under FITS_ARCHIVE/{object}/ like any other frame, just with no
+    # sources/astrometry/photometry run against it (see the quality_flag
+    # branch right below).
     # ------------------------------------------------------------------
-    qc_result: dict = await qc.analyze(fits_path)
+    qc_result: dict = await qc.analyze(fits_path, move_on_reject=False)
     quality_flag: str = qc_result.get("quality_flag", "BAD")
 
     logger.info(
@@ -290,8 +316,17 @@ async def analyze_frame(fits_path: str) -> dict | None:
     )
 
     if quality_flag != "OK":
-        logger.warning("QC rejected %s: %s", basename, quality_flag, extra=extra)
-        return None
+        # No early return: the frame is still registered (Step 6), its
+        # source list is retracted/purged via an empty POST /frames/{id}/sources
+        # call (Step 7 — a no-op if it was never OK before, or the exact
+        # mechanism a re-analysis "downgrade" relies on if it used to be OK),
+        # and the file is still archived (Step 8) so a later re-analysis
+        # (after tuning QC thresholds) can find it again via
+        # _resolve_bare_filename().
+        logger.warning(
+            "QC rejected %s: %s — registering frame with QC metrics only, no sources",
+            basename, quality_flag, extra=extra,
+        )
 
     # qc.analyze() reports fwhm_median in "arcsec" when the frame's headers
     # carried enough info to derive a plate scale, otherwise in raw "pixels"
@@ -309,9 +344,20 @@ async def analyze_frame(fits_path: str) -> dict | None:
 
     # ------------------------------------------------------------------
     # Step 3 — Astrometry (optional)
+    #
+    # Skipped entirely when QC rejected this frame — every step through 5.6
+    # below (subtraction, catalog matching, photometry, forced photometry)
+    # is already guarded on `astro_result`/`sources` being non-empty, so
+    # leaving astro_result == {} here is sufficient to cascade-skip all of
+    # them without touching their own conditions.
     # ------------------------------------------------------------------
     astro_result: dict = {}
-    if astrometry is not None:
+    if quality_flag != "OK":
+        logger.debug(
+            "QC rejected — skipping astrometry/subtraction/catalog matching/photometry",
+            extra=extra,
+        )
+    elif astrometry is not None:
         try:
             astro_result = await astrometry.solve(
                 fits_path,
@@ -711,7 +757,12 @@ async def analyze_frame(fits_path: str) -> dict | None:
 
         # Rename file to normalized filename (if normalization enabled)
         dest_path = os.path.join(dest_dir, normalized_filename)
-        shutil.move(fits_path, dest_path)
+        if os.path.abspath(fits_path) != os.path.abspath(dest_path):
+            shutil.move(fits_path, dest_path)
+        else:
+            # Re-analysis of an already-archived frame (see
+            # _resolve_bare_filename()): fits_path already IS dest_path.
+            logger.debug("Already at archive destination (re-analysis): %s", dest_path, extra=extra)
 
         logger.info("Archived: %s → %s", original_filename, dest_path, extra=extra)
 
@@ -733,6 +784,7 @@ async def analyze_frame(fits_path: str) -> dict | None:
         "object_name": object_name,
         "obs_time": header.get("obs_time"),
         "subtraction_performed": subtraction_info.get("performed", False),
+        "quality_flag": quality_flag,
     }
 
 
@@ -887,6 +939,19 @@ async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
     frame = await api_client.get_frame(frame_id)
     if frame is None:
         logger.warning("detect_anomalies_for_frame_id: frame_id=%s not found", frame_id)
+        return []
+
+    quality_flag = frame.get("quality_flag")
+    if quality_flag is not None and quality_flag != "OK":
+        # QC-failed frame — it has no sources (see analyze_frame()), so
+        # there is nothing to classify. Silently skip rather than posting an
+        # empty anomaly set: a DETECT_ANOMALIES task item for such a frame
+        # (e.g. submitted as part of a batch spanning an object's whole
+        # observation history) is simply a no-op, not a failure.
+        logger.info(
+            "detect_anomalies_for_frame_id: frame_id=%s quality_flag=%s — skipping (no sources)",
+            frame_id, quality_flag,
+        )
         return []
 
     api_sources = await api_client.get_frame_sources(frame_id)
@@ -1079,6 +1144,13 @@ async def run(fits_path: str) -> None:
     if result is None:
         return
 
+    if result.get("quality_flag") != "OK":
+        # QC-failed frame — no sources were ever produced for it, and
+        # anomaly detection/chart generation must not run against it (same
+        # rule DETECT_ANOMALIES task items follow via
+        # detect_anomalies_for_frame_id() below).
+        return
+
     anomaly_frame_meta = {
         "filename": result["basename"],
         "obs_time": result["obs_time"],
@@ -1165,6 +1237,57 @@ async def preview_catalog_match(fits_path: str, task_id: str, item_id: str) -> d
         "quality_flag": result["quality_flag"],
         "chart_uploaded": chart_uploaded,
     }
+
+
+# ---------------------------------------------------------------------------
+# Stage 5 — frame deletion (backs the DELETE_FRAME task type)
+# ---------------------------------------------------------------------------
+
+
+def move_archived_file_to_rejected(filename: str, object_name: str) -> str | None:
+    """
+    Physically relocate an already-archived frame's file to FITS_REJECTED —
+    backs the DELETE_FRAME task type (see worker.py's `_run_delete_frame_task()`).
+
+    Per the file-lifecycle invariant this pipeline maintains: FITS_INCOMING
+    holds only unprocessed files, FITS_ARCHIVE/{object}/ holds every
+    processed frame regardless of `quality_flag` (see analyze_frame()'s Step
+    8 — a QC-rejected frame is archived exactly like an OK one), and
+    FITS_REJECTED is used exclusively by this deletion flow, never by QC
+    rejection itself. A registered frame's file can therefore only ever be
+    found at FITS_ARCHIVE/{object_name}/{filename} — no need to also search
+    FITS_INCOMING.
+
+    Never deletes the file — only relocates it, so an operator can still
+    recover it by hand if a deletion was a mistake. observatory-api is
+    responsible for the actual DB-side cascade delete (the frames row +
+    its source_observations/frame_sources/anomalies, plus purging any
+    source left with zero observations anywhere) once this move is reported
+    DONE — see that repo's `TasksController::postItemsProgress()`.
+
+    Returns
+    -------
+    str | None
+        The destination path the file was moved to, or `None` if it could
+        not be found at its expected archive location (already moved or
+        deleted out-of-band) — the caller (worker.py) treats this as
+        best-effort, not fatal: the API's DB-side deletion is the actual
+        goal here, and a missing file doesn't block it.
+    """
+    src_path = os.path.join(config.FITS_ARCHIVE, object_name, filename)
+    if not os.path.isfile(src_path):
+        logger.warning(
+            "move_archived_file_to_rejected: %s not found at expected archive path %s",
+            filename, src_path,
+        )
+        return None
+
+    dest_dir = os.path.join(config.FITS_REJECTED, object_name)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, filename)
+    shutil.move(src_path, dest_path)
+    logger.info("Moved %s to rejected (frame deletion): %s → %s", filename, src_path, dest_path)
+    return dest_path
 
 
 # ---------------------------------------------------------------------------

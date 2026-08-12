@@ -8,7 +8,13 @@ task's items to the matching pipeline.py stage function:
     DETECT_ANOMALIES       -> pipeline.detect_anomalies_for_frame_id(frame_id)
     GENERATE_CHARTS        -> pipeline.generate_charts_for_source_ids(...)
     PREVIEW_CATALOG_MATCH  -> pipeline.preview_catalog_match(fits_path, task_id, item_id)
+    DELETE_FRAME           -> pipeline.move_archived_file_to_rejected(filename, object_name)
     RESTART                -> clean exit (Docker restarts the container with fresh settings)
+
+DELETE_FRAME is operator-initiated (observatory-api's Web\FramesController,
+same frame-selection UI as ANALYZE/DETECT_ANOMALIES) — the file is only
+relocated to FITS_REJECTED, never deleted; observatory-api performs the
+actual DB-side cascade delete once the move is reported DONE.
 
 DETECT_ANOMALIES and GENERATE_CHARTS are decoupled: anomaly detection saves
 its results to the API, and the operator then decides which anomalies need
@@ -271,6 +277,69 @@ async def _run_preview_task(task: dict, items: list[dict]) -> None:
         )
 
 
+async def _run_delete_frame_task(task: dict, items: list[dict]) -> None:
+    """
+    Process every PENDING item of one DELETE_FRAME task — sequentially,
+    reporting each item's outcome immediately after it finishes, same
+    reasoning as _run_analyze_task() above.
+
+    Each item carries `frame_id` (observatory-api's Web\\FramesController
+    builds these directly off an operator's frame selection — see
+    CLAUDE.md's job-queue table). For each one:
+      1. Fetch the frame via GET /frames/{id} for its `filename`/`object`.
+      2. Physically move the file from FITS_ARCHIVE/{object}/ to
+         FITS_REJECTED/{object}/ via pipeline.move_archived_file_to_rejected()
+         — never deletes it.
+      3. Report the item DONE. observatory-api's own
+         TasksController::postItemsProgress() is responsible for the actual
+         DB-side cascade delete (frames row + source_observations/
+         frame_sources/anomalies + orphaned-source purge) once it sees this
+         item transition to DONE for a DELETE_FRAME task — see that repo's
+         CLAUDE.md.
+
+    A missing file (already moved/deleted out-of-band) is logged but not
+    treated as a failure — the actual goal is the DB-side deletion, which
+    doesn't depend on the physical file still being found.
+    """
+    for item in items:
+        frame_id = item.get("frame_id")
+        if not frame_id:
+            await api_client.post_task_items_progress(
+                task["id"], [{"item_id": item["id"], "status": "FAILED", "error": "Item has no frame_id"}],
+            )
+            continue
+
+        try:
+            frame = await api_client.get_frame(frame_id)
+        except Exception as exc:
+            logger.exception("DELETE_FRAME item failed to fetch frame_id=%s", frame_id)
+            await api_client.post_task_items_progress(
+                task["id"], [{"item_id": item["id"], "status": "FAILED", "error": str(exc)}],
+            )
+            continue
+
+        if frame is None:
+            await api_client.post_task_items_progress(
+                task["id"],
+                [{"item_id": item["id"], "status": "FAILED", "error": f"frame_id={frame_id} not found"}],
+            )
+            continue
+
+        filename = frame.get("filename")
+        object_name = frame.get("object") or "_UNKNOWN"
+
+        try:
+            pipeline.move_archived_file_to_rejected(filename, object_name)
+        except Exception as exc:
+            logger.exception("DELETE_FRAME item failed to move file for frame_id=%s", frame_id)
+            await api_client.post_task_items_progress(
+                task["id"], [{"item_id": item["id"], "status": "FAILED", "error": str(exc)}],
+            )
+            continue
+
+        await api_client.post_task_items_progress(task["id"], [{"item_id": item["id"], "status": "DONE"}])
+
+
 async def _run_restart_task(task: dict, items: list[dict]) -> None:
     """
     Handle a RESTART task — a signal from the API that the worker should
@@ -292,6 +361,7 @@ _HANDLERS = {
     "DETECT_ANOMALIES": _run_detect_task,
     "GENERATE_CHARTS": _run_charts_task,
     "PREVIEW_CATALOG_MATCH": _run_preview_task,
+    "DELETE_FRAME": _run_delete_frame_task,
     "RESTART": _run_restart_task,
 }
 
