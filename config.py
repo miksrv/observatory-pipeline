@@ -282,6 +282,19 @@ CHART_STAMP_SIZE_ARCSEC: float = float(_get("CHART_STAMP_SIZE_ARCSEC", "60.0"))
 # the number of local archive FITS files opened per chart, bounded for
 # sources with a very long observation history.
 CHART_MAX_EPOCHS: int = int(_get("CHART_MAX_EPOCHS", "12"))
+# When a source's chart style is "track" or "stamp_strip" (2+ epochs — a
+# single-epoch source always gets "before_after", which has no animation
+# equivalent), also render and upload an animated GIF alongside the static
+# PNG: "track_gif" (cumulative reveal of the motion track, one epoch added
+# per frame) or "stamp_strip_gif" (one epoch's own crop per frame — a
+# proper "blink" instead of a static side-by-side grid). Independent of
+# CHART_ENABLED being true; set false to keep generating only the static
+# PNGs. Best-effort like every other chart upload — a GIF render/upload
+# failure never affects the PNG's own already-reported result (see
+# modules/finder_chart.py's update_charts_for_sources() docstring).
+CHART_GIF_ENABLED: bool = _get("CHART_GIF_ENABLED", "true").lower() in ("true", "1", "yes")
+# Per-frame display duration of the animated GIF, in milliseconds.
+CHART_GIF_FRAME_DURATION_MS: int = int(_get("CHART_GIF_FRAME_DURATION_MS", "700"))
 
 # ---------------------------------------------------------------------------
 # Normalization settings
@@ -429,6 +442,8 @@ _OVERRIDABLE: dict[str, type] = {
     "CHART_ENABLED": None,  # special: bool from string
     "CHART_STAMP_SIZE_ARCSEC": float,
     "CHART_MAX_EPOCHS": int,
+    "CHART_GIF_ENABLED": None,  # special: bool from string
+    "CHART_GIF_FRAME_DURATION_MS": int,
     # Normalization
     "NORMALIZE_ENABLED": None,  # special: bool from string
     # Catalog cache
@@ -447,7 +462,7 @@ _OVERRIDABLE: dict[str, type] = {
     "NARROWBAND_FILTERS": None,  # special: frozenset from CSV
 }
 
-_BOOL_KEYS = {"CHART_ENABLED", "NORMALIZE_ENABLED"}
+_BOOL_KEYS = {"CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED"}
 
 
 def _cast_value(name: str, raw: str) -> object:
