@@ -54,7 +54,7 @@ import sys
 
 import config
 import pipeline
-from api_client import client as api_client
+import api_client
 
 logger = logging.getLogger(__name__)
 

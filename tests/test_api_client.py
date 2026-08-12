@@ -1,8 +1,8 @@
 """
-tests/test_api_client.py — Unit tests for api_client/client.py
+tests/test_api_client.py — Unit tests for the api_client package
 
 All HTTP I/O is mocked via unittest.mock.AsyncMock — respx is NOT used.
-The mock strategy patches `api_client.client.httpx.AsyncClient` as an
+The mock strategy patches `api_client.httpx.AsyncClient` as an
 async context manager whose .post() / .get() methods return controlled
 Response-like objects.
 
@@ -18,8 +18,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from api_client import client as api_client_module
-from api_client.client import (
+import api_client as api_client_module
+from api_client import anomalies as _anomalies_module
+from api_client import frames as _frames_module
+from api_client import sources as _sources_module
+from api_client import (
     get_frames_covering,
     get_nearest_frame_before,
     get_source_tracks_batch,
@@ -112,7 +115,7 @@ def _patch_client(
     mock_client_class.return_value.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client_class.return_value.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("api_client.client.httpx.AsyncClient", mock_client_class):
+    with patch("api_client.httpx.AsyncClient", mock_client_class):
         yield mock_client
 
 
@@ -226,7 +229,7 @@ class TestPostSources:
         exc = _make_5xx_status_error()
         # We patch the _inner retryable function directly to avoid real sleep
         with patch.object(
-            api_client_module,
+            _sources_module,
             "_post_sources_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -238,7 +241,7 @@ class TestPostSources:
         """TransportError after retries exhausted must not propagate."""
         exc = httpx.ConnectError("connection refused")
         with patch.object(
-            api_client_module,
+            _sources_module,
             "_post_sources_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -292,7 +295,7 @@ class TestPostAnomalies:
         """Exhausted retries (5xx) must not propagate out of post_anomalies."""
         exc = _make_5xx_status_error()
         with patch.object(
-            api_client_module,
+            _anomalies_module,
             "_post_anomalies_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -336,7 +339,7 @@ class TestGetSourcesNear:
         """TransportError (after retries exhausted) must return []."""
         exc = httpx.ConnectError("connection refused")
         with patch.object(
-            api_client_module,
+            _sources_module,
             "_get_sources_near_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -348,7 +351,7 @@ class TestGetSourcesNear:
         """TimeoutException must return []."""
         exc = httpx.ReadTimeout("read timeout")
         with patch.object(
-            api_client_module,
+            _sources_module,
             "_get_sources_near_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -426,7 +429,7 @@ class TestGetFramesCovering:
         """Any exception after retries exhausted must return []."""
         exc = httpx.ConnectError("connection refused")
         with patch.object(
-            api_client_module,
+            _frames_module,
             "_get_frames_covering_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -446,7 +449,7 @@ class TestGetFramesCovering:
         """HTTP 5xx (after retries exhausted via inner mock) must return []."""
         exc = _make_5xx_status_error()
         with patch.object(
-            api_client_module,
+            _frames_module,
             "_get_frames_covering_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -498,7 +501,7 @@ class TestGetNearestFrameBefore:
         """Any exception after retries exhausted must return None, not raise."""
         exc = httpx.ConnectError("connection refused")
         with patch.object(
-            api_client_module,
+            _frames_module,
             "_get_nearest_frame_before_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -509,7 +512,7 @@ class TestGetNearestFrameBefore:
     async def test_returns_none_on_5xx(self):
         exc = _make_5xx_status_error()
         with patch.object(
-            api_client_module,
+            _frames_module,
             "_get_nearest_frame_before_with_retry",
             AsyncMock(side_effect=exc),
         ):
@@ -565,7 +568,7 @@ class TestGetSourceTracksBatch:
     async def test_returns_empty_dict_on_transport_error(self):
         exc = httpx.ConnectError("connection refused")
         with patch.object(
-            api_client_module,
+            _sources_module,
             "_get_source_tracks_batch_with_retry",
             AsyncMock(side_effect=exc),
         ):

@@ -32,7 +32,7 @@ before:
                     explicit note why, if no earlier frame of the object
                     exists yet (this is its first-ever frame) or it can't be
                     loaded. The earlier frame comes from
-                    GET /frames/nearest-before (see api_client.client and
+                    GET /frames/nearest-before (see api_client and
                     docs/API.md section 13) — the one query this module
                     needs that isn't already answered by a source's own
                     track, since it asks about a DIFFERENT frame of the same
@@ -143,7 +143,7 @@ observatory-api side this needs `style` to also accept "track_gif"/
 chart-serving endpoint to stop hardcoding `Content-Type: image/png` on the
 way back out; api_client.upload_source_chart() already sends the correct
 Content-Type on the way in by sniffing the image's own magic bytes (see
-api_client/client.py's _content_type_for_image_bytes()).
+api_client/_shared.py's _content_type_for_image_bytes()).
 """
 from __future__ import annotations
 
@@ -163,7 +163,7 @@ from astropy.wcs import WCS
 from PIL import Image
 
 import config
-from api_client import client as api_client
+import api_client
 
 logger = logging.getLogger(__name__)
 

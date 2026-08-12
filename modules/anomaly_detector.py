@@ -28,7 +28,7 @@ from enum import Enum
 from typing import Any
 
 import config
-from api_client import client as api_client
+import api_client
 from modules import ephemeris
 
 logger = logging.getLogger(__name__)

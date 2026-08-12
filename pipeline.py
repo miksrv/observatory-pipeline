@@ -118,7 +118,7 @@ except ImportError:
     finder_chart = None  # type: ignore[assignment]
 
 try:
-    from api_client import client as api_client
+    import api_client
 except ImportError:
     api_client = None  # type: ignore[assignment]
 

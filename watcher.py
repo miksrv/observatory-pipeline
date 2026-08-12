@@ -53,7 +53,7 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 import config
-from api_client import client as api_client
+import api_client
 
 logger = logging.getLogger(__name__)
 
