@@ -224,8 +224,8 @@ Aperture photometry via `photutils`. Performs differential photometry against Ga
 ### `modules/subtraction.py`
 Image subtraction (difference imaging) — a second detection path for transients and moving objects that catalog matching alone would miss. If ≥`SUBTRACTION_MIN_FRAMES` frames of the same object are already archived, aligns them with `astroalign`, builds a median reference image, subtracts it from the new frame, masks out the vicinity of any saturated pixel (`SATURATION_MASK_RADIUS_ARCSEC`, to suppress astroalign residual artifacts around bright stars), and runs `sep` on the (masked) difference image (threshold `SUBTRACTION_DETECT_SIGMA`). Candidates are merged into the source list, flagged `_from_subtraction=True` so `anomaly_detector.py` can treat them with different coverage rules. Skipped gracefully when too few reference frames exist yet — e.g. for a brand-new target.
 
-### `modules/catalog_matcher.py`
-Cross-matches the source list against external catalogs using `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC` (`MOVING_CONE_ARCSEC` for MPC). Also computes a Gaia-based WCS offset correction applied in-place to every source's coordinates before the remaining catalogs are queried.
+### `modules/catalog_matcher/`
+A package, one file per catalog (`_gaia.py`, `_simbad.py`, `_2mass.py`, `_panstarrs.py`, `_mpc.py`) plus shared `_cache.py`/`_wcs_offset.py` and the `_match.py` orchestrator — see CLAUDE.md for the exact split. `__init__.py` re-exports `match()`/`get_gaia_stars()`/`get_mpc_objects()`, so it's still imported and called the same way everywhere else in this codebase. Cross-matches the source list against external catalogs using `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC` (`MOVING_CONE_ARCSEC` for MPC). Also computes a Gaia-based WCS offset correction applied in-place to every source's coordinates before the remaining catalogs are queried.
 
 Catalogs, queried in order:
 1. **Simbad** — named objects: variable stars, double stars, galaxies, nebulae — provides rich `object_type`

@@ -379,7 +379,7 @@ follow-up task (unlike `ANALYZE` → `DETECT_ANOMALIES` → `GENERATE_CHARTS`); 
 uploading the rendered chart. It exists to let an operator visually sanity-check catalog-matching
 quality on a batch of files — new or already archived — by rendering a PNG per frame with detected
 sources circled green (matched a catalog) or red (didn't). It still calls the real
-`modules/catalog_matcher.py`, so repeated frames of the same object/session within one task benefit
+`modules/catalog_matcher/`, so repeated frames of the same object/session within one task benefit
 from its on-disk cache exactly like a production `ANALYZE` run — only the first frame per sky tile
 actually re-hits Gaia/Simbad/2MASS/Pan-STARRS/MPC. See `modules/catalog_preview.py` below. Its
 result (`{"matched", "total", "quality_flag", "chart_uploaded"}`) is written onto each item's own
@@ -668,8 +668,16 @@ entry at all, at any position).
 Gracefully skipped (`performed=False`) when fewer than `SUBTRACTION_MIN_FRAMES` archived frames
 exist yet — e.g. the very first observations of a new target.
 
-### `modules/catalog_matcher.py`
-Cross-matches the source list against external catalogs using
+### `modules/catalog_matcher/`
+A package, not a single file — one file per catalog (`_gaia.py`, `_simbad.py`, `_2mass.py`,
+`_panstarrs.py`, `_mpc.py`, each holding that catalog's own query + match functions),
+plus `_cache.py` (shared query cache), `_wcs_offset.py` (the vote-accumulator below), and
+`_match.py` (the `match()` orchestrator itself, which calls each catalog through a
+qualified submodule reference — `_gaia._query_gaia(...)`, not a bare `_query_gaia(...)` —
+so that a test patching `modules.catalog_matcher._gaia.Gaia` reaches the actual call).
+`__init__.py` re-exports `match()`/`get_gaia_stars()`/`get_mpc_objects()`, so every call
+site elsewhere in this codebase is unchanged. Cross-matches the source list against
+external catalogs using
 `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC`
 (`MOVING_CONE_ARCSEC` for the MPC step, since moving objects shift between frames).
 
@@ -1132,7 +1140,7 @@ moving object is a moving object regardless of what filter caught it moving.
 
 ## External Catalogs & APIs
 
-Catalog matching order and rationale are covered under `modules/catalog_matcher.py` above; this
+Catalog matching order and rationale are covered under `modules/catalog_matcher/` above; this
 is the per-catalog reference (source, depth, access method, rate limit).
 
 ### Simbad
@@ -1254,7 +1262,7 @@ Without this check, the first observation of any field would generate false UNKN
 for every single source.
 
 ### Catalog query caching
-Implemented in `modules/catalog_matcher.py`: an in-process dict (fast path within one run) backed
+Implemented in `modules/catalog_matcher/_cache.py`: an in-process dict (fast path within one run) backed
 by files under `CATALOG_CACHE_DIR`, TTL `CACHE_TTL_HOURS` (default 1 hour, from `mtime`). The disk
 tier exists specifically because a pipeline restart — frequent during testing, and after every
 code change without `--reload` — would otherwise throw away every cached query and re-hit
@@ -1317,7 +1325,7 @@ fall below the completeness limit of Gaia DR3 (~21 mag). These are NOT new disco
 normal faint stars missing from the catalog.
 
 **Status:** Partially mitigated. Pan-STARRS DR1 (depth ~23.3 mag) was added as a fourth catalog
-in `modules/catalog_matcher.py` specifically to catch faint optical sources Gaia misses. However,
+in `modules/catalog_matcher/` specifically to catch faint optical sources Gaia misses. However,
 there is still **no magnitude threshold** in `anomaly_detector.py`'s `UNKNOWN` branch — a source
 that even Pan-STARRS doesn't catalog is still unconditionally flagged `UNKNOWN`, however faint
 it is.

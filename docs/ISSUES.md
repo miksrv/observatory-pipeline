@@ -96,7 +96,7 @@ to the Aladin portal — appears slightly off from the actual star. On sparser f
 (~300 sources) the same kind of link lands precisely on the star.
 
 **Hypothesis (not yet verified against logs — reasoned from code, not confirmed by a real
-repro):** `modules/catalog_matcher.py::_compute_wcs_offset()` receives the frame's full
+repro):** `modules/catalog_matcher/_wcs_offset.py::_compute_wcs_offset()` receives the frame's full
 `sources_all` list (loose filter — every detection, not just strict stars) together with
 Gaia DR3 stars for the same field, then:
 1. Runs a quick nearest-neighbour check and exits early with no correction
