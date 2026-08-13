@@ -112,8 +112,9 @@ async def render(fits_path: str) -> dict:
 
     # move_on_reject=False: this module must never touch the input frame —
     # qc.analyze() otherwise moves a non-OK frame to FITS_REJECTED itself,
-    # on its own, before returning (see debug/README.md's "Background" for
-    # the incident that established this convention).
+    # on its own, before returning. This is a read-only diagnostic tool, not
+    # part of the QC accept/reject pipeline (see git log for the incident
+    # that established this convention).
     qc_result = await qc.analyze(fits_path, move_on_reject=False)
     quality_flag = qc_result.get("quality_flag", "BAD")
     logger.info(

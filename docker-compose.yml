@@ -22,7 +22,6 @@ services:
       - ~/Developer/data/fits/incoming:/fits/incoming
       - ~/Developer/data/fits/archive:/fits/archive
       - ~/Developer/data/fits/rejected:/fits/rejected
-      - ~/Developer/data/fits/debug:/fits/debug
       - ~/Developer/data/astap/catalogs:/astap/catalogs
     env_file:
       - .env
@@ -45,7 +44,6 @@ services:
       - ~/Developer/data/fits/incoming:/fits/incoming
       - ~/Developer/data/fits/archive:/fits/archive
       - ~/Developer/data/fits/rejected:/fits/rejected
-      - ~/Developer/data/fits/debug:/fits/debug
       - ~/Developer/data/astap/catalogs:/astap/catalogs
       # Deliberately a path OUTSIDE the container's own writable layer (a
       # host directory bind-mounted in, exactly like the /fits/* dirs above)

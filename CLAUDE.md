@@ -420,8 +420,7 @@ TemporaryDirectory()` that's removed on the way out regardless of success or fai
 `POST /tasks/{task_id}/items/{item_id}/chart` (observatory-api's `SourceChartModel`, keyed by
 `task_item_id` instead of `source_id` since a catalog-preview chart has no source at all) — that
 upload is the only place the image ends up; there is deliberately no local-save option. There is
-no more standalone CLI script for this (removed — see debug/README.md); create a
-`PREVIEW_CATALOG_MATCH` task instead.
+no standalone CLI script for this — create a `PREVIEW_CATALOG_MATCH` task instead.
 
 ### `modules/qc.py`
 Computes quality metrics from a FITS file without plate solving:

@@ -102,7 +102,7 @@ class TestRender:
     async def test_qc_never_moves_a_rejected_frame(self, mock_stages, fits_file):
         """This module is a read-only diagnostic — it must call qc.analyze()
         with move_on_reject=False, never letting it relocate the input file
-        (see debug/README.md's "Background" for the incident this guards)."""
+        (see git log for the incident this guards against)."""
         await catalog_preview.render(fits_file)
 
         mock_stages["qc"].assert_called_once()

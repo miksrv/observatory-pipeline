@@ -557,6 +557,92 @@ class TestAstapFailures:
 
 
 # ---------------------------------------------------------------------------
+# ASTAP timeout budgets — unit tests
+#
+# Regression coverage for the 2026-08-13 IC3322A incident: the wide/blind
+# retry attempt used to share the narrow attempt's ASTAP_TIMEOUT_SEC (60s)
+# budget, which is nowhere near enough for a blind search over tens of
+# degrees against the full star catalog — re-running ANALYZE on 24
+# mis-pointed frames only fixed 1 of them, because the wide retry was almost
+# always killed by the shared timeout before astap could finish. These test
+# _run_astap_attempt() directly (not through the higher-level solve()) since
+# that's the one place that decides which budget applies.
+# ---------------------------------------------------------------------------
+
+from modules.astrometry._astap import _run_astap, _run_astap_attempt  # noqa: E402
+
+
+class TestAstapTimeoutBudgets:
+
+    def test_narrow_attempt_uses_astap_timeout_sec(self, monkeypatch):
+        monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 42.0)
+        monkeypatch.setattr(config, "ASTAP_WIDE_SEARCH_TIMEOUT_SEC", 999.0)
+
+        run_mock = MagicMock(return_value=MagicMock(
+            returncode=0, stdout="Solution found", stderr="",
+        ))
+        with patch("modules.astrometry.subprocess.run", run_mock):
+            outcome = _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
+
+        assert outcome == "solved"
+        assert run_mock.call_args.kwargs["timeout"] == 42.0
+
+    def test_wide_attempt_uses_astap_wide_search_timeout_sec(self, monkeypatch):
+        """The wide retry must get its OWN, separate (larger) budget — not
+        ASTAP_TIMEOUT_SEC, the narrow attempt's own timeout."""
+        monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 42.0)
+        monkeypatch.setattr(config, "ASTAP_WIDE_SEARCH_TIMEOUT_SEC", 999.0)
+
+        run_mock = MagicMock(return_value=MagicMock(
+            returncode=0, stdout="Solution found", stderr="",
+        ))
+        with patch("modules.astrometry.subprocess.run", run_mock):
+            outcome = _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=30.0)
+
+        assert outcome == "solved"
+        assert run_mock.call_args.kwargs["timeout"] == 999.0
+
+    def test_wide_retry_timeout_is_not_further_retried(self, monkeypatch):
+        """A timeout on the wide retry itself must not trigger yet another
+        attempt — "error" (from either attempt) is always terminal."""
+        monkeypatch.setattr(config, "ASTAP_RETRY_WIDE_SEARCH", True)
+        monkeypatch.setattr(config, "ASTAP_WIDE_SEARCH_RADIUS_DEG", 30.0)
+
+        def _side_effect(cmd, **kwargs):
+            if "30.0" in cmd:
+                raise subprocess.TimeoutExpired(cmd="astap", timeout=kwargs["timeout"])
+            return MagicMock(returncode=1, stdout="No solution found", stderr="")
+
+        run_mock = MagicMock(side_effect=_side_effect)
+        with patch("modules.astrometry.subprocess.run", run_mock):
+            result = _run_astap(_FITS_PATH, None)
+
+        assert result is False
+        assert run_mock.call_count == 2  # narrow (no_solution), then wide (timeout) — no third attempt
+
+    def test_full_retry_flow_uses_distinct_timeouts_for_each_attempt(self, monkeypatch):
+        """End-to-end through _run_astap(): narrow attempt reports no
+        solution, is retried wide, and each subprocess.run call carries its
+        own attempt's configured timeout, not the other one's."""
+        monkeypatch.setattr(config, "ASTAP_RETRY_WIDE_SEARCH", True)
+        monkeypatch.setattr(config, "ASTAP_WIDE_SEARCH_RADIUS_DEG", 30.0)
+        monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 42.0)
+        monkeypatch.setattr(config, "ASTAP_WIDE_SEARCH_TIMEOUT_SEC", 999.0)
+
+        def _side_effect(cmd, **kwargs):
+            if "30.0" in cmd:
+                return MagicMock(returncode=0, stdout="Solution found", stderr="")
+            return MagicMock(returncode=1, stdout="No solution found", stderr="")
+
+        run_mock = MagicMock(side_effect=_side_effect)
+        with patch("modules.astrometry.subprocess.run", run_mock):
+            result = _run_astap(_FITS_PATH, None)
+
+        assert result is True
+        assert [c.kwargs["timeout"] for c in run_mock.call_args_list] == [42.0, 999.0]
+
+
+# ---------------------------------------------------------------------------
 # Test 4 — Zero-source frame
 # ---------------------------------------------------------------------------
 

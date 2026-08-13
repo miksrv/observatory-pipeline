@@ -675,6 +675,17 @@ async def analyze_frame(fits_path: str) -> dict | None:
             logger.debug("Forced photometry module not available — skipping", extra=extra)
 
     # ------------------------------------------------------------------
+    # Step 5.7 — Cross-catalog duplicate dedup.
+    #
+    # Forced photometry (Step 5.6) can re-add a star that catalog_matcher.match()
+    # (Step 4) already matched to an earlier catalog in its sequential-exclusive
+    # order (Simbad → Gaia DR3 → 2MASS → Pan-STARRS → MPC) — see
+    # _dedupe_cross_catalog_duplicates()'s own docstring for the exact mechanism
+    # and the real incident this fixes.
+    # ------------------------------------------------------------------
+    sources = _dedupe_cross_catalog_duplicates(sources, extra)
+
+    # ------------------------------------------------------------------
     # Step 6 — Post frame to API
     # ------------------------------------------------------------------
     if api_client is None:
@@ -1538,6 +1549,121 @@ def _prefer_candidate(candidate: dict, existing: dict) -> bool:
     return (candidate.get("flux") or 0.0) > (existing.get("flux") or 0.0)
 
 
+# Sequential-exclusive catalog priority order — mirrors the query order
+# modules/catalog_matcher/_match.py itself matches sources against (Simbad
+# first, then Gaia DR3, 2MASS, Pan-STARRS, MPC last — see that module's
+# CLAUDE.md section). Used only by _dedupe_cross_catalog_duplicates() below
+# to decide, when the SAME physical object ends up matched under two
+# different catalogs within one frame, which entry catalog_matcher.match()
+# itself would have kept had it seen both at once.
+_CATALOG_PRIORITY: dict[str, int] = {
+    "Simbad": 0,
+    "Gaia DR3": 1,
+    "2MASS": 2,
+    "Pan-STARRS": 3,
+    "MPC": 4,
+}
+
+
+def _prefer_catalog(candidate: dict, existing: dict) -> bool:
+    """
+    Return True if `candidate`'s catalog outranks `existing`'s (per
+    _CATALOG_PRIORITY) and should replace it as the kept detection. An
+    unrecognized catalog_name (should not happen in practice — every value
+    modules/catalog_matcher/ ever sets is listed above) ranks lowest rather
+    than raising, and ties (same rank — only possible for two unrecognized
+    names) fall back to _prefer_candidate()'s non-subtraction/flux rule.
+    """
+    candidate_rank = _CATALOG_PRIORITY.get(candidate.get("catalog_name"), len(_CATALOG_PRIORITY))
+    existing_rank = _CATALOG_PRIORITY.get(existing.get("catalog_name"), len(_CATALOG_PRIORITY))
+    if candidate_rank != existing_rank:
+        return candidate_rank < existing_rank
+    return _prefer_candidate(candidate, existing)
+
+
+def _dedupe_cross_catalog_duplicates(sources: list, extra: dict) -> list:
+    """
+    Collapse two catalog-matched detections in this frame that refer to the
+    same physical object but were matched to DIFFERENT catalogs.
+
+    _dedupe_by_catalog_identity() (Step 4.5) only collapses duplicates
+    sharing the exact same (catalog_name, catalog_id) — it does nothing when
+    the same star is matched twice under two different catalog identities.
+    This happens because forced_photometry.py (Step 5.6) decides whether a
+    Gaia DR3 star or MPC object is "already recovered" purely by checking
+    whether ITS OWN catalog_id already appears in `sources` — so a star that
+    catalog_matcher.match() (Step 4) already matched to an earlier catalog
+    in its sequential-exclusive query order (Simbad → Gaia DR3 → 2MASS →
+    Pan-STARRS → MPC — see modules/catalog_matcher/'s CLAUDE.md section)
+    looks "not yet recovered" to forced_photometry, which then appends a
+    second entry for it under its Gaia DR3 identity, at essentially the same
+    position (real incident, 2026-08-12, IC3322A: 16 such Simbad/Gaia DR3
+    pairs — separations under 3" — found in a single frame; every bright,
+    individually-named star in the field had been registered twice).
+
+    Only two MATCHED sources (catalog_name is not None on both) within
+    MATCH_CONE_ARCSEC of each other, from DIFFERENT catalogs, are collapsed
+    here — the same catalog+id case is _dedupe_by_catalog_identity()'s job,
+    two different objects genuinely catalogued under the SAME catalog are
+    left alone (a crowded field can legitimately have two Gaia stars this
+    close together), and an uncatalogued source near a matched one is
+    _dedupe_unmatched_near_matched()'s job. The surviving entry is whichever
+    catalog ranks earlier in _CATALOG_PRIORITY — the one catalog_matcher.match()
+    itself would have kept, had both detections reached it as a single
+    candidate instead of one arriving later via forced photometry.
+    """
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    candidate_positions = [i for i, s in enumerate(sources) if s.get("catalog_name") is not None]
+    if len(candidate_positions) < 2:
+        return sources
+
+    threshold = config.MATCH_CONE_ARCSEC * u.arcsec
+    dropped: set[int] = set()
+    n_merged = 0
+
+    for a_pos, idx_a in enumerate(candidate_positions):
+        if idx_a in dropped:
+            continue
+        src_a = sources[idx_a]
+
+        for idx_b in candidate_positions[a_pos + 1:]:
+            if idx_b in dropped:
+                continue
+            src_b = sources[idx_b]
+
+            if src_a.get("catalog_name") == src_b.get("catalog_name"):
+                # Same catalog — either the same identity (already
+                # _dedupe_by_catalog_identity()'s job, run before this) or
+                # two genuinely distinct objects in that catalog. Either
+                # way, not this function's concern.
+                continue
+
+            sep = SkyCoord(ra=src_a["ra"] * u.deg, dec=src_a["dec"] * u.deg).separation(
+                SkyCoord(ra=src_b["ra"] * u.deg, dec=src_b["dec"] * u.deg)
+            )
+            if sep >= threshold:
+                continue
+
+            n_merged += 1
+            if _prefer_catalog(src_b, src_a):
+                dropped.add(idx_a)
+                break  # src_a lost; stop pairing it against further candidates
+            dropped.add(idx_b)
+
+    if n_merged:
+        logger.info(
+            "Deduplicated %d cross-catalog duplicate(s) of the same object "
+            "(e.g. Simbad-matched by normal detection, re-added under Gaia DR3 "
+            "by forced photometry) — %d source(s) remain",
+            n_merged, len(sources) - len(dropped),
+            extra=extra,
+        )
+
+    return [s for i, s in enumerate(sources) if i not in dropped]
+
+
 def _write_solved_wcs(fits_path: str, wcs) -> bool:
     """
     Write astap's verified, freshly-solved WCS into fits_path's own header.
@@ -1680,10 +1806,20 @@ def _calculate_fov_from_headers(header: dict) -> float | None:
     effective_pixel_size_um = pixel_size_um * max(binning_x, binning_y)
 
     # Calculate plate scale in arcsec/pixel
-    # plate_scale = 206.265 * pixel_size_mm / focal_length_mm
-    # 206.265 is the conversion factor from radians to arcseconds
+    # plate_scale = 206265 * pixel_size_mm / focal_length_mm
+    # 206265 is the conversion factor from radians to arcseconds. Bug fixed
+    # 2026-08-12: this used to read "206.265" — a leftover from a variant of
+    # this formula that takes pixel_size directly in µm (no mm conversion).
+    # Combined with the explicit /1000.0 below (which DOES convert to mm),
+    # that applied the µm→mm conversion twice, under-estimating fov_deg by
+    # exactly 1000x. Real incident: 24 IC3322A frames (2021-04-11/04-20
+    # sessions) all registered with fov_deg=0.00101372 instead of ~1.01 —
+    # every one of them had astrometry.solve() fail entirely (astap's narrow
+    # header-based search window couldn't handle a ~10° mount-pointing
+    # offset — see ASTAP_RETRY_WIDE_SEARCH in config.py) and fell back to
+    # this function.
     pixel_size_mm = effective_pixel_size_um / 1000.0
-    plate_scale_arcsec = 206.265 * pixel_size_mm / focal_length_mm
+    plate_scale_arcsec = 206265 * pixel_size_mm / focal_length_mm
 
     # Calculate FOV for both axes
     fov_x_arcsec = width_px * plate_scale_arcsec

@@ -1355,6 +1355,110 @@ class TestDedupeUncataloguedSubtractionPair:
         assert catalogued_subtraction in result
 
 
+# ---------------------------------------------------------------------------
+# _dedupe_cross_catalog_duplicates — unit tests
+#
+# Regression coverage for the 2026-08-12 IC3322A incident: forced_photometry.py
+# checks "already recovered" only against its OWN catalog's catalog_id, so a
+# star catalog_matcher.match() already matched to an earlier catalog in its
+# sequential-exclusive order (e.g. Simbad) looks unclaimed to it and gets
+# appended a second time under its Gaia DR3 identity — 16 such pairs found in
+# a single frame.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupeCrossCatalogDuplicates:
+
+    def test_fewer_than_two_matched_sources_returns_unchanged(self):
+        assert pipeline._dedupe_cross_catalog_duplicates([], {}) == []
+
+        one = [{"ra": 1.0, "dec": 1.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}]
+        assert pipeline._dedupe_cross_catalog_duplicates(one, {}) == one
+
+    def test_simbad_and_gaia_duplicate_of_same_star_collapses_to_simbad(self):
+        """Regression: forced photometry re-adds a Simbad-matched star under
+        its Gaia DR3 identity — Simbad wins (queried first)."""
+        simbad_detection = {
+            "ra": 186.4313, "dec": 7.2146, "catalog_name": "Simbad", "catalog_id": "HD 108903",
+            "mag": None, "_from_subtraction": False,
+        }
+        forced_gaia_duplicate = {
+            "ra": 186.4314, "dec": 7.2147, "catalog_name": "Gaia DR3", "catalog_id": "6028...1234",
+            "mag": 6.28, "_from_subtraction": False,
+        }
+        other_star = {
+            "ra": 10.0, "dec": 10.0, "catalog_name": "Gaia DR3", "catalog_id": "unrelated",
+            "mag": 12.0,
+        }
+
+        result = pipeline._dedupe_cross_catalog_duplicates(
+            [simbad_detection, forced_gaia_duplicate, other_star], {}
+        )
+
+        assert len(result) == 2
+        assert simbad_detection in result
+        assert forced_gaia_duplicate not in result
+        assert other_star in result
+
+    def test_kept_entry_wins_regardless_of_order(self):
+        """Simbad wins whether it's seen before or after the Gaia duplicate."""
+        gaia = {"ra": 1.0, "dec": 1.0, "catalog_name": "Gaia DR3", "catalog_id": "X", "mag": 6.0}
+        simbad = {"ra": 1.0, "dec": 1.0, "catalog_name": "Simbad", "catalog_id": "Y", "mag": None}
+
+        result = pipeline._dedupe_cross_catalog_duplicates([gaia, simbad], {})
+
+        assert len(result) == 1
+        assert result[0] is simbad
+
+    def test_same_catalog_different_ids_are_not_merged(self):
+        """Two distinct Gaia DR3 stars sitting close together in a crowded
+        field are two real objects, not a duplicate — same-catalog pairs are
+        left alone regardless of separation."""
+        a = {"ra": 1.0, "dec": 1.0, "catalog_name": "Gaia DR3", "catalog_id": "A", "mag": 10.0}
+        b = {"ra": 1.0, "dec": 1.0, "catalog_name": "Gaia DR3", "catalog_id": "B", "mag": 11.0}
+
+        result = pipeline._dedupe_cross_catalog_duplicates([a, b], {})
+
+        assert len(result) == 2
+
+    def test_far_apart_different_catalogs_are_not_merged(self):
+        """Separation well beyond MATCH_CONE_ARCSEC — two different objects
+        that simply happen to be matched to different catalogs."""
+        simbad = {"ra": 1.0, "dec": 1.0, "catalog_name": "Simbad", "catalog_id": "A", "mag": None}
+        far_gaia = {"ra": 1.0, "dec": 1.5, "catalog_name": "Gaia DR3", "catalog_id": "B", "mag": 10.0}
+
+        result = pipeline._dedupe_cross_catalog_duplicates([simbad, far_gaia], {})
+
+        assert len(result) == 2
+
+    def test_uncatalogued_sources_are_never_considered(self):
+        """This dedup only ever looks at catalog_name is not None entries —
+        an unmatched source near a matched one is _dedupe_unmatched_near_matched()'s
+        job, not this one's."""
+        matched = {"ra": 1.0, "dec": 1.0, "catalog_name": "Gaia DR3", "catalog_id": "A", "mag": 10.0}
+        unmatched = {"ra": 1.0, "dec": 1.0, "catalog_name": None, "catalog_id": None, "mag": None}
+
+        result = pipeline._dedupe_cross_catalog_duplicates([matched, unmatched], {})
+
+        assert len(result) == 2
+
+    def test_mpc_asteroid_and_gaia_star_duplicate_collapses_to_mpc(self):
+        """An MPC-matched asteroid re-added under a background Gaia star's
+        identity (or vice versa) at the same instant is the same shape of
+        bug — MPC is queried last, so it only wins here because the other
+        side of the pair is checked against the priority table, not because
+        MPC is generally preferred."""
+        mpc = {"ra": 5.0, "dec": 5.0, "catalog_name": "MPC", "catalog_id": "Vesta", "mag": 7.1}
+        gaia = {"ra": 5.0, "dec": 5.0, "catalog_name": "Gaia DR3", "catalog_id": "other", "mag": 15.0}
+
+        result = pipeline._dedupe_cross_catalog_duplicates([gaia, mpc], {})
+
+        # Gaia DR3 outranks MPC in the sequential-match order, so the Gaia
+        # entry is the one that survives here.
+        assert len(result) == 1
+        assert result[0] is gaia
+
+
 @pytest.mark.asyncio
 async def test_pipeline_dedupes_duplicate_catalog_matches_before_posting(mock_modules):
     """
@@ -1403,6 +1507,52 @@ async def test_pipeline_dedupes_duplicate_catalog_matches_before_posting(mock_mo
     detect_sources = pipeline.anomaly_detector.detect.call_args.args[1]
     vesta_in_detect = [s for s in detect_sources if s.get("catalog_id") == "Vesta"]
     assert len(vesta_in_detect) == 1
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedupes_forced_photometry_cross_catalog_duplicate(mock_modules):
+    """
+    Full-pipeline regression test for the 2026-08-12 IC3322A incident:
+    catalog_matcher (mocked here) matches the first source to Simbad;
+    forced_photometry (mocked here) then "recovers" that same star again
+    under its Gaia DR3 identity, at essentially the same position, because
+    its own eligibility check only compares against Gaia catalog_ids. Only
+    the Simbad entry must reach POST /frames/{id}/sources.
+    """
+    async def mock_match_first_to_simbad(sources, frame_meta):
+        for i, s in enumerate(sources):
+            if i == 0:
+                s["catalog_name"] = "Simbad"
+                s["catalog_id"] = "HD 108903"
+                s["object_type"] = "STAR"
+            else:
+                s.setdefault("catalog_name", "Gaia DR3")
+                s.setdefault("catalog_id", f"12345-{i}")
+                s.setdefault("catalog_mag", 14.5)
+                s.setdefault("object_type", "STAR")
+        return sources
+
+    pipeline.catalog_matcher.match.side_effect = mock_match_first_to_simbad
+
+    # _GOOD_ASTRO's first source sits at (202.47, 47.20) — forced photometry
+    # "recovers" a Gaia DR3 star less than 1" away, mimicking a duplicate
+    # measurement of the very same physical star.
+    forced_gaia_duplicate = {
+        "ra": 202.47003, "dec": 47.20003,
+        "flux": 12000.0, "mag_calibrated": 6.28, "calibrated": True,
+        "catalog_name": "Gaia DR3", "catalog_id": "gaia-forced-dup",
+        "catalog_mag": 6.28, "object_type": "STAR",
+    }
+    pipeline.forced_photometry.run.return_value = [forced_gaia_duplicate]
+
+    await pipeline.run(str(mock_modules))
+
+    posted_sources = pipeline.api_client.post_sources.call_args.args[2]
+    assert not any(s.get("catalog_id") == "gaia-forced-dup" for s in posted_sources), (
+        "forced photometry's duplicate of the already Simbad-matched star must be dropped"
+    )
+    simbad_entries = [s for s in posted_sources if s.get("catalog_id") == "HD 108903"]
+    assert len(simbad_entries) == 1
 
 
 # ---------------------------------------------------------------------------

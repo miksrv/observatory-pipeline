@@ -198,9 +198,11 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         When True (the default — what pipeline.py relies on), a non-"OK"
         quality_flag moves fits_path to FITS_REJECTED before returning, same
         as always. Pass False to compute metrics/flag only and leave the
-        file exactly where it is — used by debug/debug_catalog_match.py,
-        which promises not to move/touch the frame it's given but otherwise
-        calls this same production analyze() path.
+        file exactly where it is — used by pipeline.py's analyze_frame()
+        (which owns the file's fate itself, see that module's docstring) and
+        by modules/catalog_preview.py, a read-only diagnostic that must never
+        move/touch the frame it's given but otherwise calls this same
+        production analyze() path.
 
     Returns
     -------

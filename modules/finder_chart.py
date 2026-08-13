@@ -25,9 +25,10 @@ before:
                     on purpose (a single-occurrence source has exactly one
                     detected position) — that shared coordinate is shown
                     once, in the figure's title, not repeated under both
-                    panels (see debug/README.md's "Third follow-up" for why:
-                    the repeat read as a bug — unmoving coordinates —
-                    instead of the intentional fixed query point it is).
+                    panels (an earlier revision repeated it under both
+                    panels, which read as a bug — unmoving coordinates —
+                    instead of the intentional fixed query point it is; see
+                    git log).
                     Falls back to a single "after only" panel, with an
                     explicit note why, if no earlier frame of the object
                     exists yet (this is its first-ever frame) or it can't be

@@ -43,6 +43,42 @@ ASTAP_BINARY: str = _get("ASTAP_BINARY", "/usr/local/bin/astap")
 ASTAP_CATALOGS: str = _get("ASTAP_CATALOGS", "/astap/catalogs")
 # Optional FOV hint in degrees (0 = auto-detect from FITS headers)
 ASTAP_FOV_HINT: float = float(_get("ASTAP_FOV_HINT", "0"))
+# When the first attempt (narrow, header-based search window) completes
+# cleanly but finds no match, retry once with a wide/effectively-blind search
+# radius before giving up. Worth having on by default: the header's own
+# RA/Dec estimate (e.g. mount pointing) can be off by several degrees while
+# the frame itself is perfectly solvable — see docs/ISSUES.md and the
+# 2026-08-12 IC3322A incident (mount pointing off by ~10° in Dec).
+ASTAP_RETRY_WIDE_SEARCH: bool = _get("ASTAP_RETRY_WIDE_SEARCH", "true").strip().lower() in ("true", "1", "yes")
+# Search radius (degrees) for that retry. 30° comfortably covers the ~10°
+# mount-pointing offset seen in the incident above with margin to spare,
+# without paying the cost of a full all-sky blind search on every genuine
+# non-solve (clouds, trailing, too few stars).
+ASTAP_WIDE_SEARCH_RADIUS_DEG: float = float(_get("ASTAP_WIDE_SEARCH_RADIUS_DEG", "30"))
+# Subprocess timeout (seconds) for the ordinary narrow, header-based search
+# attempt. 60s comfortably covers a normal ~2-5s solve with margin for a
+# loaded host; raise it only if narrow solves themselves are routinely
+# timing out on your hardware (rare — that usually points at a missing/
+# corrupt catalog file or an overloaded host instead).
+ASTAP_TIMEOUT_SEC: float = float(_get("ASTAP_TIMEOUT_SEC", "60"))
+# Subprocess timeout (seconds) for the wide/effectively-blind retry attempt
+# (config.ASTAP_WIDE_SEARCH_RADIUS_DEG). Deliberately a SEPARATE, larger
+# budget from ASTAP_TIMEOUT_SEC — a blind search over tens of degrees against
+# the full star catalog is a fundamentally more expensive match than a
+# narrow, header-guided one, and sharing the narrow attempt's 60s budget was
+# real incident, 2026-08-13: re-running ANALYZE on the 24 mis-pointed
+# IC3322A frames (see ASTAP_RETRY_WIDE_SEARCH above) fixed only 1 of them —
+# manually reproducing the exact same astap invocation showed the wide
+# attempt still hadn't produced any output after several minutes, so almost
+# every retry was being killed by the shared 60s timeout before it could
+# finish; _run_astap_attempt() deliberately does NOT retry a timeout any
+# further ("a wider radius wouldn't fix that"), so a too-short budget here
+# silently reproduces the exact same stale header-WCS fallback on every
+# re-analysis. No universal default fits every host/catalog-size
+# combination — time a manual `astap -f <file> -d <catalogs> -speed 0 -wcs
+# -r <ASTAP_WIDE_SEARCH_RADIUS_DEG>` run on your own hardware and set this a
+# comfortable margin above it.
+ASTAP_WIDE_SEARCH_TIMEOUT_SEC: float = float(_get("ASTAP_WIDE_SEARCH_TIMEOUT_SEC", "240"))
 
 # ---------------------------------------------------------------------------
 # Quality control thresholds
@@ -458,11 +494,18 @@ _OVERRIDABLE: dict[str, type] = {
     "LOG_LEVEL": None,  # special: str.upper()
     # ASTAP
     "ASTAP_FOV_HINT": float,
+    "ASTAP_RETRY_WIDE_SEARCH": None,  # special: bool from string
+    "ASTAP_WIDE_SEARCH_RADIUS_DEG": float,
+    "ASTAP_TIMEOUT_SEC": float,
+    "ASTAP_WIDE_SEARCH_TIMEOUT_SEC": float,
     # Narrowband filters
     "NARROWBAND_FILTERS": None,  # special: frozenset from CSV
 }
 
-_BOOL_KEYS = {"CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED", "FORCED_PHOTOMETRY_ENABLED"}
+_BOOL_KEYS = {
+    "CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED",
+    "FORCED_PHOTOMETRY_ENABLED", "ASTAP_RETRY_WIDE_SEARCH",
+}
 
 
 def _cast_value(name: str, raw: str) -> object:

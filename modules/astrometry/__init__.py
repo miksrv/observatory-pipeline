@@ -96,9 +96,9 @@ async def solve(
         it, ``-o`` affects only where the ``.ini``/``.wcs``/``.log`` side
         files land, never the input. Defaults to None, which keeps astap's
         own default of writing them next to ``fits_path`` (production
-        behaviour, unchanged) — debug/debug_catalog_match.py passes a
-        scratch path here instead, so repeatedly running it doesn't litter
-        the debug frame's own directory with side files.
+        behaviour, unchanged) — a caller doing repeated ad hoc solves against
+        the same frame can pass a scratch path here instead, so it doesn't
+        litter that frame's own directory with side files.
 
     Returns
     -------
