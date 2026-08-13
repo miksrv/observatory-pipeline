@@ -942,7 +942,19 @@ in **[docs/anomaly-detector.md](docs/anomaly-detector.md)**.
 - Given MPC designation + observation time → returns predicted (RA, Dec, mag, distance_au, angular_velocity)
 - Results included in the anomaly payload sent to API
 
-### `modules/finder_chart.py`
+### `modules/finder_chart/`
+A package, not a single file — split one file per rendering style, plus shared infrastructure
+(`_style.py` picks which style a source's anomaly_type(s)/epoch-count resolve to; `_io.py` holds
+FITS loading, the display stretch, and PNG/GIF assembly shared by 2+ styles; `_style_track.py`,
+`_style_stamp_strip.py`, `_style_before_after.py` each own one style below plus its own GIF counterpart where
+one exists). `__init__.py` keeps `_render_charts_for_source()`/`update_charts_for_sources()` as the
+orchestrator itself (same convention as `modules/astrometry/`'s `solve()`) rather than moving them
+to their own file — `tests/test_finder_chart.py` patches `_render_track_chart`/`_render_stamp_strip`/
+`_render_track_gif` as bare attributes directly on the package, which only takes effect for code
+that resolves those names through `__init__.py`'s own namespace, i.e. code defined directly in
+`__init__.py` — and re-exports `update_charts_for_sources`, so every call site elsewhere in this
+codebase is unchanged.
+
 Per-source finder/discovery chart generation — for an anomaly with a resolved `source_id`,
 builds a small PNG visualizing every frame that source has ever been detected on, with its
 position marked on each, and uploads it to the API. The chart is always fully regenerated from

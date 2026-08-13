@@ -145,7 +145,7 @@ observatory-pipeline/
 │   ├── catalog_matcher.py     ← cross-match: Simbad, Gaia DR3, 2MASS, Pan-STARRS DR1, MPC
 │   ├── anomaly_detector.py    ← comparison with history + anomaly classification
 │   ├── ephemeris.py           ← JPL Horizons queries for solar system objects
-│   └── finder_chart.py        ← per-source discovery-chart PNG (track / stamp-strip) generation + upload
+│   └── finder_chart/          ← per-source discovery-chart PNG (track / stamp-strip) generation + upload
 │
 ├── api_client/
 │   └── client.py              ← all HTTP calls to observatory-api
@@ -262,7 +262,7 @@ Core science logic. A package split by concern (`types.py`, `_classify.py`, `_pr
 ### `modules/ephemeris.py`
 Queries JPL Horizons via `astroquery.jplhorizons`. Given an MPC designation and observation time, returns predicted (RA, Dec, magnitude, distance in AU, angular velocity in arcsec/hour).
 
-### `modules/finder_chart.py`
+### `modules/finder_chart/`
 For every anomaly with a resolved `source_id`, (re)generates and uploads a small PNG showing every
 frame that source has ever been detected on, with its position circled on each — fully
 regenerated from the source's complete track on every new epoch, never patched in place. Two
