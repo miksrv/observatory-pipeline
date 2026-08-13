@@ -8,6 +8,14 @@ using that frame's own WCS, each circled and labelled with its timestamp,
 magnitude, and RA/Dec — see _render_stamp_strip()'s own docstring for the
 full description, and the package's __init__.py docstring for how/when this
 style is chosen over "track"/"before_after".
+
+The "stamp_strip_gif" animated companion is NOT rendered here — see
+`_style_stamp_strip_gif.py`. It used to be a thin wrapper that called
+`_render_stamp_strip()` once per single-epoch list, reusing this file's own
+grid-layout machinery for what's always a 1x1 grid. Moved into its own file
+so its "blink" animation (per-frame timing, captioning, whatever else) can
+be tuned independently, without touching this file's own static multi-panel
+rendering at all.
 """
 from __future__ import annotations
 
@@ -15,10 +23,8 @@ import logging
 import math
 from typing import Optional
 
-from ._io import _arcsec_per_pixel, _crop_around, _fig_to_png_bytes, _pngs_to_gif, _stamp_half_size_px, _stretch
+from ._io import _arcsec_per_pixel, _crop_around, _fig_to_png_bytes, _stamp_half_size_px, _stretch
 import matplotlib.pyplot as plt
-
-import config
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +96,3 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
         fig.suptitle(label, fontsize=11)
     fig.tight_layout(rect=(0, 0, 1, 0.96) if label else (0, 0, 1, 1))
     return _fig_to_png_bytes(fig)
-
-
-def _render_stamp_strip_gif(loaded_epochs: list[dict], label: Optional[str] = None) -> bytes:
-    """
-    "Blink" animation for a stationary source: one frame per epoch, each
-    simply _render_stamp_strip() called with a single-epoch list — the exact
-    same crop/circle/caption a "stamp_strip" chart already draws for one
-    cell of its grid, just returned as its own standalone frame instead of
-    being laid out next to the others.
-    """
-    frames = [_render_stamp_strip([ep], label=label) for ep in loaded_epochs]
-    return _pngs_to_gif(frames, config.CHART_GIF_FRAME_DURATION_MS)

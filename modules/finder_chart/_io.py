@@ -154,6 +154,6 @@ def _pngs_to_gif(png_frames: list[bytes], duration_ms: int) -> bytes:
     buf = io.BytesIO()
     images[0].save(
         buf, format="GIF", save_all=True, append_images=images[1:],
-        duration=duration_ms, loop=0,
+        duration=duration_ms, loop=0, optimize=True,
     )
     return buf.getvalue()

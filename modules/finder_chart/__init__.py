@@ -87,9 +87,18 @@ Split into one file per chart style, plus shared infrastructure:
   _io.py             shared FITS loading, display stretch, plate-scale/
                      stamp-size conversion, PNG/GIF assembly — used by 2+ of
                      the style files below
-  _style_track.py        "track" style + its GIF counterpart (_render_track_gif)
-  _style_stamp_strip.py  "stamp_strip" style + its GIF counterpart
-  _style_before_after.py "before_after" style + the earlier-frame lookup it needs
+  _style_track.py             "track" style (static)
+  _style_track_gif.py         "track_gif" — its OWN independent renderer, not a
+                               wrapper around _style_track.py — see that file's
+                               docstring for why (fixed-size GIF canvas, real
+                               per-epoch pixel data instead of one reused
+                               background)
+  _style_stamp_strip.py       "stamp_strip" style (static)
+  _style_stamp_strip_gif.py   "stamp_strip_gif" — its own independent renderer,
+                               same reasoning as _style_track_gif.py
+  _style_before_after.py      "before_after" style + the earlier-frame lookup
+                               it needs (no GIF counterpart — see this
+                               docstring's "Animated GIF companions" section)
 
 `__init__.py` itself stays the orchestrator (same convention as
 modules/astrometry/'s `solve()`): `_render_charts_for_source()` and
@@ -110,10 +119,11 @@ other submodule and imported `_render_track_chart` as its own bare name —
 patching the package attribute would then leave that submodule's own,
 separate global binding untouched. So `_render_track_chart`/
 `_render_stamp_strip`/`_render_track_gif`/`_render_stamp_strip_gif`/
-`_render_before_after_chart` are all imported here as bare names (`from
-._style_track import _render_track_chart, ...`) specifically so the orchestrator
-below can call them the same way the pre-split module's own functions
-always did. See
+`_render_before_after_chart` are all imported here as bare names, each from
+whichever file actually implements it (`from ._style_track import
+_render_track_chart`, `from ._style_track_gif import _render_track_gif`,
+...) specifically so the orchestrator below can call them the same way the
+pre-split module's own functions always did. See
 `.claude/agent-memory/python-senior-dev/feedback_module_to_package_split.md`
 rule 2/4 for the general pattern this follows (same one modules/astrometry/
 and modules/catalog_matcher/ already established).
@@ -161,7 +171,8 @@ from ._style_before_after import (
     _get_earlier_frame_epoch,
     _render_before_after_chart,
 )
-from ._style_stamp_strip import _grid_layout, _render_stamp_strip, _render_stamp_strip_gif
+from ._style_stamp_strip import _grid_layout, _render_stamp_strip
+from ._style_stamp_strip_gif import _render_stamp_strip_gif
 from ._style_track import (
     _angular_separation_arcsec,
     _epoch_colors,
@@ -170,8 +181,8 @@ from ._style_track import (
     _label_positions,
     _parse_delta_hours,
     _render_track_chart,
-    _render_track_gif,
 )
+from ._style_track_gif import _render_track_gif
 
 logger = logging.getLogger(__name__)
 

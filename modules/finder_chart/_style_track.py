@@ -13,18 +13,27 @@ for how/when this style is chosen over "stamp_strip"/"before_after".
 (rather than in the shared `_io.py`) because, despite being generic-looking
 geometry/formatting helpers, this track chart's own per-epoch legend is
 their only caller in this module.
+
+The "track_gif" animated companion is NOT rendered here — see
+`_style_track_gif.py`. It used to be a thin wrapper that called
+`_render_track_chart()` once per epoch-count subset, but that coupled its
+own figure sizing (this chart's height grows with epoch count, to fit the
+legend below the image) to the GIF's need for one FIXED canvas across every
+frame, and relied on synthetic markers alone rather than each animation
+frame's own real pixel data. See `_style_track_gif.py`'s own docstring for
+the full rationale; `_epoch_colors()` below is the one thing it still
+imports from this file, since the color-gradient formula is generic enough
+to be worth sharing rather than duplicating.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _pngs_to_gif, _stamp_half_size_px, _stretch
+from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _stamp_half_size_px, _stretch
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.coordinates import SkyCoord
-
-import config
 
 
 def _format_angular_shift(sep_arcsec: float) -> str:
@@ -309,26 +318,3 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
         fig.suptitle(label, fontsize=11)
 
     return _fig_to_png_bytes(fig)
-
-
-def _render_track_gif(loaded_epochs: list[dict], label: Optional[str] = None) -> bytes:
-    """
-    Cumulative-reveal animation for a moving source: frame k re-renders the
-    ordinary "track" chart using only the first k epochs (loaded_epochs[:k]),
-    so the marker trail grows one point per frame and the final frame is
-    exactly the same image update_charts_for_sources() also uploads as the
-    static "track" PNG.
-
-    Each frame's own background is that frame's own most-recent epoch (i.e.
-    _render_track_chart()'s own choice of `loaded_epochs[-1]` for whatever
-    subset it's given) — the background image genuinely is a different
-    single exposure at each step, exactly as it would be if this chart had
-    been (re)generated right after each epoch arrived historically, so a
-    background that changes between animation frames is the accurate
-    picture rather than an artifact to avoid.
-    """
-    frames = [
-        _render_track_chart(loaded_epochs[:k], label=label)
-        for k in range(1, len(loaded_epochs) + 1)
-    ]
-    return _pngs_to_gif(frames, config.CHART_GIF_FRAME_DURATION_MS)

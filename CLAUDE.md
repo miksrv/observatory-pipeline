@@ -943,11 +943,25 @@ in **[docs/anomaly-detector.md](docs/anomaly-detector.md)**.
 - Results included in the anomaly payload sent to API
 
 ### `modules/finder_chart/`
-A package, not a single file — split one file per rendering style, plus shared infrastructure
-(`_style.py` picks which style a source's anomaly_type(s)/epoch-count resolve to; `_io.py` holds
-FITS loading, the display stretch, and PNG/GIF assembly shared by 2+ styles; `_style_track.py`,
-`_style_stamp_strip.py`, `_style_before_after.py` each own one style below plus its own GIF counterpart where
-one exists). `__init__.py` keeps `_render_charts_for_source()`/`update_charts_for_sources()` as the
+A package, not a single file — split one file per chart variant, plus shared infrastructure
+(`_style.py` picks which variant a source's anomaly_type(s)/epoch-count resolve to — routing only,
+no rendering; `_io.py` holds FITS loading, the display stretch, and PNG/GIF assembly shared by 2+
+variants). Five renderable variants, each its own file: `_style_track.py` (static "track"),
+`_style_track_gif.py` ("track_gif"), `_style_stamp_strip.py` (static "stamp_strip"),
+`_style_stamp_strip_gif.py` ("stamp_strip_gif"), `_style_before_after.py` ("before_after" — no GIF
+counterpart). Each `*_gif.py` is its own independent renderer, **not** a wrapper that re-calls its
+static sibling's render function per epoch-count subset — that was the original approach and had
+two real problems: (1) the static chart's own figure height grows with epoch count (room for its
+bottom legend), so a GIF assembled from N differently-sized PNGs got every frame past the first
+silently cropped to the first frame's own canvas size when Pillow composited them; (2) every frame
+reused one single background image with only synthetic markers changing, rather than each frame
+showing that epoch's own real pixel data. `_style_track_gif.py`/`_style_stamp_strip_gif.py` fix
+both: one fixed canvas size for every frame, no bottom legend (replaced by a short one-line
+per-frame caption), and each frame cropped from that epoch's own actual FITS data — `_style_track_gif.py`
+crops every frame to one shared, fixed sky window (computed once from all epochs) so the star
+field itself visibly shifts between real exposures, the way an actual discovery blink comparator
+works, while still drawing the cumulative marker trail (epochs 1..k) projected into each frame's own
+WCS. `__init__.py` keeps `_render_charts_for_source()`/`update_charts_for_sources()` as the
 orchestrator itself (same convention as `modules/astrometry/`'s `solve()`) rather than moving them
 to their own file — `tests/test_finder_chart.py` patches `_render_track_chart`/`_render_stamp_strip`/
 `_render_track_gif` as bare attributes directly on the package, which only takes effect for code
