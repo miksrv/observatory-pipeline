@@ -18,7 +18,7 @@ all, and vice versa.
 from __future__ import annotations
 
 import logging
-import textwrap
+import re
 from typing import Optional
 
 from ._io import _arcsec_per_pixel, _crop_around, _fig_to_png_bytes, _pngs_to_gif, _stamp_half_size_px, _stretch
@@ -33,13 +33,15 @@ logger = logging.getLogger(__name__)
 _FIGSIZE = (3.0, 3.6)
 _DPI = 120
 
-# Wrap width (characters) for the label. This frame's figure is only 3.0"
-# wide at fontsize 9 — a long label (e.g. "VARIABLE_STAR (TYC
-# 1430-1407-1)") overflows that canvas width unwrapped and either gets
-# clipped or spills over the image, rather than wrapping onto a second line
-# the way an ordinary axis title would (real complaint, 2026-08-13).
-_LABEL_WRAP_WIDTH = 22
-_LABEL_FONTSIZE = 9
+# A label built by update_charts_for_sources() is either a bare
+# `anomaly_type` (e.g. "VARIABLE_STAR", uncatalogued source) or
+# `anomaly_type` + " (" + designation + ")" (e.g. "VARIABLE_STAR (TYC
+# 1430-1407-1)"). Split the two onto their own lines — one for the
+# classification, one for the designation — rather than either wrapping
+# mid-word at a fixed character width or overflowing this frame's narrow
+# 3.0" canvas (real complaint, 2026-08-14).
+_LABEL_DESIGNATION_RE = re.compile(r"^(.*\S)\s+(\(.+\))$")
+_LABEL_FONTSIZE = 8
 _CAPTION_FONTSIZE = 7.5
 
 # Same fig.suptitle() + ax.set_title() pair as _style_stamp_strip.py's
@@ -48,15 +50,12 @@ _CAPTION_FONTSIZE = 7.5
 # per-frame caption: tight_layout pads generously around a suptitle to
 # guarantee no overlap, which leaves a large blank gap between the label
 # and the caption right below it (real complaint, 2026-08-14). An explicit
-# top fraction keeps that gap small and predictable instead. Both calls
-# still handle their own multi-line "\n" spacing on their own, so no manual
-# per-line positioning is needed — `_TOP_LABEL_BASE` matches
-# _style_stamp_strip.py's single-line convention; each extra wrapped label
-# line just trims a bit more room off the top so it doesn't collide with
-# the caption.
+# top fraction keeps that gap small and predictable instead — a two-line
+# label (classification + designation) needs a bit more headroom than a
+# bare one-line anomaly_type.
 _TOP_NO_LABEL = 0.92
-_TOP_LABEL_BASE = 0.90
-_TOP_PER_EXTRA_LABEL_LINE = 0.05
+_TOP_LABEL_ONE_LINE = 0.90
+_TOP_LABEL_TWO_LINES = 0.85
 
 
 def _render_one_stamp_gif_frame(ep: dict, label: Optional[str] = None) -> bytes:
@@ -93,19 +92,17 @@ def _render_one_stamp_gif_frame(ep: dict, label: Optional[str] = None) -> bytes:
     caption += f"\nRA {ep['ra']:.4f}°  Dec {ep['dec']:.4f}°"
     ax.set_title(caption, fontsize=_CAPTION_FONTSIZE)
 
-    n_label_lines = 0
-    if label:
-        # Wrap a long label (e.g. a resolved catalog designation) onto
-        # multiple lines instead of letting it overflow this frame's narrow
-        # (3.0") canvas — see _LABEL_WRAP_WIDTH above. fig.suptitle() itself
-        # handles the resulting "\n"s just like ax.set_title() does above.
-        wrapped_label = "\n".join(textwrap.wrap(label, width=_LABEL_WRAP_WIDTH)) or label
-        n_label_lines = wrapped_label.count("\n") + 1
-        fig.suptitle(wrapped_label, fontsize=_LABEL_FONTSIZE)
-
     top = _TOP_NO_LABEL
     if label:
-        top = _TOP_LABEL_BASE - _TOP_PER_EXTRA_LABEL_LINE * (n_label_lines - 1)
+        # Split "TYPE (designation)" onto two lines; a bare "TYPE" (no
+        # designation) stays on one — see _LABEL_DESIGNATION_RE above.
+        match = _LABEL_DESIGNATION_RE.match(label)
+        if match:
+            fig.suptitle(f"{match.group(1)}\n{match.group(2)}", fontsize=_LABEL_FONTSIZE)
+            top = _TOP_LABEL_TWO_LINES
+        else:
+            fig.suptitle(label, fontsize=_LABEL_FONTSIZE)
+            top = _TOP_LABEL_ONE_LINE
     fig.subplots_adjust(left=0.03, right=0.97, bottom=0.001, top=top)
 
     return _fig_to_png_bytes(fig)

@@ -84,9 +84,12 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
             logger.debug("finder_chart: stamp crop failed for %s: %s", ep.get("filename"), exc)
             ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
 
+        # Date/time and magnitude share one line (same convention as
+        # _style_stamp_strip_gif.py's/_style_track_gif.py's per-frame
+        # captions) rather than magnitude getting its own line.
         title = ep.get("obs_time", "")
         if ep.get("mag") is not None:
-            title += f"\nmag {ep['mag']:.2f}"
+            title += f"   mag {ep['mag']:.2f}"
         title += f"\nRA {ep['ra']:.4f}°  Dec {ep['dec']:.4f}°"
         ax.set_title(title, fontsize=7.5)
         ax.set_xticks([])
@@ -94,5 +97,11 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
 
     if label:
         fig.suptitle(label, fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.96) if label else (0, 0, 1, 1))
+    # subplots_adjust with an explicit top, not tight_layout(rect=...) —
+    # tight_layout pads generously around a suptitle to guarantee no
+    # overlap, which leaves a large blank gap between the title and the
+    # grid right below it (same fix as _style_stamp_strip_gif.py's/
+    # _style_track_gif.py's own per-frame caption).
+    fig.subplots_adjust(left=0.03, right=0.97, bottom=0.03, top=0.93 if label else 0.97,
+                         wspace=0.02, hspace=0.08)
     return _fig_to_png_bytes(fig)
