@@ -63,7 +63,7 @@ def _render_before_after_chart(
     is shown as part of the figure's overall title.
     """
     n_panels = 2 if before_ep else 1
-    fig, axes = plt.subplots(1, n_panels, figsize=(4.6 * n_panels, 4.7), dpi=120)
+    fig, axes = plt.subplots(1, n_panels, figsize=(3.8 * n_panels, 4.7), dpi=120)
     axes = [axes] if n_panels == 1 else list(axes)
 
     if before_ep:
@@ -120,7 +120,13 @@ def _render_before_after_chart(
 
     if missing_reason:
         fig.text(0.5, 0.01, missing_reason, ha="center", fontsize=7.5, color=_BEFORE_AFTER_BEFORE_COLOR)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.86 if has_designation else 0.90))
+    # subplots_adjust with explicit wspace, not tight_layout(rect=...) — same
+    # reason as _style_stamp_strip.py/_style_track.py: tight_layout pads
+    # generously (and has no direct wspace knob at all), so an explicit
+    # value keeps both the top gap and the BEFORE/AFTER panel gap small and
+    # predictable.
+    fig.subplots_adjust(left=0.03, right=0.97, bottom=0.04,
+                         top=0.78 if has_designation else 0.83, wspace=0.08)
 
     return _fig_to_png_bytes(fig)
 
