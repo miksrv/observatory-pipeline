@@ -71,7 +71,7 @@ _DPI = 120
 # 1.6x margin _style_track.py's _render_track_chart() already uses for its
 # own crop.
 _WINDOW_MARGIN_FACTOR = 1.6
-_WINDOW_MIN_FACTOR = 3.0
+_WINDOW_MIN_FACTOR = 2.5
 
 
 def _sky_window(loaded_epochs: list[dict]) -> tuple[float, float, float]:
