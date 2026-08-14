@@ -30,20 +30,29 @@ Deliberately NOT a thin wrapper around _style_track.py's _render_track_chart()
      projected into it differs, because it really is a different exposure
      each time.
 
-Each frame keeps the cumulative marker trail (epochs 1..k, not just epoch k
-alone) so the "track" identity — the accumulating path, not just a single
-blink — stays visible within the animation itself, each position projected
-into THAT frame's own WCS (a marker's sky position is fixed; its pixel
-position within a shared window can still differ slightly frame to frame,
-since each is a genuinely different plate solve). Colors are a fixed
-cool→warm gradient over ALL epochs (`_style_track._epoch_colors()`, called
-once with the full count — not per-frame), so a given epoch keeps the same
-color across every frame it appears in. Each epoch is marked with a dashed,
-dim, unfilled circle — not the filled dot the static "track" chart uses —
-sized (same 10″-or-6px-minimum convention as `_style_before_after.py`'s own
-circles) to sit well clear of the object's own PSF: a filled dot big enough
-to see at a glance otherwise sits right on top of the very asteroid it's
-marking (real complaint, 2026-08-13).
+Each frame keeps the cumulative marker trail for every PAST transition
+(epochs 1..k-1, not epoch k itself) so the "track" identity — the
+accumulating path, not just a single blink — stays visible within the
+animation itself, each position projected into THAT frame's own WCS (a
+marker's sky position is fixed; its pixel position within a shared window
+can still differ slightly frame to frame, since each is a genuinely
+different plate solve). Colors are a fixed cool→warm gradient over ALL
+epochs (`_style_track._epoch_colors()`, called once with the full count —
+not per-frame), so a given epoch keeps the same color across every frame it
+appears in.
+
+No circle or marker is ever drawn at the CURRENT epoch's own position (the
+real object visible in this frame's own pixel data) — a filled dot or a
+circle sized to be visible at a glance otherwise sits right on top of the
+very asteroid it's marking (real complaint, 2026-08-13). The frame's newest
+segment (epoch k-1 → epoch k) is instead rendered as a short directional
+arrow anchored AT epoch k-1's position (the "previous value") and capped
+well short of reaching epoch k's position — it shows which way the object
+is headed without ever overlapping it. So frame 1 (no prior epoch at all)
+shows no arrow; frame 2 shows a short arrow sitting at epoch 1's position,
+pointing toward epoch 2 but stopping short of it; and so on for every later
+frame — the arrow always trails one step behind the object actually visible
+in that frame.
 
 A short, fixed-height, two-line caption (date/time + magnitude, then
 coordinates + shift/velocity from the previous epoch) replaces the static
@@ -54,6 +63,7 @@ frame via one unchanging fig.suptitle().
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional
 
 from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _pngs_to_gif, _stretch
@@ -150,8 +160,10 @@ def _render_one_track_gif_frame(
     half_size_arcsec: float, colors: list[str], label: Optional[str],
 ) -> bytes:
     """Render animation frame k (1-indexed): epoch k's own real pixel data,
-    cropped to the shared window, with the cumulative marker trail for
-    epochs 1..k projected into epoch k's own WCS."""
+    cropped to the shared window, with the cumulative trail for epochs
+    1..k-1 plus a short directional arrow stubbed at epoch k-1's position —
+    epoch k's own position (the real object visible in this frame) is never
+    marked — all projected into epoch k's own WCS."""
     current = loaded_epochs[k - 1]
 
     try:
@@ -168,7 +180,10 @@ def _render_one_track_gif_frame(
 
         # Project every epoch seen so far (1..k) into THIS frame's own WCS —
         # each is a genuinely different exposure, so the same sky position
-        # can land at a slightly different pixel in each one.
+        # can land at a slightly different pixel in each one. Epoch k itself
+        # (the last entry, xs[-1]/ys[-1]) is only ever used as a DIRECTION
+        # reference below — nothing is ever drawn ON it, since that's the
+        # real object visible in this frame's own pixel data.
         xs: list[float] = []
         ys: list[float] = []
         for ep in loaded_epochs[:k]:
@@ -176,28 +191,34 @@ def _render_one_track_gif_frame(
             xs.append(float(x) - off_x)
             ys.append(float(y) - off_y)
 
-        for i in range(1, len(xs)):
+        # Cumulative history trail: plain connecting lines between past
+        # positions only (epochs 1..k-1) — never touches epoch k's own
+        # position. No circles/dots at any of these either (real complaint,
+        # 2026-08-13: a marker sized to be visible at a glance sat right on
+        # top of the object it was marking).
+        for i in range(1, len(xs) - 1):
             ax.plot([xs[i - 1], xs[i]], [ys[i - 1], ys[i]], "-",
                     color=colors[i], linewidth=1.2, alpha=0.6, zorder=2)
+
+        # Short directional arrow anchored AT the previous position
+        # (xs[-2]/ys[-2]), pointing toward the current one but capped well
+        # short of reaching it — shows which way the object is headed
+        # without ever overlapping it. Replaces the old full-length arrow
+        # (whose head used to land exactly on the current object) and the
+        # circles entirely.
         if len(xs) >= 2:
-            ax.annotate(
-                "", xy=(xs[-1], ys[-1]), xytext=(xs[-2], ys[-2]),
-                arrowprops=dict(arrowstyle="-|>", color=colors[len(xs) - 1], lw=1.5, mutation_scale=12),
-                zorder=2,
-            )
-        # Dashed, dim, unfilled circles — same convention as
-        # _style_before_after.py's own marker circles — rather than a solid
-        # filled dot: a filled dot sized for visibility sits right on top of
-        # the asteroid's own PSF and hides the very thing being marked. A
-        # circle drawn AROUND it (radius well past any real point source, per
-        # the same 10″-or-6px-minimum sizing before_after.py uses) frames the
-        # object without ever covering its pixels.
-        radius_px = max(6.0, 10.0 / _arcsec_per_pixel(current["wcs"]))
-        for i, (x, y) in enumerate(zip(xs, ys)):
-            ax.add_patch(plt.Circle(
-                (x, y), radius=radius_px, edgecolor=colors[i], facecolor="none",
-                linewidth=1.3, linestyle="--", alpha=0.75, zorder=4,
-            ))
+            dx, dy = xs[-1] - xs[-2], ys[-1] - ys[-2]
+            dist = math.hypot(dx, dy)
+            if dist > 1e-6:
+                stub_len_px = max(6.0, 10.0 / _arcsec_per_pixel(current["wcs"]))
+                arrow_len = min(dist * 0.5, stub_len_px * 3)
+                ux, uy = dx / dist, dy / dist
+                tip_x, tip_y = xs[-2] + ux * arrow_len, ys[-2] + uy * arrow_len
+                ax.annotate(
+                    "", xy=(tip_x, tip_y), xytext=(xs[-2], ys[-2]),
+                    arrowprops=dict(arrowstyle="-|>", color=colors[-1], lw=1.5, mutation_scale=12),
+                    zorder=2,
+                )
     else:
         ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
 
@@ -243,10 +264,13 @@ def _render_track_gif(loaded_epochs: list[dict], label: Optional[str] = None) ->
     """
     Cumulative-reveal "blink" animation for a moving source: frame k shows
     epoch k's own real pixel data (cropped to a fixed sky window shared by
-    every frame — see _sky_window()), with a marker + connecting line for
-    every epoch from 1 to k, each projected into epoch k's OWN WCS so the
-    trail lines up correctly even though every frame's underlying image is
-    a different real exposure.
+    every frame — see _sky_window()), with a connecting line for every past
+    epoch from 1 to k-1 plus a short directional arrow stubbed at epoch
+    k-1's position — epoch k's own position is deliberately left unmarked,
+    since that's the real object visible in this frame's own pixel data —
+    each projected into epoch k's OWN WCS so the trail lines up correctly
+    even though every frame's underlying image is a different real
+    exposure.
 
     Deliberately independent of _style_track.py's _render_track_chart() —
     see this module's own docstring for the full rationale.
