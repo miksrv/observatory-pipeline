@@ -35,6 +35,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 from astropy.coordinates import SkyCoord
 
+# Multiplier applied to the epoch cluster's own pixel span to leave breathing
+# room around the outermost epochs (same role as _style_track_gif.py's
+# _WINDOW_MARGIN_FACTOR).
+_WINDOW_MARGIN_FACTOR = 1.6
+
+# Minimum crop size expressed as a multiple of _stamp_half_size_px() — ensures
+# the window never collapses to near-zero when all epochs sit on top of each
+# other (same role as _style_track_gif.py's _WINDOW_MIN_FACTOR).  Increase to
+# zoom out / show more sky context.
+_WINDOW_MIN_FACTOR = 2.5
+
 
 def _format_angular_shift(sep_arcsec: float) -> str:
     """
@@ -57,6 +68,34 @@ def _angular_separation_arcsec(ra1: float, dec1: float, ra2: float, dec2: float)
     c1 = SkyCoord(ra=ra1, dec=dec1, unit="deg")
     c2 = SkyCoord(ra=ra2, dec=dec2, unit="deg")
     return float(c1.separation(c2).arcsecond)
+
+
+def _format_delta_hours(delta_h: float) -> str:
+    """
+    Format a time gap in whichever unit keeps it readable — minutes below 1hr,
+    hours below 1 day, days above that. Companion to _format_angular_shift()
+    for the same "moved by X in Y" legend line.
+    """
+    if delta_h < 1.0:
+        return f"{delta_h * 60:.0f}min"
+    if delta_h < 24.0:
+        return f"{delta_h:.1f}hr"
+    return f"{delta_h / 24:.1f}d"
+
+
+def _format_shift_and_velocity(sep_arcsec: float, delta_h: Optional[float]) -> str:
+    """
+    "Δ<shift> in <dt> (<velocity>″/hr)" between two epochs, or just
+    "Δ<shift>" when `delta_h` is None/zero (unparseable obs_time on either
+    end). Shared by the static track chart's per-epoch legend
+    (_render_track_chart()) and the track_gif's per-frame caption
+    (_style_track_gif.py) — same convention, same numbers.
+    """
+    shift_str = _format_angular_shift(sep_arcsec)
+    if delta_h and delta_h > 0:
+        velocity = sep_arcsec / delta_h
+        return f"Δ{shift_str} in {_format_delta_hours(delta_h)} ({velocity:.1f}″/hr)"
+    return f"Δ{shift_str}"
 
 
 def _label_positions(
@@ -205,7 +244,7 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
     cluster_half_span = max(
         (max(abs(x - cluster_cx), abs(y - cluster_cy)) for x, y in zip(xs, ys)), default=0.0,
     )
-    half_size_px = max(3.0 * _stamp_half_size_px(wcs), cluster_half_span * 1.6)
+    half_size_px = max(_WINDOW_MIN_FACTOR * _stamp_half_size_px(wcs), cluster_half_span * _WINDOW_MARGIN_FACTOR)
 
     height, width = background["data"].shape
     x0 = int(max(0, round(cluster_cx - half_size_px)))
