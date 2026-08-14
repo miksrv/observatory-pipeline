@@ -66,7 +66,7 @@ import logging
 import math
 from typing import Optional
 
-from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _pngs_to_gif, _stretch
+from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _pngs_to_gif, _split_label_designation, _stretch
 from ._style_track import (
     _angular_separation_arcsec,
     _epoch_colors,
@@ -253,9 +253,20 @@ def _render_one_track_gif_frame(
     # headroom than the old single-line caption did — 0.97 clipped the top line
     # off the canvas entirely once a second line was added (real regression
     # caught rendering a preview GIF without a label).
+    # Same convention as _style_track.py/_style_stamp_strip_gif.py: the
+    # anomaly_type and its "(designation)" (if any) each get their own
+    # title line rather than being crammed onto one.
+    has_designation = False
     if label:
-        fig.suptitle(label, fontsize=10)
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.04, top=0.90 if label else 0.92)
+        anomaly_type, designation = _split_label_designation(label)
+        has_designation = designation is not None
+        fig.suptitle(f"{anomaly_type}\n{designation}" if designation else label, fontsize=10)
+
+    if not label:
+        top = 0.92
+    else:
+        top = 0.85 if has_designation else 0.90
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.04, top=top)
 
     return _fig_to_png_bytes(fig)
 

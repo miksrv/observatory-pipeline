@@ -20,6 +20,7 @@ from ._io import (
     _fig_to_png_bytes,
     _load_frame,
     _local_fits_path,
+    _split_label_designation,
     _stamp_half_size_px,
     _stretch,
 )
@@ -79,7 +80,7 @@ def _render_before_after_chart(
         except Exception as exc:
             logger.debug("finder_chart: before_after BEFORE crop failed: %s", exc)
             ax_before.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax_before.transAxes)
-        ax_before.set_title(f"BEFORE — {before_ep.get('obs_time', '')}\n(nothing expected here)",
+        ax_before.set_title(f"BEFORE: {before_ep.get('obs_time', '')}\n(nothing expected here)",
                              fontsize=9, color=_BEFORE_AFTER_BEFORE_COLOR)
         ax_before.set_xticks([]); ax_before.set_yticks([])
 
@@ -97,18 +98,29 @@ def _render_before_after_chart(
         logger.debug("finder_chart: before_after AFTER crop failed: %s", exc)
         ax_after.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax_after.transAxes)
     mag_txt = f"  mag {current_ep['mag']:.2f}" if current_ep.get("mag") is not None else ""
-    ax_after.set_title(f"AFTER — {current_ep.get('obs_time', '')}{mag_txt}",
+    ax_after.set_title(f"AFTER: {current_ep.get('obs_time', '')}{mag_txt}\n(object detected)",
                         fontsize=9, color=_BEFORE_AFTER_AFTER_COLOR)
     ax_after.set_xticks([]); ax_after.set_yticks([])
 
-    coord_line = (
-        f"fixed query position: RA {current_ep['ra']:.4f}°  Dec {current_ep['dec']:.4f}°"
-        "  (same in both panels, by design)"
-    )
-    fig.suptitle(f"{label}\n{coord_line}" if label else coord_line, fontsize=10)
+    coord_line = f"Fixed query position: RA {current_ep['ra']:.4f}°  Dec {current_ep['dec']:.4f}°"
+
+    # Same convention as _style_stamp_strip_gif.py: the anomaly_type and its
+    # "(designation)" (if any) each get their own header line, ahead of the
+    # coordinate line.
+    header_lines = []
+    has_designation = False
+    if label:
+        anomaly_type, designation = _split_label_designation(label)
+        header_lines.append(anomaly_type)
+        if designation:
+            header_lines.append(designation)
+            has_designation = True
+    header_lines.append(coord_line)
+    fig.suptitle("\n".join(header_lines), fontsize=10)
+
     if missing_reason:
         fig.text(0.5, 0.01, missing_reason, ha="center", fontsize=7.5, color=_BEFORE_AFTER_BEFORE_COLOR)
-    fig.tight_layout(rect=(0, 0.04, 1, 0.90))
+    fig.tight_layout(rect=(0, 0.04, 1, 0.86 if has_designation else 0.90))
 
     return _fig_to_png_bytes(fig)
 

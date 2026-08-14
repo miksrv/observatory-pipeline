@@ -18,10 +18,17 @@ all, and vice versa.
 from __future__ import annotations
 
 import logging
-import re
 from typing import Optional
 
-from ._io import _arcsec_per_pixel, _crop_around, _fig_to_png_bytes, _pngs_to_gif, _stamp_half_size_px, _stretch
+from ._io import (
+    _arcsec_per_pixel,
+    _crop_around,
+    _fig_to_png_bytes,
+    _pngs_to_gif,
+    _split_label_designation,
+    _stamp_half_size_px,
+    _stretch,
+)
 import matplotlib.pyplot as plt
 
 import config
@@ -33,14 +40,11 @@ logger = logging.getLogger(__name__)
 _FIGSIZE = (3.0, 3.6)
 _DPI = 120
 
-# A label built by update_charts_for_sources() is either a bare
-# `anomaly_type` (e.g. "VARIABLE_STAR", uncatalogued source) or
-# `anomaly_type` + " (" + designation + ")" (e.g. "VARIABLE_STAR (TYC
-# 1430-1407-1)"). Split the two onto their own lines — one for the
-# classification, one for the designation — rather than either wrapping
+# See _io.py's _split_label_designation() — splits a label built by
+# update_charts_for_sources() into its anomaly_type and "(designation)"
+# parts so each can go on its own line, rather than either wrapping
 # mid-word at a fixed character width or overflowing this frame's narrow
 # 3.0" canvas (real complaint, 2026-08-14).
-_LABEL_DESIGNATION_RE = re.compile(r"^(.*\S)\s+(\(.+\))$")
 _LABEL_FONTSIZE = 8
 _CAPTION_FONTSIZE = 7.5
 
@@ -95,10 +99,10 @@ def _render_one_stamp_gif_frame(ep: dict, label: Optional[str] = None) -> bytes:
     top = _TOP_NO_LABEL
     if label:
         # Split "TYPE (designation)" onto two lines; a bare "TYPE" (no
-        # designation) stays on one — see _LABEL_DESIGNATION_RE above.
-        match = _LABEL_DESIGNATION_RE.match(label)
-        if match:
-            fig.suptitle(f"{match.group(1)}\n{match.group(2)}", fontsize=_LABEL_FONTSIZE)
+        # designation) stays on one.
+        anomaly_type, designation = _split_label_designation(label)
+        if designation:
+            fig.suptitle(f"{anomaly_type}\n{designation}", fontsize=_LABEL_FONTSIZE)
             top = _TOP_LABEL_TWO_LINES
         else:
             fig.suptitle(label, fontsize=_LABEL_FONTSIZE)

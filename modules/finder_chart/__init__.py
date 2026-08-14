@@ -275,10 +275,25 @@ async def _render_charts_for_source(
         # still show the real classification, not fall back to the bare
         # designation.
         representative = next((t for t in types_in_group if t), types_in_group[0] if types_in_group else None)
-        if representative and designation:
-            label = f"{representative} ({designation})"
+        identifier = designation
+        if not identifier and representative in MOVING_TYPES:
+            # MOVING_UNKNOWN/SPACE_DEBRIS are uncatalogued by definition (see
+            # modules/anomaly_detector's classification table — ASTEROID/COMET
+            # already carry an MPC designation from their own catalog match),
+            # so `designation` is always None for them. Fall back to the
+            # source's own ID so its chart still has something in parentheses
+            # to reference/tell it apart from another uncatalogued mover's
+            # chart by (real ask, 2026-08-14). Keyed off `representative`
+            # (the anomaly_type itself), NOT `style == STYLE_TRACK` — a
+            # source with only ONE loaded epoch so far routes to
+            # STYLE_BEFORE_AFTER regardless of anomaly_type (see
+            # _group_types_by_style()), and a freshly-detected single-epoch
+            # MOVING_UNKNOWN/SPACE_DEBRIS needs this fallback there too.
+            identifier = source_id
+        if representative and identifier:
+            label = f"{representative} ({identifier})"
         else:
-            label = representative or designation
+            label = representative or identifier
 
         try:
             if style == STYLE_BEFORE_AFTER:

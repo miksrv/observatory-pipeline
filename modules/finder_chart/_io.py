@@ -2,10 +2,12 @@
 modules/finder_chart/_io.py — shared FITS loading and image-assembly helpers.
 
 Infrastructure used by more than one rendering style (_style_track.py,
-_style_stamp_strip.py, _style_before_after.py): local FITS I/O, the display stretch,
-plate-scale/stamp-size conversion, and turning a rendered matplotlib figure
-(or a list of them) into PNG/GIF bytes. No style-specific drawing lives here
-— see __init__.py's docstring for the package's file map.
+_style_stamp_strip.py, _style_before_after.py, _style_stamp_strip_gif.py):
+local FITS I/O, the display stretch, plate-scale/stamp-size conversion,
+splitting a label into its anomaly_type/designation parts, and turning a
+rendered matplotlib figure (or a list of them) into PNG/GIF bytes. No
+style-specific drawing lives here — see __init__.py's docstring for the
+package's file map.
 
 Sets the Agg backend (headless — no display available or wanted on the
 observatory server) before any of this package's other files import
@@ -18,6 +20,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 from typing import Optional
 
 import matplotlib
@@ -128,6 +131,28 @@ def _crop_around(data: np.ndarray, wcs: WCS, ra: float, dec: float, half_size_px
         raise ValueError("crop region is empty")
 
     return data[y0:y1, x0:x1], (x - x0, y - y0)
+
+
+# A label built by update_charts_for_sources() is either a bare
+# `anomaly_type` (e.g. "VARIABLE_STAR", uncatalogued source) or
+# `anomaly_type` + " (" + designation + ")" (e.g. "VARIABLE_STAR (TYC
+# 1430-1407-1)"). Shared by _style_stamp_strip_gif.py and
+# _style_before_after.py, both of which show the two parts on separate
+# lines rather than either wrapping mid-word at a fixed character width or
+# overflowing their own (narrow) canvas.
+_LABEL_DESIGNATION_RE = re.compile(r"^(.*\S)\s+(\(.+\))$")
+
+
+def _split_label_designation(label: str) -> tuple[str, Optional[str]]:
+    """
+    Split `label` into (anomaly_type_or_label, designation_or_None) — the
+    second element is the "(designation)" part with its own parentheses
+    still attached, or None when `label` is a bare anomaly_type.
+    """
+    match = _LABEL_DESIGNATION_RE.match(label)
+    if match:
+        return match.group(1), match.group(2)
+    return label, None
 
 
 def _fig_to_png_bytes(fig) -> bytes:

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _stamp_half_size_px, _stretch
+from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _split_label_designation, _stamp_half_size_px, _stretch
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -338,10 +338,22 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
         fig.text(0.02 + 0.035, y_pos, rest, fontsize=6.5, family="monospace",
                  ha="left", va="bottom", color="#222222")
 
-    legend_frac = 0.03 + 0.016 * n
-    top_frac = 0.92 if label else 0.96
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=legend_frac, top=top_frac)
+    # Same convention as _style_stamp_strip_gif.py/_style_before_after.py:
+    # the anomaly_type and its "(designation)" (if any — e.g. an MPC name,
+    # or a MOVING_UNKNOWN/SPACE_DEBRIS source's own ID, see
+    # update_charts_for_sources()) each get their own title line, rather
+    # than being crammed onto one.
+    has_designation = False
     if label:
-        fig.suptitle(label, fontsize=11)
+        anomaly_type, designation = _split_label_designation(label)
+        has_designation = designation is not None
+        fig.suptitle(f"{anomaly_type}\n{designation}" if designation else label, fontsize=11)
+
+    legend_frac = 0.03 + 0.016 * n
+    if not label:
+        top_frac = 0.96
+    else:
+        top_frac = 0.88 if has_designation else 0.92
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=legend_frac, top=top_frac)
 
     return _fig_to_png_bytes(fig)
