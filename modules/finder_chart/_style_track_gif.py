@@ -38,12 +38,18 @@ position within a shared window can still differ slightly frame to frame,
 since each is a genuinely different plate solve). Colors are a fixed
 cool→warm gradient over ALL epochs (`_style_track._epoch_colors()`, called
 once with the full count — not per-frame), so a given epoch keeps the same
-color across every frame it appears in.
+color across every frame it appears in. Each epoch is marked with a dashed,
+dim, unfilled circle — not the filled dot the static "track" chart uses —
+sized (same 10″-or-6px-minimum convention as `_style_before_after.py`'s own
+circles) to sit well clear of the object's own PSF: a filled dot big enough
+to see at a glance otherwise sits right on top of the very asteroid it's
+marking (real complaint, 2026-08-13).
 
-A short single-line caption (date/time + magnitude of THAT frame's own
-epoch) replaces the static chart's detailed legend — fixed height, doesn't
-grow with epoch count. The overall `label` (e.g. "ASTEROID (4 Vesta)") is
-shown identically on every frame via one unchanging fig.suptitle().
+A short, fixed-height, two-line caption (date/time + magnitude, then
+coordinates + shift/velocity from the previous epoch) replaces the static
+chart's detailed legend — fixed height, doesn't grow with epoch count. The
+overall `label` (e.g. "ASTEROID (4 Vesta)") is shown identically on every
+frame via one unchanging fig.suptitle().
 """
 from __future__ import annotations
 
@@ -51,7 +57,12 @@ import logging
 from typing import Optional
 
 from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _pngs_to_gif, _stretch
-from ._style_track import _epoch_colors
+from ._style_track import (
+    _angular_separation_arcsec,
+    _epoch_colors,
+    _format_shift_and_velocity,
+    _parse_delta_hours,
+)
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.coordinates import SkyCoord
@@ -174,18 +185,40 @@ def _render_one_track_gif_frame(
                 arrowprops=dict(arrowstyle="-|>", color=colors[len(xs) - 1], lw=1.5, mutation_scale=12),
                 zorder=2,
             )
+        # Dashed, dim, unfilled circles — same convention as
+        # _style_before_after.py's own marker circles — rather than a solid
+        # filled dot: a filled dot sized for visibility sits right on top of
+        # the asteroid's own PSF and hides the very thing being marked. A
+        # circle drawn AROUND it (radius well past any real point source, per
+        # the same 10″-or-6px-minimum sizing before_after.py uses) frames the
+        # object without ever covering its pixels.
+        radius_px = max(6.0, 10.0 / _arcsec_per_pixel(current["wcs"]))
         for i, (x, y) in enumerate(zip(xs, ys)):
-            ax.plot(x, y, "o", color=colors[i], markeredgecolor="white",
-                    markeredgewidth=0.5, markersize=6, zorder=5)
+            ax.add_patch(plt.Circle(
+                (x, y), radius=radius_px, edgecolor=colors[i], facecolor="none",
+                linewidth=1.3, linestyle="--", alpha=0.75, zorder=4,
+            ))
     else:
         ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
 
-    # Short, fixed-height per-frame caption — replaces the static chart's
-    # bottom legend block, which doesn't fit a fixed canvas.
+    # Short, fixed-height (two-line, regardless of k) per-frame caption —
+    # replaces the static chart's bottom legend block, which doesn't fit a
+    # fixed canvas. Line 1: this epoch's own date/time + magnitude. Line 2:
+    # its coordinates, plus — from the second frame on — the angular
+    # shift/time-gap/velocity from the *previous* epoch, via the same
+    # _format_shift_and_velocity() the static "track" chart's own per-epoch
+    # legend line uses (real motion diagnostic, and a quick way to spot a
+    # bogus jump between two consecutive frames).
     caption = current.get("obs_time", "")
     if current.get("mag") is not None:
         caption += f"   mag {current['mag']:.1f}"
-    ax.set_title(caption, fontsize=8)
+    coord_line = f"RA {current['ra']:.4f}°  Dec {current['dec']:+.4f}°"
+    if k >= 2:
+        prev = loaded_epochs[k - 2]
+        sep_arcsec = _angular_separation_arcsec(prev["ra"], prev["dec"], current["ra"], current["dec"])
+        delta_h = _parse_delta_hours(prev.get("obs_time", ""), current.get("obs_time", ""))
+        coord_line += "   " + _format_shift_and_velocity(sep_arcsec, delta_h)
+    ax.set_title(f"{caption}\n{coord_line}", fontsize=8)
     ax.set_xticks([])
     ax.set_yticks([])
 
@@ -194,10 +227,14 @@ def _render_one_track_gif_frame(
     # blank gap between the suptitle and the per-frame caption right above the image
     # (real complaint, 2026-08-13). A fixed top fraction (same convention
     # _style_track.py's _render_track_chart() already uses) keeps the gap small and
-    # predictable instead.
+    # predictable instead. The caption is two lines now (date/mag, then
+    # coordinates + shift/velocity) regardless of k, so both branches need more
+    # headroom than the old single-line caption did — 0.97 clipped the top line
+    # off the canvas entirely once a second line was added (real regression
+    # caught rendering a preview GIF without a label).
     if label:
         fig.suptitle(label, fontsize=10)
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.04, top=0.90 if label else 0.97)
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.04, top=0.90 if label else 0.92)
 
     return _fig_to_png_bytes(fig)
 

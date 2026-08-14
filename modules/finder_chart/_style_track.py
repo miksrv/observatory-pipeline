@@ -324,19 +324,7 @@ def _render_track_chart(loaded_epochs: list[dict], label: Optional[str] = None) 
             prev = loaded_epochs[i - 2]
             sep_arcsec = _angular_separation_arcsec(prev["ra"], prev["dec"], ep["ra"], ep["dec"])
             delta_h = _parse_delta_hours(prev.get("obs_time", ""), ep.get("obs_time", ""))
-            shift_str = _format_angular_shift(sep_arcsec)
-            if delta_h and delta_h > 0:
-                velocity = sep_arcsec / delta_h
-                # Format Δt readably
-                if delta_h < 1.0:
-                    dt_str = f"{delta_h * 60:.0f}min"
-                elif delta_h < 24.0:
-                    dt_str = f"{delta_h:.1f}hr"
-                else:
-                    dt_str = f"{delta_h / 24:.1f}d"
-                rest += f"  Δ{shift_str} in {dt_str} ({velocity:.1f}″/hr)"
-            else:
-                rest += f"  Δ{shift_str}"
+            rest += "  " + _format_shift_and_velocity(sep_arcsec, delta_h)
         legend_lines.append((prefix, rest, colors[i - 1]))
 
     # Render legend lines bottom-up so the first epoch is at the top.
