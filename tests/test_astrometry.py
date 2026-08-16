@@ -18,6 +18,7 @@ asyncio_mode = auto is set in pytest.ini, so no @pytest.mark.asyncio required.
 
 from __future__ import annotations
 
+import math
 import subprocess
 from contextlib import contextmanager
 from typing import Any
@@ -29,6 +30,7 @@ from astropy.wcs import WCS as AstropyWCS
 
 import config
 from modules import astrometry
+from modules.astrometry._frame_geometry import _position_angle_deg
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +68,36 @@ def _make_wcs(
         w.wcs.crpix = [512.0, 512.0]
         w.wcs.crval = [0.0, 0.0]
         w.wcs.cdelt = [1.0, 1.0]
+    w.wcs.set()
+    return w
+
+
+def _rotate_wcs(wcs: AstropyWCS, theta_deg: float) -> AstropyWCS:
+    """
+    Return a copy of *wcs* as if its underlying frame had been rotated by
+    ``theta_deg`` in the exact sense of ``scipy.ndimage.rotate(data,
+    angle=theta_deg)`` — i.e. CD_new = CD_old @ R_ccw(theta_deg).
+
+    Used to build known-rotation fixtures for TestPositionAngle below and
+    for modules/subtraction.py's pre-rotation tests: this is the same
+    relation _position_angle_deg()'s own docstring claims and
+    modules/subtraction.py's pre-rotation math relies on, verified here by
+    round-tripping through a real astropy WCS rather than trusting the
+    algebra alone.
+    """
+    theta = math.radians(theta_deg)
+    rot = np.array([
+        [math.cos(theta), -math.sin(theta)],
+        [math.sin(theta),  math.cos(theta)],
+    ])
+    cd_old = np.array(wcs.pixel_scale_matrix)
+    cd_new = cd_old @ rot
+
+    w = AstropyWCS(naxis=2)
+    w.wcs.ctype = wcs.wcs.ctype
+    w.wcs.crpix = wcs.wcs.crpix
+    w.wcs.crval = wcs.wcs.crval
+    w.wcs.cd = cd_new.tolist()
     w.wcs.set()
     return w
 
@@ -373,6 +405,64 @@ class TestSuccessfulSolve:
 
         expected = 1024 * 0.000278
         assert abs(result["fov_deg"] - expected) / expected < 0.5
+
+
+# ---------------------------------------------------------------------------
+# Test 1.5 — Position angle (camera rotation diagnostics; see CLAUDE.md's
+# "camera rotation" discussion and modules/subtraction.py's pre-rotation use)
+# ---------------------------------------------------------------------------
+
+class TestPositionAngle:
+    def test_unrotated_wcs_reports_zero(self):
+        """A WCS with a plain diagonal CD (North exactly up) measures PA=0."""
+        wcs = _make_wcs()
+        pa = _position_angle_deg(wcs, wcs.wcs.crpix[0] - 1.0, wcs.wcs.crpix[1] - 1.0)
+
+        assert pa == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.parametrize("theta_deg", [30.0, 90.0, 180.0, 270.0, -45.0])
+    def test_rotated_wcs_reports_matching_delta(self, theta_deg):
+        """
+        A WCS built by rotating the base one by theta_deg (in the
+        scipy.ndimage.rotate(angle=theta_deg) sense — see _rotate_wcs())
+        must measure a position angle exactly theta_deg larger, mod 360.
+        This is the exact relation modules/subtraction.py's pre-rotation
+        step relies on to undo a known orientation difference between a
+        reference frame and the new frame.
+        """
+        base = _make_wcs()
+        rotated = _rotate_wcs(base, theta_deg)
+
+        pa_base = _position_angle_deg(base, base.wcs.crpix[0] - 1.0, base.wcs.crpix[1] - 1.0)
+        pa_rotated = _position_angle_deg(rotated, rotated.wcs.crpix[0] - 1.0, rotated.wcs.crpix[1] - 1.0)
+
+        delta = (pa_rotated - pa_base) % 360.0
+        assert delta == pytest.approx(theta_deg % 360.0, abs=1e-6)
+
+    async def test_solve_result_has_position_angle_key(self):
+        with _patch_astrometry():
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert "position_angle_deg" in result
+        # Circular comparison: tiny WCS round-trip float noise can land
+        # either side of the 0/360 wraparound (e.g. 359.9997 instead of
+        # 0.0003) — both are "basically zero degrees" and must not fail.
+        wrapped = min(result["position_angle_deg"] % 360.0, 360.0 - result["position_angle_deg"] % 360.0)
+        assert wrapped == pytest.approx(0.0, abs=1e-2)
+
+    async def test_solve_reports_rotated_wcs_position_angle(self):
+        """
+        Regression fixture for the 2026-08 "camera rotation" investigation
+        (source_id 6a7cfbae64e706.89320404): a frame plate-solved with a
+        WCS rotated 180deg relative to the unrotated baseline (e.g. a
+        meridian flip) must report position_angle_deg=180, not silently
+        drop or misreport the frame's real orientation.
+        """
+        wcs = _rotate_wcs(_make_wcs(), 180.0)
+        with _patch_astrometry(wcs=wcs):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["position_angle_deg"] == pytest.approx(180.0, abs=1e-2)
 
 
 # ---------------------------------------------------------------------------

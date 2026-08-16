@@ -106,6 +106,19 @@ async def solve(
         ra_center   float   – frame centre RA in decimal degrees
         dec_center  float   – frame centre Dec in decimal degrees
         fov_deg     float   – field of view (larger image dimension) in degrees
+        position_angle_deg  float | None – this frame's own orientation on the
+                              sky (0 = North up, increasing clockwise toward
+                              +X — see _frame_geometry._position_angle_deg()'s
+                              docstring); None if the WCS round-trip used to
+                              derive it failed. Two frames differing by ~180
+                              here are rotated relative to each other (e.g. a
+                              meridian flip) — modules/subtraction.py uses
+                              this to coarse-pre-rotate a reference frame
+                              before the fine astroalign registration; it is
+                              also persisted to the API (docs/API.md §1) for
+                              operator diagnostics without re-opening FITS
+                              files. Not a reason to exclude any frame from
+                              anything on its own.
         naxis1      int     – image width in pixels
         naxis2      int     – image height in pixels
         sources     list    – list of source dicts; each has:
@@ -146,9 +159,9 @@ async def solve(
             return {}
         wcs, naxis1, naxis2 = wcs_result
 
-        # Step 3 — Frame centre and FOV
-        ra_center, dec_center, fov_deg, pixel_scale_arcsec = _frame_center_and_scale(
-            wcs, naxis1, naxis2, fits_filename
+        # Step 3 — Frame centre, FOV, and position angle
+        ra_center, dec_center, fov_deg, pixel_scale_arcsec, position_angle_deg = (
+            _frame_center_and_scale(wcs, naxis1, naxis2, fits_filename)
         )
 
         # Step 4 — Source extraction with sep
@@ -158,14 +171,15 @@ async def solve(
         )
 
         return {
-            "ra_center":   ra_center,
-            "dec_center":  dec_center,
-            "fov_deg":     fov_deg,
-            "naxis1":      naxis1,
-            "naxis2":      naxis2,
-            "sources":     sources,      # strict stars: for photometry calibration only
-            "sources_all": sources_all,  # all detections: for catalog matching + anomaly detection
-            "wcs":         wcs,
+            "ra_center":         ra_center,
+            "dec_center":        dec_center,
+            "fov_deg":           fov_deg,
+            "position_angle_deg": position_angle_deg,
+            "naxis1":            naxis1,
+            "naxis2":            naxis2,
+            "sources":           sources,      # strict stars: for photometry calibration only
+            "sources_all":       sources_all,  # all detections: for catalog matching + anomaly detection
+            "wcs":               wcs,
         }
 
     except Exception as exc:
