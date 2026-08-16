@@ -40,7 +40,9 @@ import math
 import os
 from typing import Optional
 
+import astropy.units as u
 import numpy as np
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.wcs import WCS
 import sep
@@ -50,13 +52,24 @@ import config
 logger = logging.getLogger(__name__)
 
 _MAX_FRAMES = 10
+# How many of the most-recent same-filter (or, failing that, any-filter)
+# candidates _find_archive_frames() is willing to open just to read their
+# WCS for PA-based ranking (see _sort_by_pa_closeness()) — bounds the extra
+# header-only I/O to a small, fixed cost regardless of how large the whole
+# archive directory is, rather than opening every archived frame ever taken
+# of this object.
+_PA_CANDIDATE_POOL = _MAX_FRAMES * 3
 
 
 # ---------------------------------------------------------------------------
 # Archive frame discovery
 # ---------------------------------------------------------------------------
 
-def _find_archive_frames(archive_dir: str, filter_name: Optional[str]) -> list[str]:
+def _find_archive_frames(
+    archive_dir: str,
+    filter_name: Optional[str],
+    new_position_angle_deg: Optional[float] = None,
+) -> list[str]:
     """
     Return up to _MAX_FRAMES FITS paths from archive_dir, sorted newest-first.
 
@@ -71,11 +84,27 @@ def _find_archive_frames(archive_dir: str, filter_name: Optional[str]) -> list[s
         Absolute path to the per-object archive directory.
     filter_name:
         Normalized filter string (e.g. "Ha", "R", "L") or None.
+    new_position_angle_deg:
+        The new frame's own WCS-derived position angle (run()'s own
+        _position_angle_deg(wcs) — see that helper's docstring). When given,
+        and there are more recency/filter-matching candidates than
+        _MAX_FRAMES, the final _MAX_FRAMES selection prefers frames whose
+        own orientation is CLOSEST to this one over merely-most-recent
+        ones — a reference needing less geometric correction is a mildly
+        better bet for alignment quality. This is a soft, non-exclusionary
+        preference, not a hard filter: run()'s _prerotate_reference() step
+        already coarse-corrects for whatever orientation difference remains
+        in whichever frames end up selected here, including a ~180deg
+        meridian-flip difference (see CLAUDE.md's "camera rotation"
+        discussion) — a large PA difference is never, on its own, a reason
+        to drop a reference. None (the default) preserves the exact prior
+        recency-only behavior.
 
     Returns
     -------
     list[str]
-        Sorted list of absolute FITS file paths (newest first).
+        Up to _MAX_FRAMES absolute FITS file paths, newest-first unless
+        reordered by PA-closeness per new_position_angle_deg above.
     """
     if not os.path.isdir(archive_dir):
         return []
@@ -86,6 +115,7 @@ def _find_archive_frames(archive_dir: str, filter_name: Optional[str]) -> list[s
 
     all_files.sort(key=os.path.getmtime, reverse=True)
 
+    candidates = all_files
     if filter_name:
         token = f"_{filter_name.upper()}_"
         # Compare case-insensitively: normalized filter tokens are not all
@@ -94,9 +124,46 @@ def _find_archive_frames(archive_dir: str, filter_name: Optional[str]) -> list[s
         # always fall through to the cross-filter fallback below.
         matching = [f for f in all_files if token in os.path.basename(f).upper()]
         if len(matching) >= config.SUBTRACTION_MIN_FRAMES:
-            return matching[:_MAX_FRAMES]
+            candidates = matching
 
-    return all_files[:_MAX_FRAMES]
+    if new_position_angle_deg is not None and len(candidates) > _MAX_FRAMES:
+        candidates = _sort_by_pa_closeness(candidates, new_position_angle_deg)
+
+    return candidates[:_MAX_FRAMES]
+
+
+def _sort_by_pa_closeness(paths: list[str], new_position_angle_deg: float) -> list[str]:
+    """
+    Re-sort *paths* (already recency-sorted) so that frames whose own
+    position angle is closest to new_position_angle_deg come first — using
+    the existing recency order as the tiebreaker (Python's sort is stable),
+    not replacing it outright.
+
+    Only opens the first _PA_CANDIDATE_POOL entries' WCS (cheap, header-only
+    reads) to bound the I/O cost regardless of archive size — a candidate
+    outside that recency-based shortlist is left in place after it, never
+    pulled forward purely for having a better-matching angle. A candidate
+    whose own WCS/PA can't be determined sorts last (treated as the worst
+    case, same as an unknown new_position_angle_deg would be for it).
+    """
+    pool = paths[:_PA_CANDIDATE_POOL]
+    rest = paths[_PA_CANDIDATE_POOL:]
+
+    def _pa_distance(path: str) -> float:
+        wcs = _open_wcs(path)
+        pa = _position_angle_deg(wcs) if wcs is not None else None
+        if pa is None:
+            return 180.0  # unknown orientation - treat as worst case
+        d = abs(pa - new_position_angle_deg) % 360.0
+        return min(d, 360.0 - d)
+
+    try:
+        pool_sorted = sorted(pool, key=_pa_distance)
+    except Exception as exc:
+        logger.debug("Subtraction: PA-based reference ranking failed (%s) — falling back to recency order", exc)
+        return paths
+
+    return pool_sorted + rest
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +541,120 @@ def _pixel_scale_arcsec(fits_path: str, wcs: Optional[WCS] = None) -> Optional[f
         return None
 
 
+# ---------------------------------------------------------------------------
+# Camera rotation — pre-aligning references before astroalign (see
+# CLAUDE.md's "camera rotation" discussion). Independently duplicated from
+# modules/astrometry/_frame_geometry.py's identical helper — same convention
+# this module already uses for the streak-mask pre-pass and the FWHM-floor
+# ratio (see this file's own module docstring / astrometry.py's section in
+# CLAUDE.md): keeps this module free of a cross-package import for a few
+# lines of trig, at the cost of keeping the two copies in sync by hand.
+# ---------------------------------------------------------------------------
+
+def _position_angle_deg(wcs: WCS) -> Optional[float]:
+    """
+    This frame's own orientation on the sky (0 = North up, increasing
+    clockwise toward the image's +X pixel axis) — see
+    modules/astrometry/_frame_geometry.py's identical helper for the full
+    derivation and the empirical verification of the sign convention
+    (tests/test_astrometry.py::TestPositionAngle).
+
+    Evaluated at the WCS's own reference pixel (CRPIX) rather than the
+    frame's true geometric centre: unlike
+    modules/astrometry/_frame_geometry.py's copy, this one is called here
+    purely to compare two frames' *relative* rotation (see
+    _prerotate_reference() below), for which naxis1/naxis2 aren't otherwise
+    needed — using CRPIX avoids requiring the caller to have loaded pixel
+    data (and therefore know the shape) just to ask this question. The
+    difference between evaluating at CRPIX vs. true centre is negligible
+    for any real telescope's FOV and irrelevant here regardless, since only
+    the difference between two frames' own PA values is ever used.
+
+    Returns None on any failure (pathological/degenerate WCS).
+    """
+    try:
+        cx = float(wcs.wcs.crpix[0]) - 1.0
+        cy = float(wcs.wcs.crpix[1]) - 1.0
+        center = wcs.pixel_to_world(cx, cy)
+        north = SkyCoord(ra=center.ra, dec=center.dec + 1.0 * u.arcsec)
+        north_x, north_y = wcs.world_to_pixel(north)
+        dx = float(north_x) - cx
+        dy = float(north_y) - cy
+        if dx == 0.0 and dy == 0.0:
+            return None
+        return math.degrees(math.atan2(dx, dy)) % 360.0
+    except Exception as exc:
+        logger.debug("Subtraction: position angle computation failed: %s", exc)
+        return None
+
+
+def _prerotate_reference(
+    ref_data: np.ndarray,
+    ref_path: str,
+    new_position_angle_deg: Optional[float],
+) -> np.ndarray:
+    """
+    Coarse-rotate *ref_data* toward the new frame's own orientation before
+    handing it to astroalign, using each frame's WCS-derived position angle
+    — NOT a reason to exclude a reference whose orientation differs a lot
+    (e.g. ~180deg, a meridian flip): astroalign's own triangle-matching
+    finds a correct registration for any rotation on its own, but starting
+    it from a near-zero residual angle rather than a large unknown one is
+    both faster and less prone to a wrong/degenerate match on a sparse or
+    partly-symmetric star field. See CLAUDE.md's "camera rotation"
+    discussion for the reasoning and tests/test_subtraction.py for the
+    empirical (not just algebraic) verification of the rotation direction.
+
+    The correction angle is exactly ``new_pa - ref_pa`` (normalized to
+    (-180, 180]) passed straight to ``scipy.ndimage.rotate(..., angle=...)``
+    — that specific sign/magnitude relationship is what
+    modules/astrometry/_frame_geometry.py's _position_angle_deg() docstring
+    and tests/test_astrometry.py::TestPositionAngle jointly establish and
+    verify: rotating a frame's pixel data by scipy angle theta increases its
+    own measured PA by exactly theta.
+
+    Silently returns *ref_data* unchanged (no rotation applied) whenever:
+      - new_position_angle_deg is None (new frame's WCS/PA unavailable),
+      - ref_path's own WCS/PA can't be determined,
+      - the resulting |delta| is below config.SUBTRACTION_PREROTATE_MIN_DEG
+        (not worth the interpolation cost for a negligible angle), or
+      - the rotation itself raises (e.g. scipy missing) — logged and
+        swallowed, exactly like this module's other best-effort geometry
+        helpers (_build_saturation_mask, _build_streak_mask).
+    This is a best-effort assist, never a hard requirement: a bad/omitted
+    delta just means astroalign starts from a larger residual angle than it
+    could have, not that alignment is skipped or wrong.
+    """
+    if new_position_angle_deg is None:
+        return ref_data
+
+    ref_wcs = _open_wcs(ref_path)
+    if ref_wcs is None:
+        return ref_data
+    ref_pa = _position_angle_deg(ref_wcs)
+    if ref_pa is None:
+        return ref_data
+
+    delta = (new_position_angle_deg - ref_pa) % 360.0
+    if delta > 180.0:
+        delta -= 360.0
+
+    if abs(delta) < config.SUBTRACTION_PREROTATE_MIN_DEG:
+        return ref_data
+
+    try:
+        from scipy.ndimage import rotate as _ndi_rotate
+        rotated = _ndi_rotate(ref_data, angle=delta, reshape=False, order=1, mode="constant", cval=0.0)
+        logger.info(
+            "Subtraction: pre-rotated reference %s by %.1f deg (ref_pa=%.1f, new_pa=%.1f) before alignment",
+            os.path.basename(ref_path), delta, ref_pa, new_position_angle_deg,
+        )
+        return np.asarray(rotated, dtype=ref_data.dtype)
+    except Exception as exc:
+        logger.debug("Subtraction: pre-rotation of %s failed (%s) — using un-rotated reference", ref_path, exc)
+        return ref_data
+
+
 def _pixel_to_sky(
     pixel_candidates: list[dict], fits_path: str, wcs: Optional[WCS] = None
 ) -> list[dict]:
@@ -637,10 +818,17 @@ async def run(
         The already-solved WCS for fits_path (astro_result["wcs"] from
         astrometry.solve()), forwarded to _pixel_scale_arcsec() and
         _pixel_to_sky() below so subtraction candidates get the exact same
-        sky coordinates every other source in this frame does. Pass None to
-        fall back to reading WCS straight from fits_path's own header (see
+        sky coordinates every other source in this frame does. Also used to
+        derive this frame's own position angle (_position_angle_deg(wcs)),
+        which softly ranks reference-frame selection and coarse-pre-rotates
+        whichever references are chosen before astroalign — see
+        _prerotate_reference()'s docstring and CLAUDE.md's "camera rotation"
+        discussion. Pass None to fall back to reading WCS straight from
+        fits_path's own header for sky-coordinate conversion (see
         _pixel_to_sky()'s docstring for why that's a fallback, not the
-        default, in the real pipeline).
+        default, in the real pipeline) and to disable both the PA-based
+        reference ranking and the pre-rotation entirely (graceful
+        degradation to this feature's pre-existing behavior).
     psf_fwhm_arcsec:
         This frame's own measured stellar PSF FWHM in arcseconds (QC's
         ``fwhm_median`` — the same value astrometry.solve() uses to tighten
@@ -681,7 +869,16 @@ async def run(
     """
     empty: dict = {"performed": False, "reference_frame_count": 0, "candidates": []}
 
-    archive_files = _find_archive_frames(archive_dir, filter_name)
+    # This frame's own orientation, derived from the already-solved wcs
+    # (cheap — no pixel data needed yet). Used both to softly prefer
+    # similarly-oriented references in _find_archive_frames() below and to
+    # coarse-pre-rotate whichever references end up selected, before
+    # astroalign — see CLAUDE.md's "camera rotation" discussion. None
+    # (no wcs, or its own PA round-trip failed) degrades gracefully: recency-
+    # only selection and no pre-rotation, exactly like before this feature.
+    new_position_angle_deg = _position_angle_deg(wcs) if wcs is not None else None
+
+    archive_files = _find_archive_frames(archive_dir, filter_name, new_position_angle_deg)
     # Exclude the new frame's own file from its candidate reference stack —
     # re-analyzing an already-archived frame (see pipeline.py's
     # _resolve_bare_filename()) passes a fits_path that may already be
@@ -713,6 +910,13 @@ async def run(
         ref_data = _load_frame_data(ref_path)
         if ref_data is None:
             continue
+        # Coarse-correct for a known camera/rotator orientation difference
+        # (e.g. a meridian flip) BEFORE astroalign's own fine, star-matching
+        # registration — see _prerotate_reference()'s docstring. A no-op
+        # (returns ref_data unchanged) whenever either frame's PA is
+        # unknown or the difference is below
+        # config.SUBTRACTION_PREROTATE_MIN_DEG.
+        ref_data = _prerotate_reference(ref_data, ref_path, new_position_angle_deg)
         # NOTE: deliberately no shape-equality gate here. astroalign performs
         # triangle-pattern star matching and resamples the reference frame
         # onto the new frame's pixel grid — it is explicitly designed to

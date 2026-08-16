@@ -7,6 +7,9 @@ Covers:
   - _align_frame(): success/failure wrapping of astroalign.register()
   - _detect_diff_sources(): SEP detection on a synthetic difference image
   - _pixel_to_sky(): WCS pixel -> sky conversion
+  - _position_angle_deg() / _prerotate_reference() / PA-aware reference
+    selection: camera-rotation handling (see CLAUDE.md's "camera rotation"
+    discussion)
   - run(): end-to-end orchestration
 
 run()'s own control flow is tested by monkeypatching its private helpers
@@ -21,6 +24,9 @@ asyncio_mode = auto is set in pytest.ini, so async tests need no decorator.
 """
 
 from __future__ import annotations
+
+import math
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -525,13 +531,210 @@ class TestPixelToSky:
 
 
 # ---------------------------------------------------------------------------
+# _position_angle_deg / _prerotate_reference / PA-aware reference selection
+#
+# Regression coverage for the 2026-08 "camera rotation" investigation
+# (source_id 6a7cfbae64e706.89320404, CLAUDE.md's "camera rotation"
+# discussion): a reference frame captured at a very different camera/rotator
+# orientation than the new frame (e.g. a ~180 deg meridian flip) must be
+# coarse-pre-rotated toward the new frame's orientation, NOT excluded.
+# ---------------------------------------------------------------------------
+
+def _rotate_wcs(wcs: AstropyWCS, theta_deg: float) -> AstropyWCS:
+    """
+    Same construction as tests/test_astrometry.py's helper of the same name
+    (see that module for the full derivation/verification): a copy of *wcs*
+    as if its data had been produced by ``scipy.ndimage.rotate(data,
+    angle=theta_deg)`` — CD_new = CD_old @ R_ccw(theta_deg).
+    """
+    theta = math.radians(theta_deg)
+    rot = np.array([
+        [math.cos(theta), -math.sin(theta)],
+        [math.sin(theta),  math.cos(theta)],
+    ])
+    cd_old = np.array(wcs.pixel_scale_matrix)
+    cd_new = cd_old @ rot
+
+    w = AstropyWCS(naxis=2)
+    w.wcs.ctype = wcs.wcs.ctype
+    w.wcs.crpix = wcs.wcs.crpix
+    w.wcs.crval = wcs.wcs.crval
+    w.wcs.cd = cd_new.tolist()
+    w.wcs.set()
+    return w
+
+
+def _write_wcs_fits(tmp_path, name: str, wcs: AstropyWCS, data: np.ndarray) -> str:
+    path = tmp_path / name
+    fits.PrimaryHDU(data=data.astype(np.float32), header=wcs.to_header()).writeto(path)
+    return str(path)
+
+
+def _base_wcs(scale_deg: float = 0.000278) -> AstropyWCS:
+    w = AstropyWCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crpix = [50.0, 50.0]
+    w.wcs.crval = [202.47, 47.20]
+    w.wcs.cd = [[-scale_deg, 0.0], [0.0, scale_deg]]
+    w.wcs.set()
+    return w
+
+
+class TestPositionAngleDeg:
+
+    def test_unrotated_wcs_reports_zero(self):
+        assert subtraction._position_angle_deg(_base_wcs()) == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.parametrize("theta_deg", [30.0, 90.0, 180.0, -45.0])
+    def test_rotated_wcs_reports_matching_delta(self, theta_deg):
+        base = _base_wcs()
+        rotated = _rotate_wcs(base, theta_deg)
+
+        pa_base = subtraction._position_angle_deg(base)
+        pa_rotated = subtraction._position_angle_deg(rotated)
+
+        delta = (pa_rotated - pa_base) % 360.0
+        assert delta == pytest.approx(theta_deg % 360.0, abs=1e-6)
+
+    def test_degenerate_wcs_returns_none(self):
+        w = AstropyWCS(naxis=2)  # never configured — pixel_to_world() will fail
+        assert subtraction._position_angle_deg(w) is None
+
+
+class TestPrerotateReference:
+
+    def test_none_new_pa_is_noop(self, tmp_path):
+        data = np.arange(100.0).reshape(10, 10)
+        path = _write_wcs_fits(tmp_path, "ref.fits", _base_wcs(), data)
+
+        result = subtraction._prerotate_reference(data, path, None)
+
+        assert result is data
+
+    def test_below_threshold_delta_is_noop(self, tmp_path):
+        """A near-identical orientation (well under SUBTRACTION_PREROTATE_MIN_DEG) must not be rotated."""
+        data = np.arange(100.0).reshape(10, 10)
+        path = _write_wcs_fits(tmp_path, "ref.fits", _base_wcs(), data)
+        tiny_delta_new_pa = config.SUBTRACTION_PREROTATE_MIN_DEG / 2.0
+
+        result = subtraction._prerotate_reference(data, path, tiny_delta_new_pa)
+
+        assert result is data
+
+    def test_missing_wcs_is_noop(self, tmp_path):
+        data = np.zeros((10, 10), dtype=np.float32)
+        path = tmp_path / "no_wcs.fits"
+        fits.PrimaryHDU(data=data).writeto(path)
+
+        result = subtraction._prerotate_reference(data, str(path), 90.0)
+
+        assert result is data
+
+    def test_rotation_undoes_known_180_degree_offset(self, tmp_path):
+        """
+        This is the user's actual reported scenario: a reference frame whose
+        camera was rotated ~180 deg relative to the new frame (e.g. a
+        meridian flip between sessions). The pre-rotated reference must line
+        up with the new frame's own (unrotated) star field, not merely
+        "align eventually via astroalign" — this test checks the geometry
+        directly, without astroalign in the loop at all.
+        """
+        # A handful of point sources, asymmetric so a wrong rotation
+        # direction is unambiguously detectable via cross-correlation.
+        size = 101
+        base_data = np.zeros((size, size), dtype=np.float64)
+        for r, c in [(30, 60), (70, 45), (55, 20)]:
+            base_data[r, c] = 1000.0
+
+        base_wcs = _base_wcs()
+        # The reference frame's actual pixel content was captured with the
+        # camera physically rotated 180 deg relative to "new" — same
+        # relation as scipy.ndimage.rotate(base_data, angle=180).
+        from scipy.ndimage import rotate as ndi_rotate
+        ref_data = ndi_rotate(base_data, angle=180.0, reshape=False, order=1)
+        ref_wcs = _rotate_wcs(base_wcs, 180.0)
+        ref_path = _write_wcs_fits(tmp_path, "ref_180.fits", ref_wcs, ref_data)
+
+        new_pa = subtraction._position_angle_deg(base_wcs)
+        corrected = subtraction._prerotate_reference(ref_data, ref_path, new_pa)
+
+        # The corrected reference should now closely match the new frame's
+        # own (unrotated) star field, not the original 180-degree-rotated data.
+        assert np.corrcoef(corrected.ravel(), base_data.ravel())[0, 1] > 0.99
+        assert not np.allclose(corrected, ref_data)
+
+    def test_rotation_is_skipped_when_scipy_missing(self, tmp_path, monkeypatch):
+        """A rotation failure (e.g. scipy unavailable) must degrade gracefully, not raise."""
+        data = np.arange(100.0).reshape(10, 10)
+        rotated_wcs = _rotate_wcs(_base_wcs(), 90.0)
+        path = _write_wcs_fits(tmp_path, "ref.fits", rotated_wcs, data)
+
+        def _raise(*args, **kwargs):
+            raise ImportError("no scipy")
+
+        monkeypatch.setattr(subtraction, "_open_wcs", lambda p: rotated_wcs)
+        with patch("scipy.ndimage.rotate", side_effect=_raise):
+            result = subtraction._prerotate_reference(data, path, 0.0)
+
+        assert result is data
+
+
+class TestFindArchiveFramesPositionAngle:
+
+    def test_none_pa_preserves_recency_only_order(self, tmp_path):
+        """Backward compatibility: omitting new_position_angle_deg must not change behavior at all."""
+        names = [f"f{i}.fits" for i in range(5)]
+        for name in names:
+            (tmp_path / name).write_bytes(b"x")
+
+        result = subtraction._find_archive_frames(str(tmp_path), None)
+
+        assert len(result) == 5  # under _MAX_FRAMES, nothing to reorder anyway
+
+    def test_prefers_closest_orientation_when_over_capacity(self, tmp_path, monkeypatch):
+        """
+        With more candidates than _MAX_FRAMES, the ones closest in PA to the
+        new frame must be preferred over merely-more-recent ones with a
+        very different orientation — a soft ranking, not a hard filter (see
+        TestRunPositionAngle below for proof that a bad-PA frame is still
+        usable, just deprioritized when there's a choice).
+        """
+        # More files than _MAX_FRAMES (10) so the PA-based re-sort actually
+        # has an effect on which _MAX_FRAMES survive the cap.
+        good_names = [f"good{i}.fits" for i in range(6)]
+        bad_names = [f"bad{i}.fits" for i in range(6)]
+        for name in good_names + bad_names:
+            (tmp_path / name).write_bytes(b"x")
+
+        def fake_open_wcs(path):
+            return "good_wcs" if "good" in path else "bad_wcs"
+
+        def fake_pa(wcs):
+            return 0.0 if wcs == "good_wcs" else 179.0
+
+        monkeypatch.setattr(subtraction, "_open_wcs", fake_open_wcs)
+        monkeypatch.setattr(subtraction, "_position_angle_deg", fake_pa)
+
+        result = subtraction._find_archive_frames(str(tmp_path), None, new_position_angle_deg=0.0)
+
+        assert len(result) == subtraction._MAX_FRAMES
+        # All 6 "good"-orientation candidates must survive the _MAX_FRAMES
+        # cap (none bumped out by a merely-more-recent "bad"-orientation
+        # one), and must be ordered ahead of whichever "bad" ones fill the
+        # remaining slots.
+        assert sum("good" in p for p in result) == len(good_names)
+        first_bad_idx = next(i for i, p in enumerate(result) if "bad" in p)
+        assert all("good" in p for p in result[:first_bad_idx])
+
+
+# ---------------------------------------------------------------------------
 # run() — end-to-end orchestration
 # ---------------------------------------------------------------------------
 
 class TestRun:
 
     async def test_skips_when_too_few_archive_frames(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f: ["a.fits", "b.fits"])
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ["a.fits", "b.fits"])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
 
@@ -540,7 +743,7 @@ class TestRun:
     async def test_skips_when_new_frame_unloadable(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: ["a.fits", "b.fits", "c.fits"],
+            lambda d, f, pa=None: ["a.fits", "b.fits", "c.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: None)
 
@@ -574,7 +777,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
@@ -589,7 +792,7 @@ class TestRun:
     async def test_skips_when_alignment_fails_for_all_frames(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones((10, 10), dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: None)
@@ -604,7 +807,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
@@ -643,7 +846,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(
             subtraction, "_load_frame_data",
@@ -673,7 +876,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.full(shape, 100.0, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.full(shape, 100.0, dtype=np.float32))
@@ -704,7 +907,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
@@ -746,7 +949,7 @@ class TestRun:
         new_path = str(tmp_path / "new.fits")
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f: [new_path, "ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None: [new_path, "ref1.fits", "ref2.fits", "ref3.fits"],
         )
 
         loaded_paths: list[str] = []
@@ -777,3 +980,67 @@ class TestRun:
         assert loaded_paths.count("ref1.fits") == 1
         assert loaded_paths.count("ref2.fits") == 1
         assert loaded_paths.count("ref3.fits") == 1
+
+    async def test_180_degree_rotated_reference_is_prerotated_not_excluded(
+        self, monkeypatch, tmp_path,
+    ):
+        """
+        The user's actual reported scenario, end-to-end through run(): a
+        reference frame captured with the camera rotated ~180 deg relative
+        to the new frame (e.g. a meridian flip between sessions) must still
+        be aligned and counted in reference_frame_count — never dropped
+        purely for having a very different orientation — and must reach
+        _align_frame() already coarse-pre-rotated toward the new frame's own
+        orientation, not as raw un-rotated pixel data. See CLAUDE.md's
+        "camera rotation" discussion.
+        """
+        new_wcs = _base_wcs()
+        same_orientation_wcs = _base_wcs()
+        flipped_wcs = _rotate_wcs(_base_wcs(), 180.0)
+
+        wcs_by_path = {
+            "ref_same.fits": same_orientation_wcs,
+            "ref_flipped.fits": flipped_wcs,
+            "ref_other.fits": same_orientation_wcs,
+        }
+        raw_ref_data = np.arange(100.0).reshape(10, 10)
+
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f, pa=None: list(wcs_by_path.keys()),
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: raw_ref_data.copy())
+        monkeypatch.setattr(subtraction, "_open_wcs", lambda p: wcs_by_path.get(p))
+
+        align_calls: list[np.ndarray] = []
+
+        def fake_align(source, target):
+            align_calls.append(source)
+            return np.ones((10, 10), dtype=np.float32)
+
+        monkeypatch.setattr(subtraction, "_align_frame", fake_align)
+        monkeypatch.setattr(
+            subtraction, "_detect_diff_sources",
+            lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [],
+        )
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
+
+        result = await subtraction.run(
+            str(tmp_path / "new.fits"), str(tmp_path), None, wcs=new_wcs,
+        )
+
+        # Not excluded: all 3 references (including the 180-degree-flipped
+        # one) were successfully aligned.
+        assert result["performed"] is True
+        assert result["reference_frame_count"] == 3
+        assert len(align_calls) == 3
+
+        # The same-orientation references reach _align_frame() unchanged
+        # (delta ~= 0, below SUBTRACTION_PREROTATE_MIN_DEG - not worth
+        # rotating).
+        assert np.array_equal(align_calls[0], raw_ref_data)
+        assert np.array_equal(align_calls[2], raw_ref_data)
+
+        # The 180-degree-flipped reference reaches _align_frame() already
+        # pre-rotated - i.e. NOT the raw, still-flipped data.
+        assert not np.array_equal(align_calls[1], raw_ref_data)
