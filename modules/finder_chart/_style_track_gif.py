@@ -66,7 +66,16 @@ import logging
 import math
 from typing import Optional
 
-from ._io import _arcsec_per_pixel, _fig_to_png_bytes, _pngs_to_gif, _split_label_designation, _stretch
+from ._io import (
+    _arcsec_per_pixel,
+    _fig_to_png_bytes,
+    _pngs_to_gif,
+    _prerotation_delta_deg,
+    _rotate_crop,
+    _rotate_point_in_crop,
+    _split_label_designation,
+    _stretch,
+)
 from ._style_track import (
     _angular_separation_arcsec,
     _epoch_colors,
@@ -76,6 +85,7 @@ from ._style_track import (
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.coordinates import SkyCoord
+from astropy.wcs import WCS
 
 import config
 
@@ -158,20 +168,34 @@ def _crop_to_window(
 def _render_one_track_gif_frame(
     loaded_epochs: list[dict], k: int, center_ra: float, center_dec: float,
     half_size_arcsec: float, colors: list[str], label: Optional[str],
+    reference_wcs: Optional[WCS] = None,
 ) -> bytes:
     """Render animation frame k (1-indexed): epoch k's own real pixel data,
     cropped to the shared window, with the cumulative trail for epochs
     1..k-1 plus a short directional arrow stubbed at epoch k-1's position —
     epoch k's own position (the real object visible in this frame) is never
-    marked — all projected into epoch k's own WCS."""
+    marked — all projected into epoch k's own WCS.
+
+    reference_wcs: the whole animation's shared reference orientation (see
+    _render_track_gif() below, same WCS _sky_window() itself already uses)
+    — this frame's crop is coarse-pre-rotated toward it first if epoch k's
+    own camera/rotator orientation differs enough
+    (config.CHART_PREROTATE_MIN_DEG), so the star field's orientation stays
+    stable across the whole animation instead of visibly spinning between
+    frames for reasons unrelated to real motion — see CLAUDE.md's "camera
+    rotation" discussion.
+    """
     current = loaded_epochs[k - 1]
 
     try:
         crop, off_x, off_y = _crop_to_window(current, center_ra, center_dec, half_size_arcsec)
+        delta_deg = _prerotation_delta_deg(current["wcs"], reference_wcs)
+        if delta_deg is not None:
+            crop = _rotate_crop(crop, delta_deg)
         image = _stretch(crop)
     except Exception as exc:
         logger.debug("finder_chart: track_gif frame %d crop failed: %s", k, exc)
-        crop, off_x, off_y, image = None, 0.0, 0.0, None
+        crop, off_x, off_y, image, delta_deg = None, 0.0, 0.0, None, None
 
     fig, ax = plt.subplots(figsize=_FIGSIZE, dpi=_DPI)
 
@@ -188,8 +212,11 @@ def _render_one_track_gif_frame(
         ys: list[float] = []
         for ep in loaded_epochs[:k]:
             x, y = current["wcs"].world_to_pixel(SkyCoord(ra=ep["ra"], dec=ep["dec"], unit="deg"))
-            xs.append(float(x) - off_x)
-            ys.append(float(y) - off_y)
+            x, y = float(x) - off_x, float(y) - off_y
+            if delta_deg is not None:
+                x, y = _rotate_point_in_crop(x, y, crop.shape, delta_deg)
+            xs.append(x)
+            ys.append(y)
 
         # Cumulative history trail: plain connecting lines between past
         # positions only (epochs 1..k-1) — never touches epoch k's own
@@ -289,9 +316,18 @@ def _render_track_gif(loaded_epochs: list[dict], label: Optional[str] = None) ->
     n = len(loaded_epochs)
     center_ra, center_dec, half_size_arcsec = _sky_window(loaded_epochs)
     colors = _epoch_colors(n)
+    # Same reference epoch _sky_window() itself already uses — every frame's
+    # crop is coarse-pre-rotated toward this one shared orientation so the
+    # star field doesn't visibly spin between frames purely from a
+    # camera/rotator orientation difference (see CLAUDE.md's "camera
+    # rotation" discussion).
+    reference_wcs = loaded_epochs[-1]["wcs"]
 
     frames = [
-        _render_one_track_gif_frame(loaded_epochs, k, center_ra, center_dec, half_size_arcsec, colors, label)
+        _render_one_track_gif_frame(
+            loaded_epochs, k, center_ra, center_dec, half_size_arcsec, colors, label,
+            reference_wcs=reference_wcs,
+        )
         for k in range(1, n + 1)
     ]
     return _pngs_to_gif(frames, config.CHART_GIF_FRAME_DURATION_MS)

@@ -20,11 +20,16 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from astropy.wcs import WCS
+
 from ._io import (
     _arcsec_per_pixel,
     _crop_around,
     _fig_to_png_bytes,
     _pngs_to_gif,
+    _prerotation_delta_deg,
+    _rotate_crop,
+    _rotate_point_in_crop,
     _split_label_designation,
     _stamp_half_size_px,
     _stretch,
@@ -62,12 +67,22 @@ _TOP_LABEL_ONE_LINE = 0.90
 _TOP_LABEL_TWO_LINES = 0.85
 
 
-def _render_one_stamp_gif_frame(ep: dict, label: Optional[str] = None) -> bytes:
+def _render_one_stamp_gif_frame(
+    ep: dict, label: Optional[str] = None, reference_wcs: Optional[WCS] = None,
+) -> bytes:
     """
     Render a single "blink" frame for one epoch: a crop centred on that
     epoch's own detected position (its own WCS), circled, captioned with
     timestamp/magnitude/RA/Dec — the per-frame counterpart of one cell of
     _style_stamp_strip.py's static grid, but drawn independently here.
+
+    reference_wcs: the whole animation's shared reference orientation (see
+    _render_stamp_strip_gif() below) — this epoch's crop is coarse-rotated
+    toward it first if its own camera/rotator orientation differs enough
+    (config.CHART_PREROTATE_MIN_DEG), so the star field doesn't visibly
+    rotate/flip between animation frames for reasons unrelated to real
+    motion. None (a single-frame caller with no other epoch to align to)
+    skips this entirely.
     """
     fig, ax = plt.subplots(figsize=_FIGSIZE, dpi=_DPI)
 
@@ -75,6 +90,10 @@ def _render_one_stamp_gif_frame(ep: dict, label: Optional[str] = None) -> bytes:
     half_px = _stamp_half_size_px(wcs)
     try:
         crop, (cx, cy) = _crop_around(ep["data"], wcs, ep["ra"], ep["dec"], half_px)
+        delta_deg = _prerotation_delta_deg(wcs, reference_wcs)
+        if delta_deg is not None:
+            cx, cy = _rotate_point_in_crop(cx, cy, crop.shape, delta_deg)
+            crop = _rotate_crop(crop, delta_deg)
         ax.imshow(_stretch(crop), cmap="gray", origin="lower")
         circle_radius_px = max(6.0, 8.0 / _arcsec_per_pixel(wcs))
         ax.add_patch(plt.Circle((cx, cy), radius=circle_radius_px,
@@ -118,6 +137,15 @@ def _render_stamp_strip_gif(loaded_epochs: list[dict], label: Optional[str] = No
     independently rendered by _render_one_stamp_gif_frame() — a genuine
     blink through each epoch's own crop, rather than a static side-by-side
     grid.
+
+    Every frame is coarse-rotated toward the SAME reference orientation
+    (the most recent epoch — same "background" convention as
+    _style_track.py/_style_track_gif.py) before it's drawn — see
+    CLAUDE.md's "camera rotation" discussion.
     """
-    frames = [_render_one_stamp_gif_frame(ep, label=label) for ep in loaded_epochs]
+    reference_wcs = loaded_epochs[-1]["wcs"]
+    frames = [
+        _render_one_stamp_gif_frame(ep, label=label, reference_wcs=reference_wcs)
+        for ep in loaded_epochs
+    ]
     return _pngs_to_gif(frames, config.CHART_GIF_FRAME_DURATION_MS)

@@ -23,7 +23,16 @@ import logging
 import math
 from typing import Optional
 
-from ._io import _arcsec_per_pixel, _crop_around, _fig_to_png_bytes, _stamp_half_size_px, _stretch
+from ._io import (
+    _arcsec_per_pixel,
+    _crop_around,
+    _fig_to_png_bytes,
+    _prerotation_delta_deg,
+    _rotate_crop,
+    _rotate_point_in_crop,
+    _stamp_half_size_px,
+    _stretch,
+)
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
@@ -57,6 +66,14 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
     cell_size = 3.0
     fig, axes = plt.subplots(nrows, ncols, figsize=(cell_size * ncols, (cell_size + 0.6) * nrows), dpi=120)
 
+    # Every stamp is coarse-rotated toward this SAME reference orientation
+    # (the most recent epoch — same "background" convention as _style_track.py/
+    # _style_track_gif.py) before it's drawn, so a camera/rotator orientation
+    # difference between epochs doesn't show up as the star field visibly
+    # rotated/flipped between cells — see CLAUDE.md's "camera rotation"
+    # discussion and _io.py's _prerotation_delta_deg().
+    reference_wcs = loaded_epochs[-1]["wcs"]
+
     # Normalize axes to a flat list regardless of grid shape.
     if n == 1:
         axes_flat = [axes]
@@ -76,6 +93,10 @@ def _render_stamp_strip(loaded_epochs: list[dict], label: Optional[str] = None) 
         half_px = _stamp_half_size_px(wcs)
         try:
             crop, (cx, cy) = _crop_around(ep["data"], wcs, ep["ra"], ep["dec"], half_px)
+            delta_deg = _prerotation_delta_deg(wcs, reference_wcs)
+            if delta_deg is not None:
+                cx, cy = _rotate_point_in_crop(cx, cy, crop.shape, delta_deg)
+                crop = _rotate_crop(crop, delta_deg)
             ax.imshow(_stretch(crop), cmap="gray", origin="lower")
             circle_radius_px = max(6.0, 8.0 / _arcsec_per_pixel(wcs))
             ax.add_patch(plt.Circle((cx, cy), radius=circle_radius_px,
