@@ -1724,6 +1724,75 @@ def _cleanup_astap_files(fits_path: str) -> None:
             logger.warning("Failed to remove astap temp file %s: %s", temp_file, exc)
 
 
+def _compute_pointing_error(header: dict, astro_result: dict) -> dict:
+    """
+    Quantify the mount's pointing error for this frame: the angular distance
+    between where the telescope itself reported it was pointed (``RA``/``DEC``
+    or ``OBJCTRA``/``OBJCTDEC`` FITS header keywords — read by
+    fits_header.extract_headers() as ``header["ra"]``/``header["dec"]`` before
+    anything in this pipeline touches the file) and where astrometry.solve()
+    actually found the frame centred via a real plate solve
+    (``astro_result["ra_center"]``/``["dec_center"]``, from astap's own
+    verified ``.wcs`` file — see modules/astrometry/_wcs.py).
+
+    This is the same discrepancy astap already reports for every solve in its
+    own log/`.wcs` comment (e.g. "Mount offset RA=-0.2', DEC=-2.9'" — see
+    that module's UGC_6930 real-incident docstring) — computed here from the
+    two positions this function already has in hand, so it can be persisted
+    per frame (docs/API.md §1) instead of only ever appearing in a throwaway
+    astap log line.
+
+    Returns a dict with all three fields ``None`` together whenever either
+    position is unavailable — no mount-reported target at all (header ra/dec
+    missing, e.g. a capture program that never writes RA/DEC/OBJCTRA/OBJCTDEC),
+    or astrometry never solved this frame (QC-rejected before step 6, or astap
+    itself failed) so there is nothing to compare the mount's report against.
+
+    Caveat (not handled here): a capture program that writes OBJCTRA/OBJCTDEC
+    in the mount's current-epoch (JNow) frame rather than J2000/ICRS would
+    show a spurious few-arcmin "error" from precession/nutation alone, not a
+    real pointing error — this assumes, like the rest of this codebase, that
+    header RA/Dec is J2000 (the near-universal convention for ASCOM/INDI-based
+    capture software).
+    """
+    ra_mount = header.get("ra")
+    dec_mount = header.get("dec")
+    ra_solved = astro_result.get("ra_center")
+    dec_solved = astro_result.get("dec_center")
+
+    if ra_mount is None or dec_mount is None or ra_solved is None or dec_solved is None:
+        return {
+            "pointing_error_arcsec": None,
+            "pointing_error_ra_arcsec": None,
+            "pointing_error_dec_arcsec": None,
+        }
+
+    import math  # noqa: PLC0415
+    from astropy.coordinates import SkyCoord  # noqa: PLC0415
+    import astropy.units as u  # noqa: PLC0415
+
+    mount_coord = SkyCoord(ra=ra_mount * u.deg, dec=dec_mount * u.deg)
+    solved_coord = SkyCoord(ra=ra_solved * u.deg, dec=dec_solved * u.deg)
+    total_arcsec = float(mount_coord.separation(solved_coord).arcsec)
+
+    # Signed RA/Dec components, purely for diagnosing the *direction* of the
+    # offset (e.g. a systematic polar-alignment drift) rather than just its
+    # magnitude — this small-angle decomposition, not the true great-circle
+    # separation above, is what's reported as pointing_error_{ra,dec}_arcsec.
+    # The RA delta is wrapped into (-180, 180] degrees first so a solved
+    # position landing just the other side of the 0h/24h boundary from the
+    # mount's report reads as a small signed offset instead of a ~360deg one.
+    delta_ra_deg = (ra_solved - ra_mount + 180.0) % 360.0 - 180.0
+    delta_ra_arcsec = delta_ra_deg * 3600.0 * math.cos(math.radians(dec_mount))
+    delta_dec_arcsec = (dec_solved - dec_mount) * 3600.0
+
+    return {
+        "pointing_error_arcsec": total_arcsec,
+        "pointing_error_ra_arcsec": delta_ra_arcsec,
+        "pointing_error_dec_arcsec": delta_dec_arcsec,
+    }
+
+
 def _build_frame_payload(
     fits_path: str,
     header: dict,
@@ -1745,6 +1814,8 @@ def _build_frame_payload(
     if fov_deg is None:
         fov_deg = _calculate_fov_from_headers(header)
 
+    pointing_error = _compute_pointing_error(header, astro_result)
+
     return {
         "filename": filename,
         "obs_time": header.get("obs_time"),
@@ -1757,6 +1828,17 @@ def _build_frame_payload(
         # comes from a freshly solved WCS, never from header.get("..."): an
         # unsolved frame has no trustworthy orientation to report at all.
         "position_angle_deg": astro_result.get("position_angle_deg"),
+        # Mount pointing error vs. this frame's real plate solve — see
+        # _compute_pointing_error() above. Sent on every analysis, including
+        # a re-analysis of an already-registered frame; the API is expected
+        # to keep the FIRST value it ever stored for a given frame rather
+        # than overwrite it on re-analysis (a re-solve of the same archived
+        # file reports substantially the same mount error every time anyway,
+        # but the mount's *own* pointing behavior at capture time is what
+        # this is meant to characterize, not this particular re-run).
+        "pointing_error_arcsec": pointing_error["pointing_error_arcsec"],
+        "pointing_error_ra_arcsec": pointing_error["pointing_error_ra_arcsec"],
+        "pointing_error_dec_arcsec": pointing_error["pointing_error_dec_arcsec"],
         "quality_flag": qc_result.get("quality_flag"),
         "observation": header.get("observation", {}),
         "instrument": header.get("instrument", {}),

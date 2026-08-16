@@ -199,6 +199,9 @@ Accept: application/json
   "dec_center": 47.1952,
   "fov_deg": 1.25,
   "position_angle_deg": 0.0,
+  "pointing_error_arcsec": 12.4,
+  "pointing_error_ra_arcsec": -8.1,
+  "pointing_error_dec_arcsec": -9.4,
   "quality_flag": "OK",
 
   "observation": {
@@ -260,6 +263,9 @@ Accept: application/json
 | `dec_center` | float | yes | Declination of frame center in decimal degrees |
 | `fov_deg` | float | yes | Field of view (longest axis) in degrees, from plate solve |
 | `position_angle_deg` | float | no | This frame's own orientation on the sky in decimal degrees (0 = North up, increasing clockwise toward the image's +X pixel axis), derived from the solved WCS. `null`/omitted when astrometry never ran or its WCS round-trip failed. Two frames differing by ~180° here are rotated relative to each other (e.g. a meridian flip) — diagnostic only, not a data-quality signal. See observatory-pipeline's CLAUDE.md, "camera rotation" discussion. |
+| `pointing_error_arcsec` | float | no | Angular (great-circle) separation, in arcseconds, between the mount's own reported target position (`RA`/`DEC` or `OBJCTRA`/`OBJCTDEC` FITS header keywords) and this frame's actual plate-solved centre (`ra_center`/`dec_center`) — i.e. how far off the mount's pointing was. `null`/omitted whenever either position is unavailable: no mount-reported target in the header, or astrometry never solved this frame. **Should be preserved from this frame's first-ever registration and left untouched by any later re-analysis of the same `filename`** — it characterizes the mount's pointing behavior at original capture time, not this particular re-run; a re-analysis still sends a (near-identical) freshly computed value on every call, since the pipeline itself has no notion of "already stored". |
+| `pointing_error_ra_arcsec` | float | no | Signed East-West component of the same offset, in arcseconds (`(ra_center - ra_mount) * cos(dec_mount)`, wrapped across the 0h/24h boundary) — positive means the plate solve is East of the mount's reported position. Diagnostic only (e.g. characterizing a systematic polar-alignment drift direction); not a substitute for `pointing_error_arcsec`'s true angular separation at large offsets. Same preserve-on-re-analysis expectation as `pointing_error_arcsec`. |
+| `pointing_error_dec_arcsec` | float | no | Signed North-South component of the same offset, in arcseconds (`dec_center - dec_mount`). Same preserve-on-re-analysis expectation as `pointing_error_arcsec`. |
 | `quality_flag` | string | yes | Always `"OK"` — bad frames are never sent to the API |
 | `observation.object` | string | no | Target name from `OBJECT` FITS header |
 | `observation.exptime` | float | no | Exposure time in seconds |

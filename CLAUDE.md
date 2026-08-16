@@ -241,7 +241,22 @@ Orchestrates processing of a single FITS file in order:
     magnitudes reaching the API whenever a whole frame failed to calibrate). This is the
     field the API payload documents and the one `anomaly_detector.py` reads for
     magnitude-change comparisons.
-11. `api_client.post_frame(frame_data)` → registers the frame, gets back `frame_id`
+11. `api_client.post_frame(frame_data)` → registers the frame, gets back `frame_id`. `frame_data`
+    (`pipeline._build_frame_payload()`) also carries `pointing_error_arcsec`/
+    `pointing_error_ra_arcsec`/`pointing_error_dec_arcsec` — the mount's pointing error, computed by
+    `pipeline._compute_pointing_error()` as the angular separation between the mount's own reported
+    target position (`RA`/`DEC`/`OBJCTRA`/`OBJCTDEC` header keywords, read once by
+    `fits_header.extract_headers()` before anything in this pipeline touches the file) and this
+    frame's actual plate-solved centre (`astro_result["ra_center"]`/`["dec_center"]`, step 6) — the
+    same discrepancy astap's own `.wcs` comment already reports for every solve (see
+    `modules/astrometry/`'s `_wcs.py` real-incident docstring, `UGC_6930` — astap had found and
+    logged a ~178" "Mount offset" that an earlier revision of this codebase silently discarded
+    instead of trusting). All three fields are `None` together whenever either position is missing
+    (no mount-reported target at all, or astrometry never solved this frame — QC-rejected before
+    step 6, or astap failed). See docs/API.md §1 for the exact wire fields, and note there that
+    the API is expected to keep the first value it ever stored per `frame_id` rather than overwrite
+    it on a later re-analysis of the same file — the pipeline itself sends a freshly (re)computed
+    value on every call regardless, same as every other field in this payload.
 12. `api_client.post_sources(frame_id, filename, sources)` → saves all detected sources (already
     catalog-matched and photometrically calibrated); returns `source_ids` (positionally parallel
     to `sources`), which this step zips back onto each source dict as `_source_id` so

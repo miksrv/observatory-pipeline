@@ -2026,3 +2026,89 @@ class TestResolveBareFilename:
         result = pipeline._resolve_bare_filename("dup.fits")
 
         assert result == str(tmp_path / "archive" / "M51" / "dup.fits")
+
+
+# ---------------------------------------------------------------------------
+# _compute_pointing_error — mount pointing error vs. the plate-solved centre
+# ---------------------------------------------------------------------------
+
+
+class TestComputePointingError:
+    def test_returns_none_when_header_has_no_mount_position(self):
+        header = {"ra": None, "dec": None}
+        astro_result = {"ra_center": 202.47, "dec_center": 47.20}
+
+        result = pipeline._compute_pointing_error(header, astro_result)
+
+        assert result == {
+            "pointing_error_arcsec": None,
+            "pointing_error_ra_arcsec": None,
+            "pointing_error_dec_arcsec": None,
+        }
+
+    def test_returns_none_when_astrometry_never_solved(self):
+        header = {"ra": 202.40, "dec": 47.10}
+
+        result = pipeline._compute_pointing_error(header, {})
+
+        assert result == {
+            "pointing_error_arcsec": None,
+            "pointing_error_ra_arcsec": None,
+            "pointing_error_dec_arcsec": None,
+        }
+
+    def test_zero_offset_when_mount_and_solve_agree(self):
+        header = {"ra": 202.47, "dec": 47.20}
+        astro_result = {"ra_center": 202.47, "dec_center": 47.20}
+
+        result = pipeline._compute_pointing_error(header, astro_result)
+
+        assert result["pointing_error_arcsec"] == pytest.approx(0.0, abs=1e-6)
+        assert result["pointing_error_ra_arcsec"] == pytest.approx(0.0, abs=1e-6)
+        assert result["pointing_error_dec_arcsec"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_dec_only_offset_matches_signed_arcsec_delta(self):
+        # 1 arcmin = 1/60 deg north of the mount's reported position.
+        header = {"ra": 200.0, "dec": 10.0}
+        astro_result = {"ra_center": 200.0, "dec_center": 10.0 + 1.0 / 60.0}
+
+        result = pipeline._compute_pointing_error(header, astro_result)
+
+        assert result["pointing_error_dec_arcsec"] == pytest.approx(60.0, abs=1e-3)
+        assert result["pointing_error_ra_arcsec"] == pytest.approx(0.0, abs=1e-6)
+        assert result["pointing_error_arcsec"] == pytest.approx(60.0, abs=1e-3)
+
+    def test_ra_offset_is_scaled_by_cos_dec(self):
+        # 1 deg of RA at dec=60 corresponds to cos(60)=0.5 deg of great-circle
+        # separation, i.e. 1800 arcsec rather than the naive 3600.
+        header = {"ra": 100.0, "dec": 60.0}
+        astro_result = {"ra_center": 101.0, "dec_center": 60.0}
+
+        result = pipeline._compute_pointing_error(header, astro_result)
+
+        assert result["pointing_error_ra_arcsec"] == pytest.approx(1800.0, rel=1e-3)
+        assert result["pointing_error_dec_arcsec"] == pytest.approx(0.0, abs=1e-6)
+        assert result["pointing_error_arcsec"] == pytest.approx(1800.0, rel=1e-3)
+
+    def test_wraps_across_the_0h_24h_ra_boundary(self):
+        # Mount reports 359.9 deg, solve lands at 0.1 deg — a real 0.2 deg
+        # (=720") offset, not a ~360 deg one.
+        header = {"ra": 359.9, "dec": 0.0}
+        astro_result = {"ra_center": 0.1, "dec_center": 0.0}
+
+        result = pipeline._compute_pointing_error(header, astro_result)
+
+        assert result["pointing_error_ra_arcsec"] == pytest.approx(720.0, rel=1e-3)
+        assert result["pointing_error_arcsec"] == pytest.approx(720.0, rel=1e-3)
+
+    def test_build_frame_payload_includes_pointing_error_fields(self):
+        header = dict(_GOOD_HEADER)
+        astro_result = dict(_GOOD_ASTRO)
+
+        payload = pipeline._build_frame_payload(
+            "frame.fits", header, _GOOD_QC, astro_result, filename="frame.fits"
+        )
+
+        assert payload["pointing_error_arcsec"] == pytest.approx(0.0, abs=1e-6)
+        assert payload["pointing_error_ra_arcsec"] == pytest.approx(0.0, abs=1e-6)
+        assert payload["pointing_error_dec_arcsec"] == pytest.approx(0.0, abs=1e-6)
