@@ -198,6 +198,7 @@ Accept: application/json
   "ra_center": 202.4696,
   "dec_center": 47.1952,
   "fov_deg": 1.25,
+  "position_angle_deg": 0.0,
   "quality_flag": "OK",
 
   "observation": {
@@ -258,6 +259,7 @@ Accept: application/json
 | `ra_center` | float | yes | Right ascension of frame center in decimal degrees |
 | `dec_center` | float | yes | Declination of frame center in decimal degrees |
 | `fov_deg` | float | yes | Field of view (longest axis) in degrees, from plate solve |
+| `position_angle_deg` | float | no | This frame's own orientation on the sky in decimal degrees (0 = North up, increasing clockwise toward the image's +X pixel axis), derived from the solved WCS. `null`/omitted when astrometry never ran or its WCS round-trip failed. Two frames differing by ~180° here are rotated relative to each other (e.g. a meridian flip) — diagnostic only, not a data-quality signal. See observatory-pipeline's CLAUDE.md, "camera rotation" discussion. |
 | `quality_flag` | string | yes | Always `"OK"` — bad frames are never sent to the API |
 | `observation.object` | string | no | Target name from `OBJECT` FITS header |
 | `observation.exptime` | float | no | Exposure time in seconds |

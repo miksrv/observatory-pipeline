@@ -105,7 +105,9 @@ flowchart TD
     Vacated -- no --> Coverage
     Coverage -- yes --> FromSub{"_from_subtraction\n== True?"}
     FromSub -- no --> FirstObs["FIRST_OBSERVATION\n(not an anomaly, logged only)"]
-    FromSub -- yes --> UnkNewArea["🔔 UNKNOWN\n(subtraction already confirmed\nnovelty despite\nno coverage record)"]
+    FromSub -- yes --> SubCatalog{"catalog_name\nis not None?"}
+    SubCatalog -- yes --> SubKnown["known catalog match\n(not an anomaly — most likely\nan astroalign registration\nresidual near a real object;\nsee 'camera rotation' below)"]
+    SubCatalog -- no --> UnkNewArea["🔔 UNKNOWN\n(subtraction already confirmed\nnovelty despite\nno coverage record)"]
 
     Coverage -- no, area\nwas covered --> History{"n_history == 0?\n(no prior detection\nwithin MATCH_CONE_ARCSEC)"}
 
@@ -220,7 +222,12 @@ one condition matches, the function returns and no further checks run:
    (`history`, `MATCH_CONE_ARCSEC` cone):
    - no coverage at all → `FIRST_OBSERVATION` (not an anomaly), except when
      `_from_subtraction=True` → then `UNKNOWN` (subtraction already proved novelty at
-     the pixel level, so missing API coverage doesn't override that);
+     the pixel level, so missing API coverage doesn't override that) — **unless**
+     `catalog_name is not None`, in which case it's a known object (not an anomaly at
+     all), most likely an ordinary astroalign registration residual near it rather
+     than a real transient (real incident, 2026-08-14, source_id
+     `6a7cfbae64e706.89320404`, a Gaia DR3 star — this branch used to ignore
+     `catalog_name` entirely; see CLAUDE.md's "camera rotation" discussion);
    - covered, no history, near a galaxy (Simbad OTYPE) → `SUPERNOVA_CANDIDATE`;
    - covered, no history, not in any catalog → `UNKNOWN`;
    - covered, no history, in a catalog (not a galaxy) → `KNOWN_CATALOG_NEW` (not an anomaly);
@@ -261,7 +268,7 @@ Table of Simbad OTYPE substrings used by the classifiers:
 | `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening beyond Δmag | **Yes** |
 | `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold | **Yes** |
 | `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | **Yes** |
-| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction regardless of coverage | **Yes** |
+| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match
 `AnomalyModel::ALLOWED_TYPES`/the `ENUM` constraint on the `observatory-api` side — the

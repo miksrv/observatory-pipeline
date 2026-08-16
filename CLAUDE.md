@@ -581,10 +581,17 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   when no PSF estimate is available. This tightened lower bound applies to `sources_all` too, not
   just the strict `sources` list, since both share the same underlying FWHM mask.
 - Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`
-- Returns a dict: `{ra_center, dec_center, fov_deg, naxis1, naxis2, sources, sources_all, wcs}`
+- Returns a dict: `{ra_center, dec_center, fov_deg, position_angle_deg, naxis1, naxis2, sources, sources_all, wcs}`
   - `sources` — strict star filter, list of dicts `{ra, dec, flux, fwhm, elongation, saturated, near_edge, ...}`
   - `sources_all` — loose filter; additionally keeps bright/saturated and faint detections rejected by the strict filter, used downstream for catalog matching / WCS offset correction so moving or transient objects aren't lost
   - `wcs` — the `astropy.wcs.WCS` object itself, also consumed by `modules/subtraction.py` to convert difference-image pixel candidates back to sky coordinates
+  - `position_angle_deg` (`float | None`) — this frame's own orientation on the sky (0° = North
+    up, increasing clockwise toward the image's +X pixel axis), derived from the solved WCS via a
+    pixel↔world round trip rather than decoding the CD/PC matrix's trig directly (stays correct
+    regardless of the matrix's flip/determinant sign convention or any SIP/TPV terms). `None` if
+    that round trip fails. Persisted to the API purely as a diagnostic (see "Camera rotation" under
+    `modules/subtraction.py` below) — never gates anything on its own; a large difference between
+    two frames is expected and unremarkable (e.g. a meridian flip), not a data-quality signal.
   - `saturated` (bool, on every source in both lists) — raw ADU at the detection's peak
     (`sep`'s background-subtracted `peak` field with `bkg.globalback` added back) at or above
     `SATURATION_ADU`. Added because bright/saturated stars are deliberately kept in `sources_all`
@@ -699,6 +706,64 @@ entry at all, at any position).
 
 Gracefully skipped (`performed=False`) when fewer than `SUBTRACTION_MIN_FRAMES` archived frames
 exist yet — e.g. the very first observations of a new target.
+
+#### Camera rotation
+
+Real investigation, 2026-08-14, source_id `6a7cfbae64e706.89320404` (a Gaia DR3 star, `catalog_id`
+`3901066435010508672`, object `IC3322A`): frames of the same object taken on different sessions can
+have a substantially different camera/rotator orientation (e.g. a meridian flip on a German
+equatorial mount) — one session's frames rotated ~180° relative to another's.
+
+**Catalog matching needs no fix at all here.** `astrometry.solve()` plate-solves every frame
+independently from scratch (astap has no notion of "the previous frame's orientation"), so the
+resulting WCS already fully encodes whatever rotation that particular frame has. `catalog_matcher`
+cross-matches purely by (RA, Dec) — sky coordinates, not pixel geometry — so camera rotation is
+invisible to it by construction. The DB confirms this: the star above matched to the *same*
+`source_id` across sessions dated 2026-08-14, with (RA, Dec) consistent to well under 1″ throughout.
+
+**Image subtraction (`modules/subtraction.py`) is the one place pixel geometry actually matters**,
+since it differences raw pixels rather than comparing sky coordinates. `astroalign` already solves
+for rotation as part of its triangle-matching registration — including a full 180° difference — so
+a differently-rotated reference is never a reason to exclude it outright; doing so would be
+wasteful (an archive that naturally splits into two roughly-180°-apart PA clusters could otherwise
+never accumulate `SUBTRACTION_MIN_FRAMES` "acceptable" references). Two mechanisms address this
+instead, both soft/best-effort — see that module's own section above for the exact functions:
+
+1. **`position_angle_deg`** — every plate-solved frame's own orientation (0° = North up, increasing
+   clockwise toward the image's own +X pixel axis) is derived from its solved WCS via a
+   pixel↔world round trip (`_position_angle_deg()`, independently duplicated once in
+   `modules/astrometry/_frame_geometry.py` and once in `modules/subtraction.py`, same convention as
+   this codebase's other small duplicated geometry helpers — see that module's own section). It's
+   returned by `astrometry.solve()`, threaded through `pipeline.py`'s frame payload, and persisted
+   as a nullable `frames.position_angle_deg` column (docs/API.md §1) purely for operator diagnostics
+   (e.g. spotting a ~180° difference between sessions without re-opening archived FITS files) — it
+   never gates or excludes anything on the API side.
+2. **Pre-rotation, not exclusion** — before handing a reference frame to `astroalign`,
+   `subtraction.py`'s `_prerotate_reference()` coarse-rotates it by the *known* angle
+   (`new_frame_PA − reference_PA`, via `scipy.ndimage.rotate`) toward the new frame's own
+   orientation. This doesn't replace `astroalign`'s own fine, star-matching registration — it just
+   gives it a near-zero residual angle to start from instead of a large, unknown one, which is both
+   faster and less prone to a wrong/degenerate match on a sparse or partly-symmetric star field.
+   Skipped entirely below `SUBTRACTION_PREROTATE_MIN_DEG` (not worth the interpolation cost for a
+   negligible angle) or whenever either frame's WCS/PA is unavailable — never a hard failure.
+   `_find_archive_frames()` additionally uses PA-closeness as a *soft* tiebreaker when there are more
+   candidate references than `_MAX_FRAMES` (a reference needing less correction is a marginally
+   safer bet), never as a hard filter.
+
+**What this does *not* fix**: coma/optical-aberration residuals near bright stars after
+differencing are a property of the aberration pattern being fixed to the *sensor*, not the sky —
+rotating the pixel data (by any method, pre-rotation or `astroalign` alone) necessarily moves that
+pattern relative to the star field whenever two frames have a real orientation difference. Neither
+mechanism above removes this; it's still mitigated the same way as always, downstream on the diff
+image itself (`near_edge` exclusion, saturation masking, the streak/FWHM-floor filters — see this
+module's own section above).
+
+The investigation also surfaced an unrelated but related bug in `anomaly_detector.py`: a subtraction
+candidate landing in a sky tile with no prior `POST /frames/covering/batch` record yet was
+unconditionally classified `UNKNOWN` + alert regardless of `catalog_name` — so the Gaia star above,
+recovered as a subtraction candidate (an ordinary registration residual near it) before its object's
+first frame was ever marked "covered", fired a false `UNKNOWN` alert purely on that technicality. See
+that module's section below and `docs/anomaly-detector.md` for the fix.
 
 ### `modules/catalog_matcher/`
 A package, not a single file — one file per catalog (`_gaia.py`, `_simbad.py`, `_2mass.py`,
@@ -835,7 +900,8 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | Unmatched (`catalog_name is None`) and `near_edge=True` | Suppressed — `return None` (coma shifts the measured centroid away from the star's true catalog position, making catalog matching miss it; these are overwhelmingly ordinary stars with optical distortion, not real transients — real incident, 2026-08-10: 27 of 80 UNKNOWN alerts were non-subtraction near_edge sources) |
 | No historical coverage | `FIRST_OBSERVATION` — not an anomaly, just note |
 | No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction already filters edge candidates at extraction time) |
-| No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=False` | `UNKNOWN` → **ALERT** (subtraction already confirms it's absent from the reference stack, so missing API coverage doesn't downgrade it) |
+| No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is not None` | Suppressed — `return None` (a known catalog object — most likely an ordinary astroalign registration residual near it, not a real transient; see "camera rotation" below. Real incident, 2026-08-14, source_id `6a7cfbae64e706.89320404`, a Gaia DR3 star — this branch used to ignore `catalog_name` entirely) |
+| No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is None` | `UNKNOWN` → **ALERT** (subtraction already confirms it's absent from the reference stack, so missing API coverage doesn't downgrade it) |
 | Area covered, source not in history at all, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (new point source, no baseline to compare against) |
 | Area covered, source not in history, found in catalog (not a galaxy) | `KNOWN_CATALOG_NEW` — was below detection threshold |
 | Area covered, source not in history, not in any catalog, `near_edge=True` | Suppressed — `return None` (same coma-shifted-centroid rationale as above) |
@@ -1063,6 +1129,23 @@ already-successful result. On observatory-api's side this needed `source_charts.
 repo's `CLAUDE.md`. `api_client.upload_source_chart()` sets the outgoing `Content-Type` from the
 image bytes' own magic number (`_content_type_for_image_bytes()`), not from `style`, so it needs
 no signature change to carry either format.
+
+**Camera rotation** (see the top-level "camera rotation" discussion under `modules/subtraction.py`
+above): `stamp_strip`, `stamp_strip_gif`, and `track_gif` each draw a crop taken from a DIFFERENT
+epoch's own raw pixel data — unlike `track`, which only ever shows ONE epoch's own pixels and
+projects every other epoch onto it purely as a sky-coordinate marker (orientation-independent by
+construction). A camera/rotator orientation difference between epochs (e.g. a meridian flip
+between sessions) would otherwise show the star field visibly rotated/flipped between stamps or
+animation frames — defeating the entire point of a "blink comparator", where only the
+astrophysical content is supposed to change. `modules/finder_chart/_io.py`'s
+`_prerotation_delta_deg()`/`_rotate_crop()`/`_rotate_point_in_crop()` (same `_position_angle_deg()`
+formula/sign-convention as `modules/astrometry/`'s and `modules/subtraction.py`'s identical copies)
+coarse-rotate each non-reference epoch's crop — and any marker/track point drawn on it — toward one
+shared reference orientation before drawing: the most recent epoch's own WCS, the same "background"
+convention `track`/`track_gif` already use elsewhere. Gated by `CHART_PREROTATE_MIN_DEG` (default
+2°) — skipped for a negligible difference, same as `modules/subtraction.py`'s
+`SUBTRACTION_PREROTATE_MIN_DEG`. A large orientation difference (e.g. ~180°) is never a reason to
+drop an epoch from a chart, only to rotate its crop before display.
 
 ### `api_client/`
 All communication with the remote `observatory-api`. A package, not a single file — split by
