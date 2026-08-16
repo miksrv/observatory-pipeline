@@ -251,6 +251,15 @@ SPACE_DEBRIS_EDGE_ELONGATION_MIN: float = float(_get("SPACE_DEBRIS_EDGE_ELONGATI
 SUBTRACTION_MIN_FRAMES: int = int(_get("SUBTRACTION_MIN_FRAMES", "3"))
 # Detection threshold on the difference image (multiples of background RMS).
 SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
+# A reference frame captured with a different camera/rotator orientation than
+# the new frame (e.g. a meridian flip) is coarse-pre-rotated by the known
+# WCS-derived angle before being handed to astroalign — see
+# modules/subtraction.py's _prerotate_reference() and CLAUDE.md's "camera
+# rotation" discussion. Below this many degrees of difference, the rotation
+# is skipped entirely: astroalign's own sub-pixel registration already
+# absorbs a small residual angle, and rotating (interpolating) the reference
+# array for a fraction of a degree only adds blur for no real benefit.
+SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG", "2.0"))
 
 # ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
@@ -331,6 +340,19 @@ CHART_MAX_EPOCHS: int = int(_get("CHART_MAX_EPOCHS", "12"))
 CHART_GIF_ENABLED: bool = _get("CHART_GIF_ENABLED", "true").lower() in ("true", "1", "yes")
 # Per-frame display duration of the animated GIF, in milliseconds.
 CHART_GIF_FRAME_DURATION_MS: int = int(_get("CHART_GIF_FRAME_DURATION_MS", "700"))
+# An epoch captured at a different camera/rotator orientation than the
+# chart's own reference epoch (e.g. a meridian flip between sessions) is
+# coarse-pre-rotated by the known WCS-derived angle before its crop is drawn
+# — "stamp_strip"/"stamp_strip_gif" (a blink comparator across epochs) and
+# "track_gif" (a per-frame crop whose orientation must stay stable across
+# the whole animation) all rely on this; see modules/finder_chart/_io.py's
+# _prerotation_delta_deg() and CLAUDE.md's "camera rotation" discussion.
+# "track" needs no equivalent — it only ever displays ONE epoch's own pixel
+# data, with every other epoch projected onto it purely as a sky-coordinate
+# marker, which is already orientation-independent. Below this many degrees
+# of difference, the rotation is skipped — not worth the interpolation cost
+# for a negligible angle.
+CHART_PREROTATE_MIN_DEG: float = float(_get("CHART_PREROTATE_MIN_DEG", "2.0"))
 
 # ---------------------------------------------------------------------------
 # Normalization settings
@@ -466,6 +488,7 @@ _OVERRIDABLE: dict[str, type] = {
     # Image subtraction
     "SUBTRACTION_MIN_FRAMES": int,
     "SUBTRACTION_DETECT_SIGMA": float,
+    "SUBTRACTION_PREROTATE_MIN_DEG": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
     "FORCED_PHOTOMETRY_MAG_LIMIT": float,
@@ -480,6 +503,7 @@ _OVERRIDABLE: dict[str, type] = {
     "CHART_MAX_EPOCHS": int,
     "CHART_GIF_ENABLED": None,  # special: bool from string
     "CHART_GIF_FRAME_DURATION_MS": int,
+    "CHART_PREROTATE_MIN_DEG": float,
     # Normalization
     "NORMALIZE_ENABLED": None,  # special: bool from string
     # Catalog cache

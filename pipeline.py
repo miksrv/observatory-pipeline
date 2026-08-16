@@ -1751,6 +1751,12 @@ def _build_frame_payload(
         "ra_center": astro_result.get("ra_center") or header.get("ra"),
         "dec_center": astro_result.get("dec_center") or header.get("dec"),
         "fov_deg": fov_deg,
+        # None whenever astrometry.solve() never ran (e.g. QC-rejected before
+        # step 6, or astap itself failed) or its own WCS round-trip failed —
+        # the API stores this as nullable (see docs/API.md §1). Only ever
+        # comes from a freshly solved WCS, never from header.get("..."): an
+        # unsolved frame has no trustworthy orientation to report at all.
+        "position_angle_deg": astro_result.get("position_angle_deg"),
         "quality_flag": qc_result.get("quality_flag"),
         "observation": header.get("observation", {}),
         "instrument": header.get("instrument", {}),
