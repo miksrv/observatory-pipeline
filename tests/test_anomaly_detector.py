@@ -67,6 +67,7 @@ def _make_source(
     saturated: bool = False,
     filter: str | None = "L",
     near_edge: bool = False,
+    from_subtraction: bool = False,
 ) -> dict:
     return {
         "ra":           ra,
@@ -96,6 +97,13 @@ def _make_source(
         # No leading underscore — mirrors "saturated" above, since it must
         # survive to the wire for a standalone DETECT_ANOMALIES re-run.
         "near_edge":    near_edge,
+        # Leading underscore — internal-only, never sent to the wire (see
+        # api_client's _to_wire_source()). Defaults to False so every
+        # existing test keeps exercising the ordinary (non-subtraction)
+        # classification path unless a test explicitly opts in — see
+        # TestDetectEmptyAndFirstObservation below for the from_subtraction
+        # cases.
+        "_from_subtraction": from_subtraction,
     }
 
 
@@ -335,6 +343,72 @@ class TestDetectEmptyAndFirstObservation:
             patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
         ):
             # No sources, no coverage
+            mock_sources.return_value = {}
+            mock_cov.return_value = {}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_detect_subtraction_unknown_alert_when_uncatalogued(self):
+        """
+        No coverage at all, but the source was detected via image
+        subtraction and isn't catalog-matched: subtraction already proved
+        this position is genuinely new relative to the reference stack, so
+        missing API coverage doesn't downgrade it -> UNKNOWN, ALERT.
+        """
+        source = _make_source(catalog_name=None, from_subtraction=True, source_id="src-sub-001")
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {}
+            mock_cov.return_value = {}  # no coverage at all
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "UNKNOWN"
+        assert result[0]["source_id"] == "src-sub-001"
+
+    async def test_detect_subtraction_suppressed_when_catalog_matched(self):
+        """
+        Regression test for the 2026-08-14 "camera rotation" investigation
+        (source_id 6a7cfbae64e706.89320404, CLAUDE.md): a subtraction
+        candidate that DID match a catalog (a known Gaia DR3 star, in this
+        case) must NOT be reported as a false UNKNOWN alert merely because
+        its sky tile has no POST /frames/covering/batch record yet — it's a
+        known object, most likely an ordinary astroalign registration
+        residual near it, not a real transient. This branch used to ignore
+        catalog_name entirely.
+        """
+        source = _make_source(
+            catalog_name="Gaia DR3", catalog_id="3901066435010508672",
+            from_subtraction=True, source_id="src-sub-002",
+        )
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {}
+            mock_cov.return_value = {}  # no coverage at all
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_detect_subtraction_near_edge_still_suppressed_regardless_of_catalog(self):
+        """near_edge suppression (checked first) must still win even for a catalog-matched source."""
+        source = _make_source(
+            catalog_name="Gaia DR3", from_subtraction=True, near_edge=True,
+        )
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
             mock_sources.return_value = {}
             mock_cov.return_value = {}
 

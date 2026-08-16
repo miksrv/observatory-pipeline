@@ -285,6 +285,30 @@ def _classify_source_sync(
                 extra=extra,
             )
             return None
+        # A subtraction candidate that DID match a catalog (Simbad/Gaia/
+        # 2MASS/Pan-STARRS — MPC is handled by Priority 1, above) is a known
+        # object, not a genuine transient — most likely an ordinary
+        # astroalign registration residual near that object (e.g. a small
+        # centroid offset from imperfect alignment when the reference stack
+        # includes a frame at a different camera/rotator orientation; see
+        # CLAUDE.md's "camera rotation" discussion) that happens to fall in
+        # a sky tile with no POST /frames/covering/batch record yet — e.g.
+        # one of the very first frames of a session, before enough archived
+        # frames exist for "coverage" to be established at all. Treat it
+        # the same as KNOWN_CATALOG_NEW further below: a legitimate catalog
+        # match, not an anomaly. Real incident, 2026-08-14, source_id
+        # 6a7cfbae64e706.89320404 (a Gaia DR3 star, catalog_id
+        # 3901066435010508672): this branch unconditionally alerted UNKNOWN
+        # for it without ever consulting catalog_name at all.
+        if catalog_name is not None:
+            logger.debug(
+                "Suppressed UNKNOWN (subtraction, new area): catalog_name=%s "
+                "catalog_id=%s ra=%.4f dec=%.4f — known object, not a real "
+                "transient",
+                catalog_name, catalog_id, ra, dec,
+                extra=extra,
+            )
+            return None
         logger.info(
             "UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f mag=%s",
             ra, dec, mag,
