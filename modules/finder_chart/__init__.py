@@ -85,8 +85,11 @@ Split into one file per chart style, plus shared infrastructure:
   _style.py         style routing: MOVING_TYPES, STYLE_*, _style_for_source,
                      _group_types_by_style — no rendering, no I/O
   _io.py             shared FITS loading, display stretch, plate-scale/
-                     stamp-size conversion, PNG/GIF assembly — used by 2+ of
-                     the style files below
+                     stamp-size conversion, PNG/GIF assembly, camera-rotation
+                     helpers (_position_angle_deg / _prerotation_delta_deg /
+                     _rotate_crop / _rotate_point_in_crop — see CLAUDE.md's
+                     "camera rotation" discussion) — used by 2+ of the style
+                     files below
   _style_track.py             "track" style (static)
   _style_track_gif.py         "track_gif" — its OWN independent renderer, not a
                                wrapper around _style_track.py — see that file's
@@ -151,6 +154,10 @@ from ._io import (
     _load_frame,
     _local_fits_path,
     _pngs_to_gif,
+    _position_angle_deg,
+    _prerotation_delta_deg,
+    _rotate_crop,
+    _rotate_point_in_crop,
     _stamp_half_size_px,
     _stretch,
 )

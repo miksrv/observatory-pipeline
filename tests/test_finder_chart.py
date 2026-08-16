@@ -19,6 +19,7 @@ asyncio_mode = auto is set in pytest.ini, so async tests need no decorator.
 from __future__ import annotations
 
 import io
+import math
 
 import numpy as np
 import pytest
@@ -32,13 +33,32 @@ from modules import finder_chart
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
-def _make_wcs_fits(path, ra=202.47, dec=47.20, scale_deg=0.000278, size=100):
-    """Write a tiny synthetic FITS file with a valid celestial WCS."""
+def _make_wcs_fits(path, ra=202.47, dec=47.20, scale_deg=0.000278, size=100, rotation_deg=0.0):
+    """
+    Write a tiny synthetic FITS file with a valid celestial WCS.
+
+    rotation_deg: 0 (default) keeps the original diagonal-CD (via cdelt)
+    behavior every existing caller relies on. A non-zero value instead
+    builds an explicit CD matrix rotated by that many degrees in the exact
+    ``scipy.ndimage.rotate(data, angle=rotation_deg)`` sense — see
+    TestPositionAngleAndPrerotation below, which relies on this exact
+    relation (same convention as tests/test_astrometry.py's/
+    tests/test_subtraction.py's own ``_rotate_wcs()`` helpers).
+    """
     w = AstropyWCS(naxis=2)
     w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     w.wcs.crpix = [size / 2.0, size / 2.0]
     w.wcs.crval = [ra, dec]
-    w.wcs.cdelt = [-scale_deg, scale_deg]
+    if rotation_deg:
+        theta = math.radians(rotation_deg)
+        base_cd = np.array([[-scale_deg, 0.0], [0.0, scale_deg]])
+        rot = np.array([
+            [math.cos(theta), -math.sin(theta)],
+            [math.sin(theta),  math.cos(theta)],
+        ])
+        w.wcs.cd = (base_cd @ rot).tolist()
+    else:
+        w.wcs.cdelt = [-scale_deg, scale_deg]
     w.wcs.set()
 
     rng = np.random.default_rng(42)
@@ -267,14 +287,113 @@ class TestCropAround:
 
 
 # ---------------------------------------------------------------------------
+# _position_angle_deg / _prerotation_delta_deg / _rotate_crop /
+# _rotate_point_in_crop — camera rotation handling shared by
+# _style_stamp_strip.py / _style_stamp_strip_gif.py / _style_track_gif.py.
+# See CLAUDE.md's "camera rotation" discussion.
+# ---------------------------------------------------------------------------
+
+class TestPositionAngleAndPrerotation:
+
+    def test_unrotated_wcs_reports_zero(self):
+        w = AstropyWCS(naxis=2)
+        w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        w.wcs.crpix = [50.0, 50.0]
+        w.wcs.crval = [202.47, 47.20]
+        w.wcs.cd = [[-0.000278, 0.0], [0.0, 0.000278]]
+        w.wcs.set()
+
+        assert finder_chart._position_angle_deg(w) == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.parametrize("theta_deg", [30.0, 90.0, 180.0, -45.0])
+    def test_rotated_wcs_reports_matching_delta(self, tmp_path, theta_deg):
+        base = _make_wcs_fits(tmp_path / "base.fits", rotation_deg=0.0)
+        rotated = _make_wcs_fits(tmp_path / "rotated.fits", rotation_deg=theta_deg)
+
+        pa_base = finder_chart._position_angle_deg(base)
+        pa_rotated = finder_chart._position_angle_deg(rotated)
+
+        delta = (pa_rotated - pa_base) % 360.0
+        assert delta == pytest.approx(theta_deg % 360.0, abs=1e-6)
+
+    def test_degenerate_wcs_returns_none(self):
+        assert finder_chart._position_angle_deg(AstropyWCS(naxis=2)) is None
+
+
+class TestPrerotationDeltaDeg:
+
+    def test_none_reference_is_none(self, tmp_path):
+        wcs = _make_wcs_fits(tmp_path / "e.fits")
+        assert finder_chart._prerotation_delta_deg(wcs, None) is None
+
+    def test_below_threshold_is_none(self, tmp_path):
+        own = _make_wcs_fits(tmp_path / "own.fits", rotation_deg=0.0)
+        ref = _make_wcs_fits(tmp_path / "ref.fits", rotation_deg=config.CHART_PREROTATE_MIN_DEG / 2.0)
+
+        assert finder_chart._prerotation_delta_deg(own, ref) is None
+
+    def test_above_threshold_returns_expected_delta(self, tmp_path):
+        own = _make_wcs_fits(tmp_path / "own.fits", rotation_deg=0.0)
+        ref = _make_wcs_fits(tmp_path / "ref.fits", rotation_deg=40.0)
+
+        delta = finder_chart._prerotation_delta_deg(own, ref)
+
+        assert delta == pytest.approx(40.0, abs=1e-6)
+
+
+class TestRotateCropAndPoint:
+
+    def test_180_degree_rotation_undoes_known_offset(self):
+        """
+        Same validation approach as tests/test_subtraction.py's
+        TestPrerotateReference: a handful of asymmetric point sources,
+        rotated by a known angle, must be correctly un-rotated by
+        _rotate_crop() using the delta _prerotation_delta_deg() would
+        derive from two frames' actual WCS-based PA difference.
+        """
+        from scipy.ndimage import rotate as ndi_rotate
+
+        size = 101
+        base = np.zeros((size, size), dtype=np.float64)
+        for r, c in [(30, 60), (70, 45), (55, 20)]:
+            base[r, c] = 1000.0
+
+        rotated_180 = ndi_rotate(base, angle=180.0, reshape=False, order=1)
+        corrected = finder_chart._rotate_crop(rotated_180, 180.0)
+
+        assert np.corrcoef(corrected.ravel(), base.ravel())[0, 1] > 0.99
+
+    def test_rotate_point_matches_array_rotation(self):
+        """
+        A marker point rotated by _rotate_point_in_crop() must land on the
+        same physical feature _rotate_crop() moves it to — verified by
+        placing a single bright pixel, rotating the array, and checking the
+        rotated point lands on (or immediately next to, allowing for
+        nearest-pixel rounding) the array's own brightest pixel.
+        """
+        size = 41
+        crop = np.zeros((size, size), dtype=np.float64)
+        px, py = 30.0, 25.0  # off-center, asymmetric
+        crop[int(py), int(px)] = 1.0
+
+        for theta in (30.0, 90.0, 180.0, -60.0):
+            rotated = finder_chart._rotate_crop(crop, theta)
+            new_x, new_y = finder_chart._rotate_point_in_crop(px, py, crop.shape, theta)
+
+            peak_row, peak_col = np.unravel_index(np.argmax(rotated), rotated.shape)
+            assert abs(new_x - peak_col) < 1.5, f"theta={theta}"
+            assert abs(new_y - peak_row) < 1.5, f"theta={theta}"
+
+
+# ---------------------------------------------------------------------------
 # Rendering — real (tiny) output, checked only for a valid PNG signature
 # ---------------------------------------------------------------------------
 
 class TestRendering:
 
-    def _loaded_epoch(self, tmp_path, name, ra, dec, obs_time, mag=15.0):
+    def _loaded_epoch(self, tmp_path, name, ra, dec, obs_time, mag=15.0, rotation_deg=0.0):
         path = tmp_path / name
-        wcs = _make_wcs_fits(path, ra=ra, dec=dec)
+        wcs = _make_wcs_fits(path, ra=ra, dec=dec, rotation_deg=rotation_deg)
         data, wcs = finder_chart._load_frame(str(path))
         return {
             "frame_id": name,
@@ -391,6 +510,85 @@ class TestRendering:
         assert gif_bytes[:6] in (b"GIF87a", b"GIF89a")
         with Image.open(io.BytesIO(gif_bytes)) as img:
             assert img.n_frames == len(epochs)
+
+    # -----------------------------------------------------------------
+    # Camera rotation robustness — an epoch captured at a different
+    # camera/rotator orientation than the chart's reference epoch must
+    # still render without crashing (see CLAUDE.md's "camera rotation"
+    # discussion). These check survival + valid output only; the actual
+    # geometry is covered precisely by TestPositionAngleAndPrerotation /
+    # TestPrerotationDeltaDeg / TestRotateCropAndPoint above.
+    # -----------------------------------------------------------------
+
+    def test_stamp_strip_survives_epochs_at_different_orientations(self, tmp_path):
+        epochs = [
+            self._loaded_epoch(tmp_path, "e0.fits", 202.47, 47.20, "2024-01-01T00:00:00Z", rotation_deg=180.0),
+            self._loaded_epoch(tmp_path, "e1.fits", 202.47, 47.20, "2024-01-02T00:00:00Z", rotation_deg=0.0),
+        ]
+
+        png_bytes = finder_chart._render_stamp_strip(epochs)
+
+        assert png_bytes[:8] == PNG_SIGNATURE
+
+    def test_stamp_strip_gif_survives_epochs_at_different_orientations(self, tmp_path):
+        epochs = [
+            self._loaded_epoch(tmp_path, "e0.fits", 202.47, 47.20, "2024-01-01T00:00:00Z", rotation_deg=90.0),
+            self._loaded_epoch(tmp_path, "e1.fits", 202.47, 47.20, "2024-01-02T00:00:00Z", rotation_deg=0.0),
+        ]
+
+        gif_bytes = finder_chart._render_stamp_strip_gif(epochs, label="UNKNOWN")
+
+        assert gif_bytes[:6] in (b"GIF87a", b"GIF89a")
+        with Image.open(io.BytesIO(gif_bytes)) as img:
+            assert img.n_frames == len(epochs)
+
+    def test_track_gif_survives_epochs_at_different_orientations(self, tmp_path):
+        epochs = [
+            self._loaded_epoch(tmp_path, "e0.fits", 202.47, 47.20, "2024-01-01T00:00:00Z", rotation_deg=180.0),
+            self._loaded_epoch(tmp_path, "e1.fits", 202.48, 47.21, "2024-01-01T01:00:00Z", rotation_deg=0.0),
+        ]
+
+        gif_bytes = finder_chart._render_track_gif(epochs, label="MOVING_UNKNOWN")
+
+        assert gif_bytes[:6] in (b"GIF87a", b"GIF89a")
+        with Image.open(io.BytesIO(gif_bytes)) as img:
+            assert img.n_frames == len(epochs)
+
+    def test_stamp_strip_actually_invokes_rotation_for_a_misoriented_epoch(self, tmp_path, monkeypatch):
+        """
+        Wiring check, not just survival: with a reference epoch (the last
+        one) and a first epoch rotated 90 deg relative to it,
+        _style_stamp_strip._rotate_crop() must actually be called with a
+        non-trivial angle for the misoriented epoch — and must NOT be
+        called at all for the reference-orientation epoch (delta below
+        threshold, since it matches its own reference exactly).
+        """
+        from modules.finder_chart import _style_stamp_strip as _mod
+
+        epochs = [
+            self._loaded_epoch(tmp_path, "e0.fits", 202.47, 47.20, "2024-01-01T00:00:00Z", rotation_deg=90.0),
+            self._loaded_epoch(tmp_path, "e1.fits", 202.47, 47.20, "2024-01-02T00:00:00Z", rotation_deg=0.0),
+        ]
+
+        calls: list[float] = []
+        real_rotate_crop = _mod._rotate_crop
+
+        def spy_rotate_crop(crop, delta_deg):
+            calls.append(delta_deg)
+            return real_rotate_crop(crop, delta_deg)
+
+        monkeypatch.setattr(_mod, "_rotate_crop", spy_rotate_crop)
+
+        finder_chart._render_stamp_strip(epochs)
+
+        # Exactly one rotation call (the misoriented first epoch) — the
+        # second epoch IS the reference, so its own delta is ~0 and stays
+        # below config.CHART_PREROTATE_MIN_DEG. Delta is reference_pa -
+        # own_pa = 0 - 90 = -90 (rotate e0's own +90 deg orientation BACK
+        # by 90 deg to match the reference's 0 deg) — same sign convention
+        # as modules/subtraction.py's _prerotate_reference().
+        assert len(calls) == 1
+        assert calls[0] == pytest.approx(-90.0, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------
