@@ -1800,11 +1800,52 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
         from astropy.io import fits as astropy_fits  # noqa: PLC0415
 
         with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
-            hdul[0].header.update(wcs.to_header())
+            header = hdul[0].header
+            _strip_wcs_representation(header)
+            header.update(wcs.to_header())
         return True
     except Exception as exc:
         logger.warning("Could not write solved WCS into %s: %s", fits_path, exc)
         return False
+
+
+# The two interchangeable ways FITS can express a pixel-to-world linear
+# transform, plus the rotation keyword that predates both. A header is only
+# well-defined if it carries one of them.
+_WCS_LINEAR_PREFIXES: tuple[str, ...] = ("CD", "PC", "CDELT", "CROTA")
+
+
+def _strip_wcs_representation(header) -> None:
+    """
+    Remove any existing CD / PC / CDELT / CROTA cards before a fresh WCS is
+    written over them.
+
+    `WCS.to_header()` emits a PC+CDELT representation even when the WCS it was
+    built from came from a CD matrix, and `header.update()` only sets the keys
+    it is given — it does not remove the ones it isn't. An archived file could
+    therefore end up carrying the old CD matrix (a capture program's
+    mount-pointing estimate) and the new PC+CDELT (astap's real solve) at the
+    same time, describing two different transforms at once (audit 2026-08-18,
+    finding H17).
+
+    What a reader then does with that is not guaranteed: `modules/astrometry/
+    _wcs.py`'s own `_read_wcs()` had to be taught explicitly to strip PC/CDELT
+    when CD is present, after astropy multiplied the two together and turned
+    0.78"/px into 0.0002"/px (real incident, 2026-08-06). This is the
+    symmetric protection on the write side — a file this pipeline archives
+    should not need that defence from whoever reads it next.
+
+    CROTA1/2 goes too: it is the pre-CD rotation convention, and a stale copy
+    of it alongside a fresh CD matrix is the same ambiguity in older clothes.
+    """
+    for key in list(header.keys()):
+        if not key:
+            continue
+        if key.upper().startswith(_WCS_LINEAR_PREFIXES):
+            try:
+                del header[key]
+            except KeyError:
+                pass
 
 
 def _write_qc_headers(fits_path: str, qc_result: dict) -> bool:

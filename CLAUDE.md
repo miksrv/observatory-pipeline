@@ -293,7 +293,11 @@ Orchestrates processing of a single FITS file in order:
     to `sources`), which this step zips back onto each source dict as `_source_id` so
     `anomaly_detector.py` can populate `anomalies[].source_id`.
 12.5. Move file to `/fits/archive/{object_name}/` directory. Just before the move,
-     `_write_solved_wcs()` bakes astap's verified solve into the file's own header and
+     `_write_solved_wcs()` bakes astap's verified solve into the file's own header — clearing
+     any pre-existing `CD`/`PC`/`CDELT`/`CROTA` cards first, since `WCS.to_header()` emits a
+     PC+CDELT representation even for a CD-matrix WCS and `header.update()` removes nothing,
+     so an incoming mount-pointing CD matrix would otherwise survive alongside astap's solve
+     and the file would describe two transforms at once (audit 2026-08-18, finding H17) — and
      `_write_qc_headers()` stamps `QCFLAG`/`QCFWHM` beside it — both so that a *later* frame
      reading this one back off disk (finder charts for the WCS, subtraction's reference screen
      for the QC verdict) doesn't have to re-derive or re-ask for what this run already knew. Runs immediately after step 12, NOT

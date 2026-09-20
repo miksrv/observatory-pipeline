@@ -554,6 +554,60 @@ async def test_archived_file_gets_solved_wcs(mock_modules, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_archived_file_carries_only_one_wcs_representation(mock_modules, tmp_path):
+    """
+    Audit 2026-08-18, finding H17: WCS.to_header() emits PC+CDELT even when
+    the WCS came from a CD matrix, and header.update() only sets the keys it
+    is given — it does not remove the ones it isn't. An incoming file whose
+    capture software wrote a CD matrix from mount pointing would keep those
+    cards alongside astap's fresh PC+CDELT, describing two transforms at once.
+    What a reader does with that is not guaranteed: _read_wcs() had to be
+    taught to strip PC/CDELT when CD is present, after astropy multiplied the
+    two and turned 0.78"/px into 0.0002"/px.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    # A mount-pointing estimate in the older CD representation.
+    real_hdu.header["CTYPE1"] = "RA---TAN"
+    real_hdu.header["CTYPE2"] = "DEC--TAN"
+    real_hdu.header["CRVAL1"] = 100.0
+    real_hdu.header["CRVAL2"] = 10.0
+    real_hdu.header["CRPIX1"] = 5.0
+    real_hdu.header["CRPIX2"] = 5.0
+    real_hdu.header["CD1_1"] = -0.001
+    real_hdu.header["CD1_2"] = 0.0
+    real_hdu.header["CD2_1"] = 0.0
+    real_hdu.header["CD2_2"] = 0.001
+    real_hdu.header["CROTA2"] = 12.0
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    solved_wcs = AstropyWCS(naxis=2)
+    solved_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    solved_wcs.wcs.crval = [202.47, 47.20]
+    solved_wcs.wcs.crpix = [5, 5]
+    solved_wcs.wcs.cdelt = [-0.001, 0.001]
+    solved_wcs.wcs.set()
+
+    pipeline.astrometry.solve = AsyncMock(
+        return_value={**copy.deepcopy(_GOOD_ASTRO), "wcs": solved_wcs}
+    )
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        header = hdul[0].header
+        has_cd = any(k.startswith("CD1_") or k.startswith("CD2_") for k in header)
+        has_pc = any(k.startswith("PC") for k in header)
+        assert not (has_cd and has_pc), "archived header carries two WCS representations"
+        assert "CROTA2" not in header
+        # And the solve that survived is astap's, not the mount's.
+        assert header["CRVAL1"] == pytest.approx(202.47, abs=1e-6)
+
+
+@pytest.mark.asyncio
 async def test_archived_file_gets_qc_headers(mock_modules, tmp_path):
     """
     Audit 2026-08-18, finding H10: a later frame's subtraction picks its
