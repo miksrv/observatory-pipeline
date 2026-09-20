@@ -22,7 +22,7 @@ def _build_streak_mask(
     data_sub: np.ndarray,
     rms: float,
     pixel_scale_arcsec: float | None,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray, list[dict]] | None:
     """
     Coarse, low-threshold, non-deblended pre-pass that finds long thin
     streaks — satellite/aircraft trails crossing a single exposure, and
@@ -71,10 +71,25 @@ def _build_streak_mask(
 
     Returns
     -------
-    np.ndarray | None
-        Boolean mask, same shape as data_sub, or None when nothing
-        streak-like was found (the common case) or the coarse pass itself
-        failed — callers should treat None as "nothing to mask".
+    tuple[np.ndarray, list[dict]] | None
+        The boolean mask (same shape as data_sub) and one dict per masked
+        feature, carrying its own centroid, flux, axes, elongation and length
+        in pixels. None when nothing streak-like was found (the common case)
+        or the coarse pass itself failed — callers should treat None as
+        "nothing to mask".
+
+        The feature list exists because masking alone deletes evidence. The
+        two thresholds here cannot geometrically tell a satellite trail from a
+        genuine fast NEO trailing within a single exposure — a 30" streak at
+        elongation 5 is exactly what both look like — so the pixels of a real
+        moving object were erased before `sep.extract()` ever ran, and with
+        no second chance: the frame is not re-analysed from other data (audit
+        2026-08-18, finding H16). `_extraction.py` turns each of these back
+        into one detection at the streak's own centroid, which is enough for
+        the MPC cone search to identify a known object there and for the
+        SPACE_DEBRIS branch to classify an unknown one, while the masking
+        still does its real job of stopping the trail from fragmenting into
+        several false "stars".
     """
     if rms is None or rms <= 0:
         return None
@@ -128,9 +143,22 @@ def _build_streak_mask(
             "Streak mask dilation failed (%s) — using un-dilated mask", exc
         )
 
+    features: list[dict] = []
+    for i in streak_idx:
+        features.append({
+            "x":            float(objs["x"][i]),
+            "y":            float(objs["y"][i]),
+            "flux":         float(objs["flux"][i]),
+            "peak":         float(objs["peak"][i]),
+            "a":            float(objs["a"][i]),
+            "b":            float(objs["b"][i]),
+            "elongation":   float(elongation[i]),
+            "length_px":    float(bbox_diag_px[i]),
+        })
+
     logger.info(
         "Streak masking: %d streak-like feature(s) found (elongation>=%.1f, "
         "length>=%.0fpx), masking %d pixel(s)",
         len(streak_idx), config.STREAK_ELONGATION_MIN, min_len_px, int(mask.sum()),
     )
-    return mask
+    return mask, features

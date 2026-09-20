@@ -1058,14 +1058,31 @@ class TestDegenerateSource:
 # their pixels in data_sub before the real extraction runs.
 # ---------------------------------------------------------------------------
 
-def _make_coarse_object(a: float, xmin: int, xmax: int, ymin: int, ymax: int, b: float = 1.0) -> np.ndarray:
+def _make_coarse_object(
+    a: float, xmin: int, xmax: int, ymin: int, ymax: int, b: float = 1.0,
+    x: float | None = None, y: float | None = None,
+    flux: float = 50_000.0, peak: float = 900.0,
+) -> np.ndarray:
+    """
+    One row of the coarse pre-pass's sep.extract() output.
+
+    Carries x/y/flux/peak as well as the shape fields, because
+    _build_streak_mask() now also hands each masked streak back to
+    _extraction.py as a detection of its own (audit 2026-08-18, finding H16).
+    """
     obj = np.zeros(1, dtype=[
         ("a", np.float64), ("b", np.float64),
+        ("x", np.float64), ("y", np.float64),
+        ("flux", np.float64), ("peak", np.float64),
         ("xmin", np.int32), ("xmax", np.int32),
         ("ymin", np.int32), ("ymax", np.int32),
     ])
     obj["a"] = a
     obj["b"] = b
+    obj["x"] = x if x is not None else (xmin + xmax) / 2.0
+    obj["y"] = y if y is not None else (ymin + ymax) / 2.0
+    obj["flux"] = flux
+    obj["peak"] = peak
     obj["xmin"], obj["xmax"] = xmin, xmax
     obj["ymin"], obj["ymax"] = ymin, ymax
     return obj
@@ -1103,6 +1120,66 @@ class TestStreakMasking:
         final_data, final_kwargs = calls[1]
         assert not final_kwargs.get("segmentation_map")
         assert np.all(final_data[10:200, streak_col] == 0.0)
+
+    async def test_a_masked_streak_is_re_emitted_as_a_detection(self):
+        """
+        Audit 2026-08-18, finding H16: the two thresholds behind the mask
+        cannot geometrically tell a satellite trail from a genuine fast NEO
+        trailing within one exposure, so a real moving object's pixels were
+        erased before sep.extract() ever ran — with no second chance, since
+        the frame is never re-analysed from other data. The mask stays (it
+        stops the trail fragmenting into false stars), but the streak comes
+        back as one detection at its own centroid.
+        """
+        streak_col = 10
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=95.0, xmin=streak_col, xmax=streak_col, ymin=10, ymax=200,
+                    x=float(streak_col), y=105.0, flux=123_456.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:200, streak_col] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                result = await astrometry.solve(_FITS_PATH)
+
+        streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(123_456.0)]
+        assert len(streaks) == 1
+        assert streaks[0]["elongation"] == pytest.approx(95.0)
+        # Not a star: it must never reach the photometric reference set.
+        assert not any(s["flux"] == pytest.approx(123_456.0) for s in result["sources"])
+
+    async def test_a_streak_bypasses_the_sources_all_elongation_ceiling(self):
+        """
+        SOURCES_ALL_ELONGATION_MAX exists to reject the degenerate a/b of a
+        near-zero minor axis, not a feature deliberately selected for being
+        elongated — a full-frame trail's ratio is far past it.
+        """
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=300.0, b=1.0, xmin=10, xmax=10, ymin=10, ymax=600,
+                    x=10.0, y=305.0, flux=999.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:600, 10] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                result = await astrometry.solve(_FITS_PATH)
+
+        streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(999.0)]
+        assert len(streaks) == 1
+        assert streaks[0]["elongation"] > config.SOURCES_ALL_ELONGATION_MAX
 
     async def test_short_elongated_feature_is_not_masked(self):
         """A coarse candidate elongated enough but far shorter than

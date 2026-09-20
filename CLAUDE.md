@@ -641,6 +641,18 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   in sync by hand — same convention as the FWHM/elongation filtering logic both modules already
   independently reimplement) so its `fwhm_median`/`elongation_median`/`star_count` stay consistent
   with what this module will end up extracting from the same frame.
+
+  Each masked streak is then **re-emitted as one detection of its own**, at its own centroid,
+  appended to `sources_all` (never to `sources` — a trail is not a star and must not reach the
+  photometric reference set) and bypassing that list's elongation ceiling, which exists to reject
+  a near-zero minor axis's degenerate `a/b` rather than a feature deliberately selected for being
+  elongated. The mask's two thresholds cannot geometrically tell a satellite or aircraft trail
+  from a genuine fast NEO trailing within a single exposure — both are a long, thin streak — so
+  masking alone erased a real moving object's pixels before `sep.extract()` ever ran, with no
+  second chance, since the frame is never re-analysed from other data (audit 2026-08-18, finding
+  H16). One detection per streak restores the evidence without restoring the fragmentation: enough
+  for the MPC cone search to identify a known object there, and for the `SPACE_DEBRIS` branch to
+  classify an unknown one.
 - Calls `astap` binary as a subprocess via `xvfb-run` (astap needs a display even headless) for plate solving,
   invoked without `-update` — astap therefore never writes into the FITS file itself, only into a `.wcs` side
   file (plus `.ini`/`.log`) next to it, or under an optional `output_base` (`-o`) path

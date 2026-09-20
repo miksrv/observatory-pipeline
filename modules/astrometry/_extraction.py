@@ -8,6 +8,7 @@ Internal helper only — not part of this package's public surface.
 from __future__ import annotations
 
 import logging
+import math
 
 import astropy.io.fits as fits
 import numpy as np
@@ -58,7 +59,9 @@ def _extract_sources(
     # arms, run BEFORE the real point-source extraction below so they
     # can never fragment into false stars. See config.STREAK_* and
     # _build_streak_mask()'s docstring.
-    streak_mask = _build_streak_mask(data_sub, bkg.globalrms, pixel_scale_arcsec)
+    streak_result = _build_streak_mask(data_sub, bkg.globalrms, pixel_scale_arcsec)
+    streak_mask = streak_result[0] if streak_result is not None else None
+    streak_features = streak_result[1] if streak_result is not None else []
     if streak_mask is not None:
         data_sub = np.array(data_sub, copy=True)
         data_sub[streak_mask] = 0.0
@@ -351,4 +354,85 @@ def _extract_sources(
         sources_all = []
         logger.info("Astrometry complete: 0 sources extracted  file=%s", fits_filename)
 
+    # ----------------------------------------------------------
+    # Put the masked streaks back, as detections of their own.
+    #
+    # The mask above exists to stop a trail from fragmenting into several
+    # small round "stars" — a real problem, and it stays solved. But the two
+    # thresholds behind it (elongation and a 30" length) cannot geometrically
+    # tell a satellite or aircraft trail from a genuine fast NEO trailing
+    # within a single exposure; both look exactly like that. So the pixels of
+    # a real moving object were erased before sep.extract() ever ran, and
+    # there is no second chance — the frame is not re-analysed from other
+    # data (audit 2026-08-18, finding H16).
+    #
+    # One detection per streak, at the streak's own centroid, restores the
+    # evidence without restoring the fragmentation: enough for the MPC cone
+    # search to identify a known object there, and for the SPACE_DEBRIS
+    # branch to classify an unknown one. They join sources_all only — a trail
+    # is not a star and must never reach the photometric reference set — and
+    # bypass its elongation ceiling, which exists to reject the degenerate
+    # a/b of a near-zero minor axis, not a feature deliberately selected for
+    # being elongated.
+    if streak_features:
+        sources_all.extend(
+            _streak_sources(streak_features, wcs, pixel_scale_arcsec, naxis1, naxis2, bkg)
+        )
+        logger.info(
+            "Streak masking: re-emitted %d masked streak(s) as detection(s) "
+            "so a genuine fast mover isn't erased  file=%s",
+            len(streak_features), fits_filename,
+        )
+
     return sources, sources_all
+
+
+def _streak_sources(
+    features: list[dict],
+    wcs,
+    pixel_scale_arcsec: float,
+    naxis1: int,
+    naxis2: int,
+    bkg,
+) -> list[dict[str, float]]:
+    """
+    Turn the coarse pre-pass's masked streaks into ordinary source dicts, one
+    per streak, positioned at its own centroid.
+
+    Shaped exactly like any other entry in `sources_all` so it flows through
+    catalog matching, photometry and classification unchanged. `fwhm` uses the
+    same Gaussian approximation over sep's second-moment axes as every other
+    detection here, which for a streak is dominated by its length — that is
+    the honest description of the feature, and nothing downstream treats
+    `fwhm` as a stellar PSF for a source this elongated.
+    """
+    out: list[dict[str, float]] = []
+    margin_x = config.EDGE_MARGIN_FRAC * naxis1
+    margin_y = config.EDGE_MARGIN_FRAC * naxis2
+
+    for feature in features:
+        try:
+            coord = wcs.all_pix2world([[feature["x"], feature["y"]]], 0)[0]
+            ra, dec = float(coord[0]), float(coord[1])
+            if not (math.isfinite(ra) and math.isfinite(dec)):
+                continue
+        except Exception:
+            continue
+
+        fwhm_px = 2.0 * math.sqrt(
+            2.0 * math.log(2.0) * (feature["a"] ** 2 + feature["b"] ** 2) / 2.0
+        )
+        out.append({
+            "ra":         ra,
+            "dec":        dec,
+            "flux":       feature["flux"],
+            "fwhm":       fwhm_px * pixel_scale_arcsec,
+            "elongation": feature["elongation"],
+            "saturated":  bool(feature["peak"] + bkg.globalback >= config.SATURATION_ADU),
+            "near_edge":  bool(
+                feature["x"] < margin_x or feature["x"] > naxis1 - margin_x
+                or feature["y"] < margin_y or feature["y"] > naxis2 - margin_y
+            ),
+        })
+
+    return out
