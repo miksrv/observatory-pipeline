@@ -387,6 +387,40 @@ class TestMeasureAtPixel:
         result = fp._measure_at_pixel(data_sub, image, 200.0, 200.0, ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0)
         assert result is None
 
+    def test_a_saturated_pixel_outside_the_aperture_is_tolerated(self):
+        """
+        Audit 2026-08-18, finding M7: the check scanned the square bounding
+        the ANNULUS, nearly twice the area of the aperture circle and with
+        most of the surplus in the corners — the part of the neighbourhood
+        that contributes nothing to the flux. A bright star there discarded a
+        perfectly good recovery over a pixel the measurement never touches.
+        """
+        image = _make_image()
+        # A saturated pixel 10 px away: inside the annulus' bounding square
+        # for these radii, well outside the 6 px photometric aperture.
+        image[100, 110] = 65000.0
+        data_sub = image - 1000.0
+
+        result = fp._measure_at_pixel(
+            data_sub, image, 100.0, 100.0,
+            ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0,
+        )
+
+        assert result is not None
+
+    def test_a_saturated_pixel_inside_the_aperture_still_rejects(self):
+        """The core of the measurement is what must not be clipped."""
+        image = _make_image()
+        image[100, 103] = 65000.0
+        data_sub = image - 1000.0
+
+        result = fp._measure_at_pixel(
+            data_sub, image, 100.0, 100.0,
+            ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0,
+        )
+
+        assert result is None
+
     def test_gain_divides_the_poisson_term(self):
         """
         flux_err = sqrt(|net_flux| / gain + ap_area * sky_sigma**2) — the

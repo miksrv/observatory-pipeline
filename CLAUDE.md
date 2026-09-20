@@ -1189,7 +1189,12 @@ hurt most, since an overstated `flux_err` understates the significance and drops
 recoveries against `FORCED_PHOTOMETRY_MIN_SNR`) — duplicated by hand rather than imported, the same
 convention `modules/qc.py`/`modules/subtraction.py` already use for `astrometry.py`'s streak-mask
 helper. A position is rejected outright (not reported at all) when its aperture would fall outside
-the frame, or any pixel under it is at/above `SATURATION_ADU` — a forced measurement on a saturated
+the frame, or any pixel **inside the circular photometric aperture** is at/above `SATURATION_ADU`
+(`_aperture_max()`; the check used to scan the square bounding the whole annulus, nearly twice
+that area with most of the surplus in corners that contribute no flux, so a bright star there
+discarded a perfectly good recovery — audit 2026-08-18, finding M7. The annulus itself is left
+out of the check too: a saturated pixel in the sky ring biases the background rather than
+clipping the source's core, and the annulus sigma clip already handles that) — a forced measurement on a saturated
 core is exactly as physically meaningless as it is for a blindly-detected source (see
 `modules/photometry.py`'s section above). **A genuine non-detection (significance below
 `FORCED_PHOTOMETRY_MIN_SNR`) is silently dropped, never reported as an "upper limit" magnitude** —

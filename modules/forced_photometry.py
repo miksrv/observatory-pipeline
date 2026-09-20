@@ -172,6 +172,32 @@ def _sky_sigma_clip() -> SigmaClip | None:
     return SigmaClip(sigma=float(sigma), maxiters=5)
 
 
+def _aperture_max(data: np.ndarray, x_px: float, y_px: float, radius: float) -> float:
+    """
+    The largest raw value inside the circular photometric aperture at
+    (x_px, y_px) — the pixels that actually contribute flux.
+
+    Falls back to the bounding square's maximum if the circular mask can't be
+    built, which is the previous, stricter behaviour: erring toward rejecting
+    a measurement is the safe direction here.
+    """
+    r = int(math.ceil(radius))
+    x0, x1 = int(x_px) - r, int(x_px) + r + 1
+    y0, y1 = int(y_px) - r, int(y_px) + r + 1
+    patch = data[y0:y1, x0:x1]
+    if patch.size == 0:
+        return float("inf")
+
+    try:
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        inside = (xx - x_px) ** 2 + (yy - y_px) ** 2 <= radius ** 2
+        if not inside.any():
+            return float(np.max(patch))
+        return float(np.max(patch[inside]))
+    except Exception:
+        return float(np.max(patch))
+
+
 def _measure_at_pixel(
     data_sub: np.ndarray,
     raw_data: np.ndarray,
@@ -203,7 +229,16 @@ def _measure_at_pixel(
     if x0 < 0 or y0 < 0 or x1 > naxis1 or y1 > naxis2:
         return None  # too close to the edge for the full annulus to fit
 
-    if float(np.max(raw_data[y0:y1, x0:x1])) >= config.SATURATION_ADU:
+    # Saturation is checked inside the PHOTOMETRIC APERTURE, not across the
+    # square that bounds the annulus. The square is nearly twice the area of
+    # the circle it contains, and most of that surplus sits in the corners —
+    # the part of the neighbourhood that contributes nothing to the flux. A
+    # bright star there discarded a perfectly good recovery for a pixel the
+    # measurement never touches (audit 2026-08-18, finding M7). The annulus
+    # is deliberately not included either: a saturated pixel in the sky ring
+    # biases the background estimate but does not clip the source's own core,
+    # and the sigma clip on the annulus stats (H7) already handles it.
+    if _aperture_max(raw_data, x_px, y_px, ap_radius) >= config.SATURATION_ADU:
         return None
 
     position = (x_px, y_px)
