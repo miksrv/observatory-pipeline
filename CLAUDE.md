@@ -907,6 +907,19 @@ external catalogs using
 `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC`
 (`MOVING_CONE_ARCSEC` for the MPC step, since moving objects shift between frames).
 
+Every Gaia DR3 star is **proper-motion propagated** from its own `ref_epoch` (J2016.0 for DR3)
+to the frame's `obs_time` before it is used for anything — once, in `match()`, so both the
+WCS-offset accumulator and `_match_gaia()` see the corrected positions (`_gaia`'s
+`_propagate_to_epoch()`). A high-proper-motion star has drifted several arcsec since DR3,
+comparable to `MATCH_CONE_ARCSEC` itself; uncorrected it simply fails to match, ends up
+`catalog_name=None`, satisfies the anomaly detector's "shifted" condition, and is reported
+`MOVING_UNKNOWN`, while also voting for a wrong offset on behalf of every other source in the
+frame (audit 2026-08-18, finding H1). The star dicts are copied rather than mutated — the query
+returns the *cached* list, shared with frames of the same region at other epochs. A star with no
+astrometric proper-motion solution, an unparseable `obs_time`, or a position at the pole keeps
+its catalog position. `get_gaia_stars()` deliberately returns un-propagated positions, since
+`modules/forced_photometry.py` applies the same correction itself.
+
 Before matching, computes a **WCS offset correction**: an all-pairs vote-accumulator matches
 the source list against Gaia DR3 to estimate a small systematic RA/Dec offset, then applies
 that offset **in-place** to every source's `ra`/`dec` before the remaining catalogs are queried.

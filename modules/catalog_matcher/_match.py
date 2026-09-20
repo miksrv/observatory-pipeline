@@ -107,6 +107,14 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     gaia_stars: list[dict] = []
     try:
         gaia_stars = _gaia._query_gaia(ra_center, dec_center, fov_deg)
+        # Propagate every star from Gaia's own J2016.0 epoch to this frame's
+        # epoch before it is used for anything. Both consumers below — the
+        # WCS-offset vote accumulator and _match_gaia() itself — compare
+        # catalog positions against measured ones within a few arcsec, and a
+        # high-proper-motion star has drifted that far since DR3 (audit
+        # 2026-08-18, finding H1). Returns the query result unchanged when
+        # obs_time is missing or the stars carry no proper motion.
+        gaia_stars = _gaia._propagate_to_epoch(gaia_stars, obs_time)
         logger.info(
             "Gaia query: ra=%.4f dec=%.4f fov=%.4f° radius=%.4f° → %d catalog stars  fits_filename=%s",
             ra_center, dec_center, fov_deg, fov_deg * math.sqrt(2) / 2.0, len(gaia_stars), fits_filename,

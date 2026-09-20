@@ -954,3 +954,125 @@ class TestPublicCatalogAccessors:
 
         mock_query.assert_called_once_with(_RA, _DEC, _FRAME_META["obs_time"], 1.0)
         assert result == [{"designation": "2019 XY3"}]
+
+
+# ===========================================================================
+# TestGaiaProperMotionPropagation — audit 2026-08-18, finding H1
+#
+# Gaia DR3's positions are at J2016.0. A high-proper-motion star has drifted
+# several arcsec by now — comparable to MATCH_CONE_ARCSEC itself — so matching
+# and the WCS-offset accumulator both have to see the star where it actually
+# is at the observation epoch, not where it was a decade ago.
+# ===========================================================================
+
+
+class TestGaiaProperMotionPropagation:
+    def test_high_proper_motion_star_is_moved_to_the_observation_epoch(self):
+        """500 mas/yr over ~8 years is 4" — enough to miss a 5" cone."""
+        star = {
+            "ra":              _RA,
+            "dec":             _DEC,
+            "source_id":       "1",
+            "phot_g_mean_mag": 14.5,
+            "pmra":            500.0,
+            "pmdec":           -500.0,
+            "ref_epoch":       2016.0,
+        }
+        out = cm._propagate_to_epoch([star], "2024-01-01T00:00:00")
+
+        moved = SkyCoord(ra=out[0]["ra"] * u.deg, dec=out[0]["dec"] * u.deg)
+        original = SkyCoord(ra=_RA * u.deg, dec=_DEC * u.deg)
+        sep = moved.separation(original).to(u.arcsec).value
+        assert sep == pytest.approx(math.hypot(4.0, 4.0), abs=0.2)
+
+    def test_pmra_is_divided_back_out_by_cos_dec(self):
+        """
+        pmra is Gaia's mu_alpha* (already × cos(dec)); the RA coordinate
+        offset is therefore larger than pmra × dt by 1/cos(dec).
+        """
+        dec = 60.0  # cos(dec) = 0.5 — a factor-of-two effect, easy to see
+        star = {
+            "ra": _RA, "dec": dec, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": 3600.0, "pmdec": 0.0, "ref_epoch": 2016.0,
+        }
+        out = cm._propagate_to_epoch([star], "2017-01-01T00:00:00")
+
+        d_ra_arcsec = (out[0]["ra"] - _RA) * 3600.0
+        assert d_ra_arcsec == pytest.approx(3.6 / math.cos(math.radians(dec)), rel=0.02)
+        assert out[0]["dec"] == pytest.approx(dec)
+
+    def test_star_without_a_proper_motion_solution_is_left_alone(self):
+        star = {
+            "ra": _RA, "dec": _DEC, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": None, "pmdec": None, "ref_epoch": 2016.0,
+        }
+        out = cm._propagate_to_epoch([star], "2024-01-01T00:00:00")
+
+        assert out[0]["ra"] == _RA
+        assert out[0]["dec"] == _DEC
+
+    def test_unparseable_obs_time_degrades_to_the_catalog_position(self):
+        star = {
+            "ra": _RA, "dec": _DEC, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": 500.0, "pmdec": 500.0, "ref_epoch": 2016.0,
+        }
+        for bad in ("", None, "not-a-date"):
+            out = cm._propagate_to_epoch([star], bad)
+            assert out[0]["ra"] == _RA
+            assert out[0]["dec"] == _DEC
+
+    def test_cached_catalog_list_is_never_mutated_in_place(self):
+        """
+        _query_gaia() hands back the cached list itself, and the same sky
+        region is re-used by frames from other epochs within the cache TTL —
+        propagating in place would write one frame's epoch into every later
+        frame's catalog.
+        """
+        star = {
+            "ra": _RA, "dec": _DEC, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": 500.0, "pmdec": 500.0, "ref_epoch": 2016.0,
+        }
+        cached = [star]
+        cm._propagate_to_epoch(cached, "2024-01-01T00:00:00")
+
+        assert cached[0]["ra"] == _RA
+        assert cached[0]["dec"] == _DEC
+
+    async def test_match_finds_a_star_that_has_drifted_out_of_the_cone(self):
+        """
+        End-to-end: a star whose J2016.0 position is 8" from the detection
+        (beyond MATCH_CONE_ARCSEC) but whose propagated position lands on it
+        must match Gaia rather than staying uncatalogued.
+        """
+        detected_ra, detected_dec = _RA, _DEC
+        # Catalog position 8" west in RA; +1000 mas/yr in RA over 8 years
+        # carries it back onto the detection.
+        cat_ra = detected_ra - 8.0 / 3600.0 / math.cos(math.radians(_DEC))
+        pmra = 1000.0
+
+        table = Table({
+            "ra":              [cat_ra],
+            "dec":             [detected_dec],
+            "source_id":       [777],
+            "phot_g_mean_mag": [14.5],
+            "pmra":            [pmra],
+            "pmdec":           [0.0],
+            "ref_epoch":       [2016.0],
+        })
+        mock_gaia = MagicMock()
+        mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+
+        sources = [_make_source(detected_ra, detected_dec)]
+        frame_meta = dict(_FRAME_META, obs_time="2024-01-01T00:00:00")
+
+        with (
+            patch("modules.catalog_matcher._gaia.Gaia", mock_gaia),
+            patch("modules.catalog_matcher._simbad._query_simbad", return_value=[]),
+            patch("modules.catalog_matcher._2mass._query_2mass", return_value=[]),
+            patch("modules.catalog_matcher._panstarrs._query_panstarrs", return_value=[]),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
+        ):
+            result = await cm.match(sources, frame_meta)
+
+        assert result[0]["catalog_name"] == "Gaia DR3"
+        assert result[0]["catalog_id"] == "777"
