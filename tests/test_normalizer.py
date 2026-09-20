@@ -332,3 +332,44 @@ class TestNormalizeHeaders:
         assert result["dec"] == 45.678
         assert result["observation"]["exptime"] == 120.0
         assert result["observation"]["airmass"] == 1.2
+
+
+class TestExtractObjectFromFilename:
+    """
+    Fallback used by pipeline.py when the OBJECT header is missing or empty.
+    Audit 2026-08-18, finding H4: the loop terminated at the first pure-digit
+    segment, taking it for an exposure time — but a numbered minor planet or
+    star carries its number first, so those frames collected nothing and
+    archived under "_UNKNOWN" instead of their real object directory,
+    breaking history continuity for modules/subtraction.py.
+    """
+
+    @pytest.mark.parametrize("filename,expected", [
+        ("UGC6930_Light_Luminance_300_secs_2021-01-01.fits", "UGC6930"),
+        ("M51_L_L_60_2024-03-15T22-01-34.fits",              "M51"),
+        ("Andromeda_Galaxy_Light_L_300_2024-03-15.fits",     "Andromeda_Galaxy"),
+        ("NGC1234_Dark_300_2024-03-15.fits",                 "NGC1234"),
+        ("M51_300_2024-03-15T22-01-34.fits",                 "M51"),
+    ])
+    def test_ordinary_names_are_unchanged(self, filename, expected):
+        assert normalizer.extract_object_from_filename(filename) == expected
+
+    @pytest.mark.parametrize("filename,expected", [
+        ("4_Vesta_Light_L_120_2024-03-15T22-01-34.fits", "4_Vesta"),
+        ("433_Eros_Light_L_300_2024-03-15.fits",         "433_Eros"),
+        ("61_Cygni_Light_V_60_2024-03-15.fits",          "61_Cygni"),
+    ])
+    def test_numbered_designations_keep_their_number(self, filename, expected):
+        assert normalizer.extract_object_from_filename(filename) == expected
+
+    def test_a_leading_exposure_time_still_yields_unknown(self):
+        """
+        The guardrail: a timestamp segment contains letters ("...T22-01-34"),
+        so the designation test checks that the next segment STARTS with one.
+        A filename that really does lead with an exposure time must keep
+        falling back to "_UNKNOWN" rather than swallowing the timestamp.
+        """
+        assert normalizer.extract_object_from_filename("300_2024-03-15T22-01-34.fits") == "_UNKNOWN"
+
+    def test_no_usable_segment_yields_unknown(self):
+        assert normalizer.extract_object_from_filename("Light_L_300_2024-03-15.fits") == "_UNKNOWN"

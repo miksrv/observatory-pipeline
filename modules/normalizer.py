@@ -106,6 +106,16 @@ def extract_object_from_filename(filename: str) -> str:
     Splits on underscores and collects parts until a frame-type keyword or
     a pure-digit segment (exposure time) is encountered.
 
+    The pure-digit rule deliberately does not apply to the FIRST segment: a
+    numbered minor planet ("4_Vesta", "433_Eros") or star ("61_Cygni") starts
+    with its own number, and treating that as an exposure time collected
+    nothing at all and archived the frame under "_UNKNOWN" instead of its real
+    object directory — which in turn breaks history continuity for
+    modules/subtraction.py, since that object never accumulates
+    SUBTRACTION_MIN_FRAMES in one place (audit 2026-08-18, finding H4). An
+    exposure time is never the leading token of a filename in any convention
+    this pipeline has seen, so nothing is lost by exempting it.
+
     Returns:
         Normalized object name, or "_UNKNOWN" if nothing usable is found.
 
@@ -114,6 +124,8 @@ def extract_object_from_filename(filename: str) -> str:
         "M51_L_L_60_2024-...fits" → "M51"
         "Andromeda_Galaxy_Light_L_300_2024-...fits" → "Andromeda_Galaxy"
         "NGC1234_Dark_300_2024-...fits" → "NGC1234"
+        "4_Vesta_Light_L_120_2024-...fits" → "4_Vesta"
+        "61_Cygni_Light_V_60_2024-...fits" → "61_Cygni"
     """
     _FRAME_TYPE_KEYWORDS: frozenset[str] = frozenset({
         "light", "dark", "flat", "bias",
@@ -126,11 +138,25 @@ def extract_object_from_filename(filename: str) -> str:
     parts = stem.split("_")
 
     collected: list[str] = []
-    for part in parts:
+    for index, part in enumerate(parts):
         if part.lower() in _FRAME_TYPE_KEYWORDS:
             break
         if re.fullmatch(r"\d+", part):
-            break
+            # A number in the leading position, immediately followed by a
+            # segment that STARTS with a letter, is a numbered object's own
+            # designation ("4_Vesta", "433_Eros", "61_Cygni") rather than an
+            # exposure time — that is the whole shape of such a name. The
+            # "starts with" test matters: a timestamp segment
+            # ("2024-03-15T22-01-34") contains letters too, so a filename that
+            # really does lead with an exposure time still terminates
+            # collection here and falls back to "_UNKNOWN" exactly as before.
+            is_designation = (
+                index == 0
+                and len(parts) > 1
+                and re.match(r"[A-Za-z]", parts[1]) is not None
+            )
+            if not is_designation:
+                break
         collected.append(part)
 
     if not collected:
