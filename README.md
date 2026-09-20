@@ -246,7 +246,7 @@ Core science logic. A package split by concern (`types.py`, `_classify.py`, `_pr
 |---|---|---|
 | `FIRST_OBSERVATION` | Sky area never observed before | No |
 | `KNOWN_CATALOG_NEW` | Not in history, but found in a catalog (Simbad/Gaia/2MASS/Pan-STARRS) — was simply below the detection threshold before | No |
-| `VARIABLE_STAR` | Has history, Δmag > `DELTA_MAG_ALERT`, Simbad classifies it as a known variable | No (logged) |
+| `VARIABLE_STAR` | Has history and Δmag > `DELTA_MAG_ALERT`, with either Simbad classifying it as a known variable, or the change exceeding `VARIABILITY_SIGMA` × the source's own same-filter historical scatter over at least `VARIABILITY_MIN_EPOCHS` epochs | No (logged) |
 | `BINARY_STAR` | Has history, Δmag > `DELTA_MAG_ALERT`, Simbad classifies it as a known binary | No (logged) |
 | `ASTEROID` | Shifted source, matched in MPC/SkyBot as an asteroid | No (logged + ephemeris) |
 | `COMET` | Shifted source, matched in MPC/SkyBot as a comet | No (logged + ephemeris) |
@@ -438,6 +438,8 @@ SATURATION_MASK_RADIUS_ARCSEC=10.0
 MATCH_CONE_ARCSEC=5.0
 MOVING_CONE_ARCSEC=120.0       # code default; see note below
 DELTA_MAG_ALERT=0.5
+VARIABILITY_MIN_EPOCHS=3
+VARIABILITY_SIGMA=3.0
 
 # ── Image subtraction (modules/subtraction.py) ────────────────────────────────
 SUBTRACTION_MIN_FRAMES=3
@@ -514,6 +516,8 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `MATCH_CONE_ARCSEC` | `5.0` | No | Cone search radius in arcseconds for point-source catalog matching (Simbad, Gaia, 2MASS, Pan-STARRS). |
 | `MOVING_CONE_ARCSEC` | `120.0` | No | Wider cone radius in arcseconds for moving-object (MPC) detection. Widened from an earlier default of `30.0` because fast movers like Vesta travel ~60"/hr. `.env.example` is up to date with this value — see the note above. |
 | `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
+| `VARIABILITY_MIN_EPOCHS` | `3` | No | Minimum number of same-filter historical detections a source needs before `modules/anomaly_detector/` will judge a magnitude change against its own light curve. Below this, a change that no catalog explains is not reported. |
+| `VARIABILITY_SIGMA` | `3.0` | No | How many times its own historical scatter a source's magnitude must depart from its same-filter baseline to be reported as a `VARIABLE_STAR` candidate without any catalog classifying it as one. Keeps intrinsically noisy sources quiet; `DELTA_MAG_ALERT` still applies as an absolute floor. |
 | **Edge-of-Frame Geometry** |
 | `EDGE_MARGIN_FRAC` | `0.1` | No | Fraction of NAXIS1/NAXIS2 treated as "near the edge" — coma and other off-axis aberrations stretch a star's PSF near the edges/corners of a wide-field frame, inflating its measured elongation. `modules/astrometry/_extraction.py`/`modules/subtraction.py` flag such sources `near_edge`; tune to your own optics. |
 | `SPACE_DEBRIS_ELONGATION_MIN` | `3.0` | No | Elongation threshold for the "single-exposure trail" `SPACE_DEBRIS` shortcut in `modules/anomaly_detector/`, for a source not flagged `near_edge`. |

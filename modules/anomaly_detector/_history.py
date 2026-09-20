@@ -74,3 +74,31 @@ def _same_filter_history(history: list[dict], filter_name: str | None) -> list[d
     if filter_name is None:
         return []
     return [src for src in history if src.get("filter") == filter_name]
+
+
+def _history_mag_scatter(history: list[dict]) -> float | None:
+    """
+    Robust scatter (1-sigma equivalent) of a source's OWN historical
+    magnitudes — the baseline against which _classify.py decides whether a
+    magnitude change is remarkable *for this particular source*, without
+    consulting any catalog's opinion of what the source is.
+
+    Uses the median absolute deviation scaled by 1.4826 (the MAD→sigma
+    factor for a normal distribution) rather than a plain standard
+    deviation: a light curve's own outlier — one bad epoch through cloud, one
+    cosmic ray in the aperture — would inflate an RMS enough to mask the very
+    change this number exists to calibrate, while the MAD barely moves.
+
+    Returns None when fewer than two magnitudes are available (a single
+    epoch has no scatter to speak of). May legitimately return 0.0 for a
+    source whose historical magnitudes are identical — callers must treat
+    that as "no measurable scatter" and fall back to an absolute threshold
+    (config.DELTA_MAG_ALERT) rather than dividing by it.
+    """
+    mags = [m for src in history if (m := _extract_mag(src)) is not None]
+    if len(mags) < 2:
+        return None
+
+    median = statistics.median(mags)
+    mad = statistics.median([abs(m - median) for m in mags])
+    return 1.4826 * mad

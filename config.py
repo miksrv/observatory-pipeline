@@ -199,6 +199,37 @@ MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
 MOVING_CONE_ARCSEC: float = float(_get("MOVING_CONE_ARCSEC", "120.0"))
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
 
+# --- Statistical variability detection (modules/anomaly_detector/) ---------
+# The Δmag branches of the classifier used to fire ONLY for a source whose
+# Simbad OTYPE already said "variable"/"binary"/"galaxy" — but Simbad is the
+# only catalog that writes a real OTYPE at all (_gaia.py/_2mass.py/
+# _panstarrs.py all hardcode the generic "STAR"), so a star known only
+# through Gaia DR3 — the overwhelming majority of any field — could change
+# brightness by several magnitudes and be silently dropped. The variability
+# detector could therefore only ever confirm variability the catalog already
+# knew about, never discover any (audit 2026-08-18, finding C1).
+#
+# These two settings drive the catalog-independent fallback: a source whose
+# OWN same-filter history is long enough and tight enough to establish a
+# quiescent baseline, and whose current magnitude departs from that baseline
+# by more than VARIABILITY_SIGMA times its own historical scatter, is
+# reported as a VARIABLE_STAR candidate regardless of what (if anything) the
+# catalogs call it.
+#
+# Minimum number of same-filter historical detections required before that
+# scatter is considered meaningful at all. Below this the source simply falls
+# through to "no anomaly", exactly as before — three epochs is the smallest
+# sample from which a median plus a deviation from it carries any weight.
+VARIABILITY_MIN_EPOCHS: int = int(_get("VARIABILITY_MIN_EPOCHS", "3"))
+# How many times its own historical scatter the current magnitude must depart
+# from the historical median. This is what keeps an intrinsically noisy source
+# (poor SNR, blended neighbour, variable seeing) from alerting every night:
+# such a source has a large scatter, so a large Δmag is unremarkable for it.
+# DELTA_MAG_ALERT still applies on top as an absolute floor, so a source with
+# an implausibly tight history can't alert on a photometrically meaningless
+# change.
+VARIABILITY_SIGMA: float = float(_get("VARIABILITY_SIGMA", "3.0"))
+
 # Faintest predicted visual magnitude (V) for an MPC/SkyBot object to be
 # eligible for source matching. Objects fainter than this are almost certainly
 # below the pipeline's detection threshold and would only ever "match" to an
@@ -480,6 +511,8 @@ _OVERRIDABLE: dict[str, type] = {
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "DELTA_MAG_ALERT": float,
+    "VARIABILITY_MIN_EPOCHS": int,
+    "VARIABILITY_SIGMA": float,
     "MPC_MAG_LIMIT": float,
     # Edge geometry
     "EDGE_MARGIN_FRAC": float,

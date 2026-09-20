@@ -125,8 +125,10 @@ flowchart TD
     Bright -- no --> Binary{"Simbad object_type\nindicates a\ndouble/eclipsing binary?"}
     Binary -- yes --> BinaryStar["BINARY_STAR"]
     Binary -- no --> Variable{"Simbad object_type\nindicates a\nvariable star?"}
-    Variable -- yes --> VarStar["VARIABLE_STAR"]
-    Variable -- no --> NoAnomaly
+    Variable -- yes --> VarStar["VARIABLE_STAR\n(catalog-classified)"]
+    Variable -- no --> LightCurve{"own same-filter light curve:\n>= VARIABILITY_MIN_EPOCHS epochs\nAND abs(delta_mag) >\nVARIABILITY_SIGMA x scatter?"}
+    LightCurve -- yes --> VarStarLC["VARIABLE_STAR\n(light-curve based —\nno catalog label needed)"]
+    LightCurve -- no --> NoAnomaly
 
     Asteroid --> Collect["build anomaly dict\n(source_id, ra, dec, mag,\ndelta_mag, notes, ...)"]
     SpaceDebris --> Collect
@@ -137,6 +139,7 @@ flowchart TD
     SNbright --> Collect
     BinaryStar --> Collect
     VarStar --> Collect
+    VarStarLC --> Collect
 
     Collect --> Ephem["_resolve_ephemerides()\nfor everything flagged\n_needs_ephemeris=True:\nparallel ephemeris.query()\nvia JPL Horizons"]
     Ephem --> Return(["return list[dict]\nanomalies (excluding FIRST_OBSERVATION\nand KNOWN_CATALOG_NEW)"])
@@ -243,7 +246,23 @@ one condition matches, the function returns and no further checks run:
        (`**`, `EB`, `SB`) → `BINARY_STAR`;
      - otherwise, if Simbad classifies the object as a variable
        (`V*`, `RR`, `Cep`, `BY`, `RS`, `Ell`, `bL`) → `VARIABLE_STAR`;
+     - otherwise, if the source's **own** same-filter light curve establishes a baseline
+       — at least `VARIABILITY_MIN_EPOCHS` (default 3) epochs — and `abs(delta_mag)`
+       exceeds `VARIABILITY_SIGMA` (default 3.0) times that baseline's own robust scatter
+       (`_history_mag_scatter()`, a MAD-derived 1σ equivalent) → `VARIABLE_STAR`, with
+       notes stating the classification came from the light curve rather than a catalog;
      - otherwise — no anomaly.
+
+   The last of those exists because only `_simbad.py` ever writes a real OTYPE:
+   `_gaia.py`, `_2mass.py` and `_panstarrs.py` all hardcode the generic `"STAR"`, which no
+   OTYPE classifier matches. Without a catalog-independent path, a star known solely
+   through Gaia DR3 — the overwhelming majority of any field — could change brightness by
+   several magnitudes and still be dropped silently, so the Δmag detector could only ever
+   re-confirm variability Simbad already knew about and could never discover any (audit
+   2026-08-18, finding C1). Screening on the source's own scatter rather than on a flat
+   threshold is what keeps an intrinsically noisy source (low SNR, blended neighbour,
+   variable seeing) from alerting every night: a large `delta_mag` is unremarkable against
+   a large scatter. `DELTA_MAG_ALERT` still applies on top as an absolute floor.
 
 Table of Simbad OTYPE substrings used by the classifiers:
 
@@ -261,7 +280,7 @@ Table of Simbad OTYPE substrings used by the classifiers:
 |---|---|---|
 | `FIRST_OBSERVATION` | Sky area never observed before | No (logged only, not returned) |
 | `KNOWN_CATALOG_NEW` | Not in history, but found in a catalog | No (logged only, not returned) |
-| `VARIABLE_STAR` | Has history, Δmag > `DELTA_MAG_ALERT`, Simbad variable | No (logged) |
+| `VARIABLE_STAR` | Has history, Δmag > `DELTA_MAG_ALERT`, and either Simbad classifies it as a variable **or** the change exceeds `VARIABILITY_SIGMA` × the source's own same-filter historical scatter over ≥ `VARIABILITY_MIN_EPOCHS` epochs | No (logged) |
 | `BINARY_STAR` | Has history, Δmag > `DELTA_MAG_ALERT`, Simbad binary | No (logged) |
 | `ASTEROID` | Matched in MPC/SkyBot, type "asteroid" | No (logged + ephemeris) |
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |

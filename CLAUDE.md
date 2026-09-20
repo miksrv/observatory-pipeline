@@ -907,7 +907,7 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 
 1. **Query history via API** — `POST /sources/near/batch` with every source position in a single call, returning historical sources near each (RA, Dec) from previous frames. Queried for **every** source regardless of catalog-match status — this is what makes the Δmag-based classifications below (`VARIABLE_STAR`, `BINARY_STAR`, and the "already-known host brightened" path of `SUPERNOVA_CANDIDATE`) reachable at all for a catalog-matched source.
 2. **Coverage check** — `POST /frames/covering/batch` — did we ever observe each sky position before? (batched the same way)
-3. **Classify** each source. Real priority order in code: MPC/SkyBot match first → **if unmatched (`catalog_name is None`) and `saturated=True`, suppressed outright** (see below) → unmatched, no detection within `MATCH_CONE_ARCSEC` of this exact position, elongation above the trail threshold (a single-exposure trail — `SPACE_DEBRIS_ELONGATION_MIN`, or the higher `SPACE_DEBRIS_EDGE_ELONGATION_MIN` when the source is flagged `near_edge` — see below) → `SPACE_DEBRIS` immediately, no position-shift evidence required (see below) → position-shifted-but-unmatched, elongation at or below that same threshold (→ `MOVING_UNKNOWN`) → no historical coverage (→ `FIRST_OBSERVATION`, *unless* the source came from image subtraction — see below) → no prior detection at this exact position but near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → not in history or any catalog (→ `UNKNOWN`) → in catalog but not history (→ `KNOWN_CATALOG_NEW`) → **has** prior history and brightened beyond `DELTA_MAG_ALERT`: near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → known binary (→ `BINARY_STAR`) → known variable (→ `VARIABLE_STAR`):
+3. **Classify** each source. Real priority order in code: MPC/SkyBot match first → **if unmatched (`catalog_name is None`) and `saturated=True`, suppressed outright** (see below) → unmatched, no detection within `MATCH_CONE_ARCSEC` of this exact position, elongation above the trail threshold (a single-exposure trail — `SPACE_DEBRIS_ELONGATION_MIN`, or the higher `SPACE_DEBRIS_EDGE_ELONGATION_MIN` when the source is flagged `near_edge` — see below) → `SPACE_DEBRIS` immediately, no position-shift evidence required (see below) → position-shifted-but-unmatched, elongation at or below that same threshold (→ `MOVING_UNKNOWN`) → no historical coverage (→ `FIRST_OBSERVATION`, *unless* the source came from image subtraction — see below) → no prior detection at this exact position but near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → not in history or any catalog (→ `UNKNOWN`) → in catalog but not history (→ `KNOWN_CATALOG_NEW`) → **has** prior history and brightened beyond `DELTA_MAG_ALERT`: near a Simbad galaxy (→ `SUPERNOVA_CANDIDATE`) → known binary (→ `BINARY_STAR`) → known variable (→ `VARIABLE_STAR`) → nothing in any catalog explains it, but the source's own same-filter light curve does (→ `VARIABLE_STAR`, light-curve based):
 
 | Situation | Classification |
 |---|---|
@@ -924,6 +924,7 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | Source **has** prior history, brightened by more than `DELTA_MAG_ALERT`, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (already-known host got brighter) |
 | Source in history, Δmag > DELTA_MAG_ALERT, known binary (Simbad) | `BINARY_STAR` |
 | Source in history, Δmag > DELTA_MAG_ALERT, known variable (Simbad) | `VARIABLE_STAR` |
+| Source in history, Δmag > DELTA_MAG_ALERT, no catalog classification that explains it, but the change exceeds `VARIABILITY_SIGMA` × the source's own same-filter historical scatter over ≥ `VARIABILITY_MIN_EPOCHS` epochs | `VARIABLE_STAR` (light-curve based — see below) |
 | Source present but shifted > MATCH_CONE_ARCSEC, matches MPC | `ASTEROID` or `COMET` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC` of this position, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default), or > `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) when `near_edge=True` | `SPACE_DEBRIS` → **ALERT** (elongation alone is treated as sufficient trail evidence — no "vacated old position" proof required, see below) |
 | Source present but shifted, not in MPC, `near_edge=True` | Suppressed — `return None` (coma shifts centroid between frames, creating false "position shifted" evidence) |
@@ -1001,6 +1002,26 @@ produced it (`source_observations` itself has no filter column). This restrictio
 magnitude comparison only — the **existence** check (`history`/`n_history`, used for
 `FIRST_OBSERVATION`/`UNKNOWN`/`KNOWN_CATALOG_NEW` above) stays filter-agnostic, since a position
 already detected in a different filter is still a real prior detection, not a new source.
+
+The `VARIABLE_STAR`/`BINARY_STAR`/brightening-`SUPERNOVA_CANDIDATE` branches all gate on
+`object_type`, which only `modules/catalog_matcher/_simbad.py` ever fills with a real Simbad
+OTYPE; `_gaia.py`, `_2mass.py` and `_panstarrs.py` hardcode the generic
+`"STAR"`, which no OTYPE classifier matches. A star known solely through Gaia DR3 (the
+overwhelming majority of any field) could therefore change brightness by several magnitudes and
+be dropped silently, leaving the Δmag detector able only to re-confirm variability Simbad already
+knew about — never to discover any (audit 2026-08-18, finding C1). A final, catalog-independent
+branch closes that: a source whose own same-filter history spans at least
+`VARIABILITY_MIN_EPOCHS` (3 by default) epochs and whose `delta_mag` exceeds `VARIABILITY_SIGMA`
+(3.0) times that history's own robust scatter — `_history.py`'s `_history_mag_scatter()`, a
+MAD-derived 1σ equivalent, chosen over an RMS so that one bad epoch through cloud can't inflate
+the baseline enough to mask the very change it calibrates — is reported as `VARIABLE_STAR`
+regardless of what (if anything) the catalogs call it. Screening against the source's *own*
+scatter rather than a flat threshold is what keeps an intrinsically noisy source (low SNR,
+blended neighbour, variable seeing) quiet: a large `delta_mag` is unremarkable against a large
+scatter. `DELTA_MAG_ALERT` still applies on top as an absolute floor, and the anomaly's `notes`
+field states that the classification came from the light curve rather than a catalog — the
+distinction is not carried by `anomaly_type`, since the enum is mirrored as an `ENUM` column
+constraint in observatory-api and a new member can't be added from this repository alone.
 
 4. For `ASTEROID` / `COMET`: calls `ephemeris.py` to compute current ephemeris via JPL Horizons.
 

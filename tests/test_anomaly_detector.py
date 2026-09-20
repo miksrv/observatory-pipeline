@@ -207,6 +207,45 @@ class TestHistoryMedianMag:
         assert ad._history_median_mag([]) is None
 
 
+class TestHistoryMagScatter:
+    """
+    _history_mag_scatter() is the catalog-independent baseline behind the
+    light-curve-based VARIABLE_STAR branch (audit finding C1) — a robust
+    (MAD-scaled) 1-sigma equivalent of a source's OWN historical magnitudes.
+    """
+
+    def test_scatter_of_identical_magnitudes_is_zero(self):
+        history = [_make_hist_source(mag=14.0) for _ in range(4)]
+        assert ad._history_mag_scatter(history) == pytest.approx(0.0)
+
+    def test_scatter_scales_with_spread(self):
+        tight = [_make_hist_source(mag=m) for m in (14.00, 14.01, 13.99, 14.00)]
+        loose = [_make_hist_source(mag=m) for m in (14.0, 15.0, 13.0, 14.0)]
+        assert ad._history_mag_scatter(tight) < ad._history_mag_scatter(loose)
+
+    def test_scatter_is_robust_against_a_single_outlier(self):
+        """
+        One bad epoch (cloud, cosmic ray in the aperture) must not inflate the
+        baseline enough to mask a real change — this is why the MAD is used
+        rather than a plain standard deviation.
+        """
+        history = [_make_hist_source(mag=m) for m in (14.0, 14.0, 14.0, 14.0, 20.0)]
+        assert ad._history_mag_scatter(history) == pytest.approx(0.0)
+
+    def test_single_epoch_has_no_scatter(self):
+        assert ad._history_mag_scatter([_make_hist_source(mag=14.0)]) is None
+
+    def test_empty_history_returns_none(self):
+        assert ad._history_mag_scatter([]) is None
+
+    def test_entries_without_magnitude_are_ignored(self):
+        history = [
+            _make_hist_source(mag=14.0),
+            {"ra": _RA, "dec": _DEC},  # no magnitude at all
+        ]
+        assert ad._history_mag_scatter(history) is None
+
+
 class TestSameFilterHistory:
     """
     _same_filter_history() restricts magnitude comparisons to same-filter
@@ -690,6 +729,153 @@ class TestDetectSameFilterDeltaMag:
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
         assert result == []
+
+
+class TestDetectLightCurveVariability:
+    """
+    Audit finding C1 — the Δmag branches used to gate entirely on Simbad
+    OTYPE, but only _simbad.py writes a real OTYPE: _gaia.py, _2mass.py and
+    _panstarrs.py all hardcode the generic "STAR". A star known solely
+    through Gaia DR3 (the overwhelming majority of any field) could therefore
+    change brightness by any amount and be silently dropped, so the detector
+    could only confirm variability a catalog already knew about and could
+    never discover any.
+
+    The fallback uses the source's OWN same-filter light curve instead: a
+    long enough, tight enough baseline plus a departure from it of more than
+    config.VARIABILITY_SIGMA times its own historical scatter.
+    """
+
+    async def _run(self, source: dict, hist: list[dict]) -> list[dict]:
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            return await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+    async def test_gaia_only_star_brightening_is_reported(self):
+        """
+        The headline C1 scenario: a Gaia DR3 star (object_type "STAR", which
+        no OTYPE classifier matches) with a quiet four-epoch baseline
+        brightens by 2.5 mag. Previously dropped outright.
+        """
+        source = _make_source(mag=12.0, catalog_name="Gaia DR3",
+                              catalog_id="Gaia DR3 999", object_type="STAR")
+        hist = [_make_hist_source(mag=m) for m in (14.50, 14.52, 14.48, 14.51)]
+
+        result = await self._run(source, hist)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "VARIABLE_STAR"
+        assert result[0]["delta_mag"] == pytest.approx(12.0 - 14.505, abs=0.02)
+        assert "own light curve" in result[0]["notes"]
+
+    async def test_gaia_only_star_dimming_is_reported(self):
+        """Variability is symmetric — a quiescent star that fades is as much
+        a variability candidate as one that brightens (unlike the
+        SUPERNOVA_CANDIDATE branch, which is brightening-only)."""
+        source = _make_source(mag=17.0, catalog_name="Gaia DR3", object_type="STAR")
+        hist = [_make_hist_source(mag=m) for m in (14.50, 14.52, 14.48, 14.51)]
+
+        result = await self._run(source, hist)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "VARIABLE_STAR"
+        assert result[0]["delta_mag"] > 0
+
+    async def test_uncatalogued_source_with_stable_history_is_reported(self):
+        """A source no catalog claims at all still has its own light curve —
+        the branch must not require a catalog match either."""
+        source = _make_source(mag=12.0, catalog_name=None, object_type=None)
+        hist = [_make_hist_source(mag=m) for m in (14.50, 14.52, 14.48, 14.51)]
+
+        result = await self._run(source, hist)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "VARIABLE_STAR"
+
+    async def test_noisy_history_does_not_alert(self):
+        """
+        An intrinsically noisy source (low SNR, blended neighbour, variable
+        seeing) must stay quiet: a 2.5 mag departure is unremarkable against
+        a baseline that already scatters by more than that.
+        """
+        source = _make_source(mag=12.0, catalog_name="Gaia DR3", object_type="STAR")
+        hist = [_make_hist_source(mag=m) for m in (14.5, 11.0, 17.0, 13.0)]
+
+        assert await self._run(source, hist) == []
+
+    async def test_too_few_epochs_does_not_alert(self):
+        """
+        Below config.VARIABILITY_MIN_EPOCHS same-filter epochs there is no
+        baseline worth calling quiescent — the source falls through to "no
+        anomaly", exactly as it did before this branch existed.
+        """
+        source = _make_source(mag=12.0, catalog_name="Gaia DR3", object_type="STAR")
+        hist = [_make_hist_source(mag=14.50), _make_hist_source(mag=14.52)]
+
+        assert await self._run(source, hist) == []
+
+    async def test_cross_filter_epochs_do_not_count_toward_the_baseline(self):
+        """
+        The baseline is same-filter only, for the same color-term reason the
+        Δmag comparison itself is (see TestDetectSameFilterDeltaMag) — three
+        R-band epochs plus one L-band epoch is a one-epoch L baseline, not a
+        four-epoch one.
+        """
+        source = _make_source(mag=12.0, catalog_name="Gaia DR3",
+                              object_type="STAR", filter="L")
+        hist = [
+            _make_hist_source(mag=14.50, filter="L"),
+            _make_hist_source(mag=14.52, filter="R"),
+            _make_hist_source(mag=14.48, filter="R"),
+            _make_hist_source(mag=14.51, filter="R"),
+        ]
+
+        assert await self._run(source, hist) == []
+
+    async def test_absolute_delta_mag_floor_still_applies(self):
+        """
+        An extremely tight baseline makes the scatter test trivially easy to
+        clear, so DELTA_MAG_ALERT stays in force as an absolute floor — a
+        0.1 mag change is not worth an operator's attention however
+        statistically significant it looks.
+        """
+        source = _make_source(mag=14.60, catalog_name="Gaia DR3", object_type="STAR")
+        hist = [_make_hist_source(mag=m) for m in (14.500, 14.501, 14.499, 14.500)]
+
+        assert await self._run(source, hist) == []
+
+    async def test_simbad_variable_still_uses_the_catalog_branch(self):
+        """
+        The catalog-driven branch keeps priority: a Simbad-classified
+        variable is reported on its OTYPE alone, with no baseline-length or
+        scatter requirement, and keeps its own "Known variable star" notes.
+        """
+        source = _make_source(mag=14.5, catalog_name="Simbad", object_type="V*")
+        hist = [_make_hist_source(mag=12.0)]  # single epoch — no scatter at all
+
+        result = await self._run(source, hist)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "VARIABLE_STAR"
+        assert "Known variable star" in result[0]["notes"]
+
+    async def test_galaxy_brightening_still_wins_over_the_variability_branch(self):
+        """
+        Branch ordering regression: a brightening galaxy must stay a
+        SUPERNOVA_CANDIDATE, not be swallowed by the new catalog-independent
+        VARIABLE_STAR branch sitting below it.
+        """
+        source = _make_source(mag=16.0, catalog_name="Simbad", object_type="G")
+        hist = [_make_hist_source(mag=m) for m in (20.0, 20.02, 19.98, 20.01)]
+
+        result = await self._run(source, hist)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "SUPERNOVA_CANDIDATE"
 
 
 class TestDetectMpcMovingObjects:

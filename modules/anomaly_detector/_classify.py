@@ -13,7 +13,11 @@ import logging
 import config
 
 from ._geometry import _find_sources_within_radius, _tile_key
-from ._history import _history_median_mag, _same_filter_history
+from ._history import (
+    _history_mag_scatter,
+    _history_median_mag,
+    _same_filter_history,
+)
 from ._movement import _is_position_shifted
 from ._otypes import _is_binary_star, _is_galaxy, _is_variable_star
 from .types import AnomalyType
@@ -420,7 +424,8 @@ def _classify_source_sync(
     # Magnitude comparison uses only same-filter history — see
     # _same_filter_history()'s docstring. `history` itself (the existence
     # check above, n_history) stays filter-agnostic on purpose.
-    median_hist_mag = _history_median_mag(_same_filter_history(history, source_filter))
+    same_filter_history = _same_filter_history(history, source_filter)
+    median_hist_mag = _history_median_mag(same_filter_history)
     delta_mag: float | None = None
 
     if mag is not None and median_hist_mag is not None:
@@ -508,6 +513,70 @@ def _classify_source_sync(
                     f"delta_mag={delta_mag:.3f} (threshold "
                     f"{config.DELTA_MAG_ALERT:.2f}). "
                     f"object_type='{object_type}'."
+                ),
+            }
+
+        # --- VARIABLE_STAR (catalog-independent) — the source's OWN light
+        # curve says it changed. Reached only when none of the OTYPE-gated
+        # branches above fired, which for any star known solely through
+        # Gaia DR3/2MASS/Pan-STARRS is every time: those three modules
+        # hardcode the generic object_type "STAR", and no OTYPE classifier
+        # matches it. Before this branch existed, such a source — the
+        # overwhelming majority of every field — was silently dropped here
+        # no matter how far it had moved in magnitude, so the Δmag detector
+        # could only ever re-confirm variability Simbad already knew about
+        # and could never discover any (audit 2026-08-18, finding C1).
+        #
+        # The evidence used instead of a catalog label is the source's own
+        # same-filter history: a long enough, tight enough baseline, and a
+        # current magnitude that departs from it by more than
+        # VARIABILITY_SIGMA times that baseline's own scatter. An
+        # intrinsically noisy source (low SNR, blended neighbour, variable
+        # seeing) therefore stays quiet — a large Δmag is unremarkable
+        # against a large scatter — while a genuinely quiescent star that
+        # suddenly brightens or fades is reported. DELTA_MAG_ALERT is still
+        # required on top (`mag_changed`, above), so an implausibly tight
+        # history cannot alert on a photometrically meaningless change.
+        #
+        # Reported as VARIABLE_STAR rather than a new anomaly_type of its
+        # own: the enum is mirrored as an ENUM column constraint in
+        # observatory-api, and a new member cannot be introduced from this
+        # repository alone. The notes field states explicitly that the
+        # classification came from the light curve rather than from a
+        # catalog, so the distinction survives for an operator.
+        scatter = _history_mag_scatter(same_filter_history)
+        n_same_filter = len(same_filter_history)
+
+        if (
+            scatter is not None
+            and n_same_filter >= config.VARIABILITY_MIN_EPOCHS
+            and abs(delta_mag) > config.VARIABILITY_SIGMA * scatter
+        ):
+            logger.warning(
+                "VARIABLE_STAR (light-curve based): ra=%.4f dec=%.4f "
+                "delta_mag=%.3f scatter=%.3f epochs=%d catalog=%s object_type=%s",
+                ra, dec, delta_mag, scatter, n_same_filter, catalog_name, object_type,
+                extra=extra,
+            )
+            return {
+                "anomaly_type":    AnomalyType.VARIABLE_STAR,
+                "source_id":       source_id,
+                "ra":              ra,
+                "dec":             dec,
+                "magnitude":       mag,
+                "delta_mag":       delta_mag,
+                "mpc_designation": None,
+                "ephemeris":       None,
+                "notes": (
+                    f"Brightness change delta_mag={delta_mag:.3f} (threshold "
+                    f"{config.DELTA_MAG_ALERT:.2f}) exceeds "
+                    f"{config.VARIABILITY_SIGMA:.1f}x this source's own "
+                    f"historical scatter ({scatter:.3f} mag over "
+                    f"{n_same_filter} same-filter epochs). Variability "
+                    f"candidate identified from its own light curve, not "
+                    f"from a catalog classification "
+                    f"(catalog_name='{catalog_name}', "
+                    f"object_type='{object_type}')."
                 ),
             }
 
