@@ -12,10 +12,17 @@ observatory's topocentric coordinates from config.py.
 Returns None on any error (network timeout, unknown designation, rate limit).
 Errors are logged but never raised — the pipeline continues with partial results.
 No tenacity retries: JPL Horizons enforces strict rate limits.
+
+astroquery's Horizons client is fully synchronous and carries no timeout of
+its own. The blocking call therefore runs in a worker thread under an
+explicit config.EPHEMERIS_TIMEOUT_SEC budget, so that an unresponsive
+Horizons can neither stall the worker's whole event loop nor hold up the
+frame indefinitely (audit 2026-08-18, finding C8).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 
@@ -64,7 +71,18 @@ async def query(designation: str, obs_time: str) -> dict | None:
         }
 
         horizons = Horizons(id=designation, location=location, epochs=jd)
-        eph = horizons.ephemerides()
+
+        # Off the event loop and under a wall-clock budget: the call below is
+        # a blocking HTTP round trip with no timeout of its own. Running it
+        # inline made _resolve_ephemerides()' asyncio.gather() concurrent in
+        # name only, and left an unresponsive Horizons able to stall the
+        # worker for as long as it liked. On timeout the thread is abandoned
+        # (a thread cannot be cancelled) — harmless, since it holds nothing
+        # but its own HTTP socket and its result is simply discarded.
+        eph = await asyncio.wait_for(
+            asyncio.to_thread(horizons.ephemerides),
+            timeout=config.EPHEMERIS_TIMEOUT_SEC,
+        )
 
         row = eph[0]
 
@@ -117,6 +135,13 @@ async def query(designation: str, obs_time: str) -> dict | None:
             "angular_velocity_arcsec_per_hour": angular_velocity,
         }
 
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Horizons query for %s at %s exceeded EPHEMERIS_TIMEOUT_SEC=%.0fs "
+            "— giving up on the ephemeris",
+            designation, obs_time, config.EPHEMERIS_TIMEOUT_SEC,
+        )
+        return None
     except Exception as e:
         logger.warning(
             "Horizons query failed for %s at %s: %s",

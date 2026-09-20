@@ -271,7 +271,13 @@ Orchestrates processing of a single FITS file in order:
      **Module 1** ends — steps 1–12.5 are `pipeline.analyze_frame(fits_path)`'s entire body,
      independently callable as a task item (see "Job queue" below).
 13. `anomaly_detector.detect(frame_id, sources, catalog_matches, frame_meta)` → finds anomalies, using the batched history/coverage API calls (see `api_client/` below)
-14. `api_client.post_anomalies(frame_id, filename, anomalies)` → saves anomalies. Steps 13–14 are
+14. `api_client.post_anomalies(frame_id, filename, anomalies)` → saves anomalies, but **only when
+     step 13 actually ran to completion**. An empty list is a meaningful payload when detection
+     genuinely found nothing (and is still posted then), but this call *replaces* the frame's
+     anomaly set — posting `[]` because detection *failed* would erase anomalies a previous
+     successful run had stored, turning one transient failure into permanent data loss (audit
+     2026-08-18, finding C8). A failed or unavailable classifier therefore leaves the frame's
+     stored anomalies untouched. Steps 13–14 are
      **Module 2** — `pipeline.detect_anomalies_for_frame_data()` (in-memory `sources`, used right
      after step 12.5 above) or its standalone counterpart
      `pipeline.detect_anomalies_for_frame_id(frame_id)` (reconstructs `sources` purely from
@@ -1112,6 +1118,16 @@ in **[docs/anomaly-detector.md](docs/anomaly-detector.md)**.
 - Queries JPL Horizons via `astroquery.jplhorizons`
 - Given MPC designation + observation time → returns predicted (RA, Dec, mag, distance_au, angular_velocity)
 - Results included in the anomaly payload sent to API
+- astroquery's `Horizons` client is fully synchronous and carries no timeout of its own, so the
+  blocking call runs via `asyncio.to_thread()` under an `EPHEMERIS_TIMEOUT_SEC` budget — without
+  it, an unresponsive Horizons stalls the worker's whole event loop (and made
+  `_ephemeris_resolution.py`'s `asyncio.gather()` concurrent in name only). A timeout, like any
+  other failure here, returns `None`: an ephemeris is supplementary detail on an anomaly that was
+  already classified without it. `_resolve_ephemerides()` gathers with `return_exceptions=True`
+  so that one designation's failure costs only that anomaly its ephemeris — anything escaping
+  `query()`'s own `except Exception` used to propagate out of `detect()`, and `pipeline.py` would
+  then post an **empty** anomaly list, which *replaces* the frame's whole anomaly set (audit
+  2026-08-18, finding C8).
 
 ### `modules/finder_chart/`
 A package, not a single file — split one file per chart variant, plus shared infrastructure

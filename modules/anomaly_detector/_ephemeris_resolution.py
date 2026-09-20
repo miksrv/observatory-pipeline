@@ -53,13 +53,32 @@ async def _resolve_ephemerides(
         extra=extra,
     )
 
-    results: list[dict | None] = await asyncio.gather(
+    # return_exceptions=True isolates one designation's failure from the rest.
+    # ephemeris.query() already swallows its own errors, but asyncio.gather()
+    # gives no isolation for anything that escapes an inner `except Exception`
+    # — a BaseException such as CancelledError, or an error raised while the
+    # coroutine is being set up. Without isolation that propagates out of
+    # detect(), and pipeline.py's caller then posts an EMPTY anomaly list for
+    # the frame; since POST /frames/{id}/anomalies REPLACES the frame's whole
+    # anomaly set, one failed Horizons lookup would erase every other anomaly
+    # on that frame, including ones already stored by an earlier run (audit
+    # 2026-08-18, finding C8). An ephemeris is supplementary detail on an
+    # anomaly that has already been classified without it.
+    results: list = await asyncio.gather(
         *[ephemeris.query(desig, obs_time) for desig in designations],
-        return_exceptions=False,
+        return_exceptions=True,
     )
 
     for anomaly, eph_result in zip(pending, results):
-        if eph_result is None:
+        if isinstance(eph_result, BaseException):
+            logger.warning(
+                "Ephemeris query raised for designation=%s: %s — "
+                "keeping the anomaly without an ephemeris",
+                anomaly["mpc_designation"], eph_result,
+                extra=extra,
+            )
+            eph_result = None
+        elif eph_result is None:
             logger.warning(
                 "Ephemeris query returned None for designation=%s",
                 anomaly["mpc_designation"],

@@ -396,6 +396,15 @@ SITE_LAT: float = float(_get("SITE_LAT", "0.0"))   # degrees, positive = North
 SITE_LON: float = float(_get("SITE_LON", "0.0"))   # degrees, positive = East
 SITE_ELEV: int  = int(_get("SITE_ELEV", "0"))      # metres above sea level
 
+# Wall-clock budget for a single JPL Horizons ephemeris lookup
+# (modules/ephemeris.py). astroquery's Horizons client is fully synchronous
+# with no timeout of its own, so an unresponsive Horizons would otherwise
+# stall the worker indefinitely — the query runs in a worker thread and is
+# abandoned after this many seconds. An ephemeris is supplementary detail on
+# an anomaly that has already been classified without it, so giving up is
+# always preferable to blocking the frame.
+EPHEMERIS_TIMEOUT_SEC: float = float(_get("EPHEMERIS_TIMEOUT_SEC", "30"))
+
 # ---------------------------------------------------------------------------
 # Finder charts (modules/finder_chart.py)
 # ---------------------------------------------------------------------------
@@ -609,6 +618,8 @@ _OVERRIDABLE: dict[str, type] = {
     "ASTAP_WIDE_SEARCH_RADIUS_DEG": float,
     "ASTAP_TIMEOUT_SEC": float,
     "ASTAP_WIDE_SEARCH_TIMEOUT_SEC": float,
+    # Ephemeris
+    "EPHEMERIS_TIMEOUT_SEC": float,
     # Narrowband filters
     "NARROWBAND_FILTERS": None,  # special: frozenset from CSV
 }

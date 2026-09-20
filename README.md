@@ -552,6 +552,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `SITE_LAT` | `0.0` | No | Observatory latitude in decimal degrees (positive = North). Used for topocentric ephemeris queries to JPL Horizons. |
 | `SITE_LON` | `0.0` | No | Observatory longitude in decimal degrees (positive = East). |
 | `SITE_ELEV` | `0` | No | Observatory elevation in metres above sea level. |
+| `EPHEMERIS_TIMEOUT_SEC` | `30` | No | Wall-clock budget for one JPL Horizons ephemeris lookup. astroquery's Horizons client is synchronous and has no timeout of its own, so the query runs in a worker thread and is abandoned after this long — the anomaly is then kept without its ephemeris rather than the frame stalling. |
 | **Normalization** |
 | `NORMALIZE_ENABLED` | `true` | No | Enable automatic normalization of FITS header values and filenames. Normalizes object names (`M 51` → `M51`), filter names (`Blue` → `B`, `Luminance` → `L`, `H-Alpha` → `Ha`), frame types (`Light Frame` → `Light`), and renames files to standard format `{Object}_{Type}_{Filter}_{Exp}_{DateTime}.fits`. Ensures consistency across different capture software. |
 | **Logging** |

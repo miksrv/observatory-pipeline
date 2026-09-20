@@ -978,6 +978,48 @@ class TestDetectMpcMovingObjects:
         assert result[0]["ephemeris"] is None
         assert "_needs_ephemeris" not in result[0]
 
+    async def test_one_raising_ephemeris_query_does_not_sink_the_frame(self):
+        """
+        Audit 2026-08-18, finding C8: asyncio.gather() gave no isolation
+        between concurrent Horizons lookups, so anything escaping
+        ephemeris.query()'s own `except Exception` — a BaseException such as
+        CancelledError, or a failure during coroutine setup — propagated out
+        of detect(). pipeline.py then posted an EMPTY anomaly list, and since
+        that endpoint REPLACES the frame's anomaly set, one failed lookup
+        erased every other anomaly on the frame.
+        """
+        first = _make_source(
+            catalog_name="MPC", catalog_id="2019 XY3", object_type="ASTEROID",
+        )
+        second = _make_source(
+            ra=_RA + 0.01, dec=_DEC + 0.01,
+            catalog_name="MPC", catalog_id="C/2024 A1", object_type="COMET",
+        )
+
+        async def flaky(designation, obs_time):
+            if designation == "2019 XY3":
+                raise RuntimeError("Horizons unreachable")
+            return _EPH_DICT
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+            patch("modules.anomaly_detector.ephemeris.query", side_effect=flaky),
+        ):
+            mock_sources.return_value = {"0": [], "1": []}
+            mock_cov.return_value = {"0": [], "1": []}
+
+            result = await ad.detect(_FRAME_ID, [first, second], [first, second], _FRAME_META)
+
+        by_designation = {a["mpc_designation"]: a for a in result}
+        assert len(result) == 2
+        # The failing lookup costs that one anomaly its ephemeris, nothing more.
+        assert by_designation["2019 XY3"]["ephemeris"] is None
+        assert by_designation["2019 XY3"]["anomaly_type"] == "ASTEROID"
+        # Its neighbour is unaffected.
+        assert by_designation["C/2024 A1"]["ephemeris"] == _EPH_DICT
+        assert all("_needs_ephemeris" not in a for a in result)
+
 
 class TestDetectUnmatchedMovingObjects:
 

@@ -845,17 +845,29 @@ async def detect_anomalies_for_frame_data(
     -------
     list[dict]
         The anomaly dicts (whatever anomaly_detector.detect() returned, or
-        [] if the module is unavailable or classification failed). Posted
-        to the API regardless (an empty list is a valid, meaningful
-        payload — see docs/API.md's replace semantics for
-        POST /frames/{id}/anomalies).
+        [] if the module is unavailable or classification failed). Posted to
+        the API only when classification actually ran to completion: an empty
+        list IS a valid, meaningful payload when detection genuinely found
+        nothing, but POST /frames/{id}/anomalies REPLACES the frame's whole
+        anomaly set (docs/API.md), so posting one because detection FAILED
+        would erase anomalies a previous successful run had already stored
+        (audit 2026-08-18, finding C8).
     """
     extra = {"fits_filename": frame_meta.get("filename", post_filename)}
 
     anomalies: list = []
+    # Whether classification actually ran to completion. POST
+    # /frames/{id}/anomalies REPLACES the frame's whole anomaly set, so an
+    # empty list is only a meaningful payload when detection genuinely found
+    # nothing. Posting [] because detection FAILED would erase every anomaly
+    # already stored for this frame — including ones a previous, successful
+    # run found — turning one transient failure (a Horizons outage, a network
+    # blip mid-batch) into permanent data loss (audit 2026-08-18, finding C8).
+    detection_ok = False
     if anomaly_detector is not None:
         try:
             anomalies = await anomaly_detector.detect(frame_id, sources, sources, frame_meta)
+            detection_ok = True
             logger.debug(
                 "Anomaly detection complete: %d anomalies",
                 len(anomalies),
@@ -863,14 +875,15 @@ async def detect_anomalies_for_frame_data(
             )
         except Exception as exc:
             logger.error(
-                "Anomaly detection failed: %s — continuing",
+                "Anomaly detection failed: %s — leaving this frame's stored "
+                "anomalies untouched rather than replacing them with an empty set",
                 exc,
                 extra=extra,
             )
     else:
         logger.debug("Anomaly detector not available — skipping", extra=extra)
 
-    if api_client is not None:
+    if api_client is not None and detection_ok:
         try:
             await api_client.post_anomalies(frame_id, post_filename, anomalies)
             logger.debug(

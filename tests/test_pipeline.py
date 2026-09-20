@@ -787,7 +787,10 @@ async def test_optional_modules_absent(monkeypatch, fits_file, tmp_path):
 
     api_mock.post_frame.assert_called_once()
     api_mock.post_sources.assert_called_once()
-    api_mock.post_anomalies.assert_called_once()
+    # Anomaly classification never ran, so there is no result to post. An
+    # empty set would REPLACE whatever the API already holds for this frame
+    # (docs/API.md) — see test_anomaly_detection_failure_does_not_replace_anomalies.
+    api_mock.post_anomalies.assert_not_called()
 
     # When normalizer is None, file is archived with original name
     archive_path = os.path.join(
@@ -856,8 +859,40 @@ async def test_anomaly_detection_exception_continues(mock_modules):
 
     await pipeline.run(str(mock_modules))
 
-    # post_anomalies must still be called (with an empty anomaly list)
+    # The frame is still archived — detection failing is not fatal.
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    assert os.path.exists(archive_path)
+
+
+@pytest.mark.asyncio
+async def test_anomaly_detection_failure_does_not_replace_anomalies(mock_modules):
+    """
+    Audit 2026-08-18, finding C8: POST /frames/{id}/anomalies REPLACES the
+    frame's whole anomaly set, so posting [] because detection FAILED erased
+    every anomaly a previous successful run had stored — one transient
+    Horizons outage turned into permanent data loss. Nothing is posted at all
+    now unless classification actually ran to completion.
+    """
+    pipeline.anomaly_detector.detect.side_effect = RuntimeError("JPL timeout")
+
+    await pipeline.run(str(mock_modules))
+
+    pipeline.api_client.post_anomalies.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_empty_anomaly_result_is_still_posted(mock_modules):
+    """
+    The other half of the same contract: an empty list IS meaningful when
+    detection genuinely found nothing, and must still be posted so a frame
+    whose anomalies were resolved away is cleared.
+    """
+    pipeline.anomaly_detector.detect.return_value = []
+
+    await pipeline.run(str(mock_modules))
+
     pipeline.api_client.post_anomalies.assert_called_once()
+    assert pipeline.api_client.post_anomalies.call_args[0][2] == []
 
 
 @pytest.mark.asyncio
