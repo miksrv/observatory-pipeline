@@ -63,6 +63,27 @@ def _extract_sources(
         data_sub = np.array(data_sub, copy=True)
         data_sub[streak_mask] = 0.0
 
+        # Re-measure the background with the trail excluded. The mask can
+        # only be found on an already-background-subtracted image, so the
+        # first pass necessarily measured the RMS with the trail still in
+        # frame — and that RMS is both the detection threshold's scale and
+        # the denominator of every source's SNR, so one satellite track
+        # quietly desensitised the whole frame (audit 2026-08-18, finding
+        # H12, which named the identical ordering in modules/subtraction.py;
+        # the two keep hand-duplicated copies of this pre-pass).
+        if streak_mask.any():
+            bkg_masked = sep.Background(data, mask=streak_mask)
+            if float(bkg_masked.globalrms) > 0:
+                logger.debug(
+                    "SEP extraction: re-measured background with %d streak "
+                    "pixel(s) excluded — RMS %.3f -> %.3f  file=%s",
+                    int(streak_mask.sum()), bkg.globalrms,
+                    bkg_masked.globalrms, fits_filename,
+                )
+                bkg = bkg_masked
+                data_sub = data - bkg
+                data_sub[streak_mask] = 0.0
+
     # Extract sources using configurable thresholds
     # Higher thresh = fewer detections (more conservative)
     # Higher minarea = reject smaller artifacts

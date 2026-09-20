@@ -877,7 +877,14 @@ entry at all, at any position).
    `STREAK_DETECT_SIGMA`'s default (`3.0`, lower than `SUBTRACTION_DETECT_SIGMA`'s `5.0`) was tuned
    against this same real frame: at `5.0σ` the coarse pass still couldn't connect the (very faint)
    trail's brighter knots into long-enough coarse features, leaving 21 of the 42 candidates
-   unmasked; at `3.0σ` only 1 remained.
+   unmasked; at `3.0σ` only 1 remained. Once the mask exists, the background and RMS are
+   **re-measured with it excluded** before the detection threshold is set. The mask can only be
+   found on an already-background-subtracted image, so the first pass necessarily measured the
+   RMS with the trail still in frame — and since the threshold is `SUBTRACTION_DETECT_SIGMA × rms`,
+   one bright track quietly raised the bar for every faint real transient elsewhere in the same
+   frame (audit 2026-08-18, finding H12). `modules/astrometry/_extraction.py` re-measures the same
+   way, for the same reason: there the RMS is both the threshold's scale and the denominator of
+   every source's SNR.
 5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry/_extraction.py`), since `sep.extract()` doesn't return a native `fwhm` field.
 5.5. Rejects any candidate whose `fwhm` is below `psf_fwhm_arcsec / 1.5` (converted to pixels via
    the frame's plate scale — same ratio `modules/astrometry/_extraction.py` uses for its own lower FWHM bound;

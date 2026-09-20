@@ -315,7 +315,9 @@ def _patch_astrometry(
             stderr=""
         )
 
-    def _sep_background(data):
+    def _sep_background(data, mask=None):
+        # mask= is passed by the second, streak-excluded background pass
+        # (_extraction.py re-measures the RMS once a trail has been masked).
         if sep_background_raises:
             raise RuntimeError("sep.Background intentional failure")
         return fake_bkg

@@ -867,9 +867,31 @@ def _detect_diff_sources(
         if rms <= 0:
             return []
 
+        # The streak mask has to be found on a background-subtracted image,
+        # so the pass above is unavoidable — but its background and RMS were
+        # measured with the trail still in the frame. A bright satellite
+        # track below the saturation threshold contributes to globalrms, and
+        # since the detection threshold is SUBTRACTION_DETECT_SIGMA x rms,
+        # one trail raises the bar for every faint real transient elsewhere
+        # in the same frame (audit 2026-08-18, finding H12). Re-measure both
+        # with the trail excluded before setting that threshold.
         streak_mask = _build_streak_mask(sub, rms, pixel_scale_arcsec)
-        if streak_mask is not None:
-            sub[streak_mask] = 0.0
+        if streak_mask is not None and streak_mask.any():
+            combined = streak_mask if use_mask is None else (use_mask | streak_mask)
+            bkg = sep.Background(arr, mask=combined)
+            sub = arr - bkg.back()
+            sub[combined] = 0.0
+            rms_masked = float(bkg.globalrms)
+            if rms_masked <= 0:
+                return []
+            logger.info(
+                "Subtraction: re-measured background with %d streak pixel(s) "
+                "excluded — RMS %.3f -> %.3f",
+                int(streak_mask.sum()), rms, rms_masked,
+            )
+            rms = rms_masked
+            use_mask = combined
+
         thresh = config.SUBTRACTION_DETECT_SIGMA * rms
         try:
             objs = sep.extract(sub, thresh=thresh, minarea=5)

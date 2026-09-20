@@ -672,6 +672,49 @@ class TestDetectDiffSources:
 # Uses real (unmocked) sep, same style as TestDetectDiffSources above.
 # ---------------------------------------------------------------------------
 
+class TestBackgroundReMeasuredAfterStreakMasking:
+    """
+    Audit 2026-08-18, finding H12: the streak mask can only be found on an
+    already-background-subtracted image, so the first pass necessarily
+    measured the RMS with the trail still in frame. That RMS is the scale of
+    the detection threshold, so one bright satellite track quietly raised the
+    bar for every faint real transient elsewhere in the same frame.
+    """
+
+    def _diff_with_trail_and_faint_blob(self):
+        rng = np.random.default_rng(3)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(300, 300))
+        # A long, bright trail — elongation and length well past the
+        # STREAK_* thresholds at pixel_scale_arcsec=1.0.
+        diff[20:280, 148:152] += 3000.0
+        # A faint round source far from it, close to the detection limit.
+        yy, xx = np.mgrid[0:300, 0:300]
+        diff = diff + 45.0 * np.exp(-(((xx - 250) ** 2 + (yy - 250) ** 2) / (2 * 3.0 ** 2)))
+        return diff
+
+    def test_the_rms_used_for_the_threshold_excludes_the_trail(self, monkeypatch):
+        """
+        The second sep.Background() call must be the one whose globalrms sets
+        the threshold, and it must see a lower RMS than the first.
+        """
+        seen: list[float] = []
+        real_background = subtraction.sep.Background
+
+        def spy(data, mask=None):
+            bkg = real_background(data, mask=mask) if mask is not None else real_background(data)
+            seen.append(float(bkg.globalrms))
+            return bkg
+
+        monkeypatch.setattr(subtraction.sep, "Background", spy)
+
+        subtraction._detect_diff_sources(
+            self._diff_with_trail_and_faint_blob(), pixel_scale_arcsec=1.0,
+        )
+
+        assert len(seen) >= 2, "background was not re-measured after streak masking"
+        assert seen[1] < seen[0]
+
+
 class TestDetectDiffSourcesStreakMasking:
 
     def test_streak_segments_are_suppressed_round_blob_survives(self):
