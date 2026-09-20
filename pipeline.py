@@ -521,6 +521,10 @@ async def analyze_frame(fits_path: str) -> dict | None:
     # ------------------------------------------------------------------
     # Step 4.6 — Positional dedup: suppress unmatched sources sitting on
     # top of a matched source (deblending artifacts, not real objects).
+    # Subtraction candidates are exempt — they carry independent,
+    # catalog-free pixel-level evidence, and dropping them here lost real
+    # transients flaring in projection near a catalogued star (audit
+    # 2026-08-18, finding C6). See the function's own docstring.
     # ------------------------------------------------------------------
     sources = _dedupe_unmatched_near_matched(sources, extra)
 
@@ -1498,6 +1502,26 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
     Only suppresses the UNMATCHED duplicate — a matched source is never
     removed, and two unmatched sources near each other are left alone (they
     might genuinely be two faint uncatalogued objects in a crowded field).
+
+    An uncatalogued source carrying `_from_subtraction=True` is exempt. The
+    artifact this step guards against is a *deblending* one: sep splitting a
+    single distorted PSF into two components in THIS frame's own pixels. A
+    subtraction candidate has already been confirmed as a genuine
+    pixel-level change against a median stack of the object's own archived
+    history by a method that consults no catalog at all — evidence of a
+    different and stronger kind than "nothing within 5 arcsec claims it".
+    Without the exemption, a supernova or nova flaring in projection within
+    MATCH_CONE_ARCSEC of any catalogued star (routine in a dense field, and
+    the expected geometry near a known host galaxy) was dropped here —
+    before anomaly_detector.py and before POST /frames/{id}/sources, so the
+    event was never stored in any form (audit 2026-08-18, finding C6).
+
+    Registration residuals around bright stars, the obvious worry with this
+    exemption, are already handled upstream in modules/subtraction.py rather
+    than here: it masks everything within SATURATION_MASK_RADIUS_ARCSEC
+    (10 arcsec, wider than MATCH_CONE_ARCSEC's 5) of any saturated pixel in
+    the new frame or any aligned reference, and rejects near_edge candidates
+    outright, so such a residual cannot reach this function to begin with.
     """
     from astropy.coordinates import SkyCoord
     import astropy.units as u
@@ -1514,6 +1538,7 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
     threshold = config.MATCH_CONE_ARCSEC * u.arcsec
     kept: list = []
     n_suppressed = 0
+    n_exempt_subtraction = 0
 
     for src in sources:
         if src.get("catalog_name") is not None:
@@ -1524,6 +1549,12 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
         src_coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg)
         sep = src_coord.separation(matched_coords).min()
         if sep < threshold:
+            # Pixel-level confirmation outweighs the deblending-artifact
+            # risk this step exists to guard against — see the docstring.
+            if src.get("_from_subtraction"):
+                n_exempt_subtraction += 1
+                kept.append(src)
+                continue
             n_suppressed += 1
             continue
 
@@ -1534,6 +1565,15 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
             "Suppressed %d unmatched source(s) within %.1f\" of a matched source "
             "(deblending artifacts) — %d sources remain",
             n_suppressed, config.MATCH_CONE_ARCSEC, len(kept),
+            extra=extra,
+        )
+
+    if n_exempt_subtraction:
+        logger.info(
+            "Kept %d uncatalogued subtraction candidate(s) within %.1f\" of a "
+            "matched source — confirmed as a pixel-level change against the "
+            "reference stack, so not treated as a deblending artifact",
+            n_exempt_subtraction, config.MATCH_CONE_ARCSEC,
             extra=extra,
         )
 

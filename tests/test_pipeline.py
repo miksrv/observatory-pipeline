@@ -1367,6 +1367,70 @@ class TestDedupeUncataloguedSubtractionPair:
 # ---------------------------------------------------------------------------
 
 
+class TestDedupeUnmatchedNearMatched:
+    """
+    Step 4.6 suppresses an uncatalogued source sitting on top of a
+    catalogue-matched one — sep splitting a single distorted PSF into two
+    components, one of which lands just outside the catalog cone.
+
+    Audit finding C6: the step had no exemption for a source already
+    confirmed as a real pixel-level change by image subtraction, so a
+    transient flaring in projection near a catalogued star was dropped here,
+    before anomaly_detector.py and before POST /frames/{id}/sources — the
+    event was never stored in any form.
+    """
+
+    def test_no_matched_sources_returns_unchanged(self):
+        only_unmatched = [{"ra": 1.0, "dec": 1.0, "catalog_name": None}]
+        assert pipeline._dedupe_unmatched_near_matched(only_unmatched, {}) is only_unmatched
+
+    def test_deblending_artifact_near_a_matched_star_is_suppressed(self):
+        """The case the step exists for — unchanged by the C6 exemption."""
+        star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
+        artifact = {"ra": 10.0003, "dec": 20.0, "catalog_name": None}  # ~1" away
+
+        result = pipeline._dedupe_unmatched_near_matched([star, artifact], {})
+
+        assert result == [star]
+
+    def test_subtraction_candidate_near_a_matched_star_is_kept(self):
+        """
+        A supernova/nova flaring within MATCH_CONE_ARCSEC of a catalogued
+        star — routine in a dense field, and the expected geometry near a
+        known host galaxy. subtraction.run() has already confirmed the
+        pixel-level change against the object's own archived history, which
+        is evidence of a different kind from "nothing within 5 arcsec
+        claims it".
+        """
+        star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
+        transient = {
+            "ra": 10.0003, "dec": 20.0, "catalog_name": None,
+            "_from_subtraction": True,
+        }
+
+        result = pipeline._dedupe_unmatched_near_matched([star, transient], {})
+
+        assert result == [star, transient]
+
+    def test_distant_unmatched_source_is_kept_either_way(self):
+        star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
+        far = {"ra": 10.5, "dec": 20.0, "catalog_name": None}
+
+        result = pipeline._dedupe_unmatched_near_matched([star, far], {})
+
+        assert result == [star, far]
+
+    def test_matched_sources_are_never_removed(self):
+        """Two catalogued sources at the same position are this step's
+        business only as reference points — neither is ever dropped here."""
+        a = {"ra": 10.0, "dec": 20.0, "catalog_name": "Simbad", "catalog_id": "A"}
+        b = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "B"}
+
+        result = pipeline._dedupe_unmatched_near_matched([a, b], {})
+
+        assert result == [a, b]
+
+
 class TestDedupeCrossCatalogDuplicates:
 
     def test_fewer_than_two_matched_sources_returns_unchanged(self):
