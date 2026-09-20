@@ -269,6 +269,87 @@ def midpoint_time(obs_time: Any, exptime: float | None) -> str | None:
 # Extraction groups (called by extract_headers)
 # ---------------------------------------------------------------------------
 
+# Words a capture program might use in the RA card's own comment to say which
+# unit it wrote. Checked longest-first so "hours" isn't matched by "h" in
+# something unrelated.
+_RA_HOUR_WORDS: tuple[str, ...] = ("hourangle", "hours", "hour", "hrs", "hr")
+_RA_DEGREE_WORDS: tuple[str, ...] = ("degrees", "degree", "deg")
+
+
+def _resolve_numeric_ra(hdr: fits.Header, ra_raw: Any) -> float | None:
+    """
+    Interpret a bare numeric `RA`/`OBJCTRA` value, which may be in decimal
+    degrees or in decimal HOURS.
+
+    The FITS convention is degrees, and that is what this assumed
+    unconditionally — but some ASCOM-driven capture software writes decimal
+    hours into the same keyword, a factor of 15 (audit 2026-08-18, finding
+    H18). The cost is not only a wrong `pointing_error_arcsec`: this same RA
+    seeds astap's narrow search centre, so with the wrong unit the narrow
+    search reliably misses and every such frame pays the full cost of a blind
+    wide search.
+
+    Any value at or above 24 is unambiguous — no clock reaches it — so only
+    the [0, 24) range needs deciding, and it is decided from evidence rather
+    than guessed:
+
+    1. The card's own comment, when it names a unit ("RA of target [hours]").
+       Capture software that writes hours usually says so.
+    2. The frame's own `CRVAL1`, when it has one. Whichever interpretation
+       lands closer to the header's own idea of where the frame is pointing
+       is the right one — a 15x error is never the closer of the two, even
+       against a badly mis-pointed mount.
+    3. Neither available: degrees, per the convention, with a warning naming
+       the ambiguity so an operator whose frames are all mis-solving has
+       something to find.
+    """
+    ra = _to_float(ra_raw)
+    if ra is None or not (0.0 <= ra < 24.0):
+        return ra
+
+    comment = ""
+    for key in ("RA", "OBJCTRA"):
+        try:
+            if key in hdr:
+                comment = str(hdr.comments[key]).lower()
+                break
+        except Exception:
+            comment = ""
+    if any(word in comment for word in _RA_HOUR_WORDS):
+        logger.info("RA=%s interpreted as decimal hours (per its own card comment)", ra_raw)
+        return ra * 15.0
+    if any(word in comment for word in _RA_DEGREE_WORDS):
+        return ra
+
+    crval1 = _to_float(_get(hdr, "CRVAL1"))
+    if crval1 is not None and 0.0 <= crval1 <= 360.0:
+        as_degrees = _angular_distance_deg(ra, crval1)
+        as_hours = _angular_distance_deg(ra * 15.0, crval1)
+        if as_hours < as_degrees:
+            logger.info(
+                "RA=%s interpreted as decimal hours: %.3f deg sits %.1f deg from "
+                "CRVAL1=%.3f, while %.3f deg sits %.1f deg from it",
+                ra_raw, ra, as_degrees, crval1, ra * 15.0, as_hours,
+            )
+            return ra * 15.0
+        return ra
+
+    logger.warning(
+        "RA=%s is below 24 and this header says nothing about its unit — "
+        "assuming decimal degrees per the FITS convention. If this mount "
+        "writes decimal HOURS, every pointing error is wrong by 15x and "
+        "astap's narrow search is being seeded with the wrong centre",
+        ra_raw,
+    )
+    return ra
+
+
+def _angular_distance_deg(a: float, b: float) -> float:
+    """Separation between two RA values in degrees, the short way round."""
+    diff = abs(a - b) % 360.0
+    return min(diff, 360.0 - diff)
+
+
 def _build_dict(hdr: fits.Header) -> dict:
     raw_object = _get(hdr, "OBJECT", "OBJNAME", "TARGET")
 
@@ -283,7 +364,7 @@ def _build_dict(hdr: fits.Header) -> dict:
     if isinstance(ra_raw, str) and re.search(r"[\s:]", ra_raw):
         ra = _sexagesimal_to_degrees(ra_raw, "hourangle")
     else:
-        ra = _to_float(ra_raw)
+        ra = _resolve_numeric_ra(hdr, ra_raw)
 
     # Dec: if it looks sexagesimal use deg
     if isinstance(dec_raw, str) and re.search(r"[\s:]", dec_raw):

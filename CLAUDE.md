@@ -106,7 +106,7 @@ Standard FITS keywords supported (with common aliases):
 |---|---|---|
 | **Observation** | `DATE-OBS`, `TIME-OBS`, `MJD-OBS` | Observation timestamp (see below — these three are resolved together, not first-non-empty) |
 | **Target** | `OBJECT`, `OBJNAME`, `TARGET` | Name of the observed object (e.g., "M51", "NGC 1234") |
-| **Coordinates** | `RA`, `DEC`, `OBJCTRA`, `OBJCTDEC` | Target coordinates (if provided by telescope) |
+| **Coordinates** | `RA`, `DEC`, `OBJCTRA`, `OBJCTDEC` | Target coordinates (if provided by telescope; a bare numeric RA below 24 is unit-ambiguous — see below) |
 | **Exposure** | `EXPTIME`, `EXPOSURE` | Exposure time in seconds |
 | **Filter** | `FILTER`, `FILTNAM`, `FILTERID` | Filter name (e.g., "V", "B", "R", "Ha", "Luminance") |
 | **Instrument** | `INSTRUME`, `CAMERA` | Camera/instrument name |
@@ -146,6 +146,18 @@ one. Taking the first non-empty key instead — as an earlier revision did — s
 frame of an old-convention night at midnight, an hours-scale epoch error for the SkyBot/Horizons
 queries and for history comparisons (audit 2026-08-18, finding C10). A date-only frame with no
 `TIME-OBS` at all still resolves to midnight, but logs a warning saying so.
+
+**Numeric RA units.** A bare numeric `RA`/`OBJCTRA` is degrees by FITS convention, but some
+ASCOM-driven capture software writes decimal *hours* into the same keyword — a factor of 15.
+Any value at or above 24 is unambiguous, so only `[0, 24)` needs deciding, and
+`_resolve_numeric_ra()` decides it from evidence rather than guessing: the card's own comment
+when it names a unit (`RA of target [hours]`), else the frame's own `CRVAL1` — whichever
+interpretation lands closer to the header's own idea of where the frame points is the right one,
+since a 15× error is never the closer of the two even against a badly mis-pointed mount. With
+neither available it keeps the convention and logs the ambiguity. Getting this wrong costs more
+than a wrong `pointing_error_arcsec`: the same RA seeds astap's narrow search centre, so the
+narrow search reliably misses and every such frame pays for a blind wide search (audit
+2026-08-18, finding H18).
 
 **Exposure midpoint.** Alongside `obs_time` (the timestamp exactly as the header gives it), the
 returned dict carries `obs_time_mid` — `obs_time + EXPTIME/2`, via the public

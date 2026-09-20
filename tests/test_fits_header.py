@@ -342,6 +342,82 @@ class TestCoordinateConversion:
 
 
 # ---------------------------------------------------------------------------
+# Numeric RA units — audit 2026-08-18, finding H18
+#
+# A bare numeric RA was always read as decimal degrees. Some ASCOM-driven
+# capture software writes decimal HOURS into the same keyword — a factor of
+# 15. The cost is not only a wrong pointing_error_arcsec: that RA also seeds
+# astap's narrow search centre, so with the wrong unit the narrow search
+# reliably misses and every such frame pays for a blind wide search.
+# ---------------------------------------------------------------------------
+
+class TestNumericRaUnits:
+    def test_a_value_past_24_is_unambiguously_degrees(self):
+        path = _write_fits({"RA": 202.469})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(202.469)
+        finally:
+            _cleanup(path)
+
+    def test_the_card_comment_can_say_hours(self):
+        data = np.zeros((10, 10), dtype=np.float32)
+        hdu = fits.PrimaryHDU(data=data)
+        hdu.header["RA"] = (13.498, "RA of target [hours]")
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        hdu.writeto(tmp.name, overwrite=True)
+        tmp.close()
+        try:
+            assert extract_headers(tmp.name)["ra"] == pytest.approx(202.47, abs=0.01)
+        finally:
+            _cleanup(tmp.name)
+
+    def test_the_card_comment_can_say_degrees(self):
+        data = np.zeros((10, 10), dtype=np.float32)
+        hdu = fits.PrimaryHDU(data=data)
+        hdu.header["RA"] = (13.498, "RA of target [degrees]")
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        hdu.writeto(tmp.name, overwrite=True)
+        tmp.close()
+        try:
+            assert extract_headers(tmp.name)["ra"] == pytest.approx(13.498)
+        finally:
+            _cleanup(tmp.name)
+
+    def test_crval1_decides_in_favour_of_hours(self):
+        """
+        Whichever interpretation lands closer to the header's own idea of
+        where the frame points is the right one — a 15x error is never the
+        closer of the two, even against a badly mis-pointed mount.
+        """
+        path = _write_fits({"RA": 13.498, "CRVAL1": 202.4})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(202.47, abs=0.01)
+        finally:
+            _cleanup(path)
+
+    def test_crval1_decides_in_favour_of_degrees(self):
+        path = _write_fits({"RA": 13.498, "CRVAL1": 13.6})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(13.498)
+        finally:
+            _cleanup(path)
+
+    def test_no_evidence_falls_back_to_the_fits_convention(self):
+        path = _write_fits({"RA": 13.498})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(13.498)
+        finally:
+            _cleanup(path)
+
+    def test_a_sexagesimal_ra_is_unaffected(self):
+        path = _write_fits({"OBJCTRA": "13 29 52.7", "CRVAL1": 13.6})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(202.469, abs=0.01)
+        finally:
+            _cleanup(path)
+
+
+# ---------------------------------------------------------------------------
 # Missing / empty headers
 # ---------------------------------------------------------------------------
 
