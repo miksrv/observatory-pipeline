@@ -478,6 +478,26 @@ no standalone CLI script for this — create a `PREVIEW_CATALOG_MATCH` task inst
 Computes quality metrics from a FITS file without plate solving:
 - **FWHM** (median over detected stars) — indicator of focus quality
 - **Elongation** (major/minor axis ratio of PSF ellipse) — indicator of tracking/trailing
+
+  Both medians gate `BLUR`/`TRAIL`, so each is taken over the frame's *stars*, not over every
+  raw `sep` detection — otherwise whatever extended, non-stellar morphology the field contains
+  (nebula filaments, galaxies, compact knots) is averaged in, and a well-focused, well-tracked
+  narrowband frame of a nebula can be rejected for what it was pointed at. The narrowband case
+  is the sharp one, since such a frame is allowed a much smaller sample
+  (`QC_STARS_MIN_NARROWBAND`) in which the clumps can outnumber the stars outright (audit
+  2026-08-18, finding C11).
+
+  Reusing the `star_count` mask for this does **not** work: it cuts at `STAR_FWHM_MAX_ARCSEC`
+  and `STAR_ELONGATION_MAX`, whose defaults (8.0″, 1.5) sit at or below `QC_FWHM_MAX_ARCSEC`
+  (8.0″) and `QC_ELONGATION_MAX` (2.0), so a median over its survivors could never exceed either
+  QC threshold and both flags would become dead branches — the same failure as finding C2. Each
+  median is therefore filtered on the *other* axis, never on the one it measures: `fwhm_median`
+  over **round** sources (plus a relative pass dropping anything far broader than that subset's
+  own compact population, which is what catches a round-*and*-extended blob), `elongation_median`
+  over **compact** ones. Both reject anything sharper than `STAR_FWHM_MIN_ARCSEC` (hot pixels — a
+  floor can only bias upward, so it can't hide blur). A subset of fewer than 3 sources falls back
+  to the raw all-detections median, which is also what keeps both flags reachable on a frame so
+  badly blurred or trailed that its own stars fall outside the opposite axis' bound.
 - **SNR** (signal-to-noise ratio of detected sources) — computed and reported as `snr_median`,
   but **not currently compared** against `QC_SNR_MIN` in the accept/reject decision (see
   Known Issues #2 below — the threshold is effectively dead)

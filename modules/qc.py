@@ -179,6 +179,91 @@ def _compute_fwhm_pixels(a: float, b: float) -> float:
     return 2.0 * math.sqrt(2.0 * math.log(2.0)) * math.sqrt((a ** 2 + b ** 2) / 2.0)
 
 
+# Below this many members a subset is not a population — the raw
+# all-detections median is used instead. Matches the hard floor of 3 raw
+# detections analyze() already refuses to compute any statistics below.
+_MEDIAN_MIN_SOURCES = 3
+
+
+# How much broader than the frame's own compact population a source may be
+# before it is treated as extended rather than as a blurred star — the same
+# stellar-PSF tolerance modules/astrometry/_extraction.py applies around its
+# own psf_fwhm_arcsec estimate.
+_EXTENDED_FWHM_FACTOR = 1.5
+
+
+def _clip_broad_outliers(
+    fwhm_values: np.ndarray,
+    subset: np.ndarray,
+    fits_filename: str,
+) -> np.ndarray:
+    """
+    Narrow *subset* by dropping sources far broader than the compact
+    population it already contains.
+
+    A roundness cut removes filaments and edge-on galaxies, but not a
+    face-on galaxy or a round nebula knot — extended and round at once. Those
+    still inflate fwhm_median, and no ABSOLUTE upper bound can remove them
+    without also capping the very quantity BLUR tests (see analyze()'s
+    step 4).
+
+    So the bound is relative: the lower quartile of the subset's own FWHM
+    distribution — star-dominated in any field where stars outnumber extended
+    objects by more than 1:3 — times _EXTENDED_FWHM_FACTOR. A uniformly
+    blurred frame shifts that quartile up with everything else and nothing is
+    clipped, so BLUR remains reachable at any blur level; only a source
+    broader than the compact population *of this same frame* is dropped.
+
+    Returns *subset* unchanged whenever it is too small to estimate a
+    quartile from, or when clipping would leave too few sources to take a
+    median over.
+    """
+    selected = fwhm_values[subset]
+    if selected.size < _MEDIAN_MIN_SOURCES:
+        return subset
+
+    ceiling = float(np.percentile(selected, 25)) * _EXTENDED_FWHM_FACTOR
+    clipped = subset & (fwhm_values <= ceiling)
+
+    n_dropped = int(subset.sum()) - int(clipped.sum())
+    if int(clipped.sum()) < _MEDIAN_MIN_SOURCES:
+        return subset
+    if n_dropped:
+        logger.debug(
+            "QC: dropped %d extended source(s) broader than %.2f px "
+            "(%.1fx the compact population) from the FWHM median  file=%s",
+            n_dropped, ceiling, _EXTENDED_FWHM_FACTOR, fits_filename,
+        )
+    return clipped
+
+
+def _subset_median(
+    values: np.ndarray,
+    subset: np.ndarray,
+    metric: str,
+    fits_filename: str,
+) -> float:
+    """
+    Median of *values* over *subset*, falling back to the median of all of
+    *values* when the subset is too small to be meaningful.
+
+    The fallback is not just defensive: it is what keeps BLUR and TRAIL
+    reachable on a frame so badly blurred or trailed that its own stars fall
+    outside the opposite axis' bound and empty the subset out — see the long
+    note in analyze()'s step 4.
+    """
+    n = int(subset.sum())
+    if n >= _MEDIAN_MIN_SOURCES:
+        return float(np.median(values[subset]))
+
+    logger.debug(
+        "QC: %s subset holds only %d source(s) — using the median over all "
+        "%d detections instead  file=%s",
+        metric, n, values.size, fits_filename,
+    )
+    return float(np.median(values))
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -346,13 +431,92 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         )
 
     # ------------------------------------------------------------------
-    # 4. FWHM (pixels → arcsec when plate scale is available)
+    # 4. Per-source shape, and the subsets the two medians are taken over
     # ------------------------------------------------------------------
+    # fwhm_median/elongation_median gate BLUR/TRAIL, so they must describe
+    # the frame's STARS. Taken over every raw detection — as they were until
+    # audit 2026-08-18, finding C11 — they also carry whatever extended,
+    # non-stellar morphology the field contains (nebula filaments, galaxies,
+    # compact clumps), which is broader and less round than any point source.
+    # A well-focused, well-tracked narrowband frame of a nebula could be
+    # rejected BLUR/TRAIL purely for what it was pointed at, and the same
+    # skewed FWHM then travelled downstream as psf_fwhm_arcsec to
+    # astrometry.solve()/subtraction.run().
+    #
+    # The obvious fix — reuse the star_mask computed below for star_count —
+    # does NOT work: that mask cuts at STAR_FWHM_MAX_ARCSEC and
+    # STAR_ELONGATION_MAX, whose defaults (8.0", 1.5) sit at or below
+    # QC_FWHM_MAX_ARCSEC (8.0") and QC_ELONGATION_MAX (2.0). A median taken
+    # over survivors of those cuts can never exceed either QC threshold, so
+    # BLUR and TRAIL would both become dead branches — the same
+    # cut-below-the-threshold-being-tested failure as finding C2.
+    #
+    # Each median is therefore taken over sources filtered on the OTHER axis,
+    # never on the one being measured:
+    #
+    #   fwhm_median       — over ROUND sources (elongation < STAR_ELONGATION_MAX),
+    #                       then with sources far broader than that subset's own
+    #                       compact population dropped relative to it (see
+    #                       _clip_broad_outliers(), which is what catches the
+    #                       round-AND-extended case a roundness cut cannot).
+    #                       Filaments, edge-on galaxies, streak remnants and
+    #                       face-on blobs go; every blurred star stays, however
+    #                       blurred it is.
+    #   elongation_median — over COMPACT sources (fwhm <= STAR_FWHM_MAX_ARCSEC).
+    #                       Nebula clumps and galaxies go; a trailed star's FWHM
+    #                       only grows as sqrt((e^2+1)/2), so it stays well
+    #                       inside that bound across the elongation range TRAIL
+    #                       actually discriminates.
+    #
+    # Both also require positive flux and reject anything sharper than
+    # STAR_FWHM_MIN_ARCSEC (hot/warm pixel clusters — a floor can only bias
+    # the estimate UPWARD, so it cannot hide blur). A subset with fewer than
+    # _MEDIAN_MIN_SOURCES members is not a population at all: the raw
+    # all-detections median is used instead, which is also what restores
+    # BLUR/TRAIL on a frame so badly blurred or trailed that its own stars
+    # fall outside the opposite axis' bound.
     fwhm_pixels_arr: np.ndarray = np.array(
         [_compute_fwhm_pixels(float(o["a"]), float(o["b"])) for o in objects],
         dtype=np.float64,
     )
-    fwhm_px_median: float = float(np.median(fwhm_pixels_arr))
+    elongation_arr: np.ndarray = np.array(
+        [float(o["a"]) / float(o["b"]) if float(o["b"]) > 0.0 else 1.0 for o in objects],
+        dtype=np.float64,
+    )
+
+    mask_flux: np.ndarray = objects["flux"] > 0
+    mask_round: np.ndarray = elongation_arr < config.STAR_ELONGATION_MAX
+
+    fwhm_per_source: np.ndarray | None = None
+    if plate_scale is not None:
+        fwhm_per_source = fwhm_pixels_arr * plate_scale
+        mask_fwhm_min: np.ndarray = fwhm_per_source >= config.STAR_FWHM_MIN_ARCSEC
+        mask_fwhm_max: np.ndarray = fwhm_per_source <= config.STAR_FWHM_MAX_ARCSEC
+    else:
+        # Without a plate scale the arcsec bounds are meaningless; only the
+        # scale-free roundness and flux cuts can be applied.
+        mask_fwhm_min = np.ones(raw_detection_count, dtype=bool)
+        mask_fwhm_max = np.ones(raw_detection_count, dtype=bool)
+
+    fwhm_subset: np.ndarray = mask_flux & mask_fwhm_min & mask_round
+    # A round source can still be extended (face-on galaxy, round nebula
+    # knot) — one more, purely relative pass removes those; see
+    # _clip_broad_outliers().
+    fwhm_subset = _clip_broad_outliers(
+        fwhm_pixels_arr, fwhm_subset, os.path.basename(fits_path)
+    )
+    # The elongation subset needs no counterpart: what contaminates it is
+    # extended morphology, which the compactness cut above already removes,
+    # and a relative clip on elongation itself would start eating into the
+    # uniformly-trailed case TRAIL exists to catch.
+    elongation_subset: np.ndarray = mask_flux & mask_fwhm_min & mask_fwhm_max
+
+    # ------------------------------------------------------------------
+    # 4b. FWHM (pixels → arcsec when plate scale is available)
+    # ------------------------------------------------------------------
+    fwhm_px_median: float = _subset_median(
+        fwhm_pixels_arr, fwhm_subset, "fwhm", os.path.basename(fits_path)
+    )
 
     if plate_scale is not None:
         fwhm_median: float | None = fwhm_px_median * plate_scale
@@ -362,24 +526,26 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         fwhm_unit = "pixels"
 
     logger.debug(
-        "QC: fwhm_median=%.3f %s (%.3f px)  file=%s",
+        "QC: fwhm_median=%.3f %s (%.3f px, over %d/%d round sources)  file=%s",
         fwhm_median,
         fwhm_unit,
         fwhm_px_median,
+        int(fwhm_subset.sum()),
+        raw_detection_count,
         os.path.basename(fits_path),
     )
 
     # ------------------------------------------------------------------
     # 5. Elongation
     # ------------------------------------------------------------------
-    elongation_arr: np.ndarray = np.array(
-        [float(o["a"]) / float(o["b"]) if float(o["b"]) > 0.0 else 1.0 for o in objects],
-        dtype=np.float64,
+    elongation_median: float | None = _subset_median(
+        elongation_arr, elongation_subset, "elongation", os.path.basename(fits_path)
     )
-    elongation_median: float | None = float(np.median(elongation_arr))
     logger.debug(
-        "QC: elongation_median=%.3f  file=%s",
+        "QC: elongation_median=%.3f (over %d/%d compact sources)  file=%s",
         elongation_median,
+        int(elongation_subset.sum()),
+        raw_detection_count,
         os.path.basename(fits_path),
     )
 
@@ -394,22 +560,13 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     # Note: We use QC thresholds (QC_ELONGATION_MAX, QC_FWHM_MAX_ARCSEC) for
     # the BLUR/TRAIL quality flags, but use the stricter STAR_* thresholds
     # here to count only genuine point sources, matching what astrometry
-    # will actually extract as stars.
-    
-    # Compute per-source FWHM in arcsec (or pixels if no plate scale)
-    fwhm_per_source: np.ndarray
+    # will actually extract as stars. This is the one place those stricter
+    # bounds are applied on BOTH axes at once — see the long note in step 4
+    # for why the two medians above deliberately cannot be.
+    star_mask: np.ndarray = mask_flux & mask_round & mask_fwhm_min & mask_fwhm_max
+    star_count: int = int(np.sum(star_mask))
+
     if plate_scale is not None:
-        fwhm_per_source = fwhm_pixels_arr * plate_scale
-        
-        # Apply star filters
-        mask_elongation = elongation_arr < config.STAR_ELONGATION_MAX
-        mask_fwhm_min = fwhm_per_source >= config.STAR_FWHM_MIN_ARCSEC
-        mask_fwhm_max = fwhm_per_source <= config.STAR_FWHM_MAX_ARCSEC
-        mask_flux = objects["flux"] > 0
-        
-        star_mask = mask_elongation & mask_fwhm_min & mask_fwhm_max & mask_flux
-        star_count: int = int(np.sum(star_mask))
-        
         logger.debug(
             "QC: star filter: %d raw → %d stars (elong<%0.1f, fwhm=[%.1f-%.1f]\")  file=%s",
             raw_detection_count,
@@ -420,12 +577,6 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
             os.path.basename(fits_path),
         )
     else:
-        # Without plate scale, use only elongation and flux filters
-        mask_elongation = elongation_arr < config.STAR_ELONGATION_MAX
-        mask_flux = objects["flux"] > 0
-        star_mask = mask_elongation & mask_flux
-        star_count = int(np.sum(star_mask))
-        
         logger.debug(
             "QC: star filter (no plate scale): %d raw → %d stars  file=%s",
             raw_detection_count,

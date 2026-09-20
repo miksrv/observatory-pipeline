@@ -878,3 +878,120 @@ class TestStreakMasking:
         coarse_data, _ = calls[0]
         final_data, _ = calls[1]
         assert np.array_equal(coarse_data, final_data)
+
+
+# ---------------------------------------------------------------------------
+# Star-population medians (audit 2026-08-18, C11)
+# ---------------------------------------------------------------------------
+
+_NARROWBAND_HEADER_INFO = {
+    "object_name": _OBJECT_NAME,
+    "instrument":  {"focal_length_mm": 997.0},
+    "observation": {"filter": "Ha"},
+}
+
+
+def _mixed_sources(
+    n_stars: int, n_other: int,
+    other_a: float, other_b: float,
+) -> np.ndarray:
+    """Normal stars plus *n_other* sources of a different morphology."""
+    stars = _make_sources(n_stars, _A_NORMAL, _B_NORMAL)
+    other = _make_sources(n_other, other_a, other_b)
+    return np.concatenate([stars, other])
+
+
+class TestMediansUseTheStarPopulation:
+    """
+    fwhm_median/elongation_median gate BLUR/TRAIL, so they must describe the
+    frame's stars — taken over every raw detection they also carried whatever
+    extended, non-stellar morphology the field happened to contain, and a
+    well-focused narrowband frame of a nebula could be rejected for what it
+    was pointed at.
+    """
+
+    @pytest.mark.asyncio
+    async def test_elongated_filaments_do_not_force_a_false_trail(self):
+        """
+        The narrowband nebula case from the finding: the frame is allowed a
+        smaller sample (QC_STARS_MIN_NARROWBAND=5), so the clumps can be the
+        majority of detections and carry the median outright.
+        """
+        # 6 round stars + 7 filament-like clumps at elongation 6
+        sources = _mixed_sources(6, 7, other_a=6.0, other_b=1.0)
+
+        with _patch_qc(sources, header_info=_NARROWBAND_HEADER_INFO):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["elongation_median"] < 2.0
+        assert result["quality_flag"] == "OK"
+
+    @pytest.mark.asyncio
+    async def test_round_extended_clumps_do_not_force_a_false_blur(self):
+        # 6 round stars + 7 round-but-extended knots (FWHM ~ 13 px = 13").
+        # These pass a roundness cut, so only the relative broad-outlier clip
+        # removes them.
+        sources = _mixed_sources(6, 7, other_a=6.0, other_b=5.0)
+
+        with _patch_qc(sources, header_info=_NARROWBAND_HEADER_INFO):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["fwhm_median"] < 8.0
+        assert result["quality_flag"] == "OK"
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_blurred_frame_is_still_blur(self):
+        """
+        The cut that removes extended objects must not cap the very quantity
+        BLUR tests: every source here is broad, so nothing is an outlier
+        relative to the rest.
+        """
+        sources = _make_sources(_N_SOURCES, _A_BLUR, _B_BLUR)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["fwhm_median"] > 8.0
+        assert result["quality_flag"] in ("BLUR", "BAD")
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_trailed_frame_is_still_trail(self):
+        sources = _make_sources(_N_SOURCES, _A_TRAIL, _B_TRAIL)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["elongation_median"] > 2.0
+        assert result["quality_flag"] in ("TRAIL", "BAD")
+
+    @pytest.mark.asyncio
+    async def test_hot_pixels_do_not_drag_the_fwhm_median_down(self):
+        """
+        The one absolute cut both subsets keep is STAR_FWHM_MIN_ARCSEC. It can
+        only bias the estimate upward, so it cannot hide blur.
+        """
+        # 8 normal stars + 7 detections far sharper than any real star here
+        sources = _mixed_sources(8, 7, other_a=0.4, other_b=0.4)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        # Median over the 8 stars alone (~3.4"), not dragged toward ~0.9".
+        assert result["fwhm_median"] > 3.0
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_all_detections_when_the_subset_empties(self):
+        """
+        A frame trailed badly enough that its own stars fall outside the
+        opposite axis' bound leaves no subset to take a median over — the raw
+        median is used, which is what keeps TRAIL reachable there.
+        """
+        # Elongation 10, FWHM ~ 16.7 px: outside BOTH the roundness cut and
+        # the compactness cut, so both subsets are empty.
+        sources = _make_sources(_N_SOURCES, 10.0, 1.0)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["elongation_median"] == pytest.approx(10.0)
+        assert result["quality_flag"] in ("TRAIL", "BAD")
