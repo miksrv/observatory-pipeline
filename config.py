@@ -116,8 +116,18 @@ QC_STARS_MIN_NARROWBAND: int = int(_get("QC_STARS_MIN_NARROWBAND", "5"))
 # modules/normalizer.normalize_filter_name()/is_narrowband()), so this must
 # use those canonical codes ("Ha", "OIII", "SII", "NII"), not raw header
 # spellings like "H-Alpha" or "[OIII]".
+# Multi-band filters for one-shot-colour cameras (L-eNhance, L-eXtreme,
+# L-uLtimate, NBZ, and the dual/tri/quad-band families) belong here too: each
+# passes two or three emission lines and blocks everything between them, so
+# where stars are concerned it is as narrow as a single-line filter. They were
+# missing, so such a frame was held to the broadband QC_STARS_MIN and had a
+# Gaia zero-point computed for it that no bandpass supports (audit 2026-08-18,
+# finding M9).
 NARROWBAND_FILTERS: frozenset[str] = frozenset(
-    f.strip() for f in _get("NARROWBAND_FILTERS", "Ha,OIII,SII,NII").split(",") if f.strip()
+    f.strip() for f in _get(
+        "NARROWBAND_FILTERS",
+        "Ha,OIII,SII,NII,LeNhance,LeXtreme,LuLtimate,NBZ,QuadBand,TriBand,DuoBand",
+    ).split(",") if f.strip()
 )
 
 # ---------------------------------------------------------------------------

@@ -373,3 +373,53 @@ class TestExtractObjectFromFilename:
 
     def test_no_usable_segment_yields_unknown(self):
         assert normalizer.extract_object_from_filename("Light_L_300_2024-03-15.fits") == "_UNKNOWN"
+
+
+class TestMultiBandFilters:
+    """
+    Audit 2026-08-18, finding M9: L-eNhance, L-eXtreme, NBZ and the
+    dual/tri/quad-band families each pass two or three emission lines and
+    block everything between them, so where stars are concerned they are as
+    narrow as a single-line filter. They were absent from FILTER_MAP and from
+    NARROWBAND_FILTERS, so such a frame was held to the broadband
+    QC_STARS_MIN and had a Gaia zero-point computed for it that no bandpass
+    supports.
+    """
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("L-eNhance", "LeNhance"),
+        ("l enhance", "LeNhance"),
+        ("L-eXtreme", "LeXtreme"),
+        ("L-Ultimate", "LuLtimate"),
+        ("NBZ", "NBZ"),
+        ("Quad Band", "QuadBand"),
+        ("ALP-T", "QuadBand"),
+        ("Tri-Band", "TriBand"),
+        ("Triad", "TriBand"),
+        ("Dual Band", "DuoBand"),
+        ("Duo-Band", "DuoBand"),
+    ])
+    def test_normalization(self, raw, expected):
+        assert normalizer.normalize_filter_name(raw)[0] == expected
+
+    @pytest.mark.parametrize("raw", [
+        "L-eNhance", "L-eXtreme", "L-Ultimate", "NBZ",
+        "Quad Band", "Tri-Band", "Dual Band",
+    ])
+    def test_they_count_as_narrowband(self, raw):
+        assert normalizer.is_narrowband(raw) is True
+
+    def test_each_keeps_a_token_of_its_own(self):
+        """
+        modules/subtraction.py matches its reference stack on this field, and
+        an L-eXtreme frame is not a substitute for an L-eNhance one.
+        """
+        tokens = {
+            normalizer.normalize_filter_name(raw)[0]
+            for raw in ("L-eNhance", "L-eXtreme", "L-Ultimate", "NBZ", "Quad Band", "Tri-Band", "Dual Band")
+        }
+        assert len(tokens) == 7
+
+    @pytest.mark.parametrize("raw", ["L", "R", "G", "B", "V"])
+    def test_broadband_filters_are_unaffected(self, raw):
+        assert normalizer.is_narrowband(raw) is False

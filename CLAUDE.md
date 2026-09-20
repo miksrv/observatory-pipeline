@@ -619,6 +619,8 @@ Normalizes FITS header values and filenames for consistency across different cap
 | `OIII`, `O3`, `[OIII]` | `OIII` |
 | `SII`, `S2`, `[SII]` | `SII` |
 | `NII`, `N2`, `N-II`, `Nitrogen-II`, `[NII]` | `NII` |
+| `L-eNhance`, `L-eXtreme`, `L-Ultimate` | `LeNhance`, `LeXtreme`, `LuLtimate` |
+| `NBZ`, `Quad Band`/`ALP-T`, `Tri-Band`/`Triad`, `Dual Band`/`Duo-Band` | `NBZ`, `QuadBand`, `TriBand`, `DuoBand` |
 | Johnson-Cousins / SDSS filters `U`, `V`, `I`, `u'`, `g'`, `r'`, `i'`, `z'` | passed through as-is (recognized, not remapped) |
 
 **Frame Type Normalization:**
@@ -1671,8 +1673,14 @@ the analysis its results can be trusted for:
   and `L`/Luminance/Clear (panchromatic — the closest analog to Gaia's own broadband G-band).
   Used for star fields; astrometry, catalog matching, and Gaia zero-point calibration all work
   normally.
-- **Narrowband** (`Ha`, `OIII`, `SII`, `NII` — `config.NARROWBAND_FILTERS`) — isolates one
-  emission line (e.g. Hα at 656.3 nm) for imaging nebulae/emission regions. Only the sliver of a
+- **Narrowband** (`Ha`, `OIII`, `SII`, `NII`, plus the multi-band OSC filters `LeNhance`,
+  `LeXtreme`, `LuLtimate`, `NBZ`, `QuadBand`, `TriBand`, `DuoBand` — `config.NARROWBAND_FILTERS`).
+  The multi-band ones pass two or three emission lines and block everything between them, so where
+  stars are concerned they are as narrow as a single-line filter; they were missing from the list,
+  so such a frame was held to the broadband `QC_STARS_MIN` and had a Gaia zero-point computed for
+  it that no bandpass supports (audit 2026-08-18, finding M9). Each keeps a distinct token because
+  `modules/subtraction.py` matches its reference stack on this field. A single-line filter isolates
+  one emission line (e.g. Hα at 656.3 nm) for imaging nebulae/emission regions. Only the sliver of a
   star's continuum that falls inside that narrow bandpass leaks through, so a narrowband frame of
   the *same field* genuinely contains far fewer, fainter stars than a broadband one of it — this
   is expected, not a quality problem with the frame.

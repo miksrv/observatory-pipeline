@@ -222,6 +222,42 @@ FILTER_MAP = {
     "nitrogen-ii": "NII",
     "[nii]": "NII",
 
+    # Multi-band filters for one-shot-colour cameras. Each passes two or
+    # three emission lines and blocks everything between them, so it is as
+    # narrow as a single-line filter where stars are concerned — the QC
+    # star-count floor and the Gaia zero-point both have to treat it that way
+    # (audit 2026-08-18, finding M9). Each keeps a token of its own rather
+    # than collapsing into one "multiband": modules/subtraction.py matches its
+    # reference stack on this field, and an L-eXtreme frame is not a
+    # substitute for an L-eNhance one.
+    "l-enhance": "LeNhance",
+    "lenhance": "LeNhance",
+    "l enhance": "LeNhance",
+    "l-extreme": "LeXtreme",
+    "lextreme": "LeXtreme",
+    "l extreme": "LeXtreme",
+    "l-ultimate": "LuLtimate",
+    "lultimate": "LuLtimate",
+    "l-ultimate 3nm": "LuLtimate",
+    "nbz": "NBZ",
+    "idas nbz": "NBZ",
+    "nbz uhs": "NBZ",
+    "quad band": "QuadBand",
+    "quad-band": "QuadBand",
+    "quadband": "QuadBand",
+    "alp-t": "QuadBand",
+    "alpt": "QuadBand",
+    "tri band": "TriBand",
+    "tri-band": "TriBand",
+    "triband": "TriBand",
+    "triad": "TriBand",
+    "duo band": "DuoBand",
+    "duo-band": "DuoBand",
+    "duoband": "DuoBand",
+    "dual band": "DuoBand",
+    "dual-band": "DuoBand",
+    "dualband": "DuoBand",
+
     # Standard photometric filters (Johnson-Cousins)
     "u": "U",
     "v": "V",
