@@ -232,9 +232,33 @@ def _build_result(
     zero_point_err: float | None,
     fwhm_arcsec: float | None,
     near_edge: bool,
+    color: float | None = None,
+    color_term: float = 0.0,
+    color_ref: float | None = None,
+    color_scatter: float = 0.0,
 ) -> dict:
-    """Assemble one forced-photometry result in the same shape as an ordinary source dict."""
+    """
+    Assemble one forced-photometry result in the same shape as an ordinary source dict.
+
+    The colour handling mirrors modules/photometry.py's exactly (audit
+    2026-08-18, finding H5): a source whose own Gaia BP-RP colour is known
+    gets the frame's fitted colour term applied to it, and one whose colour is
+    unknown — every MPC object, and any Gaia star with no BP/RP photometry —
+    uses the zero point as it stands, which is defined at the reference set's
+    median colour, with `mag_err` widened by what the colour term can move
+    across that set's own colour spread.
+    """
     calibrated = zero_point is not None
+
+    mag_calibrated: float | None = None
+    if calibrated:
+        mag_calibrated = mag_instrumental + zero_point
+        if color_term and color_ref is not None and color is not None and math.isfinite(color):
+            mag_calibrated += color_term * (color - color_ref)
+        elif color_term:
+            color_unc = abs(color_term) * color_scatter
+            mag_err = math.sqrt(mag_err ** 2 + color_unc ** 2)
+
     return {
         "ra": ra,
         "dec": dec,
@@ -250,7 +274,7 @@ def _build_result(
         "flux_aperture": net_flux,
         "flux_err": flux_err,
         "mag_instrumental": mag_instrumental,
-        "mag_calibrated": mag_instrumental + zero_point if calibrated else None,
+        "mag_calibrated": mag_calibrated,
         "mag_err": mag_err,
         "calibrated": calibrated,
         "edge_flag": near_edge,
@@ -281,6 +305,9 @@ async def run(
     obs_time: str | None,
     psf_fwhm_arcsec: float | None = None,
     gain: float | None = None,
+    color_term: float = 0.0,
+    color_ref: float | None = None,
+    color_scatter: float = 0.0,
 ) -> list[dict]:
     """
     Force-measure every catalog star/MPC object not already present in
@@ -332,6 +359,12 @@ async def run(
         error. None (the default) resolves it from
         config.PHOTOMETRY_GAIN_E_PER_ADU, then from the frame's own
         EGAIN/GAIN header — see _resolve_gain().
+    color_term, color_ref, color_scatter:
+        The colour part of the same photometric solution, read off an
+        already-measured source's "_color_term"/"_color_ref"/"_color_scatter"
+        the way zero_point is (see photometry._compute_zero_point()). The
+        defaults (0.0 / None / 0.0) mean "no colour term was fitted for this
+        frame" and reproduce the plain zero-point behaviour exactly.
 
     Returns
     -------
@@ -474,6 +507,8 @@ async def run(
             net_flux, flux_err,
             -2.5 * math.log10(net_flux), 1.0857 * flux_err / net_flux,
             zero_point, zero_point_err, psf_fwhm_arcsec, near_edge,
+            color=star.get("bp_rp"),
+            color_term=color_term, color_ref=color_ref, color_scatter=color_scatter,
         ))
 
     # ------------------------------------------------------------------
@@ -500,6 +535,11 @@ async def run(
             net_flux, flux_err,
             -2.5 * math.log10(net_flux), 1.0857 * flux_err / net_flux,
             zero_point, zero_point_err, psf_fwhm_arcsec, near_edge,
+            # A solar system object has no catalogued colour — the zero point
+            # at the reference colour is the best available, with the colour
+            # term's own reach folded into mag_err.
+            color=None,
+            color_term=color_term, color_ref=color_ref, color_scatter=color_scatter,
         ))
 
     if results or n_below_snr or n_unmeasurable:

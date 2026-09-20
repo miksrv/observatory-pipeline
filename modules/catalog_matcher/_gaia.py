@@ -31,12 +31,28 @@ logger = logging.getLogger(__name__)
 Gaia.ROW_LIMIT = 50000
 
 
+def _finite_or_none(row, column: str) -> float | None:
+    """
+    Read one numeric column off an astropy table row, returning None when it
+    is masked, missing, or not finite. Gaia leaves photometry columns empty
+    for sources it has no solution for, and the masked-value warning those
+    produce is noise here.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            value = float(row[column])
+    except (TypeError, ValueError, KeyError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dict]:
     """
     Query Gaia DR3 for all stars within fov_deg/2 of the frame centre.
 
     Returns a list of dicts with keys: ra, dec, source_id, phot_g_mean_mag,
-    pmra, pmdec, ref_epoch. The last three are proper motion in RA*cos(dec)
+    pmra, pmdec, ref_epoch, bp_rp. The last three are proper motion in RA*cos(dec)
     and Dec (mas/yr) and the epoch (Julian year, J2016.0 for Gaia DR3) those
     positions/motions are referenced to — needed by _propagate_to_epoch()
     below (for matching and the WCS-offset accumulator) and by
@@ -69,6 +85,9 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
         has_pmra      = "pmra"      in table.colnames
         has_pmdec     = "pmdec"     in table.colnames
         has_ref_epoch = "ref_epoch" in table.colnames
+        has_bp_rp     = "bp_rp"     in table.colnames
+        has_bp        = "phot_bp_mean_mag" in table.colnames
+        has_rp        = "phot_rp_mean_mag" in table.colnames
 
         stars: list[dict] = []
         for row in table:
@@ -103,6 +122,21 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
                 except (TypeError, ValueError):
                     pass
 
+            # BP-RP colour, for modules/photometry.py's colour term. Gaia
+            # publishes it directly, but not every astroquery version returns
+            # the precomputed column, so it is recomputed from the two band
+            # magnitudes when only those are present. A star with no BP or RP
+            # photometry (faint, or blended in the low-resolution prism)
+            # simply has no colour and is excluded from the colour fit.
+            bp_rp: float | None = None
+            if has_bp_rp:
+                bp_rp = _finite_or_none(row, "bp_rp")
+            elif has_bp and has_rp:
+                bp = _finite_or_none(row, "phot_bp_mean_mag")
+                rp = _finite_or_none(row, "phot_rp_mean_mag")
+                if bp is not None and rp is not None:
+                    bp_rp = bp - rp
+
             stars.append({
                 "ra":              float(row["ra"]),
                 "dec":             float(row["dec"]),
@@ -111,6 +145,7 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
                 "pmra":            pmra,
                 "pmdec":           pmdec,
                 "ref_epoch":       ref_epoch,
+                "bp_rp":           bp_rp,
             })
 
         _cache_set(cache_key, stars)
@@ -261,6 +296,11 @@ def _match_gaia(sources: list[dict], gaia_stars: list[dict]) -> None:
             source["catalog_id"]   = matched["source_id"]
             source["catalog_mag"]  = matched["phot_g_mean_mag"]
             source["object_type"]  = "STAR"
+            # Gaia BP-RP, for modules/photometry.py's colour term. Leading
+            # underscore: it is pipeline-internal, with no column on the API
+            # side, so api_client's _to_wire_source() strips it — same
+            # convention as "_from_subtraction"/"_source_id".
+            source["_catalog_color"] = matched.get("bp_rp")
 
 
 # ---------------------------------------------------------------------------

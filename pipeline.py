@@ -640,6 +640,14 @@ async def analyze_frame(fits_path: str) -> dict | None:
         try:
             zero_point = next((s.get("zero_point") for s in sources if s.get("zero_point") is not None), None)
             zero_point_err = next((s.get("zero_point_err") for s in sources if s.get("zero_point_err") is not None), None)
+            # The colour part of the same solution, read off the same way —
+            # so a forced measurement is transformed to Gaia's G system on
+            # exactly the terms an ordinary measured source was (audit
+            # 2026-08-18, finding H5). All three stay at their "no colour term
+            # fitted" defaults when photometry never fitted one.
+            color_term = next((s.get("_color_term") for s in sources if s.get("_color_term")), 0.0) or 0.0
+            color_ref = next((s.get("_color_ref") for s in sources if s.get("_color_ref") is not None), None)
+            color_scatter = next((s.get("_color_scatter") for s in sources if s.get("_color_scatter")), 0.0) or 0.0
             gaia_stars = catalog_matcher.get_gaia_stars(
                 astro_result.get("ra_center") or header.get("ra") or 0.0,
                 astro_result.get("dec_center") or header.get("dec") or 0.0,
@@ -667,6 +675,9 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 zero_point_err=zero_point_err,
                 obs_time=header.get("obs_time_mid") or header.get("obs_time"),
                 psf_fwhm_arcsec=psf_fwhm_arcsec,
+                color_term=color_term,
+                color_ref=color_ref,
+                color_scatter=color_scatter,
             )
             if forced_sources:
                 _tag_mag_and_filter(forced_sources)

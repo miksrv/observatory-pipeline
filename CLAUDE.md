@@ -693,6 +693,23 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
 ### `modules/photometry.py`
 - Aperture photometry via `photutils.aperture`
 - Differential photometry against Gaia reference stars in the field (requires ≥3 Gaia DR3 matches to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations
+- The zero-point carries a **colour term**, not a single constant offset: a star's instrumental
+  magnitude in R/B/V/I differs from its Gaia broadband G magnitude by an amount that depends on
+  the star's own colour, so one median offset leaves a systematic bias that drifts night to night
+  with whatever mix of red and blue reference stars the field supplied — enough to move many stars
+  in one epoch together past `DELTA_MAG_ALERT` and read as a frame-wide variability signal (audit
+  2026-08-18, finding H5). `_compute_zero_point()` fits `catalog_mag − mag_instrumental = zp + k ×
+  (BP−RP − color_ref)` with 3σ-clipped passes (`PHOTOMETRY_COLOR_TERM_*`), reporting `zp` **at**
+  `color_ref` (the reference set's own median BP−RP). A source whose Gaia BP−RP is known — carried
+  on `_catalog_color`, set by `modules/catalog_matcher/_gaia.py` — gets `k` applied to it; one
+  whose colour is unknown (every uncatalogued transient, every MPC object) uses `zp` bare, which
+  amounts to assuming a typical colour for the field, and has `mag_err` widened by
+  `|k| × color_scatter` rather than that assumption being left silent. The fit is skipped — falling
+  back to the plain median, i.e. the previous behaviour exactly — when too few references carry a
+  colour, when their colour span is too narrow to constrain a slope, or when the fitted `k` exceeds
+  `PHOTOMETRY_COLOR_TERM_MAX`. `modules/forced_photometry.py` receives the same solution from
+  `pipeline.py` (`_color_term`/`_color_ref`/`_color_scatter`, read off a measured source the way
+  `zero_point` already is) and applies it identically.
 - Adds the following fields to each source: `flux_aperture`, `flux_err`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `snr`, `calibrated` (bool), `edge_flag`, `zero_point`, `zero_point_err`
 - `flux_err` is `sqrt(|net_flux| / gain + ap_area × sky_sigma²)`. The aperture sum is in ADU,
   but photon shot noise is Poissonian in **electrons** — `N_e = net_flux × gain`, whose variance

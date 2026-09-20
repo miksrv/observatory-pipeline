@@ -376,6 +376,34 @@ PHOTOMETRY_GAIN_E_PER_ADU: float | None = (
     float(_photometry_gain_raw) if _photometry_gain_raw else None
 )
 
+# --- Colour term in the Gaia zero-point ------------------------------------
+# A star's instrumental magnitude in R (or B, V, I, ...) differs from its
+# Gaia broadband G magnitude by an amount that depends on the star's own
+# colour, not by a constant. Fitting a single median offset — all this
+# pipeline did before — therefore leaves a systematic bias in every
+# mag_calibrated, and that bias drifts night to night with whatever mix of
+# red and blue reference stars the field happened to provide. It can shift
+# many stars in one epoch together by more than DELTA_MAG_ALERT, i.e. produce
+# a frame-wide false variability signal (audit 2026-08-18, finding H5).
+#
+# With this enabled, modules/photometry.py fits
+#   catalog_mag - mag_instrumental = zero_point + k * (BP-RP - reference colour)
+# robustly against the frame's own Gaia references, reports the zero point at
+# the reference colour, and applies the k term per source for any source whose
+# own Gaia BP-RP colour is known.
+PHOTOMETRY_COLOR_TERM_ENABLED: bool = _get("PHOTOMETRY_COLOR_TERM_ENABLED", "true").lower() in ("true", "1", "yes")
+# Minimum number of reference stars carrying a usable BP-RP colour before a
+# slope is fitted at all. A slope from a handful of stars is noise.
+PHOTOMETRY_COLOR_TERM_MIN_REFS: int = int(_get("PHOTOMETRY_COLOR_TERM_MIN_REFS", "10"))
+# Minimum spread in BP-RP (mag) across those references. A slope fitted over a
+# field whose stars all share one colour is unconstrained — extrapolating it to
+# a source of a different colour is worse than not correcting at all.
+PHOTOMETRY_COLOR_TERM_MIN_SPAN: float = float(_get("PHOTOMETRY_COLOR_TERM_MIN_SPAN", "0.5"))
+# Largest |k| considered physically plausible for a broadband filter against
+# Gaia G. A fit beyond this is a degenerate one (outliers, a bad reference
+# set), and is discarded in favour of the plain constant offset.
+PHOTOMETRY_COLOR_TERM_MAX: float = float(_get("PHOTOMETRY_COLOR_TERM_MAX", "1.5"))
+
 # ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
 # ---------------------------------------------------------------------------
@@ -602,6 +630,10 @@ _OVERRIDABLE: dict[str, type] = {
     "SATURATION_ADU": float,
     "SATURATION_MASK_RADIUS_ARCSEC": float,
     # Cross-matching
+    "PHOTOMETRY_COLOR_TERM_ENABLED": bool,
+    "PHOTOMETRY_COLOR_TERM_MIN_REFS": int,
+    "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
+    "PHOTOMETRY_COLOR_TERM_MAX": float,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "MOVING_RATE_ARCSEC_PER_MIN": float,

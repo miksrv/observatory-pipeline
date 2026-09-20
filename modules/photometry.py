@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Any
+from typing import Any, NamedTuple
 
 import astropy.io.fits as fits
 import numpy as np
@@ -187,21 +187,103 @@ def _pixel_scale_from_wcs(wcs: WCS) -> float:
     return pixel_scale_deg * 3600.0      # arcsec/px
 
 
-def _compute_zero_point(
-    sources: list[dict],
-) -> tuple[float | None, float | None]:
+class _ZeroPoint(NamedTuple):
+    """
+    The frame's photometric solution: an offset, its uncertainty, and the
+    colour term that offset is defined at.
+
+    `color_term` is 0.0 and `color_ref` is None whenever no colour fit was
+    made (disabled, too few references carrying a Gaia BP-RP colour, too
+    narrow a colour span to constrain a slope, or an implausible fitted
+    slope) — in that case this behaves exactly like the plain median offset
+    this module computed before colour terms existed.
+    """
+
+    zero_point: float | None
+    zero_point_err: float | None
+    color_term: float
+    color_ref: float | None
+    color_scatter: float
+
+
+def _robust_color_fit(
+    colors: np.ndarray,
+    deltas: np.ndarray,
+    color_ref: float,
+) -> tuple[float, float, float] | None:
+    """
+    Fit ``delta = zp + k * (color - color_ref)`` with three passes of 3-sigma
+    clipping, returning ``(zp, k, residual_sigma)`` — or None when the fit
+    collapses (too few survivors, or a degenerate slope).
+
+    Clipping rather than a plain least-squares fit because the reference set
+    routinely contains a blended pair, an unflagged variable, or a star whose
+    aperture caught a cosmic ray; a single such point can tilt a slope fitted
+    over a modest colour baseline. The residual scatter is reported as a
+    MAD-derived sigma for the same reason the scatter elsewhere in this
+    pipeline is (see anomaly_detector's `_history_mag_scatter()`).
+    """
+    keep = np.ones(len(colors), dtype=bool)
+    x = colors - color_ref
+
+    fit: tuple[float, float, float] | None = None
+    for _ in range(3):
+        if int(keep.sum()) < config.PHOTOMETRY_COLOR_TERM_MIN_REFS:
+            return fit
+        try:
+            k, zp = np.polyfit(x[keep], deltas[keep], 1)
+        except Exception:
+            return fit
+
+        resid = deltas - (zp + k * x)
+        sigma = 1.4826 * float(np.median(np.abs(resid[keep] - np.median(resid[keep]))))
+        fit = (float(zp), float(k), sigma)
+
+        if sigma <= 0.0:
+            return fit
+        new_keep = np.abs(resid - np.median(resid[keep])) <= 3.0 * sigma
+        if int(new_keep.sum()) < config.PHOTOMETRY_COLOR_TERM_MIN_REFS:
+            return fit
+        if np.array_equal(new_keep, keep):
+            return fit
+        keep = new_keep
+
+    return fit
+
+
+def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
     """
     Compute the differential photometry zero-point from Gaia DR3 reference stars.
 
     Requires at least 3 sources with ``catalog_name == "Gaia DR3"``,
     a finite ``catalog_mag``, and a finite ``mag_instrumental``.
 
+    When enough of those references also carry a Gaia BP-RP colour spanning a
+    wide enough range, the offset is fitted as a line in colour rather than
+    taken as a single median. A star's instrumental magnitude in R (or B, V,
+    I) differs from its Gaia broadband G magnitude by an amount that depends
+    on the star's own colour; collapsing that into one constant leaves a
+    systematic bias in every `mag_calibrated`, and the bias moves night to
+    night with whatever mix of red and blue stars the field supplied — enough
+    to shift many stars in one epoch together past `DELTA_MAG_ALERT` and read
+    as a frame-wide variability signal (audit 2026-08-18, finding H5).
+
+    The zero point is reported **at the reference colour** (the reference
+    set's own median BP-RP), so it keeps meaning "the offset for a typical
+    star in this field" and a source whose colour is unknown can still use it
+    directly — see `measure()`, which inflates such a source's `mag_err` by
+    the colour term's own reach instead.
+
     Returns
     -------
-    (zero_point, zero_point_err)
-        Both are None when fewer than 3 valid references are available.
+    _ZeroPoint
+        ``zero_point``/``zero_point_err`` are None when fewer than 3 valid
+        references are available. ``color_term`` is 0.0 (and ``color_ref``
+        None) whenever no colour fit was made, in which case the result is
+        identical to the plain median this function returned before.
     """
     deltas: list[float] = []
+    colors: list[float] = []
     for src in sources:
         if src.get("catalog_name") != "Gaia DR3":
             continue
@@ -220,27 +302,82 @@ def _compute_zero_point(
             continue
         deltas.append(cat_mag - inst_mag)
 
+        color = src.get("_catalog_color")
+        colors.append(
+            float(color)
+            if color is not None and math.isfinite(float(color))
+            else float("nan")
+        )
+
     if len(deltas) < 3:
         logger.warning(
             "photometry: only %d Gaia DR3 reference stars available "
             "(need >= 3) — mag_calibrated will be None for all sources",
             len(deltas),
         )
-        return None, None
+        return _ZeroPoint(None, None, 0.0, None, 0.0)
 
     arr = np.array(deltas, dtype=np.float64)
+    col = np.array(colors, dtype=np.float64)
     zp: float = float(np.median(arr))
     # Median absolute deviation (no scipy dependency)
     mad: float = float(np.median(np.abs(arr - zp)))
 
+    # ------------------------------------------------------------------
+    # Colour term
+    # ------------------------------------------------------------------
+    has_color = np.isfinite(col)
+    n_color = int(has_color.sum())
+    color_ref: float | None = None
+    color_term = 0.0
+    color_scatter = 0.0
+
+    if n_color >= 2:
+        color_ref = float(np.median(col[has_color]))
+        color_scatter = 1.4826 * float(
+            np.median(np.abs(col[has_color] - color_ref))
+        )
+
+    if config.PHOTOMETRY_COLOR_TERM_ENABLED and n_color >= config.PHOTOMETRY_COLOR_TERM_MIN_REFS:
+        span = float(
+            np.percentile(col[has_color], 90) - np.percentile(col[has_color], 10)
+        )
+        if span < config.PHOTOMETRY_COLOR_TERM_MIN_SPAN:
+            logger.info(
+                "photometry: colour span of the reference set is only %.2f mag "
+                "(need >= %.2f) — a slope fitted over it would be "
+                "unconstrained; using a constant zero-point",
+                span, config.PHOTOMETRY_COLOR_TERM_MIN_SPAN,
+            )
+        else:
+            fit = _robust_color_fit(col[has_color], arr[has_color], color_ref)
+            if fit is None:
+                logger.info("photometry: colour-term fit did not converge — using a constant zero-point")
+            elif abs(fit[1]) > config.PHOTOMETRY_COLOR_TERM_MAX:
+                logger.warning(
+                    "photometry: fitted colour term k=%.3f mag/mag exceeds the "
+                    "plausible %.2f — discarding it as a degenerate fit and "
+                    "using a constant zero-point",
+                    fit[1], config.PHOTOMETRY_COLOR_TERM_MAX,
+                )
+            else:
+                zp, color_term, resid_sigma = fit
+                mad = resid_sigma
+                logger.info(
+                    "photometry: colour term k=%.3f mag/mag at BP-RP=%.3f "
+                    "(n_color=%d/%d, span=%.2f mag)",
+                    color_term, color_ref, n_color, len(deltas), span,
+                )
+
     logger.info(
-        "photometry: zero_point=%.4f  zero_point_err(MAD)=%.4f  "
-        "n_ref_stars=%d",
+        "photometry: zero_point=%.4f  zero_point_err=%.4f  "
+        "n_ref_stars=%d  color_term=%.4f",
         zp,
         mad,
         len(deltas),
+        color_term,
     )
-    return zp, mad
+    return _ZeroPoint(zp, mad, color_term, color_ref, color_scatter)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +433,10 @@ async def measure(
         flux_aperture       float | None   net aperture flux (ADU)
         flux_err            float | None   Poisson + sky noise in quadrature
         mag_instrumental    float | None   -2.5 * log10(flux_aperture)
-        mag_calibrated      float | None   mag_instrumental + zero_point
+        mag_calibrated      float | None   mag_instrumental + zero_point,
+                                            plus the fitted colour term for a
+                                            source whose own Gaia BP-RP colour
+                                            is known (see _compute_zero_point())
         mag_err             float | None   1.0857 * flux_err / flux_aperture
         snr                 float | None   flux_aperture / flux_err — same
                                             flux/noise convention as
@@ -311,7 +451,8 @@ async def measure(
         calibrated          bool           True when zero_point was applied
         edge_flag           bool           True when centroid is within 10 px of edge
         zero_point          float | None   frame-level ZP (same for all sources)
-        zero_point_err      float | None   MAD of reference-star ZP offsets
+        zero_point_err      float | None   robust scatter of the reference
+                                            stars about the fitted solution
 
     A source carrying ``saturated=True`` (set by ``astrometry.solve()``; see
     docs/ISSUES.md #2) is never measured — its photometry keys stay None
@@ -603,20 +744,74 @@ async def measure(
             "docstring)",
             fits_filename,
         )
-        zero_point, zero_point_err = None, None
+        solution = _ZeroPoint(None, None, 0.0, None, 0.0)
     else:
-        zero_point, zero_point_err = _compute_zero_point(output)
+        solution = _compute_zero_point(output)
+
+    zero_point     = solution.zero_point
+    zero_point_err = solution.zero_point_err
+    n_color_corrected = 0
 
     for out in output:
         out["zero_point"]     = zero_point
         out["zero_point_err"] = zero_point_err
+        # Leading underscore: pipeline-internal, stripped by api_client's
+        # _to_wire_source(). pipeline.py reads these back off the measured
+        # sources to hand the same solution to modules/forced_photometry.py,
+        # exactly as it already does for zero_point/zero_point_err.
+        out["_color_term"]    = solution.color_term
+        out["_color_ref"]     = solution.color_ref
+        out["_color_scatter"] = solution.color_scatter
 
         if zero_point is not None and out["mag_instrumental"] is not None:
-            out["mag_calibrated"] = out["mag_instrumental"] + zero_point
+            color = out.get("_catalog_color")
+            try:
+                color_f = float(color) if color is not None else None
+            except (TypeError, ValueError):
+                color_f = None
+
+            if (
+                solution.color_term
+                and solution.color_ref is not None
+                and color_f is not None
+                and math.isfinite(color_f)
+            ):
+                # This source's own colour is known, so the transformation to
+                # Gaia's G system is exact rather than assumed.
+                out["mag_calibrated"] = (
+                    out["mag_instrumental"]
+                    + zero_point
+                    + solution.color_term * (color_f - solution.color_ref)
+                )
+                n_color_corrected += 1
+            else:
+                # No colour for this source — the overwhelmingly common case
+                # for exactly the sources that matter, since an uncatalogued
+                # transient has no Gaia entry to take a colour from. The zero
+                # point is defined at the reference set's median colour, so
+                # applying it bare amounts to assuming this source has a
+                # typical colour for the field. That assumption is worth what
+                # the colour term can move across the field's own colour
+                # spread, so it is folded into the reported uncertainty
+                # instead of being left silent.
+                out["mag_calibrated"] = out["mag_instrumental"] + zero_point
+                if solution.color_term and out.get("mag_err") is not None:
+                    color_unc = abs(solution.color_term) * solution.color_scatter
+                    out["mag_err"] = math.sqrt(out["mag_err"] ** 2 + color_unc ** 2)
             out["calibrated"]     = True
         else:
             out["mag_calibrated"] = None
             out["calibrated"]     = False
+
+    if solution.color_term:
+        logger.info(
+            "photometry: colour term applied per-source to %d/%d source(s); "
+            "the rest use the zero point at BP-RP=%.3f with their mag_err "
+            "widened by %.3f mag  file=%s",
+            n_color_corrected, len(output), solution.color_ref or 0.0,
+            abs(solution.color_term) * solution.color_scatter,
+            fits_filename,
+        )
 
     calibrated_count = sum(1 for o in output if o["calibrated"])
     logger.info(
