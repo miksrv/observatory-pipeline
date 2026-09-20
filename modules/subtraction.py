@@ -590,7 +590,11 @@ def _align_frame(
     """
     try:
         import astroalign
-        aligned, footprint = astroalign.register(source, target)
+        # propagate_mask=True carries a masked source's own mask into the
+        # returned footprint — which is how _prerotate_reference()'s padding
+        # (the corners a same-canvas rotation would have cropped away) stays
+        # marked as "no data here" through astroalign's own resampling.
+        aligned, footprint = astroalign.register(source, target, propagate_mask=True)
         aligned_arr = np.asarray(aligned, dtype=np.float32)
 
         mask: Optional[np.ndarray] = None
@@ -1239,12 +1243,40 @@ def _prerotate_reference(
 
     try:
         from scipy.ndimage import rotate as _ndi_rotate
-        rotated = _ndi_rotate(ref_data, angle=delta, reshape=False, order=1, mode="constant", cval=0.0)
+
+        # reshape=True, not False. Rotating onto the same canvas is a crop for
+        # any angle that isn't a multiple of 90 degrees — the corners rotate
+        # off the edge and are simply lost. The gate is 2 degrees, so this
+        # fires on modest field rotation (an alt-az mount without a
+        # de-rotator), not only on meridian flips, and the stars it discards
+        # are the ones astroalign needs to find a transform at all: the
+        # failure rate rose exactly for the large-angle cases pre-rotation
+        # exists to help (audit 2026-08-18, finding H14). Letting the canvas
+        # grow keeps every star; astroalign resamples onto the new frame's
+        # grid regardless of the source's shape.
+        rotated = _ndi_rotate(ref_data, angle=delta, reshape=True, order=1, mode="constant", cval=0.0)
+
+        # The other half of that finding: the constant fill leaves a hard
+        # zero/data boundary running diagonally across the frame, which the
+        # median stack cannot cancel and sep reads as a bright edge-on
+        # residual. Rotating a validity map by the same angle (order=0, so it
+        # stays binary) marks exactly those pixels, and handing astroalign a
+        # masked array with propagate_mask=True carries the marking through
+        # its own resampling into the footprint _median_reference() already
+        # excludes from the stack.
+        valid = _ndi_rotate(
+            np.ones(ref_data.shape, dtype=np.uint8),
+            angle=delta, reshape=True, order=0, mode="constant", cval=0,
+        )
+
         logger.info(
             "Subtraction: pre-rotated reference %s by %.1f deg (ref_pa=%.1f, new_pa=%.1f) before alignment",
             os.path.basename(ref_path), delta, ref_pa, new_position_angle_deg,
         )
-        return np.asarray(rotated, dtype=ref_data.dtype)
+        return np.ma.masked_array(
+            np.asarray(rotated, dtype=ref_data.dtype),
+            mask=(valid < 1),
+        )
     except Exception as exc:
         logger.debug("Subtraction: pre-rotation of %s failed (%s) — using un-rotated reference", ref_path, exc)
         return ref_data

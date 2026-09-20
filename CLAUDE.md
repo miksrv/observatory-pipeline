@@ -979,6 +979,15 @@ instead, both soft/best-effort — see that module's own section above for the e
    faster and less prone to a wrong/degenerate match on a sparse or partly-symmetric star field.
    Skipped entirely below `SUBTRACTION_PREROTATE_MIN_DEG` (not worth the interpolation cost for a
    negligible angle) or whenever either frame's WCS/PA is unavailable — never a hard failure.
+   The rotation lets the canvas **grow** (`reshape=True`): rotating onto the same canvas is a crop
+   for any angle that isn't a multiple of 90°, and since the gate is 2° it fires on modest field
+   rotation (an alt-az mount without a de-rotator), not only on meridian flips — so the stars it
+   discarded were the ones `astroalign` needs to find a transform at all, raising the failure rate
+   exactly for the large-angle cases pre-rotation exists to help (audit 2026-08-18, finding H14).
+   The constant fill that remains is marked as invalid rather than left as a hard zero/data
+   boundary the median stack can't cancel: a validity map is rotated by the same angle, the
+   reference is handed to `astroalign` as a masked array, and `propagate_mask=True` carries that
+   marking through its own resampling into the footprint `_median_reference()` already excludes.
    `_find_archive_frames()` additionally uses PA-closeness as a *soft* tiebreaker when there are more
    candidate references than `_MAX_FRAMES` (a reference needing less correction is a marginally
    safer bet), never as a hard filter.

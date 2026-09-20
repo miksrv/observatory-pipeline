@@ -270,7 +270,7 @@ class TestAlignFrame:
     def test_align_success_returns_registered_array(self, monkeypatch):
         import astroalign
         fake_aligned = np.zeros((5, 5), dtype=np.float64)
-        monkeypatch.setattr(astroalign, "register", lambda source, target: (fake_aligned, None))
+        monkeypatch.setattr(astroalign, "register", lambda source, target, propagate_mask=False: (fake_aligned, None))
 
         result = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
 
@@ -283,7 +283,7 @@ class TestAlignFrame:
     def test_align_failure_returns_none(self, monkeypatch):
         import astroalign
 
-        def _raise(source, target):
+        def _raise(source, target, propagate_mask=False):
             raise ValueError("not enough matching triangles")
 
         monkeypatch.setattr(astroalign, "register", _raise)
@@ -314,7 +314,7 @@ class TestAlignmentFootprint:
         fake_footprint[0, :] = True
         monkeypatch.setattr(
             astroalign, "register",
-            lambda source, target: (fake_aligned, fake_footprint),
+            lambda source, target, propagate_mask=False: (fake_aligned, fake_footprint),
         )
 
         aligned, footprint = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
@@ -328,7 +328,7 @@ class TestAlignmentFootprint:
         import astroalign
         monkeypatch.setattr(
             astroalign, "register",
-            lambda source, target: (np.zeros((5, 5)), np.zeros((3, 3), dtype=bool)),
+            lambda source, target, propagate_mask=False: (np.zeros((5, 5)), np.zeros((3, 3), dtype=bool)),
         )
 
         _, footprint = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
@@ -671,6 +671,66 @@ class TestDetectDiffSources:
 # classifiable by anomaly_detector.py as its own SPACE_DEBRIS anomaly).
 # Uses real (unmocked) sep, same style as TestDetectDiffSources above.
 # ---------------------------------------------------------------------------
+
+class TestPrerotationDoesNotCropCorners:
+    """
+    Audit 2026-08-18, finding H14: scipy.ndimage.rotate(reshape=False) is a
+    crop for any angle that isn't a multiple of 90 degrees — the corners
+    rotate off the canvas and are lost. The gate is 2 degrees, so this fired
+    on modest field rotation, not only on meridian flips, and the stars it
+    discarded are the ones astroalign needs to find a transform at all.
+    """
+
+    def _prerotate(self, monkeypatch, tmp_path, ref_pa, new_pa, shape=(60, 80)):
+        data = np.arange(shape[0] * shape[1], dtype=np.float32).reshape(shape) + 1.0
+        path = str(tmp_path / "ref.fits")
+
+        monkeypatch.setattr(subtraction, "_open_wcs", lambda p: object())
+        monkeypatch.setattr(subtraction, "_position_angle_deg", lambda w: ref_pa)
+
+        return data, subtraction._prerotate_reference(data, path, new_pa)
+
+    def test_the_canvas_grows_so_no_content_is_lost(self, monkeypatch, tmp_path):
+        data, rotated = self._prerotate(monkeypatch, tmp_path, ref_pa=0.0, new_pa=30.0)
+
+        assert rotated.shape[0] > data.shape[0]
+        assert rotated.shape[1] > data.shape[1]
+
+    def test_the_padding_is_masked_rather_than_left_as_a_hard_zero_edge(
+        self, monkeypatch, tmp_path,
+    ):
+        _, rotated = self._prerotate(monkeypatch, tmp_path, ref_pa=0.0, new_pa=30.0)
+
+        assert isinstance(rotated, np.ma.MaskedArray)
+        # The corners of the enlarged canvas are outside the original frame.
+        assert bool(rotated.mask[0, 0]) is True
+        # The centre came from real data.
+        h, w = rotated.shape
+        assert bool(rotated.mask[h // 2, w // 2]) is False
+
+    def test_a_negligible_angle_is_left_untouched(self, monkeypatch, tmp_path):
+        data, rotated = self._prerotate(monkeypatch, tmp_path, ref_pa=0.0, new_pa=0.5)
+
+        assert rotated is data
+
+    def test_the_mask_reaches_astroalign(self, monkeypatch):
+        """
+        The padding only stays out of the median stack because astroalign is
+        asked to propagate a masked source's mask into its footprint.
+        """
+        import astroalign
+
+        seen: dict = {}
+
+        def fake_register(source, target, propagate_mask=False):
+            seen["propagate_mask"] = propagate_mask
+            return np.zeros(target.shape, dtype=np.float32), None
+
+        monkeypatch.setattr(astroalign, "register", fake_register)
+        subtraction._align_frame(np.ones((5, 5)), np.ones((5, 5)))
+
+        assert seen["propagate_mask"] is True
+
 
 class TestCorrelatedNoiseCorrection:
     """
