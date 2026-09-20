@@ -831,6 +831,19 @@ doesn't solve, the "faint UNKNOWN" problem — see Known Issues #1); MPC/SkyBot 
 solar system objects at the observation epoch. Per-catalog source/access details and rate limits
 are in "External Catalogs & APIs" below.
 
+**MPC/SkyBot is the one exception to "exclusive".** It runs last but sees **every** source, not
+just the unclaimed remainder — an asteroid projecting within `MATCH_CONE_ARCSEC` of a background
+star (routine in a dense field or near the galactic plane) would otherwise be permanently tagged
+`Gaia DR3`/`Simbad` before SkyBot ever got a look, losing its `ASTEROID`/`COMET` classification
+and ephemeris, while the MPC object itself was handed to whatever *other* unclaimed source
+happened to be nearest within the 120″ cone — a false stationary "asteroid" on top of the real
+miss (audit 2026-08-18, finding C3). Conflicts are resolved positionally rather than by catalog
+order: a source already claimed by a stellar catalog is taken over **only** when the ephemeris
+position sits within the tight `MATCH_CONE_ARCSEC` of it (the blend case); beyond that, the MPC
+object falls back to the nearest *unclaimed* source within `MOVING_CONE_ARCSEC` as before —
+120″ is far too loose to justify overwriting an established identification, since at that radius
+some catalogued star is almost always present regardless. A takeover logs both identities.
+
 Each matched source is enriched **in-place** with `catalog_name`, `catalog_id`, `catalog_mag`,
 `object_type` — its `ra`/`dec` fields are the already offset-corrected coordinates, there are
 no separate `source_ra`/`source_dec` fields.

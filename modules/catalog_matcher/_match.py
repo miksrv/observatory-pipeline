@@ -48,6 +48,9 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         3. 2MASS — fallback for red/cool stars faint or absent in Gaia
            (late M/K dwarfs, reddened stars near Galactic plane); J-band mag.
         4. MPC/SkyBot — solar system objects (asteroids, comets); wider cone.
+           Runs against all sources rather than the unclaimed remainder, and
+           takes over a source already claimed by a stellar catalog only on a
+           tight (MATCH_CONE_ARCSEC) positional coincidence.
 
     Parameters
     ----------
@@ -199,6 +202,12 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         logger.warning("Pan-STARRS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 5. MPC / SkyBot (solar system objects; wider cone) ---
+    #        Unlike the four stellar stages above, this one considers EVERY
+    #        source, not just the ones nothing has claimed yet: an asteroid
+    #        projecting onto a background star would otherwise lose its
+    #        ASTEROID/COMET classification to whichever catalog got there
+    #        first (audit 2026-08-18, C3). _match_mpc() resolves the conflict
+    #        positionally — see its docstring.
     mpc_objects: list[dict] = []
     try:
         mpc_objects = _mpc._query_mpc(ra_center, dec_center, obs_time, fov_deg)

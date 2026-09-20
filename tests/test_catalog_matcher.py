@@ -342,9 +342,46 @@ class TestMpcMatching:
         result = cm._query_mpc(_RA, _DEC, "invalid-time-format", 1.0)
         assert result == []
 
-    def test_mpc_skips_already_matched_sources(self):
-        """Source already matched by Gaia must not be overwritten by MPC."""
-        source = _make_source(ra=_RA, dec=_DEC)
+    def test_mpc_takes_over_a_coincident_catalogued_source(self):
+        """
+        Audit 2026-08-18, finding C3: a solar system object projecting within
+        MATCH_CONE_ARCSEC of a background star used to be permanently tagged
+        with that star's identity, because MPC only ever saw the sources no
+        earlier catalog had claimed. A tight positional coincidence now hands
+        the source to MPC instead — the ASTEROID/COMET classification and its
+        ephemeris are the far costlier thing to lose.
+        """
+        # Gaia-matched star 2" from the ephemeris position — inside the tight cone
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 2.0)
+        source = _make_source(ra=star_ra, dec=star_dec)
+        source["catalog_name"] = "Gaia DR3"
+        source["catalog_id"]   = "GAIA_STAR_ID"
+        source["catalog_mag"]  = 13.0
+        source["object_type"]  = "STAR"
+
+        mpc_objects = [{
+            "ra":          _RA,
+            "dec":         _DEC,
+            "designation": "2024 AB1",
+            "object_type": "ASTEROID",
+        }]
+
+        cm._match_mpc([source], mpc_objects)
+
+        assert source["catalog_name"] == "MPC"
+        assert source["catalog_id"]   == "2024 AB1"
+        assert source["object_type"]  == "ASTEROID"
+        assert source["catalog_mag"]  is None
+
+    def test_mpc_leaves_a_distant_catalogued_source_alone(self):
+        """
+        Beyond MATCH_CONE_ARCSEC, an established identification is never
+        overwritten: MOVING_CONE_ARCSEC (120") is wide enough that some
+        catalogued star is almost always inside it, whether or not it has
+        anything to do with the moving object.
+        """
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 40.0)
+        source = _make_source(ra=star_ra, dec=star_dec)
         source["catalog_name"] = "Gaia DR3"
         source["catalog_id"]   = "GAIA_STAR_ID"
         source["catalog_mag"]  = 13.0
@@ -360,6 +397,69 @@ class TestMpcMatching:
         cm._match_mpc([source], mpc_objects)
 
         assert source["catalog_name"] == "Gaia DR3"
+        assert source["catalog_id"]   == "GAIA_STAR_ID"
+
+    def test_mpc_prefers_an_unclaimed_source_beyond_the_tight_cone(self):
+        """
+        With no tight coincidence available, the MPC object falls back to the
+        nearest *unclaimed* source within MOVING_CONE_ARCSEC — even though a
+        catalogued one sits closer.
+        """
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 40.0)
+        star = _make_source(ra=star_ra, dec=star_dec)
+        star["catalog_name"] = "Gaia DR3"
+        star["catalog_id"]   = "GAIA_STAR_ID"
+        star["object_type"]  = "STAR"
+
+        free_ra, free_dec = _offset_ra_exact(_RA, _DEC, 60.0)
+        free = _make_source(ra=free_ra, dec=free_dec)
+        free["catalog_name"] = None
+        free["catalog_id"]   = None
+
+        mpc_objects = [{
+            "ra":          _RA,
+            "dec":         _DEC,
+            "designation": "2024 AB1",
+            "object_type": "ASTEROID",
+        }]
+
+        cm._match_mpc([star, free], mpc_objects)
+
+        assert star["catalog_name"] == "Gaia DR3"
+        assert free["catalog_name"] == "MPC"
+        assert free["catalog_id"]   == "2024 AB1"
+
+    def test_mpc_blend_does_not_displace_the_designation_onto_a_bystander(self):
+        """
+        The second half of finding C3: once the real (blended) detection was
+        out of reach, the MPC object was handed to whatever unmatched source
+        happened to be nearest within the 120" cone — a false stationary
+        "asteroid" on top of the real miss. The blended detection must win,
+        and the bystander must stay uncatalogued.
+        """
+        blend_ra, blend_dec = _offset_ra_exact(_RA, _DEC, 1.0)
+        blend = _make_source(ra=blend_ra, dec=blend_dec)
+        blend["catalog_name"] = "Gaia DR3"
+        blend["catalog_id"]   = "GAIA_STAR_ID"
+        blend["object_type"]  = "STAR"
+
+        bystander_ra, bystander_dec = _offset_ra_exact(_RA, _DEC, 80.0)
+        bystander = _make_source(ra=bystander_ra, dec=bystander_dec)
+        bystander["catalog_name"] = None
+        bystander["catalog_id"]   = None
+
+        mpc_objects = [{
+            "ra":          _RA,
+            "dec":         _DEC,
+            "designation": "2024 AB1",
+            "object_type": "ASTEROID",
+        }]
+
+        cm._match_mpc([blend, bystander], mpc_objects)
+
+        assert blend["catalog_name"] == "MPC"
+        assert blend["catalog_id"]   == "2024 AB1"
+        assert bystander["catalog_name"] is None
 
     def test_mpc_empty_obs_time_returns_empty(self):
         """If obs_time is empty, _query_mpc returns [] immediately."""

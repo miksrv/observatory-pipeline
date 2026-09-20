@@ -160,15 +160,13 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
 
 def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
     """
-    Mutate sources in-place: set catalog fields for unmatched sources within
-    MOVING_CONE_ARCSEC of a known MPC object.
-
-    Uses a wider cone than Gaia/Simbad matching to account for object motion
-    between the MPC ephemeris epoch and the actual observation time.
-    Skips sources that already have catalog_name set.
+    Mutate sources in-place: set catalog fields for sources matching a known
+    MPC object, using a wider cone (MOVING_CONE_ARCSEC) than Gaia/Simbad to
+    account for object motion between the MPC ephemeris epoch and the actual
+    observation time.
 
     One-to-one matching: each MPC object is assigned to at most ONE detected
-    source (the nearest unmatched source within the threshold). The previous
+    source (the nearest candidate within the threshold). The original
     implementation matched in the opposite direction (for each source, find
     the nearest MPC object) which allowed multiple sources to claim the same
     MPC designation — then _dedupe_by_catalog_identity() kept the brightest,
@@ -179,51 +177,97 @@ def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
     stationary on its track chart while Vesta on the same frames moved
     correctly — Vesta is bright enough to always win the dedup, but 2014 RY1
     is not).
+
+    Candidate pool — why already-matched sources are considered too
+    ------------------------------------------------------------------
+    This stage runs last, after Simbad/Gaia/2MASS/Pan-STARRS have each
+    claimed what they could. Restricting it to the leftovers (the original
+    behaviour) meant a solar system object projecting within
+    MATCH_CONE_ARCSEC of any background star — routine in a dense field or
+    near the galactic plane — was permanently tagged with that star's
+    identity before SkyBot ever got a look, losing its ASTEROID/COMET
+    classification and its ephemeris (audit 2026-08-18, finding C3). Worse,
+    the MPC object was then handed to whatever *other* unmatched source
+    happened to be nearest within the 120" cone — a false stationary
+    "asteroid" on top of the real miss.
+
+    So the pool is every source, and conflicts are resolved by an explicit
+    positional rule rather than by catalog order:
+
+    * A source already claimed by another catalog is taken over **only**
+      when the MPC prediction sits within the tight MATCH_CONE_ARCSEC of it —
+      i.e. the ephemeris and the detection genuinely coincide, which is
+      exactly the blend the finding describes. The wide MOVING_CONE_ARCSEC
+      (120") is far too loose to justify overwriting an established
+      identification: at that radius some catalogued star is almost always
+      present whether or not it has anything to do with the moving object.
+    * Beyond that tight cone, the MPC object falls back to the nearest
+      *unclaimed* source within MOVING_CONE_ARCSEC — the previous behaviour,
+      unchanged.
+
+    A takeover is logged at INFO with both identities, since it is the one
+    place in catalog matching where an already-assigned identity changes.
     """
-    unmatched = [s for s in sources if s["catalog_name"] is None]
-    if not unmatched or not mpc_objects:
+    if not sources or not mpc_objects:
         return
 
-    unmatched_coords = SkyCoord(
-        ra=[s["ra"] for s in unmatched] * u.deg,
-        dec=[s["dec"] for s in unmatched] * u.deg,
-    )
     mpc_coords = SkyCoord(
         ra=[o["ra"] for o in mpc_objects] * u.deg,
         dec=[o["dec"] for o in mpc_objects] * u.deg,
     )
+    all_coords = SkyCoord(
+        ra=[s["ra"] for s in sources] * u.deg,
+        dec=[s["dec"] for s in sources] * u.deg,
+    )
 
-    threshold = config.MOVING_CONE_ARCSEC * u.arcsec
+    # Nearest source of any kind, per MPC object — the takeover candidate.
+    all_idx, all_sep, _ = mpc_coords.match_to_catalog_sky(all_coords)
 
-    # Match in the MPC→source direction: for each MPC object, find its
-    # nearest unmatched source. This ensures each MPC designation is
-    # assigned to at most one source (the closest detection to the
-    # predicted ephemeris position), preventing a faint real asteroid from
-    # being out-competed by a brighter background star that also happened
-    # to fall within MOVING_CONE_ARCSEC.
-    idx, sep2d, _ = mpc_coords.match_to_catalog_sky(unmatched_coords)
+    # Nearest *unclaimed* source, per MPC object — the ordinary candidate.
+    unmatched_pos = [i for i, s in enumerate(sources) if s["catalog_name"] is None]
+    un_idx = un_sep = None
+    if unmatched_pos:
+        un_coords = SkyCoord(
+            ra=[sources[i]["ra"] for i in unmatched_pos] * u.deg,
+            dec=[sources[i]["dec"] for i in unmatched_pos] * u.deg,
+        )
+        un_idx, un_sep, _ = mpc_coords.match_to_catalog_sky(un_coords)
 
-    # Track which unmatched sources have already been claimed, so that if
-    # two MPC objects both want the same source, only the closer one wins.
-    claimed: dict[int, int] = {}  # unmatched_index → mpc_index that claimed it
-
-    # Process MPC objects nearest-match-first so a closer match always wins
-    # over a more distant one when two MPC objects compete for the same source.
-    order = sorted(range(len(mpc_objects)), key=lambda k: sep2d[k].arcsec)
-
-    for mpc_idx in order:
-        if sep2d[mpc_idx] >= threshold:
+    # (separation_arcsec, mpc_index, source_index) — one proposal per MPC object.
+    proposals: list[tuple[float, int, int]] = []
+    for mpc_idx in range(len(mpc_objects)):
+        sep_any = float(all_sep[mpc_idx].arcsec)
+        src_any = int(all_idx[mpc_idx])
+        if sep_any <= config.MATCH_CONE_ARCSEC:
+            proposals.append((sep_any, mpc_idx, src_any))
             continue
+        if un_idx is not None:
+            sep_un = float(un_sep[mpc_idx].arcsec)
+            if sep_un < config.MOVING_CONE_ARCSEC:
+                proposals.append((sep_un, mpc_idx, unmatched_pos[int(un_idx[mpc_idx])]))
 
-        src_idx = int(idx[mpc_idx])
+    # Nearest proposal first, so a closer MPC object always wins over a more
+    # distant one when two of them compete for the same source.
+    proposals.sort(key=lambda p: p[0])
 
-        # If this source was already claimed by a closer MPC object, skip.
+    claimed: set[int] = set()
+    for sep_arcsec, mpc_idx, src_idx in proposals:
         if src_idx in claimed:
             continue
+        claimed.add(src_idx)
 
-        claimed[src_idx] = mpc_idx
-        source = unmatched[src_idx]
+        source = sources[src_idx]
         obj = mpc_objects[mpc_idx]
+
+        if source["catalog_name"] is not None:
+            logger.info(
+                "MPC takeover: source at ra=%.5f dec=%.5f reassigned from %s (%s) to "
+                "MPC %s — ephemeris %.2f\" away, within MATCH_CONE_ARCSEC=%.1f\"",
+                source["ra"], source["dec"],
+                source["catalog_name"], source["catalog_id"],
+                obj["designation"], sep_arcsec, config.MATCH_CONE_ARCSEC,
+            )
+
         source["catalog_name"] = "MPC"
         source["catalog_id"]   = obj["designation"]
         source["catalog_mag"]  = None
