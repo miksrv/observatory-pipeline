@@ -31,6 +31,21 @@ MESSIER_PATTERN = re.compile(r"^M[_\s\-]*(\d+)$", re.IGNORECASE)
 CALDWELL_PATTERN = re.compile(r"^C[_\s\-]*(\d+)$", re.IGNORECASE)
 SH2_PATTERN = re.compile(r"^SH2?[_\s\-]*(\d+)$", re.IGNORECASE)
 ABELL_PATTERN = re.compile(r"^ABELL[_\s\-]*(\d+)$", re.IGNORECASE)
+# The bare "A39" shorthand for Abell 39, which observers and planetarium
+# software use interchangeably with the long form. Left unrecognized, the same
+# physical object arrived under two different object_names across sessions and
+# its frames split across two archive directories — the same failure mode as
+# H4, with the same consequence for subtraction's history (audit 2026-08-18,
+# finding M10).
+#
+# The number must stand alone, with nothing after it. That is what keeps an
+# old-style minor planet designation out: "A807 FA" is the 1807 discovery
+# A807 FA, not Abell 807, and the trailing letter group is exactly what
+# distinguishes them (the repo's own Vesta test data is filed under
+# "Vesta_A807_FA"). The range bound is the second guard — the Abell cluster
+# catalog ends at 2712.
+ABELL_SHORTHAND_PATTERN = re.compile(r"^A[_\s\-]*(\d{1,4})$", re.IGNORECASE)
+_ABELL_MAX_NUMBER = 2712
 
 # General catalog pattern: PREFIX[_\s-]*NUMBER → PREFIX_UPPER + NUMBER
 # Abell is excluded here and handled by ABELL_PATTERN above (mixed-case output).
@@ -56,6 +71,7 @@ def normalize_object_name(raw_name: Any) -> tuple[str, str]:
         "Mrk_501" → ("MRK501", "Mrk_501")
         "Arp_220" → ("ARP220", "Arp_220")
         "Abell_1" → ("Abell1", "Abell_1")
+        "A39" → ("Abell39", "A39")
         "Andromeda Galaxy" → ("Andromeda_Galaxy", "Andromeda Galaxy")
     """
     if raw_name is None:
@@ -80,6 +96,10 @@ def normalize_object_name(raw_name: Any) -> tuple[str, str]:
     match = ABELL_PATTERN.match(raw_str)
     if match:
         return (f"Abell{match.group(1)}", raw_str)
+
+    match = ABELL_SHORTHAND_PATTERN.match(raw_str)
+    if match and int(match.group(1)) <= _ABELL_MAX_NUMBER:
+        return (f"Abell{int(match.group(1))}", raw_str)
 
     match = _CATALOG_PATTERN.match(raw_str)
     if match:

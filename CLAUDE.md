@@ -604,7 +604,7 @@ Normalizes FITS header values and filenames for consistency across different cap
 | `IC 5070`, `IC_5070` | `IC5070` |
 | `C 14`, `Caldwell 14` | `C14` |
 | `Sh2 101`, `SH 101` | `SH2-101` |
-| `Abell 39` | `Abell39` |
+| `Abell 39`, `A39`, `A 39` | `Abell39` (the bare `A<number>` shorthand only when the number stands alone and is within the catalog's 2712 — otherwise `A807 FA`, an old-style minor planet designation, would become `Abell807`) |
 | `UGC 1234`, `PGC 1234`, `MCG 1234`, `Mrk 1234`, `Arp 1234`, `VCC 1234`, `ESO 1234`, `UGCA 1234` | `{PREFIX}{number}` (same pattern as NGC/IC) |
 | `Andromeda Galaxy` | `Andromeda_Galaxy` |
 

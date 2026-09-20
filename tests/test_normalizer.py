@@ -423,3 +423,36 @@ class TestMultiBandFilters:
     @pytest.mark.parametrize("raw", ["L", "R", "G", "B", "V"])
     def test_broadband_filters_are_unaffected(self, raw):
         assert normalizer.is_narrowband(raw) is False
+
+
+class TestAbellShorthand:
+    """
+    Audit 2026-08-18, finding M10: observers and planetarium software use
+    "A39" and "Abell 39" interchangeably. Unrecognized, the same physical
+    object arrived under two different object_names across sessions and its
+    frames split across two archive directories — the same failure mode as
+    H4, with the same consequence for subtraction's history.
+    """
+
+    @pytest.mark.parametrize("raw", ["A39", "A 39", "A_39", "a39", "Abell 39", "Abell_39"])
+    def test_every_spelling_lands_in_one_directory(self, raw):
+        assert normalizer.normalize_object_name(raw)[0] == "Abell39"
+
+    def test_a_cluster_number_is_recognized(self):
+        assert normalizer.normalize_object_name("A2151")[0] == "Abell2151"
+
+    @pytest.mark.parametrize("raw", ["A807 FA", "A807_FA"])
+    def test_an_old_style_minor_planet_designation_is_not_swallowed(self, raw):
+        """
+        "A807 FA" is the 1807 discovery, not Abell 807. The trailing letter
+        group is what distinguishes them — the repo's own Vesta test data is
+        filed under "Vesta_A807_FA".
+        """
+        assert normalizer.normalize_object_name(raw)[0] != "Abell807"
+
+    def test_a_number_past_the_catalog_is_left_alone(self):
+        """The Abell cluster catalog ends at 2712."""
+        assert normalizer.normalize_object_name("A3000")[0] == "A3000"
+
+    def test_a_bare_letter_is_left_alone(self):
+        assert normalizer.normalize_object_name("A")[0] == "A"
