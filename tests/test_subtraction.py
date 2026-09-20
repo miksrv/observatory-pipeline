@@ -728,6 +728,205 @@ class TestFindArchiveFramesPositionAngle:
 
 
 # ---------------------------------------------------------------------------
+# Photometric normalization of reference frames (audit 2026-08-18, C4)
+# ---------------------------------------------------------------------------
+
+def _write_frame(path, exptime=None, egain=None, gain=None, value=1.0, shape=(8, 8)):
+    """Write a tiny FITS file carrying the given exposure/gain keywords."""
+    hdu = fits.PrimaryHDU(np.full(shape, value, dtype=np.float32))
+    if exptime is not None:
+        hdu.header["EXPTIME"] = exptime
+    if egain is not None:
+        hdu.header["EGAIN"] = egain
+    if gain is not None:
+        hdu.header["GAIN"] = gain
+    hdu.writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestFluxScaleKeys:
+
+    def test_reads_exptime_and_egain(self, tmp_path):
+        path = _write_frame(tmp_path / "f.fits", exptime=120.0, egain=1.5)
+
+        assert subtraction._read_flux_scale_keys(path) == (120.0, 1.5)
+
+    def test_exposure_is_accepted_as_an_exptime_alias(self, tmp_path):
+        hdu = fits.PrimaryHDU(np.zeros((4, 4), dtype=np.float32))
+        hdu.header["EXPOSURE"] = 60.0
+        hdu.writeto(str(tmp_path / "f.fits"))
+
+        exptime, _ = subtraction._read_flux_scale_keys(str(tmp_path / "f.fits"))
+
+        assert exptime == 60.0
+
+    def test_egain_wins_over_gain(self, tmp_path):
+        """
+        Same preference as photometry._resolve_gain(): on most CMOS cameras
+        GAIN is the vendor gain *setting*, EGAIN the real e-/ADU conversion.
+        """
+        path = _write_frame(tmp_path / "f.fits", exptime=60.0, egain=0.8, gain=120.0)
+
+        assert subtraction._read_flux_scale_keys(path)[1] == 0.8
+
+    def test_implausible_gain_is_rejected(self, tmp_path):
+        """A bare GAIN=120 is a vendor setting, not e-/ADU — must not be used."""
+        path = _write_frame(tmp_path / "f.fits", exptime=60.0, gain=120.0)
+
+        assert subtraction._read_flux_scale_keys(path)[1] is None
+
+    def test_missing_keywords_return_none(self, tmp_path):
+        path = _write_frame(tmp_path / "f.fits")
+
+        assert subtraction._read_flux_scale_keys(path) == (None, None)
+
+    def test_unreadable_file_returns_none(self, tmp_path):
+        assert subtraction._read_flux_scale_keys(str(tmp_path / "missing.fits")) == (None, None)
+
+
+class TestFluxScaleFactor:
+
+    def test_exposure_ratio(self, tmp_path):
+        """A 60s reference must be doubled to sit on a 120s frame's scale."""
+        ref = _write_frame(tmp_path / "ref.fits", exptime=60.0)
+
+        assert subtraction._flux_scale_factor(ref, 120.0, None) == pytest.approx(2.0)
+
+    def test_gain_ratio(self, tmp_path):
+        """
+        ADU scales as exptime / gain(e-/ADU), so a reference read out at
+        2 e-/ADU carries half the counts of a 1 e-/ADU frame and must be
+        scaled up by g_ref / g_new.
+        """
+        ref = _write_frame(tmp_path / "ref.fits", exptime=60.0, egain=2.0)
+
+        assert subtraction._flux_scale_factor(ref, 60.0, 1.0) == pytest.approx(2.0)
+
+    def test_missing_exptime_falls_back_to_unity(self, tmp_path):
+        """An archive with no EXPTIME behaves exactly as it did before C4."""
+        ref = _write_frame(tmp_path / "ref.fits")
+
+        assert subtraction._flux_scale_factor(ref, 120.0, None) == 1.0
+
+    def test_missing_gain_still_applies_the_exposure_ratio(self, tmp_path):
+        ref = _write_frame(tmp_path / "ref.fits", exptime=30.0)
+
+        assert subtraction._flux_scale_factor(ref, 120.0, 1.5) == pytest.approx(4.0)
+
+
+class TestReferenceNormalizationInRun:
+
+    def _setup(self, monkeypatch, tmp_path, new_exptime, ref_exptime, star_flux=500.0):
+        """
+        Build a new frame and three references of the same star field, each
+        recorded at its own exposure time, and return the diff image run()
+        ends up detecting on.
+        """
+        shape = (12, 12)
+        sky = 100.0
+
+        def frame(exptime):
+            data = np.full(shape, sky * exptime / new_exptime, dtype=np.float32)
+            data[6, 6] += star_flux * exptime / new_exptime
+            return data
+
+        new_path = _write_frame(tmp_path / "new.fits", exptime=new_exptime)
+        ref_paths = [
+            _write_frame(tmp_path / f"ref{i}.fits", exptime=ref_exptime)
+            for i in range(3)
+        ]
+
+        data_by_path = {new_path: frame(new_exptime)}
+        for ref_path in ref_paths:
+            data_by_path[ref_path] = frame(ref_exptime)
+
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ref_paths)
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: s)
+
+        captured: dict = {}
+
+        def fake_detect(diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None):
+            captured["diff"] = diff
+            return []
+
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", fake_detect)
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
+
+        return new_path, captured
+
+    async def test_mixed_exposure_archive_leaves_no_stellar_residual(
+        self, monkeypatch, tmp_path,
+    ):
+        """
+        Audit 2026-08-18, finding C4: a 120s frame differenced against 60s
+        references used to leave ~(K-1) x flux at the position of EVERY star
+        in the frame — hundreds of false candidates. Normalizing the
+        references onto the new frame's own scale cancels them.
+        """
+        new_path, captured = self._setup(monkeypatch, tmp_path, 120.0, 60.0)
+
+        result = await subtraction.run(new_path, str(tmp_path), None)
+
+        assert result["performed"] is True
+        diff = captured["diff"]
+        # The star cancels, and so does the sky — both scaled identically.
+        assert diff[6, 6] == pytest.approx(0.0, abs=1e-3)
+        assert float(np.abs(diff).max()) == pytest.approx(0.0, abs=1e-3)
+
+    async def test_equal_exposures_are_left_untouched(self, monkeypatch, tmp_path):
+        """The ordinary homogeneous-archive case must behave exactly as before."""
+        new_path, captured = self._setup(monkeypatch, tmp_path, 60.0, 60.0)
+
+        await subtraction.run(new_path, str(tmp_path), None)
+
+        assert float(np.abs(captured["diff"]).max()) == pytest.approx(0.0, abs=1e-3)
+
+    async def test_saturation_mask_sees_unscaled_reference_values(
+        self, monkeypatch, tmp_path,
+    ):
+        """
+        The scale is applied to the median stack only, never to the aligned
+        references themselves: _build_saturation_mask() compares those against
+        SATURATION_ADU, and a reference scaled down (here 300s -> 60s, x0.2)
+        would otherwise drop its saturated core below the threshold and escape
+        masking entirely.
+        """
+        shape = (12, 12)
+        new_path = _write_frame(tmp_path / "new.fits", exptime=60.0)
+        ref_paths = [
+            _write_frame(tmp_path / f"ref{i}.fits", exptime=300.0) for i in range(3)
+        ]
+
+        new_data = np.full(shape, 10.0, dtype=np.float32)
+        ref_data = np.full(shape, 10.0, dtype=np.float32)
+        ref_data[5, 5] = float(config.SATURATION_ADU)
+
+        data_by_path = {new_path: new_data}
+        for ref_path in ref_paths:
+            data_by_path[ref_path] = ref_data
+
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ref_paths)
+        monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: s)
+        monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path, wcs=None: 1.0)
+
+        captured: dict = {}
+
+        def fake_detect(diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None):
+            captured["mask"] = mask
+            return []
+
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", fake_detect)
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
+
+        await subtraction.run(new_path, str(tmp_path), None)
+
+        assert captured["mask"] is not None
+        assert bool(captured["mask"][5, 5]) is True
+
+
+# ---------------------------------------------------------------------------
 # run() — end-to-end orchestration
 # ---------------------------------------------------------------------------
 

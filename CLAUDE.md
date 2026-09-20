@@ -685,6 +685,24 @@ entry at all, at any position).
    dimensions differ from the new frame's (e.g. archived with a different camera/resolution) —
    `astroalign` resamples onto the new frame's pixel grid regardless of the source's original
    shape, so a shape mismatch alone is not a reason to skip a candidate reference frame.
+2.5. Normalizes each aligned reference onto the new frame's own photometric scale before it
+   enters the stack: a frame's signal in ADU scales as `exposure_time / gain` (gain in e⁻/ADU),
+   so the multiplier is `(t_new / t_ref) × (g_ref / g_new)` (`_flux_scale_factor()`). An object's
+   archive routinely mixes exposure times (auto-exposure, a different session, a different
+   camera profile), and stacking those in raw ADU leaves a residual of roughly `(K−1) × flux` at
+   the position of **every** star in the frame once the stack is subtracted — hundreds of false
+   `UNKNOWN`/`SPACE_DEBRIS` candidates, plus a raised noise floor hiding the genuine faint
+   transients this module exists to find (audit 2026-08-18, finding C4). Each factor
+   independently falls back to `1.0` when its keyword is missing on either side, so a
+   header-poor archive behaves exactly as it did before this existed rather than losing
+   subtraction entirely. `gain` prefers `EGAIN` over `GAIN` for the same reason
+   `modules/photometry.py`'s `_resolve_gain()` does, and `PHOTOMETRY_GAIN_E_PER_ADU` deliberately
+   doesn't override it here — a deployment-wide value is identical on both sides and cancels in
+   the ratio. The scale is applied to the median stack only, never to the aligned references
+   themselves: step 4 below compares those against `SATURATION_ADU`, and a scaled-down
+   reference's saturated core would otherwise drop below that threshold and escape masking. The
+   scaled reference's bias/sky pedestal survives as a smooth `(K−1) × pedestal` term, which step
+   5's own `sep.Background()` pass removes before extraction.
 3. Builds a per-pixel **median stack** of the aligned reference frames as the "reference image", then subtracts it from the new frame to get a difference image.
 4. Masks the vicinity (`SATURATION_MASK_RADIUS_ARCSEC`, converted to pixels via the frame's WCS
    plate scale, dilated with `scipy.ndimage.binary_dilation`) of any pixel at or above

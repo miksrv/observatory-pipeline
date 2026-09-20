@@ -5,6 +5,10 @@ Algorithm:
   1. Find N >= SUBTRACTION_MIN_FRAMES archived FITS of same object/filter.
   2. Load new frame data + WCS.
   3. Align each reference frame to the new frame using astroalign triangle matching.
+  3.5. Normalize each aligned reference onto the new frame's own photometric
+     scale (exposure time and sensor gain) — an archive routinely mixes
+     exposure times, and stacking those in raw ADU leaves a residual at the
+     position of every star in the frame (see _flux_scale_factor()).
   4. Median-stack aligned frames -> clean reference (removes cosmic rays and hot
      pixels FROM THE REFERENCE STACK — each reference's own detector-fixed
      defects get scattered to different pixels by the sky-based astroalign
@@ -185,6 +189,140 @@ def _load_frame_data(fits_path: str) -> Optional[np.ndarray]:
     except Exception as exc:
         logger.debug("Failed to load FITS data from %s: %s", fits_path, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Photometric normalization of reference frames
+#
+# A frame's recorded signal in ADU scales as exposure_time / gain, where gain
+# is the sensor's true conversion factor in electrons per ADU. An object's
+# archive routinely mixes exposure times (auto-exposure, a different session,
+# a different camera profile), and median-stacking those in raw ADU leaves a
+# residual of roughly (K-1) x flux at the position of EVERY star in the frame
+# once the stack is subtracted, where K is the scale mismatch — hundreds of
+# false candidates across a single frame, plus an elevated noise floor that
+# hides the genuine faint transients subtraction exists to find (audit
+# 2026-08-18, finding C4).
+#
+# The gain plausibility range and the EGAIN-before-GAIN preference are the
+# same as modules/photometry.py's _resolve_gain(), duplicated here by hand
+# rather than imported — the convention this module already follows for the
+# streak-mask and FWHM-floor logic it shares with modules/astrometry/.
+# ---------------------------------------------------------------------------
+
+_GAIN_MIN_E_PER_ADU: float = 0.05
+_GAIN_MAX_E_PER_ADU: float = 20.0
+
+# A reference needing more correction than this (in either direction) is
+# reported to the operator: it still gets normalized and used, but such an
+# archive is heterogeneous enough that the scaled-up reference noise measurably
+# raises the detection threshold for the whole frame.
+_FLUX_SCALE_WARN_FACTOR: float = 2.0
+
+
+def _read_flux_scale_keys(fits_path: str) -> tuple[Optional[float], Optional[float]]:
+    """
+    Read (exposure_time_sec, gain_e_per_adu) from a frame's headers.
+
+    Either element is None when the file carries nothing usable for it.
+    Both the primary header and the first 2-D image HDU's own header are
+    consulted, since capture software differs on where it writes these.
+
+    `gain` prefers EGAIN over GAIN for the reason spelled out in
+    modules/photometry.py's _resolve_gain(): on most CMOS cameras EGAIN is
+    the true e-/ADU conversion while GAIN holds the camera's gain *setting*
+    in arbitrary vendor units (0-500 on a ZWO ASI). A value outside the
+    plausible e-/ADU range is rejected rather than used. config's
+    PHOTOMETRY_GAIN_E_PER_ADU deliberately does NOT override anything here:
+    a single deployment-wide value is by definition identical for the new
+    frame and every reference, so it cancels in the ratio and would only
+    mask a genuine per-frame difference.
+    """
+    exptime: Optional[float] = None
+    gain: Optional[float] = None
+    try:
+        with fits.open(fits_path) as hdul:
+            headers = [hdul[0].header]
+            for hdu in hdul:
+                if hdu.data is not None and hdu.data.ndim == 2:
+                    headers.append(hdu.header)
+                    break
+
+            for key in ("EXPTIME", "EXPOSURE"):
+                for hdr in headers:
+                    value = hdr.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        candidate = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(candidate) and candidate > 0:
+                        exptime = candidate
+                        break
+                if exptime is not None:
+                    break
+
+            for key in ("EGAIN", "GAIN"):
+                for hdr in headers:
+                    value = hdr.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        candidate = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(candidate) and _GAIN_MIN_E_PER_ADU <= candidate <= _GAIN_MAX_E_PER_ADU:
+                        gain = candidate
+                        break
+                if gain is not None:
+                    break
+    except Exception as exc:
+        logger.debug("Subtraction: cannot read flux-scale keys from %s: %s", fits_path, exc)
+
+    return exptime, gain
+
+
+def _flux_scale_factor(
+    ref_path: str,
+    new_exptime: Optional[float],
+    new_gain: Optional[float],
+) -> float:
+    """
+    Multiplier bringing *ref_path*'s pixel values onto the new frame's own
+    photometric scale: ``(t_new / t_ref) * (g_ref / g_new)``.
+
+    Each of the two factors independently falls back to 1.0 when the
+    corresponding keyword is missing on either side — an archive with no
+    EXPTIME at all therefore behaves exactly as it did before normalization
+    existed, rather than losing subtraction entirely.
+
+    Scaling the reference (not the new frame) is deliberate: the new frame's
+    own pixel values are what candidate fluxes and the SATURATION_ADU checks
+    are measured against, and must stay in their native ADU.
+
+    The scaled reference's bias/sky pedestal comes out of the subtraction as
+    a smooth ``(K-1) x pedestal`` term, which _detect_diff_sources()'s own
+    `sep.Background()` pass removes before extraction — unlike the per-star
+    residual this function exists to cancel, which is not smooth and is
+    exactly what SEP would otherwise report.
+    """
+    ref_exptime, ref_gain = _read_flux_scale_keys(ref_path)
+
+    scale = 1.0
+    if new_exptime and ref_exptime:
+        scale *= new_exptime / ref_exptime
+    if new_gain and ref_gain:
+        scale *= ref_gain / new_gain
+
+    if not math.isfinite(scale) or scale <= 0:
+        logger.warning(
+            "Subtraction: implausible flux scale %r for reference %s — using 1.0",
+            scale, os.path.basename(ref_path),
+        )
+        return 1.0
+
+    return scale
 
 
 # ---------------------------------------------------------------------------
@@ -905,7 +1043,20 @@ async def run(
     # ------------------------------------------------------------------
     # Align each reference frame to the new frame's pixel grid
     # ------------------------------------------------------------------
+    # This frame's own photometric scale, against which every reference is
+    # normalized below — see _flux_scale_factor(). Read once here rather than
+    # per reference.
+    new_exptime, new_gain = _read_flux_scale_keys(fits_path)
+    if new_exptime is None:
+        logger.warning(
+            "Subtraction: no usable EXPTIME on %s — reference frames cannot be "
+            "normalized to its exposure, so a mixed-exposure archive will leave a "
+            "residual at every star in the diff image",
+            os.path.basename(fits_path),
+        )
+
     aligned: list[np.ndarray] = []
+    scales: list[float] = []
     for ref_path in archive_files:
         ref_data = _load_frame_data(ref_path)
         if ref_data is None:
@@ -930,6 +1081,11 @@ async def run(
         result_frame = _align_frame(ref_data, new_data)
         if result_frame is not None:
             aligned.append(result_frame)
+            # Kept alongside rather than applied to `result_frame` itself:
+            # _build_saturation_mask() below compares the aligned references
+            # against SATURATION_ADU, and a scaled-down reference's saturated
+            # core would drop below that threshold and escape masking.
+            scales.append(_flux_scale_factor(ref_path, new_exptime, new_gain))
         else:
             logger.debug(
                 "Subtraction: skipping %s (alignment failed)",
@@ -947,7 +1103,26 @@ async def run(
     # ------------------------------------------------------------------
     # Build median reference and compute difference image
     # ------------------------------------------------------------------
-    reference = np.median(np.stack(aligned, axis=0), axis=0).astype(np.float32)
+    stack = np.stack(aligned, axis=0)
+    if any(abs(scale - 1.0) > 1e-3 for scale in scales):
+        stack *= np.asarray(scales, dtype=np.float32).reshape(-1, 1, 1)
+        logger.info(
+            "Subtraction: normalized %d reference frame(s) to this frame's "
+            "photometric scale (factors %.3f-%.3f)",
+            len(scales), min(scales), max(scales),
+        )
+        extreme = [s for s in scales
+                   if s > _FLUX_SCALE_WARN_FACTOR or s < 1.0 / _FLUX_SCALE_WARN_FACTOR]
+        if extreme:
+            logger.warning(
+                "Subtraction: %d of %d reference frame(s) needed a flux scale "
+                "beyond %.1fx (worst %.3f) — this archive mixes exposure times or "
+                "gains widely enough that the scaled reference noise raises the "
+                "detection threshold for the whole frame",
+                len(extreme), len(scales), _FLUX_SCALE_WARN_FACTOR,
+                max(extreme, key=lambda s: abs(math.log(s))),
+            )
+    reference = np.median(stack, axis=0).astype(np.float32)
     diff = new_data - reference
 
     # ------------------------------------------------------------------
