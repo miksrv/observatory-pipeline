@@ -232,6 +232,22 @@ ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MI
 ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC", "60.0"))
 
 # ---------------------------------------------------------------------------
+# Recovering a lost science payload
+#
+# The frame record itself survives an API outage: POST /frames has already
+# succeeded by then and the file is archived. What is lost when the 3-attempt
+# retry on POST /sources or POST /anomalies is exhausted is that run's entire
+# source or anomaly list — no re-post, no "needs re-analysis" flag, and no way
+# to tell afterwards that anything is missing (audit 2026-08-18, finding H19).
+#
+# pipeline.py answers that by queueing the work back onto the task queue the
+# worker already drains. This bounds how many times a single frame may be
+# re-queued that way: a transient outage clears within one, while a permanent
+# failure (a 4xx the retry decorator deliberately doesn't retry) would
+# otherwise re-queue itself forever. 0 disables recovery entirely.
+API_RECOVERY_MAX_ATTEMPTS: int = int(_get("API_RECOVERY_MAX_ATTEMPTS", "2"))
+
+# ---------------------------------------------------------------------------
 # Cross-matching
 # ---------------------------------------------------------------------------
 MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
@@ -734,6 +750,7 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_SKY_SIGMA_CLIP": float,
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
+    "API_RECOVERY_MAX_ATTEMPTS": int,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "MOVING_RATE_ARCSEC_PER_MIN": float,

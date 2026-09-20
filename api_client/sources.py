@@ -109,11 +109,15 @@ async def _post_sources_with_retry(
         resp_json = response.json()
 
     # API.md documents "source_ids" as positionally parallel to the request's
-    # "sources" array — see FramesController::saveSources. Missing/malformed
-    # is treated as "the API didn't tell us" rather than an error: callers
-    # must already tolerate None (e.g. an old API version predating this field).
+    # "sources" array — see FramesController::saveSources. Missing or
+    # malformed is treated as "the API didn't tell us" rather than an error
+    # (e.g. an old API version predating this field), and comes back as an
+    # empty list rather than None: the POST itself succeeded, and the caller
+    # re-queues the frame when it did not (audit 2026-08-18, finding H19).
+    # The existing length-mismatch branch in pipeline.py already covers the
+    # "posted, but no usable ids" case.
     source_ids = resp_json.get("source_ids") if isinstance(resp_json, dict) else None
-    return source_ids if isinstance(source_ids, list) else None
+    return source_ids if isinstance(source_ids, list) else []
 
 
 async def post_sources(frame_id: str, filename: str, sources: list) -> list | None:
@@ -134,9 +138,13 @@ async def post_sources(frame_id: str, filename: str, sources: list) -> list | No
     list | None
         The API's `source_ids` array — positionally parallel to `sources`
         (same length/order), each entry the resolved `sources.id` or `None`
-        for a skipped entry. Returns `None` (not a list of Nones) if the API
-        call failed entirely or didn't return the field, so callers can tell
-        "we don't know any source ids" apart from "every source was skipped".
+        for a skipped entry. `None` means the sources did **not** reach the
+        API: an exhausted retry or a 4xx rejection. A successful POST whose
+        response carried no usable `source_ids` returns `[]` instead, so that
+        "we don't know any source ids" stays distinguishable from "every
+        source was skipped" while the caller can still tell an accepted batch
+        from a lost one and re-queue the frame (audit 2026-08-18, finding
+        H19).
     """
     logger.info(
         "Posting %d sources for frame_id=%s",

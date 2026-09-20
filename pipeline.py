@@ -168,7 +168,83 @@ def _cleanup_empty_incoming_parents(moved_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def analyze_frame(fits_path: str) -> dict | None:
+async def _queue_recovery_task(
+    task_type: str,
+    item: dict,
+    attempt: int,
+    reason: str,
+    extra: dict,
+) -> None:
+    """
+    Put a frame's unfinished work back on the task queue after its science
+    payload could not be posted.
+
+    The frame record itself survives an API outage — `POST /frames` has
+    already succeeded and the file is archived — but once the 3-attempt retry
+    on `POST /sources` or `POST /anomalies` is exhausted, that run's entire
+    source or anomaly list is gone, with no re-post, no "needs re-analysis"
+    flag, and nothing afterwards to show anything is missing. That sits badly
+    with the stated rule "do not lose the frame": the frame is not what was
+    lost (audit 2026-08-18, finding H19).
+
+    Both endpoints this recovers are idempotent by design — `POST /frames`
+    upserts on `filename` and returns the same id, `POST /sources` reconciles
+    on `(frame_id, source_id)` (docs/API.md §1, §2) — so re-running the work
+    produces no duplicates.
+
+    `attempt` is carried in the queued item's own `payload` and bounded by
+    `API_RECOVERY_MAX_ATTEMPTS`, because not every failure is transient: the
+    retry decorator deliberately does not retry a 4xx, and a frame that fails
+    that way would otherwise re-queue itself forever.
+
+    Best-effort in the most literal sense — if the API is down hard enough to
+    lose the payload it is probably down hard enough to refuse the task too.
+    That case logs the exact item at ERROR so an operator can submit it by
+    hand, which is the same recovery that existed before, only now with the
+    frame named.
+    """
+    if api_client is None or config.API_RECOVERY_MAX_ATTEMPTS <= 0:
+        return
+
+    if attempt >= config.API_RECOVERY_MAX_ATTEMPTS:
+        logger.error(
+            "%s — giving up after %d recovery attempt(s); this frame's payload "
+            "is not in the API. Re-queue by hand: POST /tasks {\"type\": \"%s\", "
+            "\"items\": [%s]}",
+            reason, attempt, task_type, item,
+            extra=extra,
+        )
+        return
+
+    queued_item = dict(item)
+    payload = dict(queued_item.get("payload") or {})
+    payload["recovery_attempt"] = attempt + 1
+    queued_item["payload"] = payload
+
+    try:
+        task = await api_client.create_task(task_type, items=[queued_item])
+    except Exception as exc:
+        task = None
+        logger.debug("Recovery task creation raised: %s", exc, extra=extra)
+
+    if task is None:
+        logger.error(
+            "%s — and the recovery %s task could not be created either. "
+            "Re-queue by hand: POST /tasks {\"type\": \"%s\", \"items\": [%s]}",
+            reason, task_type, task_type, queued_item,
+            extra=extra,
+        )
+        return
+
+    logger.warning(
+        "%s — queued a %s task (id=%s, attempt %d/%d) to redo it",
+        reason, task_type, task.get("id"), attempt + 1,
+        config.API_RECOVERY_MAX_ATTEMPTS,
+        extra=extra,
+    )
+
+
+async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | None:
     """
     Process a single FITS file through header extraction, QC, astrometry,
     subtraction, catalog matching, photometry, forced photometry, and
@@ -196,6 +272,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
         directory component) is treated as a reference to an
         already-archived frame and resolved against FITS_ARCHIVE first —
         see `_resolve_bare_filename()` below.
+    recovery_attempt:
+        How many times this frame has already been re-queued after a failed
+        `POST /sources` — carried in the task item's own payload and read back
+        by `worker.py`. Bounds the re-queue loop; see
+        `_queue_recovery_task()`.
 
     Returns
     -------
@@ -742,8 +823,15 @@ async def analyze_frame(fits_path: str) -> dict | None:
     # `anomalies[].source_id` — otherwise the API has no way to know which
     # catalog source an anomaly refers to.
     # ------------------------------------------------------------------
+    # Whether this run's source list actually reached the API. A None return
+    # means the 3-attempt retry was exhausted (or the API refused the batch),
+    # and unlike the frame record — already registered, and the file already
+    # archived — that payload is simply gone unless the work is re-queued.
+    sources_posted = True
     try:
         source_ids = await api_client.post_sources(frame_id, basename, sources)
+        if source_ids is None:
+            sources_posted = False
         logger.debug(
             "Sources posted: frame_id=%s count=%d",
             frame_id,
@@ -762,6 +850,7 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 extra=extra,
             )
     except Exception as exc:
+        sources_posted = False
         logger.error(
             "Failed to post sources: frame_id=%s error=%s — continuing",
             frame_id,
@@ -813,8 +902,22 @@ async def analyze_frame(fits_path: str) -> dict | None:
         # processing incoming/m31/frame.fits the now-empty m31/ is removed).
         _cleanup_empty_incoming_parents(fits_path)
 
+        archive_path = dest_path
     except Exception as exc:
+        archive_path = None
         logger.error("Failed to archive file: %s", exc, extra=extra)
+
+    # Re-queue this frame when its source list never reached the API. Queued
+    # only after the archive move, and against the ARCHIVE path, because that
+    # is where the file will be by the time the worker picks the task up.
+    if not sources_posted and archive_path:
+        await _queue_recovery_task(
+            "ANALYZE",
+            {"filename": archive_path},
+            recovery_attempt,
+            f"frame_id={frame_id}: {len(sources)} source(s) could not be posted",
+            extra,
+        )
 
     return {
         "frame_id": frame_id,
@@ -860,6 +963,7 @@ async def detect_anomalies_for_frame_data(
     frame_meta: dict,
     *,
     post_filename: str,
+    recovery_attempt: int = 0,
 ) -> list[dict]:
     """
     Classify anomalies for an already-in-memory `sources` list and post the
@@ -930,8 +1034,9 @@ async def detect_anomalies_for_frame_data(
         logger.debug("Anomaly detector not available — skipping", extra=extra)
 
     if api_client is not None and detection_ok:
+        posted = False
         try:
-            await api_client.post_anomalies(frame_id, post_filename, anomalies)
+            posted = bool(await api_client.post_anomalies(frame_id, post_filename, anomalies))
             logger.debug(
                 "Anomalies posted: frame_id=%s count=%d",
                 frame_id,
@@ -944,6 +1049,20 @@ async def detect_anomalies_for_frame_data(
                 frame_id,
                 exc,
                 extra=extra,
+            )
+
+        # Same reasoning as the source list above (audit 2026-08-18, finding
+        # H19): detection ran to completion, so these anomalies are real
+        # results, and losing them to an exhausted retry leaves the frame
+        # silently missing them. DETECT_ANOMALIES reruns from stored data
+        # alone — no local FITS access — so it is cheap to redo.
+        if not posted:
+            await _queue_recovery_task(
+                "DETECT_ANOMALIES",
+                {"frame_id": frame_id},
+                recovery_attempt,
+                f"frame_id={frame_id}: {len(anomalies)} anomaly/anomalies could not be posted",
+                extra,
             )
 
     return anomalies
@@ -984,7 +1103,7 @@ def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict
     }
 
 
-async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
+async def detect_anomalies_for_frame_id(frame_id: str, recovery_attempt: int = 0) -> list[dict]:
     """
     Standalone DETECT_ANOMALIES worker entry point.
 
@@ -1050,6 +1169,7 @@ async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
         sources,
         frame_meta,
         post_filename=frame.get("filename") or "<unknown>",
+        recovery_attempt=recovery_attempt,
     )
 
     # Same "prefer mpc_designation, fall back to catalog_id via source_id"

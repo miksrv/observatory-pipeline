@@ -97,8 +97,11 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
     # api_client
     api_mock = MagicMock()
     api_mock.post_frame = AsyncMock(return_value="frame-42")
-    api_mock.post_sources = AsyncMock(return_value=None)
-    api_mock.post_anomalies = AsyncMock(return_value=None)
+    # [] rather than None: None now means "the sources did not reach the API"
+    # and triggers a recovery re-queue (audit 2026-08-18, finding H19), which
+    # is not what most of these tests are exercising.
+    api_mock.post_sources = AsyncMock(return_value=[])
+    api_mock.post_anomalies = AsyncMock(return_value=True)
     monkeypatch.setattr("pipeline.api_client", api_mock)
 
     # astrometry
@@ -551,6 +554,103 @@ async def test_archived_file_gets_solved_wcs(mock_modules, tmp_path):
     with fits.open(archive_path) as hdul:
         assert hdul[0].header["CRVAL1"] == pytest.approx(202.47, abs=1e-6)
         assert hdul[0].header["CRVAL2"] == pytest.approx(47.20, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Recovering a lost science payload — audit 2026-08-18, finding H19
+#
+# The frame record survives an API outage: POST /frames has already succeeded
+# and the file is archived. What is lost once the 3-attempt retry on POST
+# /sources or POST /anomalies is exhausted is that run's entire source or
+# anomaly list — no re-post, no "needs re-analysis" flag, nothing afterwards
+# to show anything is missing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_post_sources_queues_an_analyze_task(mock_modules):
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_awaited_once()
+    task_type, = pipeline.api_client.create_task.call_args.args
+    items = pipeline.api_client.create_task.call_args.kwargs["items"]
+    assert task_type == "ANALYZE"
+    # Queued against the ARCHIVE path — that is where the file will be by the
+    # time the worker picks the task up.
+    assert items[0]["filename"].endswith(_NORMALIZED_FILENAME)
+    assert config.FITS_ARCHIVE in items[0]["filename"]
+    assert items[0]["payload"]["recovery_attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_successful_post_queues_nothing(mock_modules):
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_stops_at_the_attempt_limit(mock_modules, monkeypatch):
+    """
+    Not every failure is transient: the retry decorator deliberately does not
+    retry a 4xx, and such a frame would otherwise re-queue itself forever.
+    """
+    monkeypatch.setattr(config, "API_RECOVERY_MAX_ATTEMPTS", 2)
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules), 2)
+
+    pipeline.api_client.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_can_be_disabled(mock_modules, monkeypatch):
+    monkeypatch.setattr(config, "API_RECOVERY_MAX_ATTEMPTS", 0)
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recovery_task_is_not_fatal(mock_modules):
+    """
+    If the API is down hard enough to lose the payload it is probably down
+    hard enough to refuse the task too. That must be logged, not raised.
+    """
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value=None)
+
+    result = await pipeline.analyze_frame(str(mock_modules))
+
+    assert result is not None
+    assert result["frame_id"] == "frame-42"
+
+
+@pytest.mark.asyncio
+async def test_failed_post_anomalies_queues_a_detect_task(mock_modules):
+    pipeline.api_client.post_anomalies = AsyncMock(return_value=False)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-11"})
+    pipeline.anomaly_detector.detect = AsyncMock(return_value=[{"anomaly_type": "UNKNOWN"}])
+
+    await pipeline.detect_anomalies_for_frame_data(
+        "frame-42", [], {"obs_time": "2024-03-15T22:01:34"}, post_filename="f.fits",
+    )
+
+    pipeline.api_client.create_task.assert_awaited_once()
+    task_type, = pipeline.api_client.create_task.call_args.args
+    items = pipeline.api_client.create_task.call_args.kwargs["items"]
+    assert task_type == "DETECT_ANOMALIES"
+    assert items[0]["frame_id"] == "frame-42"
+    assert items[0]["payload"]["recovery_attempt"] == 1
 
 
 @pytest.mark.asyncio

@@ -1701,7 +1701,17 @@ the faint-`UNKNOWN` problem, see Known Issues #1.
   they must NOT crash the pipeline. The frame should still be processed with partial results.
 - Errors in the observatory API calls: retry up to 3 attempts total (2 retries) with exponential
   backoff (see `api_client/` above and docs/API.md for the exact parameters), then log
-  and continue — do not lose the frame
+  and continue — do not lose the frame. When the retry *is* exhausted for a science payload
+  (`POST /sources` or `POST /anomalies`), the frame record itself is safe — it was registered
+  before, and the file is archived — but that run's whole source or anomaly list is gone, so
+  `pipeline._queue_recovery_task()` puts the work back on the task queue the worker already
+  drains (an `ANALYZE` task against the archive path, or a `DETECT_ANOMALIES` task for the
+  frame_id). Both endpoints are idempotent (`POST /frames` upserts on `filename`, `POST /sources`
+  reconciles on `(frame_id, source_id)` — docs/API.md §1, §2), so redoing the work creates no
+  duplicates. The re-queue count rides in the task item's own `payload` and is bounded by
+  `API_RECOVERY_MAX_ATTEMPTS`, since a 4xx is never retried and such a frame would otherwise
+  re-queue itself forever; if the API is down hard enough to refuse the recovery task too, the
+  exact item is logged at ERROR for manual submission (audit 2026-08-18, finding H19).
 - Unit tests in `tests/` use `pytest` and mock all external calls (API, catalogs, astap subprocess)
 - **All Markdown documents in this project are written in English** — this applies to every
   `.md` file (README.md, CLAUDE.md, docs/API.md, docs/anomaly-detector.md, everything under

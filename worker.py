@@ -74,6 +74,28 @@ class RestartRequested(Exception):
 # ---------------------------------------------------------------------------
 
 
+def _recovery_attempt(item: dict) -> int:
+    """
+    How many times this item is already a re-queue of failed work.
+
+    `pipeline._queue_recovery_task()` puts a frame back on the queue when its
+    sources or anomalies could not be posted (audit 2026-08-18, finding H19),
+    writing the running count into the new item's own `payload`. Reading it
+    back here is what bounds the loop: without it, a permanently failing frame
+    — a 4xx the retry decorator deliberately does not retry — would re-queue
+    itself forever.
+
+    Anything unreadable counts as 0, i.e. an ordinary first attempt.
+    """
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return 0
+    try:
+        return max(0, int(payload.get("recovery_attempt", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 async def _handle_analyze_item(item: dict) -> dict:
     """
     Run analyze_frame() for one ANALYZE task item.
@@ -95,7 +117,7 @@ async def _handle_analyze_item(item: dict) -> dict:
         return {"item_id": item["id"], "status": "FAILED", "error": "Item has no filename"}
 
     try:
-        result = await pipeline.analyze_frame(fits_path)
+        result = await pipeline.analyze_frame(fits_path, _recovery_attempt(item))
     except Exception as exc:
         logger.exception("ANALYZE item failed for %s", fits_path)
         return {"item_id": item["id"], "status": "FAILED", "error": str(exc)}
@@ -144,7 +166,7 @@ async def _run_detect_task(task: dict, items: list[dict]) -> None:
             continue
 
         try:
-            await pipeline.detect_anomalies_for_frame_id(frame_id)
+            await pipeline.detect_anomalies_for_frame_id(frame_id, _recovery_attempt(item))
         except Exception as exc:
             logger.exception("DETECT_ANOMALIES item failed for frame_id=%s", frame_id)
             await api_client.post_task_items_progress(

@@ -213,13 +213,19 @@ class TestPostSources:
         _, call_kwargs = mock_client.post.call_args
         assert call_kwargs["json"]["sources"] == []
 
-    async def test_post_sources_returns_none(self):
-        """post_sources always returns None."""
+    async def test_post_sources_returns_empty_list_when_the_api_sends_no_ids(self):
+        """
+        Audit 2026-08-18, finding H19: a successful POST whose response
+        carried no usable source_ids used to be indistinguishable from a lost
+        one — both returned None. It returns [] now, so None means exactly
+        "these sources did not reach the API" and the caller can re-queue the
+        frame on that alone.
+        """
         resp = _mock_response(status_code=200, json_data={})
         with _patch_client(post_response=resp):
             result = await post_sources("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result == []
 
     async def test_post_sources_silent_on_http_error(self):
         """
@@ -284,15 +290,21 @@ class TestPostAnomalies:
         _, call_kwargs = mock_client.post.call_args
         assert call_kwargs["json"]["anomalies"] == []
 
-    async def test_post_anomalies_returns_none(self):
+    async def test_post_anomalies_reports_success(self):
+        """
+        Audit 2026-08-18, finding H19: this used to return None
+        unconditionally, so a caller could not tell an accepted batch from a
+        lost one — and pipeline.py needs to, in order to re-queue the work
+        rather than let the anomaly set vanish silently.
+        """
         resp = _mock_response(status_code=200, json_data={})
         with _patch_client(post_response=resp):
             result = await post_anomalies("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result is True
 
     async def test_post_anomalies_silent_on_http_error(self):
-        """Exhausted retries (5xx) must not propagate out of post_anomalies."""
+        """Exhausted retries (5xx) must not propagate — but must be reported."""
         exc = _make_5xx_status_error()
         with patch.object(
             _anomalies_module,
@@ -301,15 +313,15 @@ class TestPostAnomalies:
         ):
             result = await post_anomalies("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result is False
 
     async def test_post_anomalies_silent_on_4xx(self):
-        """HTTP 4xx must be handled silently."""
+        """A 4xx is not retried, and loses the anomaly set just as surely."""
         resp = _mock_response(status_code=404, json_data={"error": "not found"})
         with _patch_client(post_response=resp):
             result = await post_anomalies("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result is False
 
 
 # ---------------------------------------------------------------------------
