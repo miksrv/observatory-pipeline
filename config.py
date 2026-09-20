@@ -404,6 +404,19 @@ PHOTOMETRY_COLOR_TERM_MIN_SPAN: float = float(_get("PHOTOMETRY_COLOR_TERM_MIN_SP
 # set), and is discarded in favour of the plain constant offset.
 PHOTOMETRY_COLOR_TERM_MAX: float = float(_get("PHOTOMETRY_COLOR_TERM_MAX", "1.5"))
 
+# --- Screening the zero-point reference stars ------------------------------
+# Gaia publishes its own opinion of each source's reliability, and a star it
+# calls variable, flags as a duplicated_source, or gives a high RUWE
+# (astrometric goodness of fit — an unresolved binary or a blend) is exactly
+# what must not anchor a photometric calibration (audit 2026-08-18, finding
+# H6). 1.4 is the community-standard RUWE cut for "well-behaved single star".
+#
+# Screening only ever narrows the reference set; if it would leave fewer than
+# the 3 references a zero point needs, modules/photometry.py logs that and
+# calibrates off the unscreened set instead — a slightly worse zero point
+# beats none at all.
+PHOTOMETRY_REF_MAX_RUWE: float = float(_get("PHOTOMETRY_REF_MAX_RUWE", "1.4"))
+
 # ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
 # ---------------------------------------------------------------------------
@@ -634,6 +647,7 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_COLOR_TERM_MIN_REFS": int,
     "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
     "PHOTOMETRY_COLOR_TERM_MAX": float,
+    "PHOTOMETRY_REF_MAX_RUWE": float,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "MOVING_RATE_ARCSEC_PER_MIN": float,

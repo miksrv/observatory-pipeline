@@ -693,6 +693,25 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
 ### `modules/photometry.py`
 - Aperture photometry via `photutils.aperture`
 - Differential photometry against Gaia reference stars in the field (requires ≥3 Gaia DR3 matches to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations
+- Zero-point reference stars are screened through Gaia's own quality flags before anything is
+  fitted: a star the catalog calls variable, one flagged `duplicated_source`, or one whose
+  astrometric solution fits badly (`ruwe` above `PHOTOMETRY_REF_MAX_RUWE`, usually an unresolved
+  binary or a blend whose aperture holds two stars' flux) must not anchor a calibration (audit
+  2026-08-18, finding H6). The flags travel on the matched source as `_catalog_flags`
+  (`modules/catalog_matcher/_gaia.py`); a flag the catalog didn't supply counts as acceptable, so
+  a narrower astroquery column set changes nothing. Screening only narrows the set — if it would
+  leave fewer than the 3 references a zero-point needs, the unscreened set is used instead and the
+  fallback is logged, since a zero-point anchored on a few imperfect stars beats losing
+  calibration for the whole frame.
+- `zero_point_err` is a **small-sample-corrected** robust scatter (`_robust_scatter()`), not a
+  plain `1.4826 × MAD`. At the minimum n=3, a "two good references plus one outlier" set puts the
+  median on one of the two good values and drives the MAD to exactly zero — a perfect reported
+  error at the moment the calibration is least trustworthy. Croux & Rousseeuw's finite-sample
+  factor corrects the MAD's low bias, and below 6 references the estimate is floored by the
+  consistency-scaled mean absolute deviation, which can't collapse unless every value is
+  identical: with three references a single outlier genuinely can't be identified as one, so the
+  honest estimate keeps its influence rather than discarding it. Both corrections converge to the
+  previous behaviour as n grows.
 - The zero-point carries a **colour term**, not a single constant offset: a star's instrumental
   magnitude in R/B/V/I differs from its Gaia broadband G magnitude by an amount that depends on
   the star's own colour, so one median offset leaves a systematic bias that drifts night to night

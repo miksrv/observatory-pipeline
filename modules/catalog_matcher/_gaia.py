@@ -52,7 +52,7 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
     Query Gaia DR3 for all stars within fov_deg/2 of the frame centre.
 
     Returns a list of dicts with keys: ra, dec, source_id, phot_g_mean_mag,
-    pmra, pmdec, ref_epoch, bp_rp. The last three are proper motion in RA*cos(dec)
+    pmra, pmdec, ref_epoch, bp_rp, ruwe, variable, duplicated. The last three are proper motion in RA*cos(dec)
     and Dec (mas/yr) and the epoch (Julian year, J2016.0 for Gaia DR3) those
     positions/motions are referenced to — needed by _propagate_to_epoch()
     below (for matching and the WCS-offset accumulator) and by
@@ -88,6 +88,9 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
         has_bp_rp     = "bp_rp"     in table.colnames
         has_bp        = "phot_bp_mean_mag" in table.colnames
         has_rp        = "phot_rp_mean_mag" in table.colnames
+        has_ruwe      = "ruwe"      in table.colnames
+        has_var       = "phot_variable_flag" in table.colnames
+        has_dup       = "duplicated_source"  in table.colnames
 
         stars: list[dict] = []
         for row in table:
@@ -137,6 +140,26 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
                 if bp is not None and rp is not None:
                     bp_rp = bp - rp
 
+            # Data-quality flags, for modules/photometry.py's zero-point
+            # reference screening. A star Gaia itself calls variable, or one
+            # whose astrometric solution is poor (high RUWE — usually an
+            # unresolved binary or a blend), is exactly what must not anchor
+            # a photometric calibration. None means "the catalog didn't say",
+            # which is treated as acceptable rather than as a failure.
+            ruwe = _finite_or_none(row, "ruwe") if has_ruwe else None
+            variable: bool | None = None
+            if has_var:
+                try:
+                    variable = str(row["phot_variable_flag"]).strip().upper() == "VARIABLE"
+                except (TypeError, ValueError):
+                    variable = None
+            duplicated: bool | None = None
+            if has_dup:
+                try:
+                    duplicated = bool(row["duplicated_source"])
+                except (TypeError, ValueError):
+                    duplicated = None
+
             stars.append({
                 "ra":              float(row["ra"]),
                 "dec":             float(row["dec"]),
@@ -146,6 +169,9 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
                 "pmdec":           pmdec,
                 "ref_epoch":       ref_epoch,
                 "bp_rp":           bp_rp,
+                "ruwe":            ruwe,
+                "variable":        variable,
+                "duplicated":      duplicated,
             })
 
         _cache_set(cache_key, stars)
@@ -301,6 +327,15 @@ def _match_gaia(sources: list[dict], gaia_stars: list[dict]) -> None:
             # side, so api_client's _to_wire_source() strips it — same
             # convention as "_from_subtraction"/"_source_id".
             source["_catalog_color"] = matched.get("bp_rp")
+            # Gaia's own view of this star's reliability, for
+            # modules/photometry.py's zero-point reference screening. Same
+            # leading-underscore, pipeline-internal convention as the colour
+            # above — the API has no column for any of it.
+            source["_catalog_flags"] = {
+                "ruwe":       matched.get("ruwe"),
+                "variable":   matched.get("variable"),
+                "duplicated": matched.get("duplicated"),
+            }
 
 
 # ---------------------------------------------------------------------------

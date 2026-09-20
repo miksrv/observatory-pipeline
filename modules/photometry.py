@@ -187,6 +187,94 @@ def _pixel_scale_from_wcs(wcs: WCS) -> float:
     return pixel_scale_deg * 3600.0      # arcsec/px
 
 
+# Finite-sample correction factors for the median absolute deviation
+# (Croux & Rousseeuw 1992). The familiar 1.4826 scaling is the asymptotic
+# value; at the handful of reference stars a zero point is routinely computed
+# from, the raw MAD is biased low by up to ~50%, which is precisely where an
+# understated zero_point_err does the most damage.
+_MAD_SMALL_SAMPLE_CORRECTION: dict[int, float] = {
+    2: 1.196, 3: 1.495, 4: 1.363, 5: 1.206,
+    6: 1.200, 7: 1.140, 8: 1.129, 9: 1.107,
+}
+# Below this many references the MAD is also floored by a scatter estimate
+# that cannot collapse to zero — see _robust_scatter().
+_SMALL_SAMPLE_N: int = 6
+# sqrt(pi/2): converts a mean absolute deviation to a sigma for a normal
+# distribution, the same role 1.4826 plays for the MAD.
+_MEAN_ABS_DEV_TO_SIGMA: float = 1.2533
+
+
+def _robust_scatter(values: np.ndarray) -> float:
+    """
+    Robust 1-sigma scatter of `values`, corrected for how few of them there
+    usually are.
+
+    The plain 1.4826 x MAD this module used before has a specific failure at
+    the minimum n=3: for a "two good references plus one outlier" set the
+    median sits on one of the two good values and the MAD is exactly **zero**,
+    so the frame reports `zero_point_err = 0.0` at the very moment its
+    calibration is least trustworthy (audit 2026-08-18, finding H6). The MAD
+    is also biased low in small samples generally.
+
+    Two corrections, both only meaningful at small n and both converging to
+    the previous behaviour as n grows:
+
+    * the Croux & Rousseeuw finite-sample factor on the MAD, and
+    * below `_SMALL_SAMPLE_N`, a floor at the (consistency-scaled) mean
+      absolute deviation, which — unlike the MAD — cannot be zero unless every
+      value is identical. With three references a single outlier genuinely
+      cannot be identified as one, so the honest estimate is the one that
+      keeps its influence rather than the one that discards it.
+    """
+    n = len(values)
+    if n == 0:
+        return 0.0
+
+    median = float(np.median(values))
+    deviations = np.abs(values - median)
+
+    mad = float(np.median(deviations))
+    sigma = 1.4826 * _MAD_SMALL_SAMPLE_CORRECTION.get(n, 1.0) * mad
+
+    if n < _SMALL_SAMPLE_N:
+        sigma = max(sigma, _MEAN_ABS_DEV_TO_SIGMA * float(np.mean(deviations)))
+
+    return sigma
+
+
+def _is_usable_reference(src: dict) -> bool:
+    """
+    Whether a Gaia-matched source is fit to anchor the frame's zero point.
+
+    Gaia publishes its own opinion of each star, and none of it was consulted
+    before (audit 2026-08-18, finding H6): a star the catalog itself calls
+    variable, one flagged `duplicated_source`, or one whose astrometric
+    solution fits badly (`ruwe` above config.PHOTOMETRY_REF_MAX_RUWE — usually
+    an unresolved binary or a blend, whose aperture flux is two stars' worth)
+    is exactly what a photometric calibration must not rest on.
+
+    A flag the catalog didn't supply is treated as acceptable rather than as a
+    failure, so a deployment whose astroquery version returns a narrower
+    column set keeps calibrating exactly as it did before.
+    """
+    flags = src.get("_catalog_flags")
+    if not isinstance(flags, dict):
+        return True
+
+    if flags.get("variable") is True or flags.get("duplicated") is True:
+        return False
+
+    ruwe = flags.get("ruwe")
+    if ruwe is not None:
+        try:
+            if float(ruwe) > config.PHOTOMETRY_REF_MAX_RUWE:
+                return False
+        except (TypeError, ValueError):
+            pass
+
+    return True
+
+
 class _ZeroPoint(NamedTuple):
     """
     The frame's photometric solution: an offset, its uncertainty, and the
@@ -236,7 +324,7 @@ def _robust_color_fit(
             return fit
 
         resid = deltas - (zp + k * x)
-        sigma = 1.4826 * float(np.median(np.abs(resid[keep] - np.median(resid[keep]))))
+        sigma = _robust_scatter(resid[keep])
         fit = (float(zp), float(k), sigma)
 
         if sigma <= 0.0:
@@ -256,7 +344,10 @@ def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
     Compute the differential photometry zero-point from Gaia DR3 reference stars.
 
     Requires at least 3 sources with ``catalog_name == "Gaia DR3"``,
-    a finite ``catalog_mag``, and a finite ``mag_instrumental``.
+    a finite ``catalog_mag``, and a finite ``mag_instrumental``. Those are
+    first screened through ``_is_usable_reference()`` — Gaia's own
+    variable/duplicated/RUWE flags — with a documented fallback to the
+    unscreened set when screening would leave too few.
 
     When enough of those references also carry a Gaia BP-RP colour spanning a
     wide enough range, the offset is fitted as a line in colour rather than
@@ -282,11 +373,35 @@ def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
         None) whenever no colour fit was made, in which case the result is
         identical to the plain median this function returned before.
     """
+    candidates = [src for src in sources if src.get("catalog_name") == "Gaia DR3"]
+    screened = [src for src in candidates if _is_usable_reference(src)]
+
+    # Screening only ever narrows the set. Dropping below the 3 references a
+    # zero point needs would mean losing calibration for the whole frame,
+    # which is a worse outcome than a zero point anchored on a few imperfect
+    # stars — so that case falls back to the unscreened set and says so.
+    if len(screened) >= 3:
+        n_rejected = len(candidates) - len(screened)
+        if n_rejected:
+            logger.info(
+                "photometry: excluded %d/%d Gaia reference star(s) as variable, "
+                "duplicated, or RUWE > %.2f",
+                n_rejected, len(candidates), config.PHOTOMETRY_REF_MAX_RUWE,
+            )
+        references = screened
+    else:
+        if len(candidates) > len(screened):
+            logger.warning(
+                "photometry: only %d of %d Gaia reference star(s) pass the "
+                "quality screen (need >= 3) — calibrating off the unscreened "
+                "set instead; zero_point_err will reflect the extra scatter",
+                len(screened), len(candidates),
+            )
+        references = candidates
+
     deltas: list[float] = []
     colors: list[float] = []
-    for src in sources:
-        if src.get("catalog_name") != "Gaia DR3":
-            continue
+    for src in references:
         # A saturated star's aperture flux is not a physically meaningful
         # measurement (its PSF core is clipped), so it must never be used as
         # a zero-point reference even if it happens to be Gaia-matched —
@@ -320,8 +435,9 @@ def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
     arr = np.array(deltas, dtype=np.float64)
     col = np.array(colors, dtype=np.float64)
     zp: float = float(np.median(arr))
-    # Median absolute deviation (no scipy dependency)
-    mad: float = float(np.median(np.abs(arr - zp)))
+    # Robust scatter, corrected for how few references there usually are —
+    # see _robust_scatter() for why a plain MAD understates it at small n.
+    mad: float = _robust_scatter(arr)
 
     # ------------------------------------------------------------------
     # Colour term

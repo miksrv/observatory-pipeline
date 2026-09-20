@@ -793,6 +793,97 @@ class TestColorTerm:
 
 
 # ---------------------------------------------------------------------------
+# Reference-star screening and small-sample scatter — audit 2026-08-18, H6
+# ---------------------------------------------------------------------------
+
+class TestReferenceScreening:
+    """
+    Gaia publishes its own opinion of each star's reliability and none of it
+    was consulted: a catalogued variable, a duplicated_source, or a star with
+    a poor astrometric fit (high RUWE — usually an unresolved binary or a
+    blend) could silently anchor the frame's whole photometric calibration.
+    """
+
+    def _flagged(self, delta: float, **flags) -> dict:
+        src = _ref(delta, None)
+        src["_catalog_flags"] = {"ruwe": None, "variable": None, "duplicated": None}
+        src["_catalog_flags"].update(flags)
+        return src
+
+    def test_a_variable_reference_is_excluded(self):
+        good = [self._flagged(24.0) for _ in range(5)]
+        bad = self._flagged(30.0, variable=True)
+        sol = photometry._compute_zero_point(good + [bad])
+
+        assert sol.zero_point == pytest.approx(24.0)
+
+    def test_a_duplicated_reference_is_excluded(self):
+        good = [self._flagged(24.0) for _ in range(5)]
+        bad = self._flagged(30.0, duplicated=True)
+        sol = photometry._compute_zero_point(good + [bad])
+
+        assert sol.zero_point == pytest.approx(24.0)
+
+    def test_a_high_ruwe_reference_is_excluded(self):
+        good = [self._flagged(24.0, ruwe=1.0) for _ in range(5)]
+        bad = self._flagged(30.0, ruwe=5.0)
+        sol = photometry._compute_zero_point(good + [bad])
+
+        assert sol.zero_point == pytest.approx(24.0)
+
+    def test_a_reference_with_no_flags_at_all_is_kept(self):
+        """
+        An astroquery version returning a narrower column set must keep
+        calibrating exactly as before, not lose every reference.
+        """
+        refs = [_ref(24.0, None) for _ in range(4)]
+        sol = photometry._compute_zero_point(refs)
+
+        assert sol.zero_point == pytest.approx(24.0)
+
+    def test_screening_below_three_falls_back_to_the_unscreened_set(self):
+        """A worse zero point beats losing calibration for the whole frame."""
+        refs = [self._flagged(24.0, variable=True) for _ in range(4)]
+        sol = photometry._compute_zero_point(refs)
+
+        assert sol.zero_point == pytest.approx(24.0)
+
+
+class TestSmallSampleScatter:
+    """
+    The plain 1.4826 x MAD collapsed to exactly zero for the minimum n=3 "two
+    good references plus one outlier" set — reporting a perfect zero_point_err
+    at the moment the calibration is least trustworthy.
+    """
+
+    def test_three_references_with_an_outlier_do_not_report_zero_error(self):
+        refs = [_ref(24.0, None), _ref(24.0, None), _ref(25.0, None)]
+        sol = photometry._compute_zero_point(refs)
+
+        assert sol.zero_point == pytest.approx(24.0)
+        assert sol.zero_point_err > 0.0
+
+    def test_identical_references_still_report_zero_error(self):
+        """No scatter genuinely means no scatter — the floor must not invent one."""
+        refs = [_ref(24.0, None) for _ in range(4)]
+        sol = photometry._compute_zero_point(refs)
+
+        assert sol.zero_point_err == pytest.approx(0.0)
+
+    def test_the_small_sample_correction_fades_with_n(self):
+        """
+        The same relative spread must not be reported as a larger scatter for
+        a large reference set than the asymptotic MAD would give.
+        """
+        spread = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        many = [_ref(24.0 + d, None) for d in spread * 12]
+        sol = photometry._compute_zero_point(many)
+
+        plain_mad = 0.5  # median |x - median| of the spread above
+        assert sol.zero_point_err == pytest.approx(1.4826 * plain_mad, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
 # Test 6.4 — skip_calibration (narrowband filters)
 # ---------------------------------------------------------------------------
 
