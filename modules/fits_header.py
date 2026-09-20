@@ -276,6 +276,77 @@ _RA_HOUR_WORDS: tuple[str, ...] = ("hourangle", "hours", "hour", "hrs", "hr")
 _RA_DEGREE_WORDS: tuple[str, ...] = ("degrees", "degree", "deg")
 
 
+# Equinoxes that already mean "the frame everything downstream works in".
+# ICRS and FK5 J2000 differ by tens of milliarcsec — far below anything this
+# pipeline measures — so neither needs converting.
+_J2000_EQUINOXES: tuple[float, ...] = (2000.0,)
+
+
+def _to_icrs(hdr: fits.Header, ra: float | None, dec: float | None) -> tuple[float | None, float | None]:
+    """
+    Precess the mount's reported RA/Dec to ICRS when the header says they are
+    in some other equinox.
+
+    A mount reporting apparent coordinates of date — "JNow", which many
+    planetarium programs and ASCOM drivers default to — writes `EQUINOX`
+    (or the older `EPOCH`) as the current year. Those coordinates differ from
+    J2000 by the accumulated precession, roughly 50" per year, or about half
+    an arcminute today. Read as if they were J2000, that difference lands
+    whole in `pointing_error_arcsec`, masking a real mount problem or
+    inventing one, and it grows every year (audit 2026-08-18, finding M1).
+
+    `RADESYS` is consulted first, since a header declaring `ICRS` or `FK5`
+    without a matching equinox means J2000 by the FITS standard's own
+    defaulting rules. An unparseable or absent equinox leaves the coordinates
+    alone, which is the previous behaviour.
+
+    Applies only to the mount's own reported target position. The WCS's
+    coordinates are astap's, already ICRS by construction, and are never
+    routed through here.
+    """
+    if ra is None or dec is None:
+        return ra, dec
+
+    radesys = _get(hdr, "RADESYS", "RADECSYS")
+    radesys_str = str(radesys).strip().upper() if radesys is not None else ""
+    if radesys_str == "ICRS":
+        return ra, dec
+
+    equinox = _to_float(_get(hdr, "EQUINOX", "EPOCH"))
+    if equinox is None or equinox in _J2000_EQUINOXES:
+        return ra, dec
+    if not (1900.0 <= equinox <= 2200.0):
+        logger.warning(
+            "EQUINOX=%r is not a plausible Julian year — leaving the mount's "
+            "reported RA/Dec uncorrected", equinox,
+        )
+        return ra, dec
+
+    try:
+        import astropy.units as _u
+        from astropy.coordinates import FK5, SkyCoord
+        from astropy.time import Time
+
+        coord = SkyCoord(
+            ra=ra * _u.deg, dec=dec * _u.deg,
+            frame=FK5(equinox=Time(equinox, format="jyear")),
+        ).icrs
+        precessed = (float(coord.ra.deg), float(coord.dec.deg))
+    except Exception as exc:
+        logger.warning(
+            "Could not precess the mount's RA/Dec from equinox %s to ICRS (%s) "
+            "— using them as-is", equinox, exc,
+        )
+        return ra, dec
+
+    logger.info(
+        "Mount RA/Dec precessed from equinox %.1f to ICRS: "
+        "(%.5f, %.5f) -> (%.5f, %.5f)",
+        equinox, ra, dec, precessed[0], precessed[1],
+    )
+    return precessed
+
+
 def _resolve_numeric_ra(hdr: fits.Header, ra_raw: Any) -> float | None:
     """
     Interpret a bare numeric `RA`/`OBJCTRA` value, which may be in decimal
@@ -371,6 +442,8 @@ def _build_dict(hdr: fits.Header) -> dict:
         dec = _sexagesimal_to_degrees(dec_raw, "deg")
     else:
         dec = _to_float(dec_raw)
+
+    ra, dec = _to_icrs(hdr, ra, dec)
 
     return {
         "obs_time":    obs_time,

@@ -106,7 +106,7 @@ Standard FITS keywords supported (with common aliases):
 |---|---|---|
 | **Observation** | `DATE-OBS`, `TIME-OBS`, `MJD-OBS` | Observation timestamp (see below — these three are resolved together, not first-non-empty) |
 | **Target** | `OBJECT`, `OBJNAME`, `TARGET` | Name of the observed object (e.g., "M51", "NGC 1234") |
-| **Coordinates** | `RA`, `DEC`, `OBJCTRA`, `OBJCTDEC` | Target coordinates (if provided by telescope; a bare numeric RA below 24 is unit-ambiguous — see below) |
+| **Coordinates** | `RA`, `DEC`, `OBJCTRA`, `OBJCTDEC`, `EQUINOX`/`EPOCH`, `RADESYS` | Target coordinates (if provided by telescope; a bare numeric RA below 24 is unit-ambiguous, and a non-J2000 equinox is precessed — see below) |
 | **Exposure** | `EXPTIME`, `EXPOSURE` | Exposure time in seconds |
 | **Filter** | `FILTER`, `FILTNAM`, `FILTERID` | Filter name (e.g., "V", "B", "R", "Ha", "Luminance") |
 | **Instrument** | `INSTRUME`, `CAMERA` | Camera/instrument name |
@@ -146,6 +146,16 @@ one. Taking the first non-empty key instead — as an earlier revision did — s
 frame of an old-convention night at midnight, an hours-scale epoch error for the SkyBot/Horizons
 queries and for history comparisons (audit 2026-08-18, finding C10). A date-only frame with no
 `TIME-OBS` at all still resolves to midnight, but logs a warning saying so.
+
+**Equinox.** The mount's reported RA/Dec is precessed to ICRS when `EQUINOX`/`EPOCH` says it is
+in another equinox (`_to_icrs()`); `RADESYS: ICRS` short-circuits that, since the FITS standard's
+own defaulting already makes such a header J2000. A mount reporting apparent coordinates of date
+— "JNow", the default in many planetarium programs and ASCOM drivers — is off from J2000 by the
+accumulated precession, roughly 50″/yr and tens of arcmin by now, and read as J2000 that lands
+whole in `pointing_error_arcsec`, masking a real mount problem or inventing one, growing every
+year (audit 2026-08-18, finding M1). Scoped to the mount's own position: the WCS's coordinates
+are astap's and ICRS by construction. An absent, J2000 or implausible equinox leaves the
+coordinates untouched.
 
 **Numeric RA units.** A bare numeric `RA`/`OBJCTRA` is degrees by FITS convention, but some
 ASCOM-driven capture software writes decimal *hours* into the same keyword — a factor of 15.

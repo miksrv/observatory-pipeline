@@ -342,6 +342,72 @@ class TestCoordinateConversion:
 
 
 # ---------------------------------------------------------------------------
+# Equinox handling — audit 2026-08-18, finding M1
+#
+# A mount reporting apparent coordinates of date ("JNow", the default in many
+# planetarium programs and ASCOM drivers) writes EQUINOX as the current year.
+# Read as J2000, the accumulated precession — roughly 50"/yr, about half a
+# degree by now — lands whole in pointing_error_arcsec, masking a real mount
+# problem or inventing one, and it grows every year.
+# ---------------------------------------------------------------------------
+
+class TestEquinox:
+    _RA = 202.469
+    _DEC = 47.195
+
+    def _ra_dec(self, extra_headers: dict) -> tuple[float, float]:
+        path = _write_fits({"RA": self._RA, "DEC": self._DEC, **extra_headers})
+        try:
+            h = extract_headers(path)
+            return h["ra"], h["dec"]
+        finally:
+            _cleanup(path)
+
+    def test_no_equinox_leaves_coordinates_alone(self):
+        assert self._ra_dec({}) == (pytest.approx(self._RA), pytest.approx(self._DEC))
+
+    def test_j2000_is_already_the_working_frame(self):
+        assert self._ra_dec({"EQUINOX": 2000.0}) == (
+            pytest.approx(self._RA), pytest.approx(self._DEC)
+        )
+
+    def test_jnow_is_precessed_to_icrs(self):
+        ra, dec = self._ra_dec({"EQUINOX": 2026.5})
+
+        # Roughly 50"/yr over ~26 years — tens of arcmin, far past anything
+        # this pipeline would otherwise call a pointing error.
+        sep_arcmin = math.hypot(
+            (ra - self._RA) * math.cos(math.radians(self._DEC)), dec - self._DEC
+        ) * 60.0
+        assert 10.0 < sep_arcmin < 40.0
+
+    def test_the_older_epoch_keyword_is_honoured(self):
+        from_epoch = self._ra_dec({"EPOCH": 2026.5})
+        from_equinox = self._ra_dec({"EQUINOX": 2026.5})
+
+        assert from_epoch == (pytest.approx(from_equinox[0]), pytest.approx(from_equinox[1]))
+
+    def test_an_explicit_icrs_radesys_wins_over_a_stale_equinox(self):
+        assert self._ra_dec({"EQUINOX": 2026.5, "RADESYS": "ICRS"}) == (
+            pytest.approx(self._RA), pytest.approx(self._DEC)
+        )
+
+    def test_an_implausible_equinox_is_ignored(self):
+        assert self._ra_dec({"EQUINOX": 12.0}) == (
+            pytest.approx(self._RA), pytest.approx(self._DEC)
+        )
+
+    def test_missing_coordinates_stay_missing(self):
+        path = _write_fits({"EQUINOX": 2026.5})
+        try:
+            h = extract_headers(path)
+            assert h["ra"] is None
+            assert h["dec"] is None
+        finally:
+            _cleanup(path)
+
+
+# ---------------------------------------------------------------------------
 # Numeric RA units — audit 2026-08-18, finding H18
 #
 # A bare numeric RA was always read as decimal degrees. Some ASCOM-driven
