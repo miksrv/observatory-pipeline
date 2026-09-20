@@ -137,6 +137,88 @@ def extract_headers(fits_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Observation timestamp
+# ---------------------------------------------------------------------------
+
+# A four-digit-year calendar date anywhere in the value, and a clock time
+# anywhere in it. Used only to tell which COMPONENTS a keyword carries, never
+# to validate the value — parsing that is astropy.time.Time's job.
+_DATE_COMPONENT_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_TIME_COMPONENT_RE = re.compile(r"\d{1,2}:\d{2}")
+
+
+def _resolve_obs_time(hdr: fits.Header) -> Any:
+    """
+    Resolve the observation timestamp from DATE-OBS / TIME-OBS / MJD-OBS.
+
+    The older FITS convention stores only the calendar date in `DATE-OBS`,
+    with the time of day in a separate `TIME-OBS`. Taking the first non-empty
+    key on an either/or basis — as this did before — dropped the time of day
+    entirely for such a file, silently placing every frame of the night at
+    midnight: an hours-scale epoch error for the SkyBot/Horizons queries and
+    for history comparisons (audit 2026-08-18, finding C10).
+
+    Resolution order:
+
+    1. `DATE-OBS` already carrying a time component — used as-is (the modern
+       convention, and by far the common case).
+    2. `DATE-OBS` (date only) combined with `TIME-OBS`. A `TIME-OBS` that is
+       itself a full timestamp — some capture software writes one there —
+       is preferred over splicing.
+    3. `MJD-OBS`, converted to ISO.
+    4. Nothing usable → None. A bare `TIME-OBS` time-of-day with no date
+       anywhere is deliberately NOT returned: it cannot be parsed by anything
+       downstream, and returning it only turns a missing timestamp into a
+       corrupt one.
+
+    Note that a pre-1997 `DD/MM/YY` date is not recognized as a date and so
+    is passed through unchanged, exactly as before.
+    """
+    date_obs = _get(hdr, "DATE-OBS")
+    time_obs = _get(hdr, "TIME-OBS")
+    time_str = str(time_obs).strip() if time_obs is not None else None
+
+    if date_obs is not None:
+        date_str = str(date_obs).strip()
+        if _TIME_COMPONENT_RE.search(date_str):
+            return date_str
+
+        if time_str:
+            if _DATE_COMPONENT_RE.search(time_str):
+                return time_str
+            if _TIME_COMPONENT_RE.search(time_str):
+                return f"{date_str}T{time_str}"
+            logger.warning(
+                "TIME-OBS=%r carries no recognizable time of day — using "
+                "DATE-OBS=%r alone, i.e. midnight",
+                time_obs, date_obs,
+            )
+        else:
+            logger.warning(
+                "DATE-OBS=%r carries no time of day and there is no TIME-OBS "
+                "— this frame is timestamped at midnight",
+                date_obs,
+            )
+        return date_str
+
+    if time_str and _DATE_COMPONENT_RE.search(time_str):
+        return time_str
+
+    mjd = _to_float(_get(hdr, "MJD-OBS"))
+    if mjd is not None:
+        from astropy.time import Time
+        return Time(mjd, format="mjd").isot
+
+    if time_str:
+        logger.warning(
+            "TIME-OBS=%r is the only timestamp in this header and carries no "
+            "date — no usable observation time",
+            time_obs,
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Exposure midpoint
 # ---------------------------------------------------------------------------
 
@@ -191,14 +273,7 @@ def _build_dict(hdr: fits.Header) -> dict:
     raw_object = _get(hdr, "OBJECT", "OBJNAME", "TARGET")
 
     # -- Observation timestamp ------------------------------------------------
-    obs_time = _get(hdr, "DATE-OBS")
-    if obs_time is None:
-        obs_time = _get(hdr, "TIME-OBS")
-    if obs_time is None:
-        mjd = _to_float(_get(hdr, "MJD-OBS"))
-        if mjd is not None:
-            from astropy.time import Time
-            obs_time = Time(mjd, format="mjd").isot
+    obs_time = _resolve_obs_time(hdr)
 
     # -- Sky coordinates ------------------------------------------------------
     ra_raw = _get(hdr, "RA", "OBJCTRA")

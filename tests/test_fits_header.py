@@ -531,3 +531,84 @@ class TestMidpointTime:
 
         assert result["obs_time"] is None
         assert result["obs_time_mid"] is None
+
+
+# ---------------------------------------------------------------------------
+# Observation timestamp resolution (audit 2026-08-18, C10)
+# ---------------------------------------------------------------------------
+
+class TestObsTimeResolution:
+    """
+    The older FITS convention puts only the calendar date in DATE-OBS and the
+    time of day in a separate TIME-OBS. Taking the first non-empty key on an
+    either/or basis dropped the time entirely, placing every frame of the
+    night at midnight.
+    """
+
+    def _obs_time(self, headers: dict):
+        path = _write_fits(headers)
+        try:
+            return extract_headers(path)["obs_time"]
+        finally:
+            _cleanup(path)
+
+    def test_date_only_is_combined_with_time_obs(self):
+        assert self._obs_time({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "22:01:34",
+        }) == "2024-03-15T22:01:34"
+
+    def test_combined_value_is_parseable_downstream(self):
+        from astropy.time import Time
+
+        obs_time = self._obs_time({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "22:01:34.500",
+        })
+
+        assert Time(obs_time, scale="utc").isot.startswith("2024-03-15T22:01:34")
+
+    def test_full_date_obs_ignores_time_obs(self):
+        """The modern convention: DATE-OBS already carries the time of day."""
+        assert self._obs_time({
+            "DATE-OBS": "2024-03-15T22:01:34",
+            "TIME-OBS": "03:00:00",
+        }) == "2024-03-15T22:01:34"
+
+    def test_time_obs_carrying_a_full_timestamp_wins_over_splicing(self):
+        """Some capture software writes a complete timestamp into TIME-OBS."""
+        assert self._obs_time({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "2024-03-15T22:01:34",
+        }) == "2024-03-15T22:01:34"
+
+    def test_date_only_without_time_obs_stays_date_only(self):
+        assert self._obs_time({"DATE-OBS": "2024-03-15"}) == "2024-03-15"
+
+    def test_bare_time_obs_alone_is_not_returned(self):
+        """
+        A time of day with no date anywhere can't be parsed by anything
+        downstream — returning it turns a missing timestamp into a corrupt
+        one.
+        """
+        assert self._obs_time({"TIME-OBS": "22:01:34"}) is None
+
+    def test_bare_time_obs_falls_through_to_mjd(self):
+        obs_time = self._obs_time({"TIME-OBS": "22:01:34", "MJD-OBS": 60384.0})
+
+        assert obs_time is not None
+        assert "2024-03-15" in obs_time
+
+    def test_combined_timestamp_feeds_the_exposure_midpoint(self):
+        """C9 and C10 compose: the midpoint is computed off the combined value."""
+        path = _write_fits({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "22:01:34",
+            "EXPTIME":  120.0,
+        })
+        try:
+            result = extract_headers(path)
+        finally:
+            _cleanup(path)
+
+        assert result["obs_time_mid"].startswith("2024-03-15T22:02:34")
