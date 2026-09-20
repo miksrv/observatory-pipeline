@@ -390,19 +390,41 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     raw_detection_count: int = len(objects)
     logger.debug("QC: detected %d raw sources in %s", raw_detection_count, os.path.basename(fits_path))
 
-    # Degenerate frame — too few sources to compute reliable statistics
+    # Degenerate frame — too few sources to compute reliable statistics.
+    #
+    # The background is still worth reporting on, and it is usually the
+    # explanation: cloud, twilight, moonlight or stray light drown the stars
+    # that should have been detected. Returning LOW_STARS regardless — as this
+    # did before — told the operator the symptom and hid the cause, which is
+    # exactly backwards for the one subsystem whose job is to say why a frame
+    # was rejected (audit 2026-08-18, finding M12). Two problems at once is
+    # BAD by this module's own flag table, and the log line names both.
     if raw_detection_count < 3:
-        logger.warning(
-            "QC: only %d sources detected (< 3), flagging LOW_STARS: %s",
-            raw_detection_count,
-            fits_path,
+        high_background = (
+            sky_background is not None
+            and sky_background > config.QC_SKY_BACKGROUND_MAX
         )
+        flag = "BAD" if high_background else "LOW_STARS"
+        if high_background:
+            logger.warning(
+                "QC: only %d sources detected (< 3) AND sky_background=%.1f "
+                "exceeds QC_SKY_BACKGROUND_MAX=%.1f — flagging BAD; the "
+                "background is the likely cause of the missing stars: %s",
+                raw_detection_count, sky_background,
+                config.QC_SKY_BACKGROUND_MAX, fits_path,
+            )
+        else:
+            logger.warning(
+                "QC: only %d sources detected (< 3), flagging LOW_STARS: %s",
+                raw_detection_count,
+                fits_path,
+            )
         return _result(
-            quality_flag="LOW_STARS",
+            quality_flag=flag,
             sky_background=sky_background,
             sky_sigma=sky_sigma,
             star_count=raw_detection_count,
-            rejected_path=_move_rejected(fits_path, "LOW_STARS", object_name) if move_on_reject else None,
+            rejected_path=_move_rejected(fits_path, flag, object_name) if move_on_reject else None,
         )
 
     # ------------------------------------------------------------------

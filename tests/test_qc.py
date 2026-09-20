@@ -197,6 +197,7 @@ def _patch_qc(
     header: dict[str, Any] | None = None,
     header_info: dict[str, Any] | None = None,
     cr_raises: bool = False,
+    sky_back: float | None = None,
 ):
     """
     Patch every external dependency of qc.py in one shot.
@@ -226,7 +227,7 @@ def _patch_qc(
         }
 
     hdul_mock = _make_hdu_mock(image, header)
-    bkg_mock  = _make_bkg_mock()
+    bkg_mock  = _FakeBackground(back=sky_back) if sky_back is not None else _make_bkg_mock()
     n = len(sources)
 
     def _detect_cosmics(data):
@@ -359,6 +360,47 @@ class TestLowStarsFlag:
             result = await qc.analyze(_FITS_PATH)
 
         assert result["quality_flag"] != "LOW_STARS"
+
+
+# ---------------------------------------------------------------------------
+# Test 4b — the degenerate-frame path reports the background too
+#
+# Audit 2026-08-18, finding M12: with fewer than 3 raw detections the function
+# returned LOW_STARS regardless of the background — telling the operator the
+# symptom and hiding the cause, which is backwards for the one subsystem whose
+# job is to say why a frame was rejected. Cloud, twilight, moonlight or stray
+# light drowning the stars is usually exactly the cause.
+# ---------------------------------------------------------------------------
+
+class TestDegenerateFrameBackground:
+    @pytest.mark.asyncio
+    async def test_two_sources_on_a_dark_sky_is_low_stars(self):
+        sources = _make_sources(2, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["quality_flag"] == "LOW_STARS"
+
+    @pytest.mark.asyncio
+    async def test_two_sources_under_a_bright_sky_is_bad(self):
+        """Two problems at once is BAD by this module's own flag table."""
+        import config
+
+        sources = _make_sources(2, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources, sky_back=config.QC_SKY_BACKGROUND_MAX * 2.0):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["quality_flag"] == "BAD"
+        assert result["sky_background"] > config.QC_SKY_BACKGROUND_MAX
+
+    @pytest.mark.asyncio
+    async def test_the_background_is_reported_either_way(self):
+        sources = _make_sources(2, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["sky_background"] is not None
+        assert result["star_count"] == 2
 
 
 # ---------------------------------------------------------------------------

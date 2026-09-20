@@ -560,7 +560,7 @@ Quality flags and classification:
 | Elongation > QC_ELONGATION_MAX | `TRAIL` |
 | Sky background > QC_SKY_BACKGROUND_MAX | `HIGH_BACKGROUND` |
 | Star count < QC_STARS_MIN (or < 3 raw detections) | `LOW_STARS` |
-| Multiple issues, or a FITS read / background-estimation / extraction failure | `BAD` |
+| Multiple issues, a FITS read / background-estimation / extraction failure, or fewer than 3 raw detections **under a sky brighter than `QC_SKY_BACKGROUND_MAX`** | `BAD` |
 | All good | `OK` |
 
 The "Action" a non-`OK` flag triggers depends entirely on the caller's `move_on_reject` argument
@@ -578,6 +578,12 @@ review (audit 2026-08-18, finding C12).
 `modules/catalog_preview.py` (the `PREVIEW_CATALOG_MATCH` task type) also always passes
 `move_on_reject=False`, for the same reason as `pipeline.py`: it must never move/touch its input
 frame — see that module's section below.
+
+The hard floor of 3 raw detections returns `LOW_STARS` on its own, but `BAD` when the sky is
+also brighter than `QC_SKY_BACKGROUND_MAX`: cloud, twilight, moonlight or stray light drowning
+the stars is usually the actual cause of their absence, and reporting only the symptom hid it
+from the one subsystem whose job is to say why a frame was rejected (audit 2026-08-18, finding
+M12).
 
 `LOW_STARS` only fires when `BLUR`, `TRAIL`, and `HIGH_BACKGROUND` are all false — a low star
 count is treated as a *consequence* of one of those three (sources filtered out, or too faint
