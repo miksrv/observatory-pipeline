@@ -85,6 +85,12 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     dec_center = float(frame_meta.get("dec_center", 0.0))
     fov_deg    = float(frame_meta.get("fov_deg",    1.0))
     obs_time   = str(frame_meta.get("obs_time",    ""))
+    # The MPC/SkyBot stage alone runs at the exposure MIDPOINT: DATE-OBS is
+    # shutter-open, and a moving object is already tens of arcsec away by
+    # mid-exposure on a long one (see fits_header.midpoint_time()). Every
+    # other catalog here is stationary on this timescale. Falls back to the
+    # start time when the caller didn't compute a midpoint.
+    obs_time_mid = str(frame_meta.get("obs_time_mid") or obs_time)
 
     # ------------------------------------------------------------------
     # Phase 1: Query Gaia to compute WCS offset, then apply it to ALL
@@ -210,7 +216,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     #        positionally — see its docstring.
     mpc_objects: list[dict] = []
     try:
-        mpc_objects = _mpc._query_mpc(ra_center, dec_center, obs_time, fov_deg)
+        mpc_objects = _mpc._query_mpc(ra_center, dec_center, obs_time_mid, fov_deg)
         _mpc._match_mpc(sources, mpc_objects)
     except Exception as exc:
         logger.warning("MPC/SkyBot matching stage failed for fits_filename=%s: %s", fits_filename, exc)

@@ -137,6 +137,53 @@ def extract_headers(fits_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Exposure midpoint
+# ---------------------------------------------------------------------------
+
+def midpoint_time(obs_time: Any, exptime: float | None) -> str | None:
+    """
+    Return the exposure MIDPOINT as an ISO 8601 string, or *obs_time*
+    unchanged when it can't be computed.
+
+    Per the FITS convention `DATE-OBS` is the shutter-OPEN time, but a
+    moving object's position is only meaningful at the instant its light was
+    centroided — the middle of the exposure, not its start. Every query that
+    computes where a solar system object was (SkyBot's cone search, JPL
+    Horizons) or propagates a proper motion to the observation epoch used the
+    start time as-is, giving a systematic (not random) offset between the
+    predicted position and the detected centroid: a fast NEO at 20-30"/min on
+    a several-minute exposure is already tens of arcsec away by mid-exposure,
+    a meaningful fraction of MOVING_CONE_ARCSEC (audit 2026-08-18, finding
+    C9).
+
+    Deliberately a separate value from `obs_time` rather than a correction
+    applied to it. `obs_time` is what the frame is registered and archived
+    under (`POST /frames`, and the DateTime field of the normalized filename)
+    and must keep meaning exactly what the header says; this one exists only
+    for the handful of consumers that compute a position.
+
+    Returns None only when *obs_time* itself is None.
+    """
+    if not obs_time:
+        return None
+    if exptime is None or not (exptime > 0):
+        return str(obs_time)
+
+    try:
+        from astropy.time import Time
+        import astropy.units as _u
+
+        return (Time(str(obs_time), scale="utc") + (exptime / 2.0) * _u.s).isot
+    except Exception as exc:
+        logger.warning(
+            "Cannot compute exposure midpoint from obs_time=%r exptime=%r: %s "
+            "— falling back to the exposure start",
+            obs_time, exptime, exc,
+        )
+        return str(obs_time)
+
+
+# ---------------------------------------------------------------------------
 # Extraction groups (called by extract_headers)
 # ---------------------------------------------------------------------------
 
@@ -171,6 +218,7 @@ def _build_dict(hdr: fits.Header) -> dict:
 
     return {
         "obs_time":    obs_time,
+        "obs_time_mid": midpoint_time(obs_time, _to_float(_get(hdr, "EXPTIME", "EXPOSURE"))),
         "ra":          ra,
         "dec":         dec,
         "object_name": sanitize_object_name(raw_object),
@@ -238,6 +286,7 @@ def _empty_dict() -> dict:
     """Return the correct structure with all values set to None."""
     return {
         "obs_time":    None,
+        "obs_time_mid": None,
         "ra":          None,
         "dec":         None,
         "object_name": "_UNKNOWN",

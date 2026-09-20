@@ -468,6 +468,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 "naxis1": astro_result.get("naxis1"),
                 "naxis2": astro_result.get("naxis2"),
                 "obs_time": header.get("obs_time"),
+                # Exposure MIDPOINT — the epoch SkyBot's cone search is run
+                # at, since DATE-OBS is shutter-open and a moving object has
+                # already travelled by mid-exposure (see
+                # fits_header.midpoint_time()).
+                "obs_time_mid": header.get("obs_time_mid"),
             }
             sources = await catalog_matcher.match(sources, frame_meta)
             matched_count = sum(1 for s in sources if s.get("catalog_name") is not None)
@@ -643,7 +648,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
             mpc_objects = catalog_matcher.get_mpc_objects(
                 astro_result.get("ra_center") or header.get("ra") or 0.0,
                 astro_result.get("dec_center") or header.get("dec") or 0.0,
-                header.get("obs_time") or "",
+                # Must be the exact epoch step 8's match() queried with — it
+                # is part of the SkyBot cache key, so anything else turns this
+                # accessor's intended cache hit into a second network round
+                # trip against a different epoch.
+                header.get("obs_time_mid") or header.get("obs_time") or "",
                 astro_result.get("fov_deg") or 1.0,
             )
             forced_sources = await forced_photometry.run(
@@ -656,7 +665,7 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 naxis2=astro_result.get("naxis2"),
                 zero_point=zero_point,
                 zero_point_err=zero_point_err,
-                obs_time=header.get("obs_time"),
+                obs_time=header.get("obs_time_mid") or header.get("obs_time"),
                 psf_fwhm_arcsec=psf_fwhm_arcsec,
             )
             if forced_sources:
@@ -798,9 +807,30 @@ async def analyze_frame(fits_path: str) -> dict | None:
         "sources": sources,
         "object_name": object_name,
         "obs_time": header.get("obs_time"),
+        "obs_time_mid": header.get("obs_time_mid"),
         "subtraction_performed": subtraction_info.get("performed", False),
         "quality_flag": quality_flag,
     }
+
+
+def _frame_exptime(frame: dict) -> float | None:
+    """
+    Read a frame record's exposure time from GET /frames/{id}, tolerating
+    both the flattened and the nested ("observation") shapes.
+    """
+    candidates = [frame.get("exptime")]
+    observation = frame.get("observation")
+    if isinstance(observation, dict):
+        candidates.append(observation.get("exptime"))
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1019,14 @@ async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
     frame_meta = {
         "filename": frame.get("filename"),
         "obs_time": frame.get("obs_time"),
+        # Recomputed from stored data rather than carried over: this path has
+        # no local FITS access at all. The exposure time is flattened onto the
+        # frame record by some API versions and nested under "observation" by
+        # others — try both before giving up and using the start time.
+        "obs_time_mid": fits_header.midpoint_time(
+            frame.get("obs_time"),
+            _frame_exptime(frame),
+        ),
     }
 
     anomalies = await detect_anomalies_for_frame_data(
@@ -1182,6 +1220,7 @@ async def run(fits_path: str) -> None:
     anomaly_frame_meta = {
         "filename": result["basename"],
         "obs_time": result["obs_time"],
+        "obs_time_mid": result.get("obs_time_mid"),
         "subtraction_performed": result["subtraction_performed"],
     }
 

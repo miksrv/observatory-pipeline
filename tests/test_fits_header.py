@@ -12,7 +12,7 @@ import numpy as np
 import astropy.io.fits as fits
 import pytest
 
-from modules.fits_header import extract_headers, sanitize_object_name
+from modules.fits_header import extract_headers, midpoint_time, sanitize_object_name
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +415,7 @@ class TestMissingHeaders:
 
 class TestOutputStructure:
     EXPECTED_KEYS = {
-        "obs_time", "ra", "dec", "object_name",
+        "obs_time", "obs_time_mid", "ra", "dec", "object_name",
         "observation", "instrument", "sensor", "observer", "software",
     }
     EXPECTED_OBSERVATION_KEYS = {"object", "exptime", "filter", "frame_type", "airmass"}
@@ -469,3 +469,65 @@ class TestOutputStructure:
             assert self.EXPECTED_SOFTWARE_KEYS == set(extract_headers(path)["software"].keys())
         finally:
             _cleanup(path)
+
+
+# ---------------------------------------------------------------------------
+# Exposure midpoint (audit 2026-08-18, C9)
+# ---------------------------------------------------------------------------
+
+class TestMidpointTime:
+    """
+    DATE-OBS is the shutter-OPEN time per the FITS convention, but a moving
+    object's position is only meaningful at the middle of the exposure —
+    every query that computes one (SkyBot, JPL Horizons, Gaia proper-motion
+    propagation) used the start time as-is.
+    """
+
+    def test_adds_half_the_exposure(self):
+        assert midpoint_time("2024-03-15T22:01:34", 120.0).startswith(
+            "2024-03-15T22:02:34"
+        )
+
+    def test_trailing_zone_marker_is_accepted(self):
+        assert midpoint_time("2024-03-15T22:01:34Z", 60.0).startswith(
+            "2024-03-15T22:02:04"
+        )
+
+    def test_crosses_a_day_boundary(self):
+        assert midpoint_time("2024-03-15T23:59:34", 120.0).startswith(
+            "2024-03-16T00:00:34"
+        )
+
+    def test_missing_exptime_returns_the_start_time(self):
+        assert midpoint_time("2024-03-15T22:01:34", None) == "2024-03-15T22:01:34"
+
+    def test_zero_exposure_returns_the_start_time(self):
+        assert midpoint_time("2024-03-15T22:01:34", 0.0) == "2024-03-15T22:01:34"
+
+    def test_missing_obs_time_returns_none(self):
+        assert midpoint_time(None, 120.0) is None
+
+    def test_unparseable_obs_time_falls_back_to_the_start_time(self):
+        assert midpoint_time("not-a-timestamp", 120.0) == "not-a-timestamp"
+
+    def test_extract_headers_exposes_the_midpoint(self):
+        path = _write_fits({"DATE-OBS": "2024-03-15T22:01:34", "EXPTIME": 300.0})
+        try:
+            result = extract_headers(path)
+        finally:
+            _cleanup(path)
+
+        # obs_time itself must keep meaning exactly what the header says —
+        # it is what the frame is registered and archived under.
+        assert result["obs_time"] == "2024-03-15T22:01:34"
+        assert result["obs_time_mid"].startswith("2024-03-15T22:04:04")
+
+    def test_extract_headers_midpoint_is_none_without_a_timestamp(self):
+        path = _write_fits({"EXPTIME": 300.0})
+        try:
+            result = extract_headers(path)
+        finally:
+            _cleanup(path)
+
+        assert result["obs_time"] is None
+        assert result["obs_time_mid"] is None

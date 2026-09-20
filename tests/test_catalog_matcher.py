@@ -571,6 +571,41 @@ class TestMatchOrchestrator:
 
         assert len(result) == 5
 
+    async def test_skybot_is_queried_at_the_exposure_midpoint(self):
+        """
+        Audit 2026-08-18, finding C9: DATE-OBS is shutter-open, so a fast
+        mover is already tens of arcsec from its start-of-exposure position
+        by mid-exposure. The MPC stage — and only it, every other catalog
+        here being stationary on this timescale — runs at the midpoint the
+        caller supplies.
+        """
+        sources = [_make_source()]
+        frame_meta = dict(_FRAME_META, obs_time_mid="2024-03-15T22:03:34")
+
+        gaia_t = _gaia_table(_RA + 10, _DEC + 10)
+        with (
+            patch("modules.catalog_matcher._gaia.Gaia", self._make_gaia_mock(gaia_t)),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]) as mock_mpc,
+        ):
+            await cm.match(sources, frame_meta)
+
+        assert mock_mpc.call_args[0][2] == "2024-03-15T22:03:34"
+
+    async def test_skybot_falls_back_to_the_start_time(self):
+        """A caller that computed no midpoint keeps the previous behaviour."""
+        sources = [_make_source()]
+
+        gaia_t = _gaia_table(_RA + 10, _DEC + 10)
+        with (
+            patch("modules.catalog_matcher._gaia.Gaia", self._make_gaia_mock(gaia_t)),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]) as mock_mpc,
+        ):
+            await cm.match(sources, _FRAME_META)
+
+        assert mock_mpc.call_args[0][2] == _FRAME_META["obs_time"]
+
     async def test_all_catalog_keys_present(self):
         """Every source in the output must have all four catalog keys."""
         sources = [_make_source()]

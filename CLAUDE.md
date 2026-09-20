@@ -135,6 +135,25 @@ def extract_headers(fits_path: str) -> dict:
 
 The `OBJECT` header is critical for organizing frames into subdirectories by target.
 
+**Exposure midpoint.** Alongside `obs_time` (the timestamp exactly as the header gives it), the
+returned dict carries `obs_time_mid` — `obs_time + EXPTIME/2`, via the public
+`fits_header.midpoint_time()`. `DATE-OBS` is the shutter-**open** time per the FITS convention,
+but a moving object's position is only meaningful at the instant its light was centroided: a fast
+NEO at 20–30″/min is already tens of arcsec away by mid-exposure on a several-minute frame — a
+meaningful fraction of `MOVING_CONE_ARCSEC` (audit 2026-08-18, finding C9). It is a *separate*
+field rather than a correction applied to `obs_time`, because `obs_time` is what the frame is
+registered under (`POST /frames`) and what `normalizer.py` builds the filename's DateTime field
+from; both must keep meaning exactly what the header says. Only the three consumers that compute
+a position read it: the MPC/SkyBot cone search (`modules/catalog_matcher/_match.py` — every other
+catalog there is stationary on this timescale), JPL Horizons
+(`modules/anomaly_detector/_detect.py` → `_ephemeris_resolution.py`), and forced photometry's
+Gaia proper-motion propagation. Anomaly detection's own history/coverage queries deliberately
+keep `obs_time`. Each falls back to `obs_time` when no midpoint could be computed (no `EXPTIME`,
+or an unparseable timestamp). The standalone `DETECT_ANOMALIES` path has no local FITS access, so
+it recomputes the midpoint from the stored `GET /frames/{id}` record instead
+(`pipeline._frame_exptime()` tolerates both the flattened and the nested `observation.exptime`
+shape).
+
 ---
 
 ## Module Descriptions & Responsibilities

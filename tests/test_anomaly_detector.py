@@ -978,6 +978,31 @@ class TestDetectMpcMovingObjects:
         assert result[0]["ephemeris"] is None
         assert "_needs_ephemeris" not in result[0]
 
+    async def test_ephemeris_is_queried_at_the_exposure_midpoint(self):
+        """
+        Audit 2026-08-18, finding C9: JPL Horizons was asked where the object
+        was at shutter-open rather than mid-exposure. The history/coverage
+        queries deliberately keep the start time — that is what the frame is
+        registered under.
+        """
+        source = _make_source(
+            catalog_name="MPC", catalog_id="2019 XY3", object_type="ASTEROID",
+        )
+        frame_meta = dict(_FRAME_META, obs_time_mid="2024-03-15T22:03:34")
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+            patch("modules.anomaly_detector.ephemeris.query", new_callable=AsyncMock, return_value=_EPH_DICT) as mock_eph,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": []}
+
+            await ad.detect(_FRAME_ID, [source], [source], frame_meta)
+
+        assert mock_eph.call_args[0][1] == "2024-03-15T22:03:34"
+        assert mock_cov.call_args[0][1] == _FRAME_META["obs_time"]
+
     async def test_one_raising_ephemeris_query_does_not_sink_the_frame(self):
         """
         Audit 2026-08-18, finding C8: asyncio.gather() gave no isolation

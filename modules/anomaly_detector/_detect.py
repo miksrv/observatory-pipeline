@@ -61,6 +61,10 @@ async def detect(
         magnitude, delta_mag, mpc_designation, ephemeris, notes.
     """
     obs_time     = str(frame_meta.get("obs_time", ""))
+    # Ephemerides are computed at the exposure MIDPOINT (see
+    # fits_header.midpoint_time()); the history/coverage queries below keep
+    # the start time, which is what the frame is registered under.
+    obs_time_mid = str(frame_meta.get("obs_time_mid") or obs_time)
     log_filename = str(frame_meta.get("filename", "<unknown>"))
     extra        = {"frame_id": frame_id, "log_filename": log_filename}
 
@@ -122,7 +126,7 @@ async def detect(
             )
 
     # Resolve ephemerides concurrently for all MPC-matched objects
-    await _resolve_ephemerides(anomalies, obs_time, frame_id, log_filename)
+    await _resolve_ephemerides(anomalies, obs_time_mid, frame_id, log_filename)
 
     n_alert = sum(1 for a in anomalies if a["anomaly_type"] in _ALERT_TYPES)
 
