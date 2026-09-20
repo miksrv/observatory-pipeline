@@ -1093,6 +1093,16 @@ def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict
         "catalog_id": api_source.get("catalog_id"),
         "object_type": api_source.get("object_type"),
         "elongation": api_source.get("elongation") or 0.0,
+        # Photometric quality, carried so that a standalone DETECT_ANOMALIES
+        # re-run judges a source on the same terms an in-process run does:
+        # mag_err feeds the Δmag significance test (audit 2026-08-18, finding
+        # M3) and snr the edge-zone test for a subtraction candidate (H11).
+        # Both are persisted on source_observations — they carry no leading
+        # underscore, so api_client._to_wire_source() sends them — and both
+        # stay None when an older row predates them, which each consumer
+        # already treats as "no evidence".
+        "mag_err": api_source.get("mag_err"),
+        "snr": api_source.get("snr"),
         "saturated": bool(api_source.get("saturated")),
         # No leading underscore on the wire, same as "saturated" — see
         # astrometry/_extraction.py's near_edge comment for why it must survive here.

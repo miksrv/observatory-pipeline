@@ -9,6 +9,7 @@ Internal helpers only — not part of this package's public surface.
 from __future__ import annotations
 
 import logging
+import math
 
 import config
 
@@ -28,6 +29,74 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Per-source classification (using prefetched data)
 # ---------------------------------------------------------------------------
+
+def _delta_mag_noise(source: dict, same_filter_history: list[dict]) -> float | None:
+    """
+    How much this source's magnitude is expected to wander from measurement
+    error alone, as a 1-sigma value — the source's own `mag_err` and its
+    historical scatter added in quadrature.
+
+    `DELTA_MAG_ALERT` is a flat 0.5 mag applied to every source equally, which
+    is the wrong shape for the question twice over: a faint source at the
+    detection limit wanders further than that on noise alone and alerts every
+    night, while a bright, well-measured star can change by 0.3 mag —
+    unmistakable at its own precision — and never be looked at (audit
+    2026-08-18, finding M3).
+
+    Returns None when neither term is available, in which case the caller
+    keeps the flat threshold on its own, exactly as before.
+    """
+    terms: list[float] = []
+
+    mag_err = source.get("mag_err")
+    if mag_err is not None:
+        try:
+            value = float(mag_err)
+            if math.isfinite(value) and value > 0:
+                terms.append(value)
+        except (TypeError, ValueError):
+            pass
+
+    scatter = _history_mag_scatter(same_filter_history)
+    if scatter is not None and scatter > 0:
+        terms.append(scatter)
+
+    if not terms:
+        return None
+    return math.sqrt(sum(term ** 2 for term in terms))
+
+
+def _is_significant_delta(
+    delta_mag: float,
+    source: dict,
+    same_filter_history: list[dict],
+) -> bool:
+    """
+    Whether a magnitude change is large enough to be worth reporting: past the
+    absolute `DELTA_MAG_ALERT` floor AND past `VARIABILITY_SIGMA` times what
+    this particular source's own noise would produce.
+
+    The floor stays because a change smaller than it is not astronomically
+    interesting however precisely it was measured; the significance test is
+    what stops the floor from meaning wildly different things for a bright
+    star and a faint one. `VARIABILITY_SIGMA` is reused rather than given a
+    setting of its own — it already answers exactly this question for the
+    catalog-independent VARIABLE_STAR branch, and two separate knobs for one
+    idea would only drift apart.
+
+    With no usable noise estimate — no `mag_err`, no same-filter history to
+    take a scatter from — the floor applies alone, which is the previous
+    behaviour.
+    """
+    if abs(delta_mag) <= config.DELTA_MAG_ALERT:
+        return False
+
+    noise = _delta_mag_noise(source, same_filter_history)
+    if noise is None:
+        return True
+
+    return abs(delta_mag) > config.VARIABILITY_SIGMA * noise
+
 
 def _survives_edge_zone(source: dict) -> bool:
     """
@@ -496,9 +565,12 @@ def _classify_source_sync(
     if mag is not None and median_hist_mag is not None:
         delta_mag = mag - median_hist_mag  # negative = brighter than history
 
+    # Not a flat threshold any more: past DELTA_MAG_ALERT *and* past what
+    # this source's own measurement error and historical scatter would
+    # produce — see _is_significant_delta() (audit 2026-08-18, finding M3).
     mag_changed = (
         delta_mag is not None
-        and abs(delta_mag) > config.DELTA_MAG_ALERT
+        and _is_significant_delta(delta_mag, source, same_filter_history)
     )
 
     if mag_changed:

@@ -1316,6 +1316,17 @@ prior detection at all near a known galaxy, and an already-catalogued/known gala
 more than `DELTA_MAG_ALERT`. Both use the same `MATCH_CONE_ARCSEC` (5″ by default) "near galaxy"
 radius as ordinary star matching — there is no separate, wider radius for extended galaxy disks.
 
+A Δmag branch fires only when the change clears `DELTA_MAG_ALERT` **and** exceeds
+`VARIABILITY_SIGMA` × the source's own noise — its `mag_err` and its same-filter historical
+scatter added in quadrature (`_is_significant_delta()`). A flat threshold is the wrong shape for
+the question twice over: a faint source at the detection limit wanders past 0.5 mag on noise
+alone and alerts every night, while a bright, well-measured star can change by 0.3 mag —
+unmistakable at its own precision — and never be looked at (audit 2026-08-18, finding M3). The
+absolute floor stays, since a change below it isn't astronomically interesting however precisely
+it was measured, and a source with no usable noise estimate falls back to that floor alone.
+`VARIABILITY_SIGMA` is deliberately reused rather than given a setting of its own — it already
+answers exactly this question for the catalog-independent `VARIABLE_STAR` branch below.
+
 Magnitude comparisons (`delta_mag`) read the `mag` field that `pipeline.py` populates right
 after `photometry.measure()` (see that module's section above) — `photometry.py` itself only
 ever sets `mag_instrumental`/`mag_calibrated`, never `mag`. `mag` is `None` whenever the source

@@ -1186,6 +1186,90 @@ class TestDetectUnmatchedMovingObjects:
         assert target_anomaly["anomaly_type"] == "UNKNOWN"
 
 
+class TestDeltaMagSignificance:
+    """
+    Audit 2026-08-18, finding M3: DELTA_MAG_ALERT is a flat 0.5 mag applied to
+    every source equally, which is the wrong shape for the question twice
+    over. A faint source at the detection limit wanders further than that on
+    noise alone and alerts every night; a bright, well-measured star can
+    change by 0.3 mag — unmistakable at its own precision — and never be
+    looked at.
+    """
+
+    def _source(self, mag: float, mag_err: float | None) -> dict:
+        src = _make_source(
+            mag=mag, catalog_name="Simbad", catalog_id="V* AB",
+            object_type="V*", source_id="src-var-001",
+        )
+        src["mag_err"] = mag_err
+        return src
+
+    def _history(self, mags: list[float]) -> list[dict]:
+        return [_make_hist_source(mag=m) for m in mags]
+
+    def test_a_noisy_source_needs_more_than_the_flat_threshold(self):
+        """0.6 mag is past DELTA_MAG_ALERT but nothing against a 0.4 mag error."""
+        src = self._source(mag=14.6, mag_err=0.4)
+
+        assert ad._is_significant_delta(0.6, src, self._history([14.0])) is False
+
+    def test_a_precise_source_clears_it_easily(self):
+        src = self._source(mag=14.6, mag_err=0.01)
+
+        assert ad._is_significant_delta(0.6, src, self._history([14.0])) is True
+
+    def test_the_absolute_floor_still_applies(self):
+        """
+        A change below DELTA_MAG_ALERT is not astronomically interesting
+        however precisely it was measured.
+        """
+        src = self._source(mag=14.3, mag_err=0.001)
+
+        assert ad._is_significant_delta(0.3, src, self._history([14.0])) is False
+
+    def test_historical_scatter_counts_as_noise_too(self):
+        src = self._source(mag=14.6, mag_err=0.01)
+        noisy_history = self._history([14.0, 14.5, 13.5, 14.4, 13.6])
+
+        assert ad._is_significant_delta(0.6, src, noisy_history) is False
+
+    def test_no_noise_estimate_falls_back_to_the_flat_threshold(self):
+        src = self._source(mag=14.6, mag_err=None)
+
+        assert ad._is_significant_delta(0.6, src, []) is True
+
+    async def test_a_noisy_variable_does_not_alert_end_to_end(self):
+        src = self._source(mag=14.6, mag_err=0.4)
+        history = [_make_hist_source(mag=14.0)]
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": history}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [src], [src], _FRAME_META)
+
+        assert result == []
+
+    async def test_the_same_change_on_a_precise_source_does_alert(self):
+        src = self._source(mag=14.6, mag_err=0.01)
+        history = [_make_hist_source(mag=14.0)]
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": history}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [src], [src], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "VARIABLE_STAR"
+
+
 class TestEdgeZoneSubtractionCandidates:
     """
     Audit 2026-08-18, finding H11: every near_edge source was suppressed
