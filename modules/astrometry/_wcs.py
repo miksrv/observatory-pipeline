@@ -9,12 +9,124 @@ Internal helper only — not part of this package's public surface.
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import astropy.io.fits as fits
+import numpy as np
 from astropy.wcs import WCS
 
+import config
+
 logger = logging.getLogger(__name__)
+
+
+def _log_astap_solve_report(wcs_hdr, fits_filename: str) -> None:
+    """
+    Surface astap's own account of the solve — the free-text line it writes
+    into the `.wcs` header's COMMENT/HISTORY cards, e.g. "Solved in 0.1 sec.
+    Offset 3.0'. Mount offset RA=-0.2', DEC=-2.9'".
+
+    Nothing had ever read it (audit 2026-08-18, finding H15). It is not
+    machine-readable enough to gate on — astap's wording varies by version and
+    by search mode — but it is the only per-solve quality statement the solver
+    produces, and an operator looking at a suspect frame should not have to
+    re-run astap by hand to see it.
+    """
+    try:
+        for card_key in ("COMMENT", "HISTORY"):
+            if card_key not in wcs_hdr:
+                continue
+            for line in wcs_hdr[card_key]:
+                text = str(line).strip()
+                if "solved" in text.lower() or "offset" in text.lower():
+                    logger.info("astap solve report for %s: %s", fits_filename, text)
+    except Exception:
+        pass  # diagnostic only — never let it affect the solve
+
+
+def _is_plausible_wcs(wcs: WCS, naxis1: int, naxis2: int, fits_filename: str) -> bool:
+    """
+    Whether a solved WCS describes a physically possible image of the sky.
+
+    The WCS is authoritative by construction — every source position, every
+    catalog match and every anomaly's coordinates come from it, and no
+    downstream module has anything to check it against. Until now nothing
+    checked it either, beyond astap reporting "Solution found" and the axes
+    being celestial, so a false star-pattern match became a systematic
+    position error for the whole frame with no distinguishing log line (audit
+    2026-08-18, finding H15). The risk is concentrated in
+    `ASTAP_RETRY_WIDE_SEARCH`'s blind 30-degree retry, where a wrong match is
+    most likely to be found in the first place.
+
+    The checks are structural rather than statistical, because astap's own
+    residual and matched-star count exist only in a free-text comment whose
+    wording varies by version (logged separately by
+    `_log_astap_solve_report()`):
+
+    * the reference coordinates are on the sphere at all;
+    * the plate scale is finite and between
+      ASTROMETRY_PIXEL_SCALE_MIN/MAX_ARCSEC — below the floor no amateur
+      telescope resolves, above the ceiling the frame is not an image of a
+      star field;
+    * the transform is non-degenerate, i.e. the CD matrix has a non-zero
+      determinant (a collapsed axis maps the whole frame onto a line);
+    * a pixel-to-world round trip at the frame centre returns finite,
+      on-sphere coordinates.
+
+    A failure here is a hard failure, not a warning: a WCS this wrong is worse
+    than none, since the frame's sources would be posted at confidently wrong
+    coordinates and then compared against history at those coordinates.
+    """
+    try:
+        crval = wcs.wcs.crval
+        ra, dec = float(crval[0]), float(crval[1])
+        if not (math.isfinite(ra) and math.isfinite(dec)) or not (-90.0 <= dec <= 90.0):
+            logger.error(
+                "Implausible WCS for %s: reference coordinates RA=%s Dec=%s are not on the sphere",
+                fits_filename, ra, dec,
+            )
+            return False
+
+        matrix = wcs.pixel_scale_matrix
+        scale_x = math.hypot(float(matrix[0, 0]), float(matrix[1, 0])) * 3600.0
+        scale_y = math.hypot(float(matrix[0, 1]), float(matrix[1, 1])) * 3600.0
+        low = config.ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC
+        high = config.ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC
+
+        for axis, scale in (("x", scale_x), ("y", scale_y)):
+            if not math.isfinite(scale) or not (low <= scale <= high):
+                logger.error(
+                    "Implausible WCS for %s: %s plate scale %.4f\"/px is outside "
+                    "the %.2f-%.1f\"/px window — treating the solve as failed",
+                    fits_filename, axis, scale, low, high,
+                )
+                return False
+
+        determinant = float(np.linalg.det(matrix))
+        if not math.isfinite(determinant) or determinant == 0.0:
+            logger.error(
+                "Implausible WCS for %s: the transform is degenerate "
+                "(CD determinant %s) — the whole frame maps onto a line",
+                fits_filename, determinant,
+            )
+            return False
+
+        centre = wcs.all_pix2world([[naxis1 / 2.0, naxis2 / 2.0]], 0)[0]
+        if not (math.isfinite(centre[0]) and math.isfinite(centre[1])) or not (-90.0 <= centre[1] <= 90.0):
+            logger.error(
+                "Implausible WCS for %s: the frame centre projects to RA=%s Dec=%s",
+                fits_filename, centre[0], centre[1],
+            )
+            return False
+    except Exception as exc:
+        logger.error(
+            "Could not validate the WCS for %s (%s) — treating the solve as failed",
+            fits_filename, exc,
+        )
+        return False
+
+    return True
 
 
 def _read_wcs(fits_path: str, output_base: str | None) -> tuple[WCS, int, int] | None:
@@ -79,6 +191,7 @@ def _read_wcs(fits_path: str, output_base: str | None) -> tuple[WCS, int, int] |
                     for key in list(wcs_hdr.keys()):
                         if key.startswith("PC") or key.startswith("CDELT"):
                             del wcs_hdr[key]
+                _log_astap_solve_report(wcs_hdr, fits_filename)
                 wcs_candidate = WCS(wcs_hdr)
                 if wcs_candidate.has_celestial:
                     wcs = wcs_candidate
@@ -144,6 +257,14 @@ def _read_wcs(fits_path: str, output_base: str | None) -> tuple[WCS, int, int] |
             astap_found if astap_found else "NONE",
             fits_filename,
         )
+        return None
+
+    # Celestial axes are necessary but nowhere near sufficient — see
+    # _is_plausible_wcs(). A WCS that passes has_celestial while describing
+    # something physically impossible is worse than no solve at all: the
+    # frame's sources get posted at confidently wrong coordinates and are then
+    # compared against history at those same wrong coordinates.
+    if not _is_plausible_wcs(wcs, naxis1, naxis2, fits_filename):
         return None
 
     return wcs, naxis1, naxis2

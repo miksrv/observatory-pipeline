@@ -644,6 +644,20 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
 - Calls `astap` binary as a subprocess via `xvfb-run` (astap needs a display even headless) for plate solving,
   invoked without `-update` — astap therefore never writes into the FITS file itself, only into a `.wcs` side
   file (plus `.ini`/`.log`) next to it, or under an optional `output_base` (`-o`) path
+- Validates the resulting WCS for plausibility before returning it (`_wcs.py`'s
+  `_is_plausible_wcs()`): reference coordinates on the sphere, a plate scale between
+  `ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC` and `ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC`, a non-degenerate
+  CD matrix, and a finite pixel→world round trip at the frame centre. Nothing checked the solve
+  beyond astap reporting "Solution found" and `has_celestial` — but the WCS is authoritative by
+  construction (every source position, catalog match and anomaly coordinate comes from it, and no
+  downstream module has anything to compare it against), so a false star-pattern match became a
+  systematic position error for the whole frame with no distinguishing log line (audit
+  2026-08-18, finding H15). The risk concentrates in `ASTAP_RETRY_WIDE_SEARCH`'s blind 30°
+  retry. A failure is a hard one — `solve()` returns `{}` — because a confidently wrong WCS is
+  worse than none: the frame's sources would be posted at wrong coordinates and then compared
+  against history at those same wrong coordinates. astap's own free-text solve report (`Solved in
+  0.1 sec. Offset 3.0'. Mount offset ...`) is logged from the `.wcs` COMMENT cards but not gated
+  on — its wording varies by astap version and search mode.
 - Parses the WCS from that fresh `.wcs` side file — deliberately preferred over any WCS the incoming FITS
   header might already carry, even when the header's own WCS already looks celestial. A capture program can
   write an approximate WCS from mount pointing alone (not a real plate solve) with valid-looking

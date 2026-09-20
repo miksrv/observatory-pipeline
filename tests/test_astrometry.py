@@ -799,6 +799,71 @@ class TestInvalidWcs:
 
 
 # ---------------------------------------------------------------------------
+# WCS plausibility — audit 2026-08-18, finding H15
+#
+# A solved WCS is authoritative by construction: every source position, every
+# catalog match and every anomaly's coordinates come from it, and no
+# downstream module has anything to check it against. Nothing checked it here
+# either, beyond astap reporting a solution and the axes being celestial, so a
+# false star-pattern match — most likely under ASTAP_RETRY_WIDE_SEARCH's blind
+# 30-degree retry — became a systematic position error for the whole frame
+# with no distinguishing log line.
+# ---------------------------------------------------------------------------
+
+class TestWcsPlausibility:
+
+    async def test_an_absurdly_fine_plate_scale_is_rejected(self):
+        """
+        The 2026-08-06 CD/PC double-scaling incident produced exactly this:
+        0.78"/px read back as 0.0002"/px. It was caught then by every FWHM
+        collapsing to zero; here it is caught outright.
+        """
+        absurd = _make_wcs(scale_deg=1e-9)
+        with _patch_astrometry(wcs=absurd):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result == {}
+
+    async def test_an_absurdly_coarse_plate_scale_is_rejected(self):
+        absurd = _make_wcs(scale_deg=1.0)  # 3600"/px
+        with _patch_astrometry(wcs=absurd):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result == {}
+
+    async def test_an_ordinary_plate_scale_is_accepted(self):
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=0.000278)):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result != {}
+        assert result["ra_center"] == pytest.approx(202.47, abs=0.5)
+
+    def test_a_degenerate_transform_is_rejected(self):
+        """A collapsed axis maps the whole frame onto a line."""
+        wcs = _make_wcs()
+        wcs.wcs.cd = np.array([[1e-4, 1e-4], [1e-4, 1e-4]])
+        wcs.wcs.set()
+
+        assert astrometry._wcs._is_plausible_wcs(wcs, 1024, 1024, "frame.fits") is False
+
+    def test_off_sphere_reference_coordinates_are_rejected(self):
+        # astropy refuses to *build* such a WCS, so the value is written in
+        # after construction — which is exactly how a corrupt or
+        # hand-edited .wcs side file would reach this code.
+        wcs = _make_wcs()
+        wcs.wcs.crval = [202.47, 120.0]
+
+        assert astrometry._wcs._is_plausible_wcs(wcs, 1024, 1024, "frame.fits") is False
+
+    def test_the_window_is_configurable(self, monkeypatch):
+        """Widen the bounds for an unusual instrument rather than disabling."""
+        wcs = _make_wcs(scale_deg=1.0)  # 3600"/px
+        monkeypatch.setattr(config, "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC", 7200.0)
+
+        assert astrometry._wcs._is_plausible_wcs(wcs, 1024, 1024, "frame.fits") is True
+
+
+# ---------------------------------------------------------------------------
 # Test 6b — astap's fresh .wcs side file is preferred over a pre-existing,
 # already-celestial WCS in the FITS header itself.
 #

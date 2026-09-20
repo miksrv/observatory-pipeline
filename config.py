@@ -213,6 +213,25 @@ SATURATION_ADU: float = float(_get("SATURATION_ADU", "60000"))
 SATURATION_MASK_RADIUS_ARCSEC: float = float(_get("SATURATION_MASK_RADIUS_ARCSEC", "10.0"))
 
 # ---------------------------------------------------------------------------
+# Plate-solve plausibility
+#
+# A solved WCS is treated as authoritative by construction: every source
+# position, every catalog match and every anomaly's coordinates come from it,
+# and no downstream module has anything to compare it against. Nothing checked
+# it beyond "astap said Solution found" and "the axes are celestial" — and a
+# blind wide-radius retry (ASTAP_RETRY_WIDE_SEARCH) is statistically the most
+# likely place for a false star-pattern match to be accepted (audit
+# 2026-08-18, finding H15).
+#
+# These bracket the plate scale a real optical setup can produce. A solution
+# whose scale falls outside them is not a marginal one, it is a wrong one:
+# below the floor no amateur telescope resolves, above the ceiling the frame
+# would not be an image of a star field at all. Widen them for an unusual
+# instrument rather than switching the check off.
+ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC", "0.05"))
+ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC", "60.0"))
+
+# ---------------------------------------------------------------------------
 # Cross-matching
 # ---------------------------------------------------------------------------
 MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
@@ -713,6 +732,8 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_COLOR_TERM_MAX": float,
     "PHOTOMETRY_REF_MAX_RUWE": float,
     "PHOTOMETRY_SKY_SIGMA_CLIP": float,
+    "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
+    "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "MOVING_RATE_ARCSEC_PER_MIN": float,
