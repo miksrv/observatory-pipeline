@@ -576,8 +576,27 @@ class TestGetSourceTracksBatch:
 
         assert result == {}
 
-    async def test_returns_empty_dict_when_results_not_a_dict(self):
-        resp = _mock_response(status_code=200, json_data={"results": ["not", "a", "dict"]})
+    async def test_list_shaped_results_are_indexed_positionally(self):
+        """
+        docs/API.md documents "results" as an object keyed by source_id, but
+        PHP's json_encode() serializes any array with sequential integer keys
+        as a plain JSON array instead — which is exactly what a foreach-built
+        results array normally has. _normalize_batch_results() accepts both
+        shapes; coercing the list form to {} (as it once did) discarded every
+        batch result on every call. See its docstring.
+        """
+        resp = _mock_response(
+            status_code=200,
+            json_data={"results": [[{"ra": 1.0}], []]},
+        )
+        with _patch_client(post_response=resp):
+            result = await get_source_tracks_batch(["src1", "src2"])
+
+        assert result == {"0": [{"ra": 1.0}], "1": []}
+
+    async def test_returns_empty_dict_when_results_is_neither_dict_nor_list(self):
+        """A "results" that is neither shape carries nothing usable."""
+        resp = _mock_response(status_code=200, json_data={"results": "not a batch"})
         with _patch_client(post_response=resp):
             result = await get_source_tracks_batch(["a"])
 

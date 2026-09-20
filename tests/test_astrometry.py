@@ -564,8 +564,8 @@ class TestSaturationFlag:
 
 class TestNearEdgeFlag:
     """
-    A 1024x1024 frame with the default EDGE_MARGIN_FRAC=0.1 has a 102.4px
-    margin on every side — sources inside [102.4, 921.6] on both axes are
+    A 1024x1024 frame with the default EDGE_MARGIN_FRAC=0.05 has a 51.2px
+    margin on every side — sources inside [51.2, 972.8] on both axes are
     "central", everything else is "near_edge".
     """
 
@@ -599,17 +599,31 @@ class TestNearEdgeFlag:
         assert result["sources_all"]
         assert result["sources_all"][0]["near_edge"] is True
 
-    async def test_margin_scales_with_frame_size(self):
-        """The margin is a FRACTION of NAXIS1/NAXIS2, not a fixed pixel count —
-        x=20 sits inside the 25.6px margin of a 256px-wide frame."""
-        small_frame_edge = _make_sources_at([(20.0, 128.0)])
-        with _patch_astrometry(sources=small_frame_edge, naxis1=256, naxis2=256):
-            result = await astrometry.solve(_FITS_PATH)
+    async def test_margin_scales_with_frame_size(self, monkeypatch):
+        """
+        The margin is a FRACTION of NAXIS1/NAXIS2, not a fixed pixel count:
+        one and the same x=30 is near-edge in a 1024px-wide frame (51.2px
+        margin) yet comfortably interior in a 256px-wide one (12.8px margin).
 
-        assert result["sources"][0]["near_edge"] is True
+        EDGE_MARGIN_FRAC is pinned explicitly rather than relying on the
+        config default, so that tuning that default (as 66cf519 did, from 0.1
+        to 0.05) can't silently invalidate the arithmetic this test asserts.
+        """
+        monkeypatch.setattr(config, "EDGE_MARGIN_FRAC", 0.05)
+
+        with _patch_astrometry(sources=_make_sources_at([(30.0, 512.0)]),
+                               naxis1=1024, naxis2=1024):
+            large = await astrometry.solve(_FITS_PATH)
+
+        with _patch_astrometry(sources=_make_sources_at([(30.0, 128.0)]),
+                               naxis1=256, naxis2=256):
+            small = await astrometry.solve(_FITS_PATH)
+
+        assert large["sources"][0]["near_edge"] is True
+        assert small["sources"][0]["near_edge"] is False
 
     async def test_custom_edge_margin_frac_widens_the_zone(self, monkeypatch):
-        """A source comfortably central under the default 0.1 margin becomes
+        """A source comfortably central under the default 0.05 margin becomes
         near-edge once EDGE_MARGIN_FRAC is widened to cover it."""
         monkeypatch.setattr(config, "EDGE_MARGIN_FRAC", 0.4)
         mid = _make_sources_at([(300.0, 512.0)])  # within 409.6px of the left edge

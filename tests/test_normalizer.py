@@ -200,7 +200,15 @@ class TestNormalizeFrameType:
 
 
 class TestGenerateNormalizedFilename:
-    """Tests for generate_normalized_filename function."""
+    """
+    Tests for generate_normalized_filename function.
+
+    The frame-type token is the full normalized word (Light/Dark/Flat/Bias),
+    not a one-letter code — changed deliberately in 3b4e369 ("updates
+    normalized filename generation to use full frame type names and
+    Light-only filter tokens"), which left these tests and CLAUDE.md/README
+    still describing the old L/D/F/B codes.
+    """
 
     def test_full_light_frame(self):
         """Test filename generation for light frame with all fields."""
@@ -211,7 +219,7 @@ class TestGenerateNormalizedFilename:
             exptime=300.0,
             obs_time="2024-03-15T22:01:34",
         )
-        assert filename == "M51_L_Ha_300_2024-03-15T22-01-34.fits"
+        assert filename == "M51_Light_Ha_300_2024-03-15T22-01-34.fits"
 
     def test_dark_frame_no_filter(self):
         """Test that dark frames exclude filter from filename."""
@@ -222,7 +230,7 @@ class TestGenerateNormalizedFilename:
             exptime=300.0,
             obs_time="2024-03-15T22:01:34",
         )
-        assert filename == "M51_D_300_2024-03-15T22-01-34.fits"
+        assert filename == "M51_Dark_300_2024-03-15T22-01-34.fits"
 
     def test_bias_frame_no_filter(self):
         """Test that bias frames exclude filter from filename."""
@@ -233,7 +241,7 @@ class TestGenerateNormalizedFilename:
             exptime=0.0,
             obs_time="2024-03-15T22:01:34",
         )
-        assert filename == "_UNKNOWN_B_0_2024-03-15T22-01-34.fits"
+        assert filename == "_UNKNOWN_Bias_0_2024-03-15T22-01-34.fits"
 
     def test_fractional_exptime(self):
         """Test fractional exposure time formatting."""
@@ -245,7 +253,7 @@ class TestGenerateNormalizedFilename:
             obs_time="2024-03-15T22:01:34",
         )
         assert "0.5" in filename
-        assert filename == "M51_L_L_0.5_2024-03-15T22-01-34.fits"
+        assert filename == "M51_Light_L_0.5_2024-03-15T22-01-34.fits"
 
     def test_sequence_number(self):
         """Test sequence number formatting."""
