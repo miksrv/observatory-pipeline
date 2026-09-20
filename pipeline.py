@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import math
 import os
 import shutil
 
@@ -1778,11 +1779,57 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
     return kept
 
 
+def _separation_arcsec(a: dict, b: dict) -> float | None:
+    """
+    Great-circle separation between two source dicts, in arcsec, or None when
+    either lacks a usable position. Haversine, to stay well-behaved near the
+    poles — the same formula modules/anomaly_detector/_geometry.py uses, kept
+    local here rather than imported across the package boundary.
+    """
+    try:
+        ra1, dec1 = math.radians(float(a["ra"])), math.radians(float(a["dec"]))
+        ra2, dec2 = math.radians(float(b["ra"])), math.radians(float(b["dec"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    h = (
+        math.sin((dec2 - dec1) / 2.0) ** 2
+        + math.cos(dec1) * math.cos(dec2) * math.sin((ra2 - ra1) / 2.0) ** 2
+    )
+    return math.degrees(2.0 * math.asin(min(1.0, math.sqrt(h)))) * 3600.0
+
+
 def _prefer_candidate(candidate: dict, existing: dict) -> bool:
-    """Return True if `candidate` should replace `existing` as the kept detection."""
+    """
+    Return True if `candidate` should replace `existing` as the kept detection.
+
+    The ordinary rule prefers the blind detection over a subtraction
+    candidate: for a stationary object both describe the same thing, and the
+    blind one is measured on the frame's own pixels rather than on a
+    difference image.
+
+    That rule inverts when the two are further apart than
+    `MATCH_CONE_ARCSEC`. Only the MPC stage matches within the wide
+    `MOVING_CONE_ARCSEC` (120"), so at that separation the pair is a moving
+    object and an unrelated star that happened to fall in the same cone —
+    and preferring the "ordinary" one substituted the star's position for the
+    mover's, in the very record the ephemeris and the track chart are built
+    from (audit 2026-08-18, finding M14). Between the two, the subtraction
+    candidate is the one that must be the mover: a static star cancels in the
+    difference image and never becomes a candidate there at all.
+    """
     existing_is_sub = bool(existing.get("_from_subtraction"))
     candidate_is_sub = bool(candidate.get("_from_subtraction"))
     if candidate_is_sub != existing_is_sub:
+        separation = _separation_arcsec(candidate, existing)
+        if separation is not None and separation > config.MATCH_CONE_ARCSEC:
+            logger.info(
+                "Dedup: the two detections sharing this identity are %.1f\" apart "
+                "— keeping the subtraction candidate, which is the one that can "
+                "be the moving object",
+                separation,
+            )
+            return candidate_is_sub  # prefer the subtraction detection
         return existing_is_sub  # prefer the non-subtraction detection
     return (candidate.get("flux") or 0.0) > (existing.get("flux") or 0.0)
 

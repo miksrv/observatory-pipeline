@@ -1370,6 +1370,71 @@ async def test_mag_field_uses_calibrated_value_when_available(mock_modules):
 # ---------------------------------------------------------------------------
 
 
+class TestPreferCandidateSeparation:
+    """
+    Audit 2026-08-18, finding M14: the dedup preference always kept the blind
+    detection over the subtraction candidate. Only the MPC stage matches
+    within the wide MOVING_CONE_ARCSEC (120"), so at that separation the pair
+    is a moving object and an unrelated star that fell in the same cone — and
+    keeping the "ordinary" one substituted the star's position for the
+    mover's, in the very record the ephemeris and the track chart are built
+    from.
+    """
+
+    def _pair(self, separation_deg: float) -> tuple[dict, dict]:
+        blind = {
+            "ra": 167.274, "dec": 17.359, "catalog_name": "MPC",
+            "catalog_id": "Vesta", "flux": 500.0, "_from_subtraction": False,
+        }
+        sub = {
+            "ra": 167.274 + separation_deg, "dec": 17.359, "catalog_name": "MPC",
+            "catalog_id": "Vesta", "flux": 100.0, "_from_subtraction": True,
+        }
+        return blind, sub
+
+    def test_a_close_pair_still_prefers_the_blind_detection(self):
+        """
+        For a stationary object both describe the same thing, and the blind
+        one is measured on the frame's own pixels.
+        """
+        blind, sub = self._pair(separation_deg=1.0 / 3600.0)
+
+        assert pipeline._prefer_candidate(sub, blind) is False
+        assert pipeline._prefer_candidate(blind, sub) is True
+
+    def test_a_distant_pair_prefers_the_subtraction_candidate(self):
+        """
+        A static star cancels in the difference image and never becomes a
+        candidate there, so the subtraction one is the one that can be the
+        mover.
+        """
+        blind, sub = self._pair(separation_deg=100.0 / 3600.0)
+
+        assert pipeline._prefer_candidate(sub, blind) is True
+        assert pipeline._prefer_candidate(blind, sub) is False
+
+    def test_a_missing_position_falls_back_to_the_old_rule(self):
+        blind, sub = self._pair(separation_deg=100.0 / 3600.0)
+        sub.pop("ra")
+
+        assert pipeline._prefer_candidate(sub, blind) is False
+
+    def test_two_of_the_same_kind_are_still_decided_by_flux(self):
+        a = {"ra": 1.0, "dec": 1.0, "flux": 100.0, "_from_subtraction": False}
+        b = {"ra": 1.0, "dec": 1.0, "flux": 500.0, "_from_subtraction": False}
+
+        assert pipeline._prefer_candidate(b, a) is True
+        assert pipeline._prefer_candidate(a, b) is False
+
+    def test_the_distant_pair_survives_the_full_dedup(self):
+        blind, sub = self._pair(separation_deg=100.0 / 3600.0)
+
+        result = pipeline._dedupe_by_catalog_identity([blind, sub], {})
+
+        assert len(result) == 1
+        assert result[0]["_from_subtraction"] is True
+
+
 class TestDedupeByCatalogIdentity:
 
     def test_no_duplicates_returns_all_sources_unchanged(self):

@@ -269,8 +269,14 @@ Orchestrates processing of a single FITS file in order:
      blobs to each independently match the same MPC object) would be posted/classified as two
      separate observations of the same object. Uncatalogued sources (`catalog_name is None`) are
      never merged — they have no stable identity to deduplicate on. Among duplicates, a normal
-     detection is preferred over a subtraction candidate; among two of the same kind, the
-     brighter one (higher flux) is kept.
+     detection is preferred over a subtraction candidate — **unless** the two are further apart
+     than `MATCH_CONE_ARCSEC`, in which case the subtraction candidate wins. Only the MPC stage
+     matches within the wide `MOVING_CONE_ARCSEC`, so at that separation the pair is a moving
+     object plus an unrelated star that fell in the same cone, and keeping the "ordinary" one
+     substituted the star's position for the mover's in the very record the ephemeris and the
+     track chart are built from (audit 2026-08-18, finding M14); a static star cancels in the
+     difference image and never becomes a candidate there, so the subtraction detection is the one
+     that can be the mover. Among two of the same kind, the brighter one (higher flux) is kept.
 9. `photometry.measure(fits_path, sources)` → returns calibrated magnitudes
 9.5. `forced_photometry.run(fits_path, sources, gaia_stars, mpc_objects, wcs=astro_result["wcs"],
      zero_point=..., obs_time=...)` → a second, independent detection path (**"forced
