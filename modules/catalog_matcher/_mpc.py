@@ -15,7 +15,7 @@ from astropy.coordinates import SkyCoord
 
 import config
 
-from ._cache import _cache_get, _cache_set
+from ._cache import _cache_get, _cache_position, _cache_radius_margin_deg, _cache_set
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,14 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
 
     Returns a list of dicts with keys: ra, dec, designation, object_type.
     """
-    cache_key = f"mpc:{ra_center:.1f}:{dec_center:.1f}:{obs_time}"
+    # Query around the TILE the cache key rounds to, with the tile's own
+    # half-diagonal added to the radius — not around this frame's exact
+    # centre. A key covers a 0.1 deg tile, so a later frame sharing it (same
+    # epoch, same tile) can sit up to a tile diagonal away, and a circle drawn
+    # around THIS frame need not contain that one's edge region at all (audit
+    # 2026-08-18, finding M5). See _cache._cache_position().
+    key_ra, key_dec = _cache_position(ra_center, dec_center)
+    cache_key = f"mpc:{key_ra:.1f}:{key_dec:.1f}:{obs_time}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -43,13 +50,13 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
             _cache_set(cache_key, [])
             return []
 
-        coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
+        coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
         epoch = Time(obs_time)
-        fov_arcmin = fov_deg * 60.0
+        fov_arcmin = (fov_deg + _cache_radius_margin_deg()) * 60.0
 
         logger.info(
             "SkyBot query: ra=%.4f dec=%.4f radius=%.1f' epoch=%s (UTC)",
-            ra_center, dec_center, fov_arcmin, epoch.utc.iso,
+            key_ra, key_dec, fov_arcmin, epoch.utc.iso,
         )
 
         result = Skybot.cone_search(coord, rad=fov_arcmin * u.arcmin, epoch=epoch)

@@ -1814,7 +1814,15 @@ for every single source.
 
 ### Catalog query caching
 Implemented in `modules/catalog_matcher/_cache.py`: an in-process dict (fast path within one run) backed
-by files under `CATALOG_CACHE_DIR`, TTL `CACHE_TTL_HOURS` (default 1 hour, from `mtime`). The disk
+by files under `CATALOG_CACHE_DIR`, TTL `CACHE_TTL_HOURS` (default 1 hour, from `mtime`).
+A key rounds the frame centre to 0.1°, so it names a **tile**, not a point — and every catalog
+therefore queries around that tile's own centre (`_cache_position()`) with the tile's
+half-diagonal added to the radius (`_cache_radius_margin_deg()`), rather than around its own
+frame. Querying around the frame but caching under the tile meant a second frame sharing the key
+got back a circle drawn up to a tile diagonal away, with its own edge region possibly never
+queried at all (audit 2026-08-18, finding M5). The extra area fetched is bounded and harmless:
+matching is positional and `MATCH_CONE_ARCSEC`-bounded, so an entry outside a given frame matches
+nothing in it. The disk
 tier exists specifically because a pipeline restart — frequent during testing, and after every
 code change without `--reload` — would otherwise throw away every cached query and re-hit
 Gaia/Simbad/2MASS/Pan-STARRS/MPC for the same sky region on the very next run. `CATALOG_CACHE_DIR`

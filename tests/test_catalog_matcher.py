@@ -158,6 +158,65 @@ class TestCacheLogic:
 
 
 # ===========================================================================
+# TestCacheTileGeometry — audit 2026-08-18, finding M5
+#
+# Every catalog queried around its frame's actual centre but cached under the
+# centre rounded to 0.1 deg. A key is therefore a tile, not a point: a second
+# frame sharing it can sit up to a tile diagonal away, and the circle drawn
+# around the FIRST frame need not contain the second one's edge region at all.
+# ===========================================================================
+
+
+class TestCacheTileGeometry:
+    def test_nearby_centres_share_one_tile(self):
+        a = cm._cache_position(_RA, _DEC)
+        b = cm._cache_position(_RA + 0.02, _DEC - 0.02)
+
+        assert a == b
+
+    def test_the_margin_covers_the_tile_half_diagonal(self):
+        assert cm._cache_radius_margin_deg() == pytest.approx(0.1 * math.sqrt(2) / 2.0)
+
+    def test_the_query_is_centred_on_the_tile_not_the_frame(self):
+        """
+        This is what makes the cached content a function of the key, which is
+        what a key is supposed to mean.
+        """
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 1.0)
+
+        coord = mock_gaia.cone_search.call_args.args[0]
+        key_ra, key_dec = cm._cache_position(_RA, _DEC)
+        assert coord.ra.deg == pytest.approx(key_ra)
+        assert coord.dec.deg == pytest.approx(key_dec)
+
+    def test_every_frame_in_the_tile_is_inside_the_queried_circle(self):
+        """
+        The property the fix has to guarantee: the worst-placed frame sharing
+        this key still has its whole footprint inside what was queried.
+        """
+        fov_deg = 1.0
+        queried_radius = fov_deg * math.sqrt(2) / 2.0 + cm._cache_radius_margin_deg()
+
+        # Worst case: a frame centre at the tile's own corner.
+        offset = 0.05
+        worst_case_distance = math.hypot(offset, offset) + fov_deg * math.sqrt(2) / 2.0
+
+        assert worst_case_distance <= queried_radius + 1e-9
+
+    def test_two_frames_in_one_tile_make_one_query(self):
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 1.0)
+            cm._query_gaia(_RA + 0.02, _DEC - 0.02, 1.0)
+
+        assert mock_gaia.cone_search.call_count == 1
+
+
+# ===========================================================================
 # TestGaiaMatching
 # ===========================================================================
 
@@ -307,7 +366,11 @@ class TestSimbadMatching:
             cm._query_simbad(_RA, _DEC, 1.0)
 
         radius = instance.query_region.call_args.kwargs["radius"]
-        assert radius.to(u.deg).value == pytest.approx(math.sqrt(2) / 2.0)
+        # Plus the cache tile's half-diagonal, so the cached result covers
+        # every frame that rounds to the same key (finding M5).
+        assert radius.to(u.deg).value == pytest.approx(
+            math.sqrt(2) / 2.0 + cm._cache_radius_margin_deg()
+        )
 
     def test_simbad_error_returns_empty_list(self):
         """If Simbad query raises, _query_simbad returns [] with no crash."""
