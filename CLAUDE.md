@@ -1196,7 +1196,15 @@ discarded a perfectly good recovery — audit 2026-08-18, finding M7. The annulu
 out of the check too: a saturated pixel in the sky ring biases the background rather than
 clipping the source's core, and the annulus sigma clip already handles that) — a forced measurement on a saturated
 core is exactly as physically meaningless as it is for a blindly-detected source (see
-`modules/photometry.py`'s section above). **A genuine non-detection (significance below
+`modules/photometry.py`'s section above). A position with another catalog entry within `FORCED_PHOTOMETRY_BLEND_FWHM` × this frame's own
+FWHM is skipped too: two stars that close share most of their light, so the aperture measures the
+pair and reports it as one star's magnitude (audit 2026-08-18, finding M8). Skipped rather than
+flagged for the same reason as the non-detection below — the wire schema has no field for
+"blended". Neighbours are taken from every Gaia/MPC entry in the field rather than only the ones
+being forced, since an already-detected star contaminates just as much, and the check disables
+itself when the frame's FWHM is unknown, there being no scale to judge "close" against.
+
+**A genuine non-detection (significance below
 `FORCED_PHOTOMETRY_MIN_SNR`) is silently dropped, never reported as an "upper limit" magnitude** —
 the wire schema (`POST /frames/{id}/sources`, docs/API.md §2) has no field to distinguish a real
 magnitude from an upper limit, and adding one is a separate, cross-repo change to

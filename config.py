@@ -531,6 +531,22 @@ PHOTOMETRY_SKY_SIGMA_CLIP: float = float(_get("PHOTOMETRY_SKY_SIGMA_CLIP", "3.0"
 # reason on the other detection path.
 PHOTOMETRY_MIN_SNR: float = float(_get("PHOTOMETRY_MIN_SNR", "3.0"))
 
+# --- Blending in forced photometry -----------------------------------------
+# Forced photometry measures a fixed aperture at a catalog position without
+# ever asking what else is in it. Two stars closer than a couple of FWHM share
+# most of their light, so each measurement is really the pair's combined flux,
+# reported as one star's magnitude with nothing on the wire to say otherwise
+# (audit 2026-08-18, finding M8).
+#
+# This is the separation, in units of the frame's own measured FWHM, within
+# which a neighbouring catalog entry makes a forced measurement untrustworthy.
+# Such a position is skipped rather than reported: the wire schema has no
+# field for "blended", and a contaminated magnitude presented as a clean one
+# is worse than a missing recovery — the same reasoning that drops a
+# below-threshold measurement instead of reporting it as an upper limit.
+# 0 disables the check.
+FORCED_PHOTOMETRY_BLEND_FWHM: float = float(_get("FORCED_PHOTOMETRY_BLEND_FWHM", "2.0"))
+
 # ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
 # ---------------------------------------------------------------------------
@@ -764,6 +780,7 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_REF_MAX_RUWE": float,
     "PHOTOMETRY_SKY_SIGMA_CLIP": float,
     "PHOTOMETRY_MIN_SNR": float,
+    "FORCED_PHOTOMETRY_BLEND_FWHM": float,
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
     "API_RECOVERY_MAX_ATTEMPTS": int,

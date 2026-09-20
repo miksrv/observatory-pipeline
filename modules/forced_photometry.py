@@ -172,6 +172,71 @@ def _sky_sigma_clip() -> SigmaClip | None:
     return SigmaClip(sigma=float(sigma), maxiters=5)
 
 
+def _blend_radius_arcsec(psf_fwhm_arcsec: float | None) -> float:
+    """
+    How close another catalog entry may be before a forced measurement is
+    considered blended, in arcsec. 0 when the check is disabled or the frame's
+    FWHM is unknown — without a PSF width there is no scale to judge
+    "close" against.
+    """
+    factor = config.FORCED_PHOTOMETRY_BLEND_FWHM
+    if factor <= 0 or not psf_fwhm_arcsec or psf_fwhm_arcsec <= 0:
+        return 0.0
+    return factor * float(psf_fwhm_arcsec)
+
+
+def _blend_lookup(
+    positions: list[tuple[float, float]],
+    radius_arcsec: float,
+):
+    """
+    Return a callable answering "is there another of these positions within
+    `radius_arcsec` of (ra, dec)?".
+
+    Forced photometry measures a fixed aperture at a catalog position without
+    asking what else is in it. Two stars closer than a couple of FWHM share
+    most of their light, so the measurement is really the pair's combined
+    flux, reported as one star's magnitude with nothing on the wire to say
+    otherwise (audit 2026-08-18, finding M8). Such a position is skipped
+    rather than reported: the schema has no field for "blended", and a
+    contaminated magnitude presented as a clean one is worse than a missing
+    recovery — the same reasoning that drops a below-threshold measurement
+    instead of calling it an upper limit.
+
+    Built once over every catalog entry in the field, so the cost is one
+    tree build rather than a scan per position. Returns a callable that always
+    says False when the check is disabled or there is nothing to compare
+    against.
+    """
+    if radius_arcsec <= 0 or len(positions) < 2:
+        return lambda ra, dec: False
+
+    try:
+        import astropy.units as u
+        from astropy.coordinates import SkyCoord
+
+        catalog = SkyCoord(
+            ra=[p[0] for p in positions] * u.deg,
+            dec=[p[1] for p in positions] * u.deg,
+        )
+    except Exception as exc:
+        logger.debug("forced_photometry: blend lookup unavailable (%s)", exc)
+        return lambda ra, dec: False
+
+    def _is_blended(ra: float, dec: float) -> bool:
+        try:
+            target = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+            separations = target.separation(catalog).arcsec
+            # The position itself is in the catalog, so its own zero
+            # separation has to be discounted — anything else inside the
+            # radius is a neighbour.
+            return bool(np.sum(separations <= radius_arcsec) > 1)
+        except Exception:
+            return False
+
+    return _is_blended
+
+
 def _aperture_max(data: np.ndarray, x_px: float, y_px: float, radius: float) -> float:
     """
     The largest raw value inside the circular photometric aperture at
@@ -513,9 +578,28 @@ async def run(
         except Exception as exc:
             logger.debug("forced_photometry: could not parse obs_time=%r: %s", obs_time, exc)
 
+    # Every catalog entry in this field, for the blend check below — the
+    # neighbour that contaminates an aperture need not be one this pass is
+    # forcing; an already-detected star is just as bright.
+    blend_radius = _blend_radius_arcsec(psf_fwhm_arcsec)
+    neighbour_positions: list[tuple[float, float]] = []
+    if blend_radius > 0:
+        for star in gaia_stars:
+            try:
+                neighbour_positions.append((float(star["ra"]), float(star["dec"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        for obj in mpc_objects:
+            try:
+                neighbour_positions.append((float(obj["ra"]), float(obj["dec"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    is_blended = _blend_lookup(neighbour_positions, blend_radius)
+
     results: list[dict] = []
     n_below_snr = 0
     n_unmeasurable = 0
+    n_blended = 0
 
     def _try_measure(ra: float, dec: float) -> tuple[float, float, float, float] | None:
         """Project (ra, dec) to a pixel and measure it, or None if out of bounds/unmeasurable."""
@@ -539,6 +623,9 @@ async def run(
     # ------------------------------------------------------------------
     for star in eligible_gaia:
         ra, dec = _propagate_gaia_position(star, obs_jyear)
+        if is_blended(ra, dec):
+            n_blended += 1
+            continue
         measured = _try_measure(ra, dec)
         if measured is None:
             n_unmeasurable += 1
@@ -567,6 +654,9 @@ async def run(
     # ------------------------------------------------------------------
     for obj in eligible_mpc:
         ra, dec = float(obj["ra"]), float(obj["dec"])
+        if is_blended(ra, dec):
+            n_blended += 1
+            continue
         measured = _try_measure(ra, dec)
         if measured is None:
             n_unmeasurable += 1
@@ -593,13 +683,14 @@ async def run(
             color_term=color_term, color_ref=color_ref, color_scatter=color_scatter,
         ))
 
-    if results or n_below_snr or n_unmeasurable:
+    if results or n_below_snr or n_unmeasurable or n_blended:
         logger.info(
             "Forced photometry: %d eligible Gaia + %d eligible MPC position(s) -> "
             "%d recovered, %d below FORCED_PHOTOMETRY_MIN_SNR=%.1f, %d unmeasurable "
-            "(saturated/edge/out-of-bounds)  file=%s",
+            "(saturated/edge/out-of-bounds), %d blended within %.2f\"  file=%s",
             len(eligible_gaia), len(eligible_mpc), len(results),
             n_below_snr, config.FORCED_PHOTOMETRY_MIN_SNR, n_unmeasurable,
+            n_blended, blend_radius,
             fits_filename,
         )
 

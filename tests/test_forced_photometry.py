@@ -205,6 +205,97 @@ class TestRunRecovery:
         assert rec["saturated"] is False
         assert rec["_forced_photometry"] is True
 
+    async def test_skips_a_blended_pair(self, scene, monkeypatch):
+        """
+        Audit 2026-08-18, finding M8: a fixed aperture is measured at a
+        catalog position without ever asking what else is in it. Two stars
+        within a couple of FWHM share most of their light, so the measurement
+        is really the pair's combined flux, reported as one star's magnitude
+        with nothing on the wire to say otherwise.
+        """
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        # Two catalog stars two pixels apart, with the frame's FWHM given as
+        # 3" at ~1"/px — comfortably inside the 2xFWHM blend radius.
+        gaia = [
+            _gaia_star(wcs, 100, 100, "blend-a", mag=17.5),
+            _gaia_star(wcs, 102, 100, "blend-b", mag=17.6),
+        ]
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=3.0,
+        )
+
+        assert result == []
+
+    async def test_an_isolated_star_is_unaffected_by_the_blend_check(self, scene, monkeypatch):
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        gaia = [
+            _gaia_star(wcs, 100, 100, "isolated", mag=17.5),
+            _gaia_star(wcs, 150, 100, "far-away", mag=17.6),
+        ]
+        sources = [{"ra": 0.0, "dec": 0.0, "catalog_name": "Gaia DR3", "catalog_id": "far-away"}]
+
+        result = await fp.run(
+            _FITS_PATH, sources=sources, gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=3.0,
+        )
+
+        assert [r["catalog_id"] for r in result] == ["isolated"]
+
+    async def test_the_blend_check_can_be_disabled(self, scene, monkeypatch):
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 0.0)
+
+        gaia = [
+            _gaia_star(wcs, 100, 100, "blend-a", mag=17.5),
+            _gaia_star(wcs, 102, 100, "blend-b", mag=17.6),
+        ]
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=3.0,
+        )
+
+        assert len(result) == 2
+
+    async def test_an_unknown_frame_fwhm_disables_the_blend_check(self, scene, monkeypatch):
+        """Without a PSF width there is no scale to judge "close" against."""
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        gaia = [
+            _gaia_star(wcs, 100, 100, "blend-a", mag=17.5),
+            _gaia_star(wcs, 102, 100, "blend-b", mag=17.6),
+        ]
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=None,
+        )
+
+        assert len(result) == 2
+
     async def test_skips_star_already_matched_in_sources(self, scene, monkeypatch):
         _, wcs = scene
         monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
