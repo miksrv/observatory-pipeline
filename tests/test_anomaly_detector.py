@@ -1186,6 +1186,111 @@ class TestDetectUnmatchedMovingObjects:
         assert target_anomaly["anomaly_type"] == "UNKNOWN"
 
 
+class TestFastMoverWideCone:
+    """
+    Audit 2026-08-18, finding H3: the wide "did this used to be somewhere
+    nearby?" cone was a fixed MOVING_CONE_ARCSEC around the current position,
+    so an object that moved further than that between two frames had its own
+    previous position outside the search entirely — "shifted" could never be
+    confirmed and a genuine fast mover fell through to plain UNKNOWN (no track
+    chart, no ephemeris) or was dropped as FIRST_OBSERVATION.
+    """
+
+    def test_radius_floor_is_the_plain_moving_cone(self):
+        """Two frames a minute apart reach less than the 120" floor."""
+        r = ad._wide_cone_radius_arcsec("2024-03-15T22:01:34Z", "2024-03-15T22:00:34Z")
+        assert r == pytest.approx(config.MOVING_CONE_ARCSEC)
+
+    def test_radius_grows_with_the_gap(self):
+        """10 minutes at 30"/min reaches 300" — well past the fixed cone."""
+        r = ad._wide_cone_radius_arcsec("2024-03-15T22:11:34Z", "2024-03-15T22:01:34Z")
+        assert r == pytest.approx(10.0 * config.MOVING_RATE_ARCSEC_PER_MIN)
+        assert r > config.MOVING_CONE_ARCSEC
+
+    def test_radius_is_capped(self):
+        r = ad._wide_cone_radius_arcsec("2024-03-15T22:29:34Z", "2024-03-15T22:01:34Z")
+        assert r == pytest.approx(config.MOVING_CONE_MAX_ARCSEC)
+
+    def test_an_old_detection_does_not_extend_the_cone(self):
+        """
+        Past MOVING_EXTEND_MAX_GAP_MIN the extension would just be the cap,
+        always — a permanently wide cone, which is the false-positive mode the
+        two-condition "shifted" test exists to prevent.
+        """
+        r = ad._wide_cone_radius_arcsec("2024-03-16T22:01:34Z", "2024-03-15T22:01:34Z")
+        assert r == pytest.approx(config.MOVING_CONE_ARCSEC)
+
+    def test_missing_or_unparseable_timestamps_fall_back_to_the_fixed_cone(self):
+        assert ad._wide_cone_radius_arcsec(_OBS_TIME, None) == pytest.approx(config.MOVING_CONE_ARCSEC)
+        assert ad._wide_cone_radius_arcsec(_OBS_TIME, "") == pytest.approx(config.MOVING_CONE_ARCSEC)
+        assert ad._wide_cone_radius_arcsec(_OBS_TIME, "yesterday") == pytest.approx(config.MOVING_CONE_ARCSEC)
+        assert ad._wide_cone_radius_arcsec("", _OBS_TIME) == pytest.approx(config.MOVING_CONE_ARCSEC)
+
+    def test_find_wide_history_sizes_each_candidate_by_its_own_age(self):
+        """
+        A 200" separation is beyond the fixed cone. It counts as a candidate
+        when the detection is 10 minutes old (a fast mover's reach) but not
+        when it is a day old.
+        """
+        offset_deg = 200.0 / 3600.0
+        recent = _make_hist_source(ra=_RA, dec=_DEC + offset_deg)
+        recent["obs_time"] = "2024-03-15T21:51:34Z"
+        old = _make_hist_source(ra=_RA, dec=_DEC + offset_deg)
+        old["obs_time"] = "2024-03-14T22:01:34Z"
+
+        found, radius = ad._find_wide_history(_RA, _DEC, [recent], _OBS_TIME)
+        assert found == [recent]
+        assert radius > config.MOVING_CONE_ARCSEC
+
+        found, radius = ad._find_wide_history(_RA, _DEC, [old], _OBS_TIME)
+        assert found == []
+        assert radius == pytest.approx(config.MOVING_CONE_ARCSEC)
+
+    async def test_fast_mover_beyond_the_fixed_cone_is_moving_unknown(self):
+        """
+        End to end: an object whose previous detection 10 minutes ago sits
+        200" away — past MOVING_CONE_ARCSEC — must classify MOVING_UNKNOWN
+        rather than UNKNOWN.
+        """
+        source = _make_source(catalog_name=None, elongation=1.2, source_id="src-fast-001")
+        prev = _make_hist_source(ra=_RA, dec=_DEC + 200.0 / 3600.0)
+        prev["obs_time"] = "2024-03-15T21:51:34Z"
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [prev]}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "MOVING_UNKNOWN"
+        assert result[0]["source_id"] == "src-fast-001"
+
+    async def test_a_day_old_detection_at_the_same_distance_stays_unknown(self):
+        """
+        The guardrail: the same 200" separation must NOT read as motion when
+        the only evidence is a detection from a previous session.
+        """
+        source = _make_source(catalog_name=None, elongation=1.2)
+        prev = _make_hist_source(ra=_RA, dec=_DEC + 200.0 / 3600.0)
+        prev["obs_time"] = "2024-03-14T22:01:34Z"
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [prev]}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "UNKNOWN"
+
+
 class TestDetectSpaceDebrisNearEdge:
     """
     Regression coverage for the 2026-08-07 T_CrB incident: coma stretches an

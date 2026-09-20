@@ -219,6 +219,37 @@ MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
 # Default widened from 30" to 120": fast-moving objects like Vesta travel ~60"/hr,
 # so 30" was too tight to detect cross-frame position shifts reliably.
 MOVING_CONE_ARCSEC: float = float(_get("MOVING_CONE_ARCSEC", "120.0"))
+
+# --- Fast movers: the time-scaled extension of MOVING_CONE_ARCSEC ----------
+# MOVING_CONE_ARCSEC alone is a FIXED radius around the source's current
+# position, so an object that moved further than it between two frames has
+# its own previous position outside the search entirely — "shifted" can never
+# be confirmed and the object falls through to a generic UNKNOWN (no track
+# chart, no ephemeris) or is dropped as FIRST_OBSERVATION (audit 2026-08-18,
+# finding H3). How far an object can legitimately have moved is not a
+# constant at all: it is a rate times the gap between the two frames.
+#
+# The plausible upper rate for something this pipeline should still be
+# calling a "moving object" — a fast NEO trailing within a single exposure
+# runs 20–30"/min (see CLAUDE.md's exposure-midpoint discussion). Anything
+# faster is a satellite, which the SPACE_DEBRIS branch catches on elongation
+# alone without needing a previous position at all.
+MOVING_RATE_ARCSEC_PER_MIN: float = float(_get("MOVING_RATE_ARCSEC_PER_MIN", "30.0"))
+# Hard ceiling on the extended radius, whatever the elapsed time works out
+# to. The cone's false-positive risk grows with its area — every extra
+# historical detection swept in is another candidate for the "its old
+# position has vacated" test — and this also bounds how wide
+# _prefetch.py has to make its batch query.
+MOVING_CONE_MAX_ARCSEC: float = float(_get("MOVING_CONE_MAX_ARCSEC", "600.0"))
+# Only frames this recent extend the cone at all. Past this gap, rate × time
+# exceeds the ceiling for any rate worth considering, so the extension would
+# degenerate into "the whole ceiling, always" — i.e. a permanently wide cone
+# in which some unrelated historical detection is nearly always present, the
+# exact false-positive mode the two-condition "shifted" test exists to stop.
+# A gap this long is also a different observing session, where the pairing of
+# "something left A" with "something appeared at B" carries little weight.
+MOVING_EXTEND_MAX_GAP_MIN: float = float(_get("MOVING_EXTEND_MAX_GAP_MIN", "30.0"))
+
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
 
 # --- Statistical variability detection (modules/anomaly_detector/) ---------
@@ -573,6 +604,9 @@ _OVERRIDABLE: dict[str, type] = {
     # Cross-matching
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
+    "MOVING_RATE_ARCSEC_PER_MIN": float,
+    "MOVING_CONE_MAX_ARCSEC": float,
+    "MOVING_EXTEND_MAX_GAP_MIN": float,
     "DELTA_MAG_ALERT": float,
     "VARIABILITY_MIN_EPOCHS": int,
     "VARIABILITY_SIGMA": float,

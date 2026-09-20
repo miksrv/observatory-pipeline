@@ -18,7 +18,7 @@ from ._history import (
     _history_median_mag,
     _same_filter_history,
 )
-from ._movement import _is_position_shifted
+from ._movement import _find_wide_history, _is_position_shifted
 from ._otypes import _is_binary_star, _is_galaxy, _is_variable_star
 from .types import AnomalyType
 
@@ -36,6 +36,7 @@ def _classify_source_sync(
     history_by_tile: dict[tuple, list],
     coverage_by_tile: dict[tuple, list],
     current_frame_positions: list[tuple[float, float]],
+    obs_time: str = "",
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).
@@ -139,7 +140,18 @@ def _classify_source_sync(
         # occupied by anything in THIS frame — see its docstring for why
         # "any nearby historical detection" alone is not sufficient evidence
         # of a mover (docs/ISSUES.md #1).
-        wide_history = _find_sources_within_radius(ra, dec, config.MOVING_CONE_ARCSEC, tile_sources)
+        # Radius is per-candidate, not one number for the whole search: a
+        # historical detection from a few minutes ago is admitted out to a
+        # fast mover's reach over that gap, while an older one is held to the
+        # plain MOVING_CONE_ARCSEC. A fixed 120" cone left MOVING_UNKNOWN
+        # structurally unreachable for anything that moved further than that
+        # between frames — its own previous position was outside the search
+        # entirely, so "shifted" could never be confirmed and the object fell
+        # through to a generic UNKNOWN or was dropped as FIRST_OBSERVATION
+        # (audit 2026-08-18, finding H3). See _wide_cone_radius_arcsec() for
+        # the two bounds that keep the extension from becoming a permanently
+        # wide cone.
+        wide_history, wide_radius = _find_wide_history(ra, dec, tile_sources, obs_time)
 
         # A trail this elongated is, on its own, sufficient evidence of a
         # fast single-exposure mover (satellite / space debris) — unlike a
@@ -242,7 +254,7 @@ def _classify_source_sync(
                 "ephemeris":       None,
                 "notes": (
                     f"No detection within {config.MATCH_CONE_ARCSEC:.1f} arcsec of this position, "
-                    f"but a historical detection within {config.MOVING_CONE_ARCSEC:.1f} arcsec of it "
+                    f"but a historical detection within {wide_radius:.1f} arcsec of it "
                     f"is no longer present in this frame; not matched in MPC. "
                     f"Elongation={elongation:.2f}."
                 ),

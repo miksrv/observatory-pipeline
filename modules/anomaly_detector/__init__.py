@@ -52,7 +52,12 @@ from ._history import (
     _history_median_mag,
     _same_filter_history,
 )
-from ._movement import _is_position_shifted, _is_still_occupied
+from ._movement import (
+    _find_wide_history,
+    _is_position_shifted,
+    _is_still_occupied,
+    _wide_cone_radius_arcsec,
+)
 from ._otypes import _is_binary_star, _is_galaxy, _is_variable_star
 from .types import AnomalyType
 

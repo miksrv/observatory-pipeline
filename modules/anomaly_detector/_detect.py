@@ -115,6 +115,7 @@ async def detect(
                 history_by_tile=history_by_tile,
                 coverage_by_tile=coverage_by_tile,
                 current_frame_positions=current_frame_positions,
+                obs_time=obs_time,
             )
             if result is not None:
                 anomalies.append(result)

@@ -199,9 +199,24 @@ one condition matches, the function returns and no further checks run:
      entirely) keeps real edge-of-frame trails detectable while filtering out the
      aberration.
    - **`elongation` at or below that threshold** → also requires (b): a historical
-     detection within the wider `MOVING_CONE_ARCSEC` (120″) whose own position is no
+     detection within the wider moving-object cone whose own position is no
      longer occupied by anything else in *this* frame (`_is_still_occupied()` is `False`
      for it) → `MOVING_UNKNOWN`. Otherwise falls through to bullet 4 below.
+
+     That cone is sized **per candidate**, not once for the whole search
+     (`_movement._find_wide_history()` / `_wide_cone_radius_arcsec()`):
+     `MOVING_CONE_ARCSEC` (120″) is its floor, extended to
+     `MOVING_RATE_ARCSEC_PER_MIN × elapsed minutes` for a historical detection recent
+     enough to be worth extending for (`MOVING_EXTEND_MAX_GAP_MIN`), and capped at
+     `MOVING_CONE_MAX_ARCSEC`. How far an object can legitimately have moved between
+     two frames is a rate times a time gap, not a constant: with a fixed 120″ radius,
+     an object that moved further than that between frames had its own previous
+     position outside the search entirely, so (b) could never be satisfied and a
+     genuine fast mover fell through to a plain `UNKNOWN` — no track chart, no
+     ephemeris — or was dropped as `FIRST_OBSERVATION` (audit 2026-08-18, finding H3).
+     Both bounds exist because the cone's false-positive risk grows with its area;
+     without them the extension would degenerate into a permanently wide cone, which
+     is exactly the failure condition (b) itself was added to fix.
 
    Condition (b) alone (an earlier revision's entire check, applied to both
    `MOVING_UNKNOWN` and `SPACE_DEBRIS`) is true near almost any populated field

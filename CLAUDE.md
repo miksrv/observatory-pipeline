@@ -1087,6 +1087,20 @@ drifted by <1″ across epochs — ordinary centroid/seeing noise — were repea
 Requiring the *old* position to have actually emptied out rules that out while still catching real
 movers, whose previous position is — by definition — vacated once they've moved away from it.
 
+That wider cone is sized **per candidate**, not once for the whole search
+(`_movement.py`'s `_find_wide_history()`/`_wide_cone_radius_arcsec()`): `MOVING_CONE_ARCSEC` is its
+floor, extended to `MOVING_RATE_ARCSEC_PER_MIN × elapsed minutes` for a historical detection no
+older than `MOVING_EXTEND_MAX_GAP_MIN`, capped at `MOVING_CONE_MAX_ARCSEC`. How far an object can
+legitimately have moved between two frames is a rate times a time gap, not a constant — with a
+fixed 120″ radius, anything that moved further than that between frames had its own previous
+position outside the search entirely, so the second half of the evidence could never be satisfied
+and a genuine fast mover fell through to plain `UNKNOWN` (no track chart, no ephemeris) or was
+dropped as `FIRST_OBSERVATION` (audit 2026-08-18, finding H3). Both bounds exist because the
+cone's false-positive risk grows with its area; without them the extension degenerates into a
+permanently wide cone — exactly what the two-condition test above was added to stop. `_prefetch.py`
+sizes its batch query off `MOVING_CONE_MAX_ARCSEC` accordingly, since a candidate the API never
+returned can't be filtered back in client-side.
+
 `SPACE_DEBRIS` deliberately does **not** wait for that second half of the evidence. A satellite or
 debris trail's entire visible track — both "endpoints" — exists within a single exposure; unlike a
 slow asteroid-like mover, it never had a *prior* detection anywhere nearby whose position could be
