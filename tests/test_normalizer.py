@@ -456,3 +456,44 @@ class TestAbellShorthand:
 
     def test_a_bare_letter_is_left_alone(self):
         assert normalizer.normalize_object_name("A")[0] == "A"
+
+
+class TestFlatFilenamesCarryTheFilter:
+    """
+    Audit 2026-08-18, finding M11: a flat is taken THROUGH a filter and is
+    valid only for that one, but the filter field was added for Light frames
+    alone. A multi-filter flat sequence of the same target, exposure and
+    second therefore produced identical filenames, and the later file
+    overwrote the earlier one.
+    """
+
+    def test_two_flats_of_different_filters_do_not_collide(self):
+        ha = normalizer.generate_normalized_filename("M42", "Flat", "Ha", 3.0, "2024-03-15T18:02:10")
+        oiii = normalizer.generate_normalized_filename("M42", "Flat", "OIII", 3.0, "2024-03-15T18:02:10")
+
+        assert ha != oiii
+        assert "_Ha_" in ha
+        assert "_OIII_" in oiii
+
+    @pytest.mark.parametrize("frame_type", ["Dark", "Bias"])
+    def test_filter_independent_frames_keep_the_shorter_name(self, frame_type):
+        name = normalizer.generate_normalized_filename("M42", frame_type, "Ha", 300.0, "2024-03-15T18:02:10")
+
+        assert name == f"M42_{frame_type}_300_2024-03-15T18-02-10.fits"
+
+    def test_light_frames_are_unchanged(self):
+        name = normalizer.generate_normalized_filename("M42", "Light", "L", 120.0, "2024-03-15T18:02:10")
+
+        assert name == "M42_Light_L_120_2024-03-15T18-02-10.fits"
+
+    def test_subtractions_parser_reads_the_new_flat_name(self):
+        """
+        The positional parser already handled {FrameType}_{Filter}_{Exptime}_
+        {DateTime} for any frame type, so a flat must still be recognized as
+        calibration and kept out of the reference stack.
+        """
+        from modules.subtraction import _parse_normalized_filename
+
+        name = normalizer.generate_normalized_filename("M42", "Flat", "Ha", 3.0, "2024-03-15T18:02:10")
+
+        assert _parse_normalized_filename(name) == ("Flat", "Ha")

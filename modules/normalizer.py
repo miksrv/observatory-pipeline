@@ -420,15 +420,20 @@ def generate_normalized_filename(
 
     Format:
         Light: {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
+        Flat:  {Object}_Flat_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
         Dark:  {Object}_Dark_{Exptime}_{DateTime}[_{Seq}].fits
-        Flat:  {Object}_Flat_{Exptime}_{DateTime}[_{Seq}].fits
         Bias:  {Object}_Bias_{Exptime}_{DateTime}[_{Seq}].fits
+
+    A flat is taken through a filter and is valid only for that one, so it
+    carries the filter field too; darks and biases are genuinely
+    filter-independent and keep the shorter name.
 
     Examples:
         M45_Light_B_60_2020-10-15T01-24-51.fits
         M51_Light_Ha_300_2024-03-15T22-01-34.fits
         NGC1234_Light_L_120_2024-03-15T22-01-34_001.fits
         M42_Dark_300_2024-03-15T22-01-34.fits
+        M42_Flat_Ha_3_2024-03-15T18-02-10.fits
 
     Returns:
         Normalized filename string
@@ -440,7 +445,15 @@ def generate_normalized_filename(
     if frame_type:
         parts.append(frame_type)
 
-    if filter_name and frame_type == "Light":
+    # Flats carry the filter as well as Lights. A flat is taken THROUGH a
+    # filter and is only valid for that one, so a multi-filter flat sequence
+    # of the same target, exposure and second produced identical filenames
+    # and the later file overwrote the earlier one (audit 2026-08-18, finding
+    # M11). Darks and biases are genuinely filter-independent and keep the
+    # shorter name. modules/subtraction.py's positional parser already reads
+    # a {FrameType}_{Filter}_{Exptime}_{DateTime} name for any frame type, so
+    # nothing there needed changing.
+    if filter_name and frame_type in ("Light", "Flat"):
         parts.append(filter_name)
 
     if exptime is not None:

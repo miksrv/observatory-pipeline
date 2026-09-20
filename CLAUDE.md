@@ -634,11 +634,16 @@ Normalizes FITS header values and filenames for consistency across different cap
 **Filename Generation:**
 Files are renamed to a standardized format (enabled by `NORMALIZE_ENABLED=true`):
 ```
-Light:            {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
-Dark/Flat/Bias:   {Object}_{FrameType}_{Exptime}_{DateTime}[_{Seq}].fits
+Light:       {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
+Flat:        {Object}_Flat_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
+Dark/Bias:   {Object}_{FrameType}_{Exptime}_{DateTime}[_{Seq}].fits
 ```
 The frame-type token is the full normalized word — `Light`, `Dark`, `Flat`, `Bias` — not a
-one-letter code, and the filter token is present on Light frames only. (An earlier revision
+one-letter code. The filter token is present on Light **and Flat** frames: a flat is taken
+through a filter and is valid only for that one, so without it a multi-filter flat sequence of
+the same target, exposure and second produced identical filenames and the later file overwrote
+the earlier (audit 2026-08-18, finding M11). Darks and biases are genuinely filter-independent
+and keep the shorter name. (An earlier revision
 used `L`/`D`/`F`/`B` codes; `modules/subtraction.py`'s reference-frame selection parses this
 field, so the two must be read together.)
 
@@ -646,6 +651,7 @@ Examples:
 - `M45_Light_B_60_2020-10-15T01-24-51.fits` (M45, Light, Blue filter, 60s)
 - `M51_Light_Ha_300_2024-03-15T22-01-34.fits` (M51, Light, Ha filter, 300s)
 - `NGC1234_Light_L_120_2024-03-15T22-01-34.fits` (NGC1234, Light, Luminance, 120s)
+- `M42_Flat_Ha_3_2024-03-15T18-02-10.fits` (Flat through Hα)
 - `M42_Dark_300_2024-03-15T22-01-34.fits` (Dark frame, no filter)
 
 When normalization is enabled, the API receives only normalized values (no duplicates).
