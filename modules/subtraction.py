@@ -42,6 +42,7 @@ import glob
 import logging
 import math
 import os
+import re
 from typing import Optional
 
 import astropy.units as u
@@ -66,6 +67,93 @@ _PA_CANDIDATE_POOL = _MAX_FRAMES * 3
 
 
 # ---------------------------------------------------------------------------
+# Normalized-filename parsing
+#
+# modules/normalizer.py writes archived frames as
+#     Light:          {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
+#     Dark/Flat/Bias: {Object}_{FrameType}_{Exptime}_{DateTime}[_{Seq}].fits
+#
+# Reference selection used to look for the filter as a bare substring
+# (``"_HA_" in basename``), which cannot tell a field apart from the object
+# name that precedes it and knows nothing about the frame type at all (audit
+# 2026-08-18, finding C5). Two consequences, one of them live today: the
+# pipeline archives Dark/Flat/Bias frames into the SAME per-object directory
+# as the science frames, so a starless calibration frame was a perfectly
+# eligible reference — and being recent, it would crowd real science frames
+# out of the newest-first _MAX_FRAMES selection. The other is the token
+# collision the finding is named for: under the earlier filename revision the
+# FrameType codes were L/D/F/B, so ``_L_`` matched every Light frame whatever
+# its actual filter, and ``_B_`` matched Bias frames when looking for Blue.
+#
+# Parsing positionally instead removes both, and is anchored from the RIGHT
+# because the object name itself may contain underscores ("Andromeda_Galaxy",
+# "4_Vesta"). The anchor is the DateTime field, the one token with a
+# distinctive shape; the exposure, filter and frame-type fields then sit at
+# fixed offsets before it. That also disambiguates the legacy single-letter
+# codes for free — "L" in the FrameType position is Light, "L" in the filter
+# position is Luminance — so an archive written by the older revision parses
+# correctly too.
+# ---------------------------------------------------------------------------
+
+_FRAME_TYPE_TOKENS: dict[str, str] = {
+    "LIGHT": "Light", "DARK": "Dark", "FLAT": "Flat", "BIAS": "Bias",
+    # Legacy one-letter codes (pre-full-word filename revision)
+    "L": "Light", "D": "Dark", "F": "Flat", "B": "Bias",
+}
+
+_CALIBRATION_FRAME_TYPES = frozenset({"Dark", "Flat", "Bias"})
+
+# The DateTime field as build_filename() writes it: an ISO timestamp with
+# ":" replaced by "-". Matched as a prefix so a trailing zone marker ("Z",
+# "+00-00") or a seconds-less timestamp still anchors.
+_DATETIME_TOKEN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}")
+
+
+def _parse_normalized_filename(basename: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return ``(frame_type, filter_name)`` parsed out of a normalized filename,
+    or ``(None, None)`` when the name doesn't follow the convention at all
+    (NORMALIZE_ENABLED=false, or a file placed in the archive by hand).
+
+    ``filter_name`` is None for a calibration frame, and also for a Light
+    frame written without a filter field.
+    """
+    tokens = os.path.splitext(basename)[0].split("_")
+
+    # Anchor on the rightmost DateTime-shaped token: everything to its left
+    # is at a fixed offset, everything to its right is the optional sequence
+    # number.
+    idx = -1
+    for i, token in enumerate(tokens):
+        if _DATETIME_TOKEN_RE.match(token):
+            idx = i
+    if idx < 2:
+        return None, None
+
+    # The field immediately before it must be the exposure time.
+    try:
+        float(tokens[idx - 1])
+    except ValueError:
+        return None, None
+
+    # {FrameType}_{Filter}_{Exptime}_{DateTime} — preferred over the
+    # filter-less reading below, so that the legacy "M51_L_L_120_<dt>"
+    # (Light frame, Luminance filter) resolves the way it was written.
+    if idx >= 3:
+        frame_type = _FRAME_TYPE_TOKENS.get(tokens[idx - 3].upper())
+        if frame_type is not None:
+            return frame_type, tokens[idx - 2]
+
+    # {FrameType}_{Exptime}_{DateTime} — a calibration frame, or a Light
+    # frame whose filter was unknown at normalization time.
+    frame_type = _FRAME_TYPE_TOKENS.get(tokens[idx - 2].upper())
+    if frame_type is not None:
+        return frame_type, None
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Archive frame discovery
 # ---------------------------------------------------------------------------
 
@@ -77,10 +165,14 @@ def _find_archive_frames(
     """
     Return up to _MAX_FRAMES FITS paths from archive_dir, sorted newest-first.
 
-    When filter_name is provided and there are at least SUBTRACTION_MIN_FRAMES
-    frames whose normalized filename contains the filter token (e.g. ``_Ha_``),
-    only those same-filter frames are returned.  Otherwise all frames are
-    returned, allowing cross-filter subtraction as a fallback.
+    Calibration frames (Dark/Flat/Bias, which pipeline.py archives into this
+    same per-object directory) are never eligible — see
+    _parse_normalized_filename().
+
+    When filter_name is provided and at least SUBTRACTION_MIN_FRAMES of the
+    remaining science frames carry that filter in their filename's own filter
+    FIELD, only those same-filter frames are returned.  Otherwise all science
+    frames are returned, allowing cross-filter subtraction as a fallback.
 
     Parameters
     ----------
@@ -119,16 +211,50 @@ def _find_archive_frames(
 
     all_files.sort(key=os.path.getmtime, reverse=True)
 
-    candidates = all_files
+    # Drop calibration frames before anything else. pipeline.py archives
+    # Dark/Flat/Bias into this same per-object directory, and a starless
+    # calibration frame is not a reference for anything — being recent, it
+    # would also crowd genuine science frames out of the newest-first
+    # _MAX_FRAMES selection below (audit 2026-08-18, finding C5). A file
+    # whose name doesn't follow the convention is kept: it can't be
+    # identified as calibration, and an archive normalized by hand or with
+    # NORMALIZE_ENABLED=false must not lose subtraction over it.
+    parsed = {f: _parse_normalized_filename(os.path.basename(f)) for f in all_files}
+    science_files = [f for f in all_files if parsed[f][0] not in _CALIBRATION_FRAME_TYPES]
+    n_calibration = len(all_files) - len(science_files)
+    if n_calibration:
+        logger.info(
+            "Subtraction: ignoring %d calibration frame(s) in %s as reference candidates",
+            n_calibration, archive_dir,
+        )
+
+    candidates = science_files
     if filter_name:
         token = f"_{filter_name.upper()}_"
-        # Compare case-insensitively: normalized filter tokens are not all
-        # uppercase (e.g. "Ha"), so a literal uppercased token would never
-        # match a mixed-case filename token and this branch would silently
-        # always fall through to the cross-filter fallback below.
-        matching = [f for f in all_files if token in os.path.basename(f).upper()]
+
+        def _same_filter(path: str) -> bool:
+            parsed_filter = parsed[path][1]
+            if parsed[path][0] is not None:
+                # Positional match against the filename's own filter FIELD.
+                # A substring test can't tell that field apart from the object
+                # name before it, nor from the frame-type code that used to
+                # share its alphabet (see _parse_normalized_filename()).
+                return parsed_filter is not None and parsed_filter.upper() == filter_name.upper()
+            # Unparseable name — fall back to the old substring test rather
+            # than excluding it outright, so a non-normalized archive keeps
+            # whatever same-filter matching it had before.
+            return token in os.path.basename(path).upper()
+
+        matching = [f for f in science_files if _same_filter(f)]
         if len(matching) >= config.SUBTRACTION_MIN_FRAMES:
             candidates = matching
+        elif matching:
+            logger.info(
+                "Subtraction: only %d frame(s) match filter %s (need %d) — "
+                "falling back to all %d science frame(s)",
+                len(matching), filter_name, config.SUBTRACTION_MIN_FRAMES,
+                len(science_files),
+            )
 
     if new_position_angle_deg is not None and len(candidates) > _MAX_FRAMES:
         candidates = _sort_by_pa_closeness(candidates, new_position_angle_deg)

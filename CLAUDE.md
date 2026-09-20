@@ -678,8 +678,23 @@ and moving objects that catalog cross-matching alone would miss (e.g. objects wi
 entry at all, at any position).
 
 1. Looks in `/fits/archive/{object}/` for ≥`SUBTRACTION_MIN_FRAMES` previously archived frames
-   of the same object (same filter preferred, matched case-insensitively by a `_{FILTER}_`
-   filename token; falls back to any filter if there aren't enough same-filter frames).
+   of the same object (same filter preferred; falls back to any filter if there aren't enough
+   same-filter frames). Both the frame type and the filter are read out of the filename
+   **positionally** (`_parse_normalized_filename()`), not as a substring: the fields are anchored
+   on the DateTime token and counted leftward from it, since the object name itself may contain
+   underscores (`Andromeda_Galaxy`, `4_Vesta`). Two things this fixes (audit 2026-08-18, finding
+   C5): **Dark/Flat/Bias frames are never eligible as references** — `pipeline.py` archives them
+   into this same per-object directory, and a starless calibration frame would, being recent,
+   also crowd genuine science frames out of the newest-first `_MAX_FRAMES` selection; and the
+   filter field can no longer be confused with the frame-type field that used to share its
+   alphabet (under the earlier `L`/`D`/`F`/`B` filename revision every Light frame carried `_L_`,
+   so a request for Luminance returned the whole directory — Ha and OIII included — as a
+   "same-filter" stack, compounding step 2.5's scale mismatch with a filter mismatch). Position
+   disambiguates those legacy codes rather than rejecting them, so an archive written by the
+   older revision still parses. A filename that doesn't follow the convention at all
+   (`NORMALIZE_ENABLED=false`, or a file placed there by hand) keeps the old substring-based
+   filter test and is never excluded as calibration — it can't be identified either way, and
+   must not lose subtraction over it.
 2. Aligns each reference frame to the new frame using `astroalign` (triangle-pattern matching —
    does not require WCS). Reference frames are handed to `astroalign` even when their pixel
    dimensions differ from the new frame's (e.g. archived with a different camera/resolution) —

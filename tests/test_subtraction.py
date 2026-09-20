@@ -26,6 +26,7 @@ asyncio_mode = auto is set in pytest.ini, so async tests need no decorator.
 from __future__ import annotations
 
 import math
+import os
 from unittest.mock import patch
 
 import numpy as np
@@ -83,6 +84,154 @@ class TestFindArchiveFrames:
         result = subtraction._find_archive_frames(str(tmp_path), "Ha")
 
         assert len(result) == 4
+
+
+# ---------------------------------------------------------------------------
+# _parse_normalized_filename (audit 2026-08-18, C5)
+# ---------------------------------------------------------------------------
+
+class TestParseNormalizedFilename:
+
+    def test_light_frame_with_filter(self):
+        assert subtraction._parse_normalized_filename(
+            "M45_Light_B_60_2020-10-15T01-24-51.fits"
+        ) == ("Light", "B")
+
+    def test_calibration_frame_has_no_filter_field(self):
+        assert subtraction._parse_normalized_filename(
+            "M42_Dark_300_2024-03-15T22-01-34.fits"
+        ) == ("Dark", None)
+
+    def test_object_name_containing_underscores(self):
+        """The fields are anchored from the right for exactly this reason."""
+        assert subtraction._parse_normalized_filename(
+            "Andromeda_Galaxy_Light_Ha_300_2024-03-15T22-01-34.fits"
+        ) == ("Light", "Ha")
+
+    def test_sequence_suffix_is_ignored(self):
+        assert subtraction._parse_normalized_filename(
+            "NGC1234_Light_L_120_2024-03-15T22-01-34_001.fits"
+        ) == ("Light", "L")
+
+    def test_fractional_exposure_time(self):
+        assert subtraction._parse_normalized_filename(
+            "M42_Bias_0.001_2024-03-15T22-01-34.fits"
+        ) == ("Bias", None)
+
+    def test_legacy_frame_type_code_is_resolved_positionally(self):
+        """
+        The collision the finding is named for: under the earlier filename
+        revision 'L' was the Light FrameType code AND the Luminance filter
+        code. Its position in the name says which is which.
+        """
+        assert subtraction._parse_normalized_filename(
+            "M51_L_Ha_120_2024-01-01T00-00-00.fits"
+        ) == ("Light", "Ha")
+        assert subtraction._parse_normalized_filename(
+            "M51_L_L_120_2024-01-01T00-00-00.fits"
+        ) == ("Light", "L")
+        assert subtraction._parse_normalized_filename(
+            "M51_B_0_2024-01-01T00-00-00.fits"
+        ) == ("Bias", None)
+
+    def test_unrecognized_name_returns_nothing(self):
+        assert subtraction._parse_normalized_filename("IMG_0042.fits") == (None, None)
+        assert subtraction._parse_normalized_filename("M51_L_Ha_120_a.fits") == (None, None)
+
+
+class TestCalibrationFramesAreNotReferences:
+
+    def _dir_with(self, tmp_path, names):
+        for name in names:
+            (tmp_path / name).write_bytes(b"x")
+        return str(tmp_path)
+
+    def test_calibration_frames_are_excluded(self, tmp_path):
+        """
+        pipeline.py archives Dark/Flat/Bias into the same per-object
+        directory as the science frames. A starless calibration frame is not
+        a reference for anything, and being recent it would crowd real
+        science frames out of the newest-first selection.
+        """
+        archive = self._dir_with(tmp_path, [
+            "M51_Light_L_120_2024-01-01T00-00-00.fits",
+            "M51_Light_L_120_2024-01-02T00-00-00.fits",
+            "M51_Light_L_120_2024-01-03T00-00-00.fits",
+            "M51_Dark_120_2024-01-04T00-00-00.fits",
+            "M51_Flat_3_2024-01-05T00-00-00.fits",
+            "M51_Bias_0_2024-01-06T00-00-00.fits",
+        ])
+
+        result = subtraction._find_archive_frames(archive, None)
+
+        assert len(result) == 3
+        assert all("Light" in os.path.basename(p) for p in result)
+
+    def test_bias_frames_do_not_answer_a_request_for_the_blue_filter(self, tmp_path):
+        """The 'B' half of the token collision: Bias frames vs. the B filter."""
+        archive = self._dir_with(tmp_path, [
+            "M51_Light_B_120_2024-01-01T00-00-00.fits",
+            "M51_Bias_0_2024-01-02T00-00-00.fits",
+            "M51_Bias_0_2024-01-03T00-00-00.fits",
+            "M51_Bias_0_2024-01-04T00-00-00.fits",
+        ])
+
+        result = subtraction._find_archive_frames(archive, "B")
+
+        assert [os.path.basename(p) for p in result] == [
+            "M51_Light_B_120_2024-01-01T00-00-00.fits"
+        ]
+
+    def test_legacy_light_code_does_not_pass_as_the_luminance_filter(self, tmp_path):
+        """
+        Every Light frame carried '_L_' as its FrameType code under the older
+        filename revision, so a request for Luminance used to return the whole
+        directory — Ha and OIII frames included — as a "same-filter" stack.
+        """
+        archive = self._dir_with(tmp_path, [
+            "M51_L_Ha_300_2024-01-01T00-00-00.fits",
+            "M51_L_Ha_300_2024-01-02T00-00-00.fits",
+            "M51_L_OIII_300_2024-01-03T00-00-00.fits",
+            "M51_L_OIII_300_2024-01-04T00-00-00.fits",
+        ])
+
+        result = subtraction._find_archive_frames(archive, "L")
+
+        # No frame actually carries the Luminance filter, so this falls back
+        # to the cross-filter pool rather than pretending all four match.
+        assert len(result) == 4
+
+    def test_same_filter_selection_still_works_on_the_current_format(self, tmp_path):
+        archive = self._dir_with(tmp_path, [
+            "M51_Light_Ha_300_2024-01-01T00-00-00.fits",
+            "M51_Light_Ha_300_2024-01-02T00-00-00.fits",
+            "M51_Light_Ha_300_2024-01-03T00-00-00.fits",
+            "M51_Light_L_120_2024-01-04T00-00-00.fits",
+            "M51_Dark_300_2024-01-05T00-00-00.fits",
+        ])
+
+        result = subtraction._find_archive_frames(archive, "Ha")
+
+        assert len(result) == 3
+        assert all("_Ha_" in os.path.basename(p) for p in result)
+
+    def test_unparseable_names_keep_the_old_substring_behaviour(self, tmp_path):
+        """
+        A hand-placed or non-normalized archive can't be parsed positionally;
+        it must keep whatever same-filter matching it had rather than losing
+        subtraction entirely.
+        """
+        archive = self._dir_with(tmp_path, [
+            "session1_Ha_a.fits",
+            "session1_Ha_b.fits",
+            "session1_Ha_c.fits",
+            "session1_R_d.fits",
+        ])
+
+        result = subtraction._find_archive_frames(archive, "Ha")
+
+        assert len(result) == 3
+        assert all("_Ha_" in os.path.basename(p) for p in result)
 
 
 # ---------------------------------------------------------------------------
