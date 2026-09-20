@@ -64,7 +64,7 @@ import os
 
 import astropy.io.fits as fits
 import numpy as np
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import SigmaClip, sigma_clipped_stats
 from astropy.time import Time
 from astropy.wcs import WCS
 from photutils.aperture import ApertureStats, CircularAnnulus, CircularAperture, aperture_photometry
@@ -160,6 +160,18 @@ def _resolve_gain(hdr, fits_filename: str, override: float | None = None) -> flo
     return 1.0
 
 
+def _sky_sigma_clip() -> SigmaClip | None:
+    """
+    The sigma-clipper applied to the sky annulus — a hand-duplicated copy of
+    modules/photometry.py's helper of the same name, kept in sync by hand the
+    same way this module's aperture/net-flux formulas already are.
+    """
+    sigma = config.PHOTOMETRY_SKY_SIGMA_CLIP
+    if sigma is None or sigma <= 0:
+        return None
+    return SigmaClip(sigma=float(sigma), maxiters=5)
+
+
 def _measure_at_pixel(
     data_sub: np.ndarray,
     raw_data: np.ndarray,
@@ -198,7 +210,11 @@ def _measure_at_pixel(
     aperture = CircularAperture(position, r=ap_radius)
     annulus = CircularAnnulus(position, r_in=annulus_inner, r_out=annulus_outer)
 
-    ann_stats = ApertureStats(data_sub, annulus)
+    # Sigma-clipped for the same reason photometry.py's identical annulus is
+    # (audit 2026-08-18, finding H7): an unclipped median takes in whatever
+    # neighbour, cosmic ray or galaxy light falls in the ring, and subtracts
+    # it straight out of the source's flux.
+    ann_stats = ApertureStats(data_sub, annulus, sigma_clip=_sky_sigma_clip())
     sky_per_px = float(ann_stats.median)
 
     phot_table = aperture_photometry(data_sub, aperture)

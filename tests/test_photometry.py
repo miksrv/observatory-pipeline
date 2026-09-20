@@ -793,6 +793,57 @@ class TestColorTerm:
 
 
 # ---------------------------------------------------------------------------
+# Sky annulus sigma-clipping — audit 2026-08-18, finding H7
+# ---------------------------------------------------------------------------
+
+class TestSkyAnnulusSigmaClipping:
+    """
+    The annulus is a background sample only in principle. In practice it
+    catches a neighbouring star, a cosmic ray, or — the case that matters most
+    — the host galaxy's own light under a SUPERNOVA_CANDIDATE, and an
+    unclipped median subtracts that straight out of the source's flux.
+    """
+
+    async def test_annulus_stats_are_sigma_clipped(self):
+        srcs = _make_sources(n=1)
+        with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
+            with patch("modules.photometry.ApertureStats") as mock_stats:
+                mock_stats.return_value = MagicMock(median=10.0)
+                await photometry.measure(_FITS_PATH, srcs)
+
+        clipper = mock_stats.call_args.kwargs["sigma_clip"]
+        assert clipper is not None
+        assert clipper.sigma == pytest.approx(config.PHOTOMETRY_SKY_SIGMA_CLIP)
+
+    def test_clipping_can_be_disabled(self, monkeypatch):
+        """A non-positive threshold restores the unclipped median."""
+        monkeypatch.setattr(config, "PHOTOMETRY_SKY_SIGMA_CLIP", 0.0)
+        assert photometry._sky_sigma_clip() is None
+
+    def test_a_contaminated_annulus_reads_lower_once_clipped(self):
+        """
+        Exercised against real photutils rather than the mock, so the fix is
+        shown to do something and not merely to pass an argument through.
+        """
+        from astropy.stats import SigmaClip
+        from photutils.aperture import ApertureStats, CircularAnnulus
+
+        rng = np.random.default_rng(0)
+        data = 10.0 + rng.normal(0.0, 1.0, (60, 60))
+        # A bright neighbour spread across part of the ring
+        data[26:34, 38:44] += 4000.0
+
+        annulus = CircularAnnulus((30, 30), r_in=8, r_out=14)
+        unclipped = float(ApertureStats(data, annulus).median)
+        clipped = float(
+            ApertureStats(data, annulus, sigma_clip=SigmaClip(sigma=3.0, maxiters=5)).median
+        )
+
+        assert clipped < unclipped
+        assert clipped == pytest.approx(10.0, abs=0.5)
+
+
+# ---------------------------------------------------------------------------
 # Reference-star screening and small-sample scatter — audit 2026-08-18, H6
 # ---------------------------------------------------------------------------
 

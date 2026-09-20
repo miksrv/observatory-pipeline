@@ -693,6 +693,13 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
 ### `modules/photometry.py`
 - Aperture photometry via `photutils.aperture`
 - Differential photometry against Gaia reference stars in the field (requires ≥3 Gaia DR3 matches to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations
+- Each source's sky annulus is **sigma-clipped** (`PHOTOMETRY_SKY_SIGMA_CLIP`, 3σ) before its
+  median is taken. The ring is a background sample only in principle — in practice it routinely
+  catches a neighbouring star, a cosmic ray, or, worst, the host galaxy's own light under a
+  `SUPERNOVA_CANDIDATE` — and an unclipped median subtracts that contamination straight out of the
+  source's flux, a systematic bias worst exactly where photometry matters most (audit 2026-08-18,
+  finding H7). A non-positive threshold restores the unclipped median.
+  `modules/forced_photometry.py` duplicates the same helper by hand.
 - Zero-point reference stars are screened through Gaia's own quality flags before anything is
   fitted: a star the catalog calls variable, one flagged `duplicated_source`, or one whose
   astrometric solution fits badly (`ruwe` above `PHOTOMETRY_REF_MAX_RUWE`, usually an unresolved

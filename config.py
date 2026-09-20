@@ -417,6 +417,16 @@ PHOTOMETRY_COLOR_TERM_MAX: float = float(_get("PHOTOMETRY_COLOR_TERM_MAX", "1.5"
 # beats none at all.
 PHOTOMETRY_REF_MAX_RUWE: float = float(_get("PHOTOMETRY_REF_MAX_RUWE", "1.4"))
 
+# --- Sky annulus statistics ------------------------------------------------
+# Sigma-clipping threshold for the per-source sky annulus. Without it the
+# annulus median takes in whatever else happens to fall in the ring — a
+# neighbouring star, a cosmic ray, or (worst) the host galaxy's own light
+# under a SUPERNOVA_CANDIDATE — and that contamination is subtracted straight
+# out of the source's flux. The bias is systematic and worst exactly where
+# photometry matters most: dense fields and the neighbourhoods of galaxies
+# (audit 2026-08-18, finding H7). 3 sigma is the conventional cut.
+PHOTOMETRY_SKY_SIGMA_CLIP: float = float(_get("PHOTOMETRY_SKY_SIGMA_CLIP", "3.0"))
+
 # ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
 # ---------------------------------------------------------------------------
@@ -648,6 +658,7 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
     "PHOTOMETRY_COLOR_TERM_MAX": float,
     "PHOTOMETRY_REF_MAX_RUWE": float,
+    "PHOTOMETRY_SKY_SIGMA_CLIP": float,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "MOVING_RATE_ARCSEC_PER_MIN": float,

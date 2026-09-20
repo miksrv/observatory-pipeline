@@ -24,7 +24,7 @@ from typing import Any, NamedTuple
 
 import astropy.io.fits as fits
 import numpy as np
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import SigmaClip, sigma_clipped_stats
 from astropy.wcs import WCS
 from photutils.aperture import (
     ApertureStats,
@@ -106,6 +106,21 @@ def _inject_nulls(
 # 1.0 assumption it replaced. See config.PHOTOMETRY_GAIN_E_PER_ADU.
 _GAIN_MIN_E_PER_ADU: float = 0.05
 _GAIN_MAX_E_PER_ADU: float = 20.0
+
+
+def _sky_sigma_clip() -> SigmaClip | None:
+    """
+    The sigma-clipper applied to every per-source sky annulus, or None when
+    config.PHOTOMETRY_SKY_SIGMA_CLIP is non-positive (which restores the
+    unclipped median this module used before).
+
+    Duplicated by hand in modules/forced_photometry.py, the same convention
+    that module already follows for the rest of this module's photometry math.
+    """
+    sigma = config.PHOTOMETRY_SKY_SIGMA_CLIP
+    if sigma is None or sigma <= 0:
+        return None
+    return SigmaClip(sigma=float(sigma), maxiters=5)
 
 
 def _resolve_gain(
@@ -768,8 +783,15 @@ async def measure(
                 position, r_in=annulus_inner, r_out=annulus_outer
             )
 
-            # Sky estimate from annulus
-            ann_stats  = ApertureStats(data_sub, annulus)
+            # Sky estimate from annulus, sigma-clipped. The ring is a
+            # background sample only in principle: in practice it routinely
+            # catches a neighbouring star, a cosmic ray, or — the case that
+            # matters most — the host galaxy's own light under a
+            # SUPERNOVA_CANDIDATE. An unclipped median takes that in and it is
+            # then subtracted straight out of the source's flux, a systematic
+            # bias worst exactly where photometry matters most (audit
+            # 2026-08-18, finding H7).
+            ann_stats  = ApertureStats(data_sub, annulus, sigma_clip=_sky_sigma_clip())
             sky_per_px: float = float(ann_stats.median)
 
             # Aperture photometry on background-subtracted data
