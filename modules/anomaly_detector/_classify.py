@@ -29,6 +29,52 @@ logger = logging.getLogger(__name__)
 # Per-source classification (using prefetched data)
 # ---------------------------------------------------------------------------
 
+def _survives_edge_zone(source: dict) -> bool:
+    """
+    Whether a near-edge **subtraction** candidate is compact and strong enough
+    to be worth reporting rather than suppressed as an aberration residual.
+
+    Every `near_edge` source used to be suppressed outright, on the strength
+    of a real incident (2026-08-10: 53 of 80 UNKNOWN alerts were
+    `from_subtraction` + `near_edge`, every one a coma residual of an ordinary
+    catalogued star). But that also means a genuine transient landing near the
+    frame edge — which a dithering pattern makes routine — can never be
+    reported, whatever it looks like (audit 2026-08-18, finding H11).
+
+    What separates the two is shape and strength, not position. Coma and the
+    other off-axis aberrations stretch a PSF into an arc, and it is the
+    *mismatch* between two such arcs that the median reference stack fails to
+    cancel, so a residual is elongated and usually weak. A round, strong
+    residual is not that shape at all.
+
+    The same two thresholds `modules/subtraction.py` applies at extraction
+    time (`SUBTRACTION_EDGE_ELONGATION_MAX`, `SUBTRACTION_EDGE_SNR_MIN`) are
+    re-applied here rather than trusted from there, because the standalone
+    `DETECT_ANOMALIES` path reconstructs its sources from the API and may
+    carry rows a previous, looser revision of that module wrote. A source that
+    did NOT come from subtraction never qualifies: its near-edge suppression
+    rests on a different mechanism — a coma-shifted centroid that made catalog
+    matching miss — which shape cannot rule out.
+    """
+    if not source.get("_from_subtraction"):
+        return False
+
+    try:
+        elongation = float(source.get("elongation") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not (0.0 < elongation <= config.SUBTRACTION_EDGE_ELONGATION_MAX):
+        return False
+
+    snr = source.get("snr")
+    if snr is None:
+        return False
+    try:
+        return float(snr) >= config.SUBTRACTION_EDGE_SNR_MIN
+    except (TypeError, ValueError):
+        return False
+
+
 def _classify_source_sync(
     source: dict,
     frame_id: str,
@@ -290,10 +336,12 @@ def _classify_source_sync(
         # reference stack, even though the API has no prior coverage record.
         # However, near-edge subtraction candidates are overwhelmingly coma
         # residuals, not real transients — suppress them here too (defense
-        # in depth: subtraction.py now filters them at extraction time, but
-        # a standalone DETECT_ANOMALIES re-run may still carry old
-        # near_edge + from_subtraction rows from the API).
-        if near_edge:
+        # in depth: subtraction.py applies the same test at extraction time,
+        # but a standalone DETECT_ANOMALIES re-run may still carry old
+        # near_edge + from_subtraction rows from the API). A candidate that
+        # is round and strong is not the shape an aberration residual takes,
+        # and is let through — see _survives_edge_zone().
+        if near_edge and not _survives_edge_zone(source):
             logger.debug(
                 "Suppressed UNKNOWN (subtraction, new area): near_edge "
                 "ra=%.4f dec=%.4f — likely coma residual",
@@ -389,7 +437,12 @@ def _classify_source_sync(
         # analysis: 27 of 80 UNKNOWN alerts were non-subtraction near_edge
         # sources — every one a normal star whose centroid was coma-shifted
         # past MATCH_CONE_ARCSEC.
-        if near_edge:
+        #
+        # A round, strong subtraction candidate is exempt: it is not the shape
+        # an aberration residual takes, and unlike an ordinary detection it
+        # carries independent pixel-level evidence that nothing was there
+        # before (see _survives_edge_zone()).
+        if near_edge and not _survives_edge_zone(source):
             logger.debug(
                 "Suppressed UNKNOWN: near_edge uncatalogued source ra=%.4f "
                 "dec=%.4f mag=%s — likely coma-shifted centroid, not a real "

@@ -607,10 +607,31 @@ class TestDetectDiffSources:
         assert len(candidates) >= 1
         assert all(c["near_edge"] is False for c in candidates)
 
-    def test_corner_candidate_is_filtered_out(self):
-        """A blob at (5, 5) on a 100x100 diff falls inside the 10px margin
-        and is now rejected — coma residuals at the edge are not real
-        transients (see EDGE_MARGIN_FRAC filtering in _detect_diff_sources).
+    def test_an_elongated_corner_candidate_is_filtered_out(self):
+        """
+        A stretched blob at (5, 5) on a 100x100 diff falls inside the 10px
+        margin and looks like what it is — a coma/aberration residual, whose
+        signature is exactly that arc shape (see EDGE_MARGIN_FRAC filtering
+        in _detect_diff_sources).
+        """
+        rng = np.random.default_rng(9)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        # Elongated along x — a/b well past SUBTRACTION_EDGE_ELONGATION_MAX
+        blob = 800.0 * np.exp(-(((xx - 5) ** 2 / (2 * 6.0 ** 2)) + ((yy - 5) ** 2 / (2 * 1.5 ** 2))))
+        diff = diff + blob
+
+        candidates = subtraction._detect_diff_sources(diff)
+
+        corner_hits = [c for c in candidates if (c["x"] - 5) ** 2 + (c["y"] - 5) ** 2 < 25]
+        assert len(corner_hits) == 0
+
+    def test_a_round_strong_corner_candidate_survives(self):
+        """
+        Audit 2026-08-18, finding H11: the edge zone used to be rejected
+        outright, so a genuine transient landing there — routine under a
+        dithering pattern — could never be found by subtraction at all. A
+        round, strong residual is not the shape an aberration takes.
         """
         rng = np.random.default_rng(9)
         diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
@@ -620,8 +641,24 @@ class TestDetectDiffSources:
 
         candidates = subtraction._detect_diff_sources(diff)
 
-        # The corner blob must NOT appear in the output — it was in the
-        # edge zone and should have been filtered.
+        corner_hits = [c for c in candidates if (c["x"] - 5) ** 2 + (c["y"] - 5) ** 2 < 25]
+        assert len(corner_hits) == 1
+        assert corner_hits[0]["near_edge"] is True
+        assert corner_hits[0]["elongation"] <= config.SUBTRACTION_EDGE_ELONGATION_MAX
+        assert corner_hits[0]["snr"] >= config.SUBTRACTION_EDGE_SNR_MIN
+
+    def test_a_weak_round_corner_candidate_is_still_filtered_out(self, monkeypatch):
+        """Strength is the second half of the bar, not an afterthought."""
+        monkeypatch.setattr(config, "SUBTRACTION_EDGE_SNR_MIN", 1e6)
+
+        rng = np.random.default_rng(9)
+        diff = rng.normal(loc=0.0, scale=5.0, size=(100, 100))
+        yy, xx = np.mgrid[0:100, 0:100]
+        blob = 800.0 * np.exp(-(((xx - 5) ** 2 + (yy - 5) ** 2) / (2 * 2.0 ** 2)))
+        diff = diff + blob
+
+        candidates = subtraction._detect_diff_sources(diff)
+
         corner_hits = [c for c in candidates if (c["x"] - 5) ** 2 + (c["y"] - 5) ** 2 < 25]
         assert len(corner_hits) == 0
 

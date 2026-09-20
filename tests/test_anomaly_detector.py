@@ -1186,6 +1186,94 @@ class TestDetectUnmatchedMovingObjects:
         assert target_anomaly["anomaly_type"] == "UNKNOWN"
 
 
+class TestEdgeZoneSubtractionCandidates:
+    """
+    Audit 2026-08-18, finding H11: every near_edge source was suppressed
+    outright, so a genuine transient landing near the frame edge — routine
+    under a dithering pattern — could never be reported, whatever it looked
+    like. Coma stretches a PSF into an arc and it is the mismatch between two
+    such arcs that fails to cancel, so a residual is elongated and usually
+    weak; a round, strong subtraction candidate is not that shape.
+    """
+
+    def _edge_candidate(self, elongation: float, snr: float) -> dict:
+        src = _make_source(
+            catalog_name=None, elongation=elongation,
+            near_edge=True, from_subtraction=True, source_id="src-edge-001",
+        )
+        src["snr"] = snr
+        return src
+
+    def test_a_round_strong_candidate_qualifies(self):
+        assert ad._survives_edge_zone(self._edge_candidate(1.1, 50.0)) is True
+
+    def test_an_elongated_candidate_does_not(self):
+        assert ad._survives_edge_zone(self._edge_candidate(3.0, 50.0)) is False
+
+    def test_a_weak_candidate_does_not(self):
+        assert ad._survives_edge_zone(self._edge_candidate(1.1, 2.0)) is False
+
+    def test_a_candidate_with_no_snr_does_not(self):
+        src = self._edge_candidate(1.1, 50.0)
+        src["snr"] = None
+        assert ad._survives_edge_zone(src) is False
+
+    def test_an_ordinary_detection_never_qualifies(self):
+        """
+        A non-subtraction source's near-edge suppression rests on a different
+        mechanism — a coma-shifted centroid that made catalog matching miss —
+        which shape cannot rule out.
+        """
+        src = self._edge_candidate(1.1, 50.0)
+        src["_from_subtraction"] = False
+        assert ad._survives_edge_zone(src) is False
+
+    async def test_a_round_strong_edge_candidate_is_reported_in_covered_sky(self):
+        source = self._edge_candidate(1.1, 50.0)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "UNKNOWN"
+
+    async def test_a_round_strong_edge_candidate_is_reported_in_uncovered_sky(self):
+        source = self._edge_candidate(1.1, 50.0)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": []}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "UNKNOWN"
+
+    async def test_an_elongated_edge_candidate_is_still_suppressed(self):
+        """The 2026-08-10 coma flood must stay suppressed."""
+        source = self._edge_candidate(3.0, 50.0)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+
 class TestFastMoverWideCone:
     """
     Audit 2026-08-18, finding H3: the wide "did this used to be somewhere

@@ -900,13 +900,23 @@ entry at all, at any position).
 7. Returns `{"performed": bool, "reference_frame_count": int, "candidates": [...]}`. Every
    candidate is tagged `_from_subtraction=True` so `anomaly_detector.py` can apply looser
    coverage rules to it (see below). Candidates whose pixel position falls within the
-   `EDGE_MARGIN_FRAC` zone are **rejected outright** (not returned in `candidates` at all) —
-   coma and other off-axis aberrations change the PSF shape between frames (rotation, guiding,
-   focus shift), so the median reference stack never perfectly cancels an edge star's coma wing;
-   the resulting residual is picked up by `sep` as a spurious "new source". Real incident,
-   2026-08-10 analysis: 53 of 80 `UNKNOWN` alerts were `from_subtraction + near_edge` — every
-   one a coma residual of an ordinary catalogued star. Candidates surviving this filter still
-   carry `near_edge=False` (by construction — the only ones left are interior).
+   `EDGE_MARGIN_FRAC` zone are held to a much higher bar: they survive only if they are both
+   round (`elongation ≤ SUBTRACTION_EDGE_ELONGATION_MAX`) and strong
+   (`snr ≥ SUBTRACTION_EDGE_SNR_MIN`). Coma and other off-axis aberrations change the PSF shape
+   between frames (rotation, guiding, focus shift), so the median reference stack never perfectly
+   cancels an edge star's coma wing and `sep` picks the leftover up as a spurious "new source" —
+   real incident, 2026-08-10 analysis: 53 of 80 `UNKNOWN` alerts were
+   `from_subtraction + near_edge`, every one a coma residual of an ordinary catalogued star.
+   Rejecting the whole zone outright (the earlier behaviour) also meant a genuine transient
+   landing near the edge — routine under a dithering pattern — could never be found by
+   subtraction at all (audit 2026-08-18, finding H11). What separates the two is shape and
+   strength, not position: an aberration stretches a PSF into an arc, and it is the *mismatch*
+   between two such arcs that fails to cancel, so a residual is elongated and usually weak. Both
+   bars are deliberately stricter than their whole-frame equivalents, because this is where the
+   false positives concentrate. `modules/anomaly_detector/_classify.py` re-applies the identical
+   test in `_survives_edge_zone()` rather than trusting this one — the standalone
+   `DETECT_ANOMALIES` path reconstructs its sources from the API and may carry rows an earlier,
+   looser revision wrote.
 
 Gracefully skipped (`performed=False`) when fewer than `SUBTRACTION_MIN_FRAMES` archived frames
 exist yet — e.g. the very first observations of a new target.
@@ -1130,9 +1140,9 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | Situation | Classification |
 |---|---|
 | Unmatched (`catalog_name is None`) and `saturated=True` | Suppressed — `return None`, no anomaly record at all (bright-star/subtraction artifact, not a real transient; see docs/ISSUES.md #1, #2) |
-| Unmatched (`catalog_name is None`) and `near_edge=True` | Suppressed — `return None` (coma shifts the measured centroid away from the star's true catalog position, making catalog matching miss it; these are overwhelmingly ordinary stars with optical distortion, not real transients — real incident, 2026-08-10: 27 of 80 UNKNOWN alerts were non-subtraction near_edge sources) |
+| Unmatched (`catalog_name is None`) and `near_edge=True` | Suppressed — `return None` (coma shifts the measured centroid away from the star's true catalog position, making catalog matching miss it; these are overwhelmingly ordinary stars with optical distortion, not real transients — real incident, 2026-08-10: 27 of 80 UNKNOWN alerts were non-subtraction near_edge sources). **Exempt**: a subtraction candidate that is round and strong (`_survives_edge_zone()` — the same `SUBTRACTION_EDGE_ELONGATION_MAX`/`SUBTRACTION_EDGE_SNR_MIN` bar `modules/subtraction.py` applies at extraction). It is not the shape an aberration residual takes, and unlike an ordinary detection it carries pixel-level evidence that nothing was there before (audit 2026-08-18, finding H11) |
 | No historical coverage | `FIRST_OBSERVATION` — not an anomaly, just note |
-| No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction already filters edge candidates at extraction time) |
+| No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction applies the same test at extraction time), **unless** it is round and strong per `_survives_edge_zone()` |
 | No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is not None` | Suppressed — `return None` (a known catalog object — most likely an ordinary astroalign registration residual near it, not a real transient; see "camera rotation" below. Real incident, 2026-08-14, source_id `6a7cfbae64e706.89320404`, a Gaia DR3 star — this branch used to ignore `catalog_name` entirely) |
 | No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is None` | `UNKNOWN` → **ALERT** (subtraction already confirms it's absent from the reference stack, so missing API coverage doesn't downgrade it) |
 | Area covered, source not in history at all, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (new point source, no baseline to compare against) |

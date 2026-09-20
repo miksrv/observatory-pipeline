@@ -929,16 +929,30 @@ def _detect_diff_sources(
                 or obj_y < margin_y or obj_y > height - margin_y
             )
 
-            # Skip candidates in the edge zone — coma and other off-axis
-            # aberrations change the PSF shape between frames (rotation,
-            # guiding drift, focus shift), so the median reference stack
-            # never perfectly cancels an edge star's coma wing.  The
-            # resulting non-zero residual is picked up by sep as a
-            # "new source", but it is a purely optical artifact, not a real
-            # transient.  Real incident, 2026-08-10 analysis: 53 of 80
-            # UNKNOWN alerts were from_subtraction + near_edge — every one
-            # of them a coma residual of an ordinary catalogued star.
-            if near_edge:
+            elongation = a_axis / b_axis
+
+            # Candidates in the edge zone are held to a much higher bar.
+            # Coma and the other off-axis aberrations change the PSF shape
+            # between frames (rotation, guiding drift, focus shift), so the
+            # median reference stack never perfectly cancels an edge star's
+            # coma wing, and sep picks the leftover up as a "new source" —
+            # a purely optical artifact. Real incident, 2026-08-10 analysis:
+            # 53 of 80 UNKNOWN alerts were from_subtraction + near_edge,
+            # every one a coma residual of an ordinary catalogued star.
+            #
+            # Rejecting the whole zone outright — the previous behaviour —
+            # also meant a genuine transient landing near the edge, which a
+            # dithering pattern makes routine, could never be found by
+            # subtraction at all (audit 2026-08-18, finding H11). What
+            # separates the two is shape and strength, not position: an
+            # aberration stretches a PSF into an arc, and it is the mismatch
+            # between two such arcs that fails to cancel, so a coma residual
+            # is elongated and usually weak. A round, strong residual is not
+            # that shape.
+            if near_edge and not (
+                elongation <= config.SUBTRACTION_EDGE_ELONGATION_MAX
+                and snr >= config.SUBTRACTION_EDGE_SNR_MIN
+            ):
                 n_rejected_edge += 1
                 continue
 
@@ -948,16 +962,19 @@ def _detect_diff_sources(
                 "flux":       flux,
                 "snr":        snr,
                 "fwhm":       fwhm,
-                "elongation": a_axis / b_axis,
+                "elongation": elongation,
                 "near_edge":  near_edge,
             })
 
         if n_rejected_edge:
             logger.info(
                 "Subtraction: rejected %d candidate(s) in the edge zone "
-                "(EDGE_MARGIN_FRAC=%.2f) — likely coma/aberration residuals, "
+                "(EDGE_MARGIN_FRAC=%.2f) for being elongated beyond %.2f or "
+                "weaker than SNR %.1f — likely coma/aberration residuals, "
                 "not real transients",
                 n_rejected_edge, config.EDGE_MARGIN_FRAC,
+                config.SUBTRACTION_EDGE_ELONGATION_MAX,
+                config.SUBTRACTION_EDGE_SNR_MIN,
             )
 
         if n_rejected_sharp:

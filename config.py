@@ -359,6 +359,28 @@ SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG
 # SUBTRACTION_MIN_FRAMES, the unscreened set is used instead.
 SUBTRACTION_REF_MAX_FWHM_RATIO: float = float(_get("SUBTRACTION_REF_MAX_FWHM_RATIO", "1.5"))
 
+# --- Edge-zone diff candidates ---------------------------------------------
+# Every candidate in the EDGE_MARGIN_FRAC zone used to be dropped outright, on
+# the strength of a real incident (2026-08-10: 53 of 80 UNKNOWN alerts were
+# from_subtraction + near_edge, every one a coma residual of an ordinary
+# catalogued star). But that also means a genuine transient landing near the
+# edge — which a dithered sequence makes routine — can never be found by
+# subtraction at all (audit 2026-08-18, finding H11).
+#
+# These two settings replace the blanket rejection with the property that
+# actually separates the two. Coma and the other off-axis aberrations stretch
+# a PSF into an arc, and it is the *mismatch* between two such arcs that the
+# median stack fails to cancel, so a coma residual is elongated and usually
+# weak. A round, strong residual at the edge is not that shape at all.
+#
+# Both bars are deliberately stricter than their whole-frame equivalents:
+# STAR_ELONGATION_MAX allows 1.5 anywhere in the frame, and detection itself
+# only asks for SUBTRACTION_DETECT_SIGMA. In the edge zone, where the false
+# positives concentrate, a candidate has to be clearly better than merely
+# acceptable to be worth reporting.
+SUBTRACTION_EDGE_ELONGATION_MAX: float = float(_get("SUBTRACTION_EDGE_ELONGATION_MAX", "1.3"))
+SUBTRACTION_EDGE_SNR_MIN: float = float(_get("SUBTRACTION_EDGE_SNR_MIN", "10.0"))
+
 # ---------------------------------------------------------------------------
 # Photometry — sensor gain
 # ---------------------------------------------------------------------------
@@ -691,6 +713,8 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_DETECT_SIGMA": float,
     "SUBTRACTION_PREROTATE_MIN_DEG": float,
     "SUBTRACTION_REF_MAX_FWHM_RATIO": float,
+    "SUBTRACTION_EDGE_ELONGATION_MAX": float,
+    "SUBTRACTION_EDGE_SNR_MIN": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
     "FORCED_PHOTOMETRY_MAG_LIMIT": float,
