@@ -291,6 +291,24 @@ class TestSimbadMatching:
 
         assert result == []
 
+    def test_simbad_radius_covers_the_frame_diagonal(self):
+        """
+        Audit 2026-08-18, finding H2: Simbad was the one catalog querying a
+        circle inscribed in the frame (fov_deg / 2) rather than one covering
+        its corners, leaving ~29% of a square frame's area never searched for
+        named objects — and a named object missed there loses the OTYPE every
+        VARIABLE_STAR/BINARY_STAR/SUPERNOVA_CANDIDATE branch gates on.
+        """
+        with patch("modules.catalog_matcher._simbad.Simbad") as mock_simbad_cls:
+            instance = MagicMock()
+            instance.query_region.return_value = None
+            mock_simbad_cls.return_value = instance
+
+            cm._query_simbad(_RA, _DEC, 1.0)
+
+        radius = instance.query_region.call_args.kwargs["radius"]
+        assert radius.to(u.deg).value == pytest.approx(math.sqrt(2) / 2.0)
+
     def test_simbad_error_returns_empty_list(self):
         """If Simbad query raises, _query_simbad returns [] with no crash."""
         with patch("modules.catalog_matcher._simbad.Simbad") as mock_simbad_cls:

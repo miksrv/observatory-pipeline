@@ -7,6 +7,7 @@ Internal helpers only — not part of this package's public surface.
 from __future__ import annotations
 
 import logging
+import math
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
@@ -21,7 +22,18 @@ logger = logging.getLogger(__name__)
 
 def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[dict]:
     """
-    Query Simbad for all named objects within fov_deg/2 of the frame centre.
+    Query Simbad for all named objects within the frame's half-diagonal of its
+    centre.
+
+    The radius is `fov_deg × sqrt(2)/2`, the same strategy Gaia/2MASS/Pan-STARRS
+    already use: `fov_deg` is the frame's larger dimension, so for any aspect
+    ratio the half-diagonal is at most that, and the circle covers every corner.
+    A plain `fov_deg / 2` — this catalog's own radius until the 2026-08-18 audit
+    (finding H2) — inscribes a circle in the frame instead, leaving the corner
+    regions (up to ~29% of a square frame's area) never queried. A named object
+    there falls through to Gaia's generic `object_type="STAR"` and permanently
+    loses the ability to trigger VARIABLE_STAR/BINARY_STAR/SUPERNOVA_CANDIDATE,
+    every one of which gates on a real Simbad OTYPE.
 
     Returns a list of dicts with keys: ra, dec, main_id, otype.
     Returns [] on any error or when Simbad returns None.
@@ -36,7 +48,7 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
         simbad.add_votable_fields("otype")
 
         coord = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
-        radius = (fov_deg / 2.0) * u.deg
+        radius = (fov_deg * math.sqrt(2) / 2.0) * u.deg
         result = simbad.query_region(coord, radius=radius)
 
         if result is None:
