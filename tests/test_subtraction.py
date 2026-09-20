@@ -275,8 +275,10 @@ class TestAlignFrame:
         result = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
 
         assert result is not None
-        assert result.shape == (5, 5)
-        assert result.dtype == np.float32
+        aligned, footprint = result
+        assert aligned.shape == (5, 5)
+        assert aligned.dtype == np.float32
+        assert footprint is None
 
     def test_align_failure_returns_none(self, monkeypatch):
         import astroalign
@@ -289,6 +291,96 @@ class TestAlignFrame:
         result = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Footprint handling in the median stack — audit 2026-08-18, finding H8
+# ---------------------------------------------------------------------------
+
+class TestAlignmentFootprint:
+    """
+    astroalign's second return value marks the target pixels it could NOT
+    fill from the source frame — the band a shift or rotation leaves empty,
+    the region outside a smaller sensor's field. It was discarded, so those
+    non-measurements entered the median stack and produced residuals in the
+    difference image that none of the saturation/streak/near_edge filters
+    are looking for.
+    """
+
+    def test_footprint_is_returned_when_astroalign_supplies_one(self, monkeypatch):
+        import astroalign
+        fake_aligned = np.zeros((5, 5), dtype=np.float64)
+        fake_footprint = np.zeros((5, 5), dtype=bool)
+        fake_footprint[0, :] = True
+        monkeypatch.setattr(
+            astroalign, "register",
+            lambda source, target: (fake_aligned, fake_footprint),
+        )
+
+        aligned, footprint = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
+
+        assert footprint is not None
+        assert footprint.dtype == bool
+        assert footprint[0, 0] is np.True_ or bool(footprint[0, 0]) is True
+
+    def test_a_mismatched_footprint_is_ignored(self, monkeypatch):
+        """Anything that isn't a usable mask of the right shape is dropped."""
+        import astroalign
+        monkeypatch.setattr(
+            astroalign, "register",
+            lambda source, target: (np.zeros((5, 5)), np.zeros((3, 3), dtype=bool)),
+        )
+
+        _, footprint = subtraction._align_frame(np.ones((3, 3)), np.ones((5, 5)))
+
+        assert footprint is None
+
+    def test_uncovered_values_are_excluded_from_the_median(self):
+        """
+        Two references hold 100 at a pixel; the third holds a wild
+        extrapolated value there but declares it uncovered. The median must
+        come out at 100, not be dragged by the value that isn't a measurement.
+        """
+        stack = np.stack([
+            np.full((4, 4), 100.0, dtype=np.float32),
+            np.full((4, 4), 100.0, dtype=np.float32),
+            np.full((4, 4), 9000.0, dtype=np.float32),
+        ])
+        fp = np.zeros((4, 4), dtype=bool)
+        fp[1, 1] = True
+        new_data = np.full((4, 4), 100.0, dtype=np.float32)
+
+        reference = subtraction._median_reference(stack, [None, None, fp], new_data)
+
+        assert reference[1, 1] == pytest.approx(100.0)
+        # Elsewhere the third frame still counts, so the median rises.
+        assert reference[0, 0] == pytest.approx(100.0)
+
+    def test_a_pixel_no_reference_covers_holds_the_difference_at_zero(self):
+        stack = np.stack([
+            np.full((4, 4), 5000.0, dtype=np.float32),
+            np.full((4, 4), 5000.0, dtype=np.float32),
+        ])
+        fp = np.zeros((4, 4), dtype=bool)
+        fp[2, 2] = True
+        new_data = np.full((4, 4), 100.0, dtype=np.float32)
+
+        reference = subtraction._median_reference(stack, [fp, fp.copy()], new_data)
+
+        assert reference[2, 2] == pytest.approx(new_data[2, 2])
+        assert (new_data - reference)[2, 2] == pytest.approx(0.0)
+
+    def test_no_footprints_at_all_is_a_plain_median(self):
+        stack = np.stack([
+            np.full((3, 3), 10.0, dtype=np.float32),
+            np.full((3, 3), 20.0, dtype=np.float32),
+            np.full((3, 3), 30.0, dtype=np.float32),
+        ])
+        new_data = np.zeros((3, 3), dtype=np.float32)
+
+        reference = subtraction._median_reference(stack, [None, None, None], new_data)
+
+        assert np.allclose(reference, 20.0)
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +1083,7 @@ class TestReferenceNormalizationInRun:
 
         monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ref_paths)
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
-        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: s)
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (s, None))
 
         captured: dict = {}
 
@@ -1057,7 +1149,7 @@ class TestReferenceNormalizationInRun:
 
         monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ref_paths)
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
-        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: s)
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (s, None))
         monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path, wcs=None: 1.0)
 
         captured: dict = {}
@@ -1121,7 +1213,7 @@ class TestRun:
 
         def fake_align(source, target):
             assert source.shape == ref_shape  # the differently-shaped ref was actually passed through
-            return np.ones(target.shape, dtype=np.float32)
+            return np.ones(target.shape, dtype=np.float32), None
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
@@ -1158,7 +1250,7 @@ class TestRun:
             lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
-        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.ones(shape, dtype=np.float32), None))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
             lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
@@ -1200,7 +1292,7 @@ class TestRun:
             subtraction, "_load_frame_data",
             lambda p: new_data if p.endswith("new.fits") else np.full(shape, 100.0, dtype=np.float32),
         )
-        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.full(shape, 100.0, dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.full(shape, 100.0, dtype=np.float32), None))
         # Force the fixed-pixel dilation fallback (no WCS lookup in this test).
         monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path, wcs=None: None)
 
@@ -1227,7 +1319,7 @@ class TestRun:
             lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.full(shape, 100.0, dtype=np.float32))
-        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.full(shape, 100.0, dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.full(shape, 100.0, dtype=np.float32), None))
 
         captured: dict = {}
 
@@ -1258,7 +1350,7 @@ class TestRun:
             lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
-        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones(shape, dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.ones(shape, dtype=np.float32), None))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
             lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [{"x": 5.0, "y": 5.0, "flux": 100.0, "snr": 8.0, "fwhm": 2.5, "elongation": 1.1}],
@@ -1307,7 +1399,7 @@ class TestRun:
             return np.ones((10, 10), dtype=np.float32)
 
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
-        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: np.ones((10, 10), dtype=np.float32))
+        monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.ones((10, 10), dtype=np.float32), None))
         monkeypatch.setattr(
             subtraction, "_detect_diff_sources",
             lambda diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None: [],
@@ -1364,7 +1456,7 @@ class TestRun:
 
         def fake_align(source, target):
             align_calls.append(source)
-            return np.ones((10, 10), dtype=np.float32)
+            return np.ones((10, 10), dtype=np.float32), None
 
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
         monkeypatch.setattr(

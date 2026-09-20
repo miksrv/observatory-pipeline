@@ -455,20 +455,103 @@ def _flux_scale_factor(
 # Image alignment
 # ---------------------------------------------------------------------------
 
-def _align_frame(source: np.ndarray, target: np.ndarray) -> Optional[np.ndarray]:
+def _align_frame(
+    source: np.ndarray,
+    target: np.ndarray,
+) -> Optional[tuple[np.ndarray, Optional[np.ndarray]]]:
     """
     Align *source* onto *target* pixel grid using astroalign triangle matching.
 
-    Returns the aligned array as float32, or None if alignment fails (e.g.
-    too few stars detected — common for sparse or heavily trailed fields).
+    Returns ``(aligned, footprint)`` — the aligned array as float32, plus
+    astroalign's own boolean footprint marking the pixels it could NOT fill
+    from the source frame (True = no information there) — or None if alignment
+    fails (e.g. too few stars detected, common for sparse or heavily trailed
+    fields).
+
+    The footprint used to be discarded (audit 2026-08-18, finding H8). It
+    matters because the geometric transform almost never maps the reference
+    exactly onto the new frame's grid: a shift, a rotation, or a different
+    sensor size all leave a band of target pixels with no source data behind
+    them. Whatever astroalign puts there is not a measurement, and letting it
+    into the median stack produces a residual in the difference image that no
+    downstream filter is looking for — the saturation, streak and near_edge
+    filters all address something else.
+
+    `footprint` is None when astroalign returned something that isn't a usable
+    boolean mask of the right shape; the caller then treats every pixel of
+    that reference as valid, i.e. exactly the previous behaviour.
     """
     try:
         import astroalign
-        aligned, _ = astroalign.register(source, target)
-        return np.asarray(aligned, dtype=np.float32)
+        aligned, footprint = astroalign.register(source, target)
+        aligned_arr = np.asarray(aligned, dtype=np.float32)
+
+        mask: Optional[np.ndarray] = None
+        if footprint is not None:
+            candidate = np.asarray(footprint)
+            if candidate.shape == aligned_arr.shape:
+                mask = candidate.astype(bool)
+
+        return aligned_arr, mask
     except Exception as exc:
         logger.debug("astroalign failed: %s", exc)
         return None
+
+
+def _median_reference(
+    stack: np.ndarray,
+    footprints: list[Optional[np.ndarray]],
+    new_data: np.ndarray,
+) -> np.ndarray:
+    """
+    Per-pixel median of the aligned reference stack, ignoring pixels each
+    reference had no data for.
+
+    astroalign's footprint marks the target pixels it could not fill from the
+    source frame — the band a shift or rotation leaves empty, or the region
+    outside a smaller sensor's field. Those values are not measurements, and
+    averaging them into the reference puts a step into the difference image
+    that reads as a bright residual (audit 2026-08-18, finding H8).
+
+    A pixel no reference covered at all has no reference value to speak of, so
+    it takes the new frame's own value: the difference there is then exactly
+    zero and nothing can be detected in it. The alternative — leaving it at
+    whatever the stack happened to hold — is precisely the false residual this
+    is avoiding.
+
+    Falls back to a plain median when no reference supplied a footprint, i.e.
+    the behaviour before footprints were kept.
+    """
+    if not any(fp is not None for fp in footprints):
+        return np.median(stack, axis=0).astype(np.float32)
+
+    invalid = np.zeros(stack.shape, dtype=bool)
+    for i, fp in enumerate(footprints):
+        if fp is not None and fp.shape == stack.shape[1:]:
+            invalid[i] = fp
+
+    n_invalid = int(invalid.sum())
+    if n_invalid:
+        logger.info(
+            "Subtraction: excluding %d uncovered pixel value(s) across %d "
+            "reference frame(s) from the median stack",
+            n_invalid, stack.shape[0],
+        )
+
+    masked = np.ma.masked_array(stack, mask=invalid)
+    median = np.ma.median(masked, axis=0)
+
+    uncovered = np.ma.getmaskarray(median)
+    reference = np.ma.filled(median, 0.0).astype(np.float32)
+    if uncovered.any():
+        logger.info(
+            "Subtraction: %d pixel(s) have no valid reference at all — the "
+            "difference image is held at zero there",
+            int(uncovered.sum()),
+        )
+        reference[uncovered] = new_data[uncovered]
+
+    return reference
 
 
 # ---------------------------------------------------------------------------
@@ -1182,6 +1265,7 @@ async def run(
         )
 
     aligned: list[np.ndarray] = []
+    footprints: list[Optional[np.ndarray]] = []
     scales: list[float] = []
     for ref_path in archive_files:
         ref_data = _load_frame_data(ref_path)
@@ -1204,9 +1288,11 @@ async def run(
         # the case it exists to handle. _align_frame()'s own try/except below
         # still catches genuine alignment failures (too few common stars,
         # no overlapping field, etc.).
-        result_frame = _align_frame(ref_data, new_data)
-        if result_frame is not None:
+        result = _align_frame(ref_data, new_data)
+        if result is not None:
+            result_frame, footprint = result
             aligned.append(result_frame)
+            footprints.append(footprint)
             # Kept alongside rather than applied to `result_frame` itself:
             # _build_saturation_mask() below compares the aligned references
             # against SATURATION_ADU, and a scaled-down reference's saturated
@@ -1248,7 +1334,7 @@ async def run(
                 len(extreme), len(scales), _FLUX_SCALE_WARN_FACTOR,
                 max(extreme, key=lambda s: abs(math.log(s))),
             )
-    reference = np.median(stack, axis=0).astype(np.float32)
+    reference = _median_reference(stack, footprints, new_data)
     diff = new_data - reference
 
     # ------------------------------------------------------------------
