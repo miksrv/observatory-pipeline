@@ -516,6 +516,21 @@ PHOTOMETRY_REF_MAX_RUWE: float = float(_get("PHOTOMETRY_REF_MAX_RUWE", "1.4"))
 # (audit 2026-08-18, finding H7). 3 sigma is the conventional cut.
 PHOTOMETRY_SKY_SIGMA_CLIP: float = float(_get("PHOTOMETRY_SKY_SIGMA_CLIP", "3.0"))
 
+# --- Minimum significance for a calibrated magnitude -----------------------
+# Aperture photometry ran for any source whose net flux came out positive,
+# however marginally, and the resulting magnitude then travelled onward with
+# nothing to say how little it meant. A source at the detection limit produces
+# a number that can wander past DELTA_MAG_ALERT on noise alone (audit
+# 2026-08-18, finding M6).
+#
+# Below this significance the aperture measurement is still reported —
+# flux_aperture, flux_err, snr and mag_instrumental are real measurements and
+# an operator may want them — but mag_calibrated stays None and `calibrated`
+# stays False, so `mag` is None and no Δmag branch can fire on it. 3 sigma
+# matches FORCED_PHOTOMETRY_MIN_SNR, which draws the same line for the same
+# reason on the other detection path.
+PHOTOMETRY_MIN_SNR: float = float(_get("PHOTOMETRY_MIN_SNR", "3.0"))
+
 # ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
 # ---------------------------------------------------------------------------
@@ -748,6 +763,7 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_COLOR_TERM_MAX": float,
     "PHOTOMETRY_REF_MAX_RUWE": float,
     "PHOTOMETRY_SKY_SIGMA_CLIP": float,
+    "PHOTOMETRY_MIN_SNR": float,
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
     "API_RECOVERY_MAX_ATTEMPTS": int,

@@ -793,6 +793,58 @@ class TestColorTerm:
 
 
 # ---------------------------------------------------------------------------
+# Minimum significance for a calibrated magnitude — audit 2026-08-18, M6
+# ---------------------------------------------------------------------------
+
+class TestMinimumSignificance:
+    """
+    The only condition on measuring a source was that its net flux came out
+    positive, however marginally, and the magnitude then travelled onward with
+    nothing to say how little it meant — a source at the detection limit
+    produces a number that wanders past DELTA_MAG_ALERT on noise alone.
+    """
+
+    async def test_a_marginal_measurement_is_not_calibrated(self):
+        srcs = _make_gaia_sources(n=5, catalog_mag=14.0)
+        # A small but positive net flux against a large sky sigma:
+        # significance far below 3, yet a real measurement.
+        with _patch_photometry(aperture_sum=1200.0, annulus_sky_per_px=10.0, sky_sigma=200.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        measured = [s for s in result if s["snr"] is not None]
+        assert measured, "expected the aperture measurement to still run"
+        assert all(s["snr"] < config.PHOTOMETRY_MIN_SNR for s in measured)
+        assert all(s["calibrated"] is False for s in measured)
+        assert all(s["mag_calibrated"] is None for s in measured)
+
+    async def test_the_aperture_numbers_are_still_reported(self):
+        """They are real measurements, and an operator may want them."""
+        srcs = _make_gaia_sources(n=5, catalog_mag=14.0)
+        with _patch_photometry(aperture_sum=1200.0, annulus_sky_per_px=10.0, sky_sigma=200.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert all(s["flux_aperture"] is not None for s in result)
+        assert all(s["mag_instrumental"] is not None for s in result)
+        assert all(s["snr"] is not None for s in result)
+
+    async def test_a_significant_measurement_is_calibrated_as_before(self):
+        srcs = _make_gaia_sources(n=5, catalog_mag=14.0)
+        with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert all(s["calibrated"] is True for s in result)
+
+    async def test_the_threshold_is_configurable(self, monkeypatch):
+        monkeypatch.setattr(config, "PHOTOMETRY_MIN_SNR", 0.0)
+        srcs = _make_gaia_sources(n=5, catalog_mag=14.0)
+
+        with _patch_photometry(aperture_sum=1200.0, annulus_sky_per_px=10.0, sky_sigma=200.0):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert all(s["calibrated"] is True for s in result)
+
+
+# ---------------------------------------------------------------------------
 # Sky annulus sigma-clipping — audit 2026-08-18, finding H7
 # ---------------------------------------------------------------------------
 

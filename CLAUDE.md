@@ -830,6 +830,13 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   merged in at `pipeline.py` step 7 carries one before this step runs — with the real
   aperture-photometry-derived value, so every source's `snr` in the API payload is computed the
   same way regardless of origin.
+- A measurement below `PHOTOMETRY_MIN_SNR` keeps its aperture numbers (`flux_aperture`,
+  `flux_err`, `snr`, `mag_instrumental` are real and an operator may want them) but is left
+  **uncalibrated**: `mag_calibrated` stays `None` and `calibrated` `False`, so `pipeline.py`'s
+  `mag` is `None` and no Δmag branch can fire on it. The only condition before was `net_flux > 0`,
+  so a source at the detection limit produced a magnitude that travelled onward with nothing to
+  say how little it meant, and could cross `DELTA_MAG_ALERT` on noise alone (audit 2026-08-18,
+  finding M6). 3.0 is the same line `FORCED_PHOTOMETRY_MIN_SNR` draws on the other detection path.
 - A source carrying `saturated=True` (set by `astrometry.solve()`) is never measured — all of the
   fields above stay `None` for it, exactly as for an out-of-bounds source. Saturated sources are
   also excluded from the Gaia DR3 reference set used to compute the frame's zero-point, so one

@@ -579,7 +579,11 @@ async def measure(
                                             pixel-space estimate) with this
                                             frame's real aperture-photometry
                                             measurement
-        calibrated          bool           True when zero_point was applied
+        calibrated          bool           True when zero_point was applied.
+                                            False for a measurement below
+                                            config.PHOTOMETRY_MIN_SNR, whose
+                                            aperture numbers are still
+                                            reported
         edge_flag           bool           True when centroid is within 10 px of edge
         zero_point          float | None   frame-level ZP (same for all sources)
         zero_point_err      float | None   robust scatter of the reference
@@ -889,6 +893,7 @@ async def measure(
     zero_point     = solution.zero_point
     zero_point_err = solution.zero_point_err
     n_color_corrected = 0
+    n_below_snr = 0
 
     for out in output:
         out["zero_point"]     = zero_point
@@ -901,7 +906,24 @@ async def measure(
         out["_color_ref"]     = solution.color_ref
         out["_color_scatter"] = solution.color_scatter
 
-        if zero_point is not None and out["mag_instrumental"] is not None:
+        # A measurement too insignificant to be a measurement. The aperture
+        # numbers stay — flux_aperture, flux_err, snr and mag_instrumental are
+        # real, and an operator may want them — but a magnitude derived from
+        # flux at the noise level would travel onward with nothing to say how
+        # little it means, and can cross DELTA_MAG_ALERT on noise alone (audit
+        # 2026-08-18, finding M6). Same line FORCED_PHOTOMETRY_MIN_SNR draws
+        # on the other detection path, for the same reason.
+        snr = out.get("snr")
+        significant = True
+        if snr is not None:
+            try:
+                significant = float(snr) >= config.PHOTOMETRY_MIN_SNR
+            except (TypeError, ValueError):
+                significant = True
+        if not significant:
+            n_below_snr += 1
+
+        if significant and zero_point is not None and out["mag_instrumental"] is not None:
             color = out.get("_catalog_color")
             try:
                 color_f = float(color) if color is not None else None
@@ -940,6 +962,13 @@ async def measure(
         else:
             out["mag_calibrated"] = None
             out["calibrated"]     = False
+
+    if n_below_snr:
+        logger.info(
+            "photometry: %d/%d source(s) measured below SNR %.1f — reported "
+            "with their aperture flux but left uncalibrated  file=%s",
+            n_below_snr, len(output), config.PHOTOMETRY_MIN_SNR, fits_filename,
+        )
 
     if solution.color_term:
         logger.info(
