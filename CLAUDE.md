@@ -1230,7 +1230,7 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 
 | Situation | Classification |
 |---|---|
-| Unmatched (`catalog_name is None`) and `saturated=True` | Suppressed — `return None`, no anomaly record at all (bright-star/subtraction artifact, not a real transient; see docs/ISSUES.md #1, #2) |
+| Unmatched (`catalog_name is None`) and `saturated=True` | Suppressed — `return None`, no anomaly record at all (bright-star/subtraction artifact, not a real transient; see docs/ISSUES.md #1, #2). **Exempt**: a source that is round (`elongation ≤ STAR_ELONGATION_MAX`), interior, and has no history at all at a position prior frames *did* cover — `_could_be_a_new_bright_object()`. A nova or fireball has no catalog match by definition and saturates if it matters at all, so an unconditional rule could never report one (audit 2026-08-18, finding M4). It falls through to the ordinary `UNKNOWN` alert, with no usable magnitude |
 | Unmatched (`catalog_name is None`) and `near_edge=True` | Suppressed — `return None` (coma shifts the measured centroid away from the star's true catalog position, making catalog matching miss it; these are overwhelmingly ordinary stars with optical distortion, not real transients — real incident, 2026-08-10: 27 of 80 UNKNOWN alerts were non-subtraction near_edge sources). **Exempt**: a subtraction candidate that is round and strong (`_survives_edge_zone()` — the same `SUBTRACTION_EDGE_ELONGATION_MAX`/`SUBTRACTION_EDGE_SNR_MIN` bar `modules/subtraction.py` applies at extraction). It is not the shape an aberration residual takes, and unlike an ordinary detection it carries pixel-level evidence that nothing was there before (audit 2026-08-18, finding H11) |
 | No historical coverage | `FIRST_OBSERVATION` — not an anomaly, just note |
 | No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction applies the same test at extraction time), **unless** it is round and strong per `_survives_edge_zone()` |
@@ -1308,7 +1308,17 @@ filtering out the aberration.
 The saturated-artifact suppression is deliberately scoped to `catalog_name is None`: a saturated
 source that *is* MPC- or Simbad-matched (a genuinely bright asteroid, a known star flaring) is a
 legitimate detection and is still classified normally — just without a usable `magnitude`, since
-`photometry.py` never measures a saturated source (see that module's section above).
+`photometry.py` never measures a saturated source (see that module's section above). Within that
+scope it is no longer unconditional: an unconditional rule could never report a nova or a
+fireball, which by definition has no catalog match yet and saturates if it is bright enough to
+matter at all. `_could_be_a_new_bright_object()` requires all of — round (`elongation ≤
+STAR_ELONGATION_MAX`; a diffraction spike or bleed trail is not), not `near_edge`, and no
+historical detection whatsoever at a position that prior frames *did* cover, since a spike
+belongs to a star present every night and "nothing was here" says nothing about sky never imaged.
+The exemption deliberately does **not** rest on `_from_subtraction`, which would otherwise be the
+natural evidence: `modules/subtraction.py` masks the vicinity of every saturated pixel out of the
+difference image, so a saturated transient never becomes a subtraction candidate in the first
+place.
 
 `SUPERNOVA_CANDIDATE` therefore has two independent triggers: a brand-new point source with no
 prior detection at all near a known galaxy, and an already-catalogued/known galaxy that

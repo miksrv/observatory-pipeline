@@ -1561,9 +1561,12 @@ class TestDetectSaturatedArtifacts:
 
         assert result == []
 
-    async def test_saturated_unmatched_covered_source_suppressed(self):
-        """Would otherwise be UNKNOWN — must be suppressed instead."""
-        source = _make_source(catalog_name=None, saturated=True)
+    async def test_a_spike_shaped_saturated_source_is_still_suppressed(self):
+        """
+        The artifact this suppression exists for: a diffraction spike or a
+        bleed trail off a bright star is elongated, not round.
+        """
+        source = _make_source(catalog_name=None, saturated=True, elongation=4.0)
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
@@ -1571,6 +1574,80 @@ class TestDetectSaturatedArtifacts:
         ):
             mock_sources.return_value = {"0": []}
             mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_a_saturated_source_with_history_is_still_suppressed(self):
+        """
+        A spike belongs to a star that is in the frame every night, so the
+        position has history. That is what tells it apart from something new.
+        """
+        source = _make_source(catalog_name=None, saturated=True, elongation=1.2)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [_make_hist_source()]}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_a_saturated_near_edge_source_is_still_suppressed(self):
+        source = _make_source(catalog_name=None, saturated=True, elongation=1.2, near_edge=True)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
+    async def test_a_round_new_bright_object_is_reported(self):
+        """
+        Audit 2026-08-18, finding M4: the suppression was unconditional and
+        structurally could not let a nova or a fireball through — by
+        definition such an object has no catalog match yet, and if it is
+        bright enough to matter it is bright enough to saturate.
+        """
+        source = _make_source(
+            catalog_name=None, saturated=True, elongation=1.1, source_id="src-nova-001",
+        )
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "UNKNOWN"
+        assert result[0]["source_id"] == "src-nova-001"
+
+    async def test_an_uncovered_area_still_suppresses_it(self):
+        """
+        "Nothing was ever here" says nothing about a patch of sky that was
+        never imaged.
+        """
+        source = _make_source(catalog_name=None, saturated=True, elongation=1.1)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": []}
 
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 

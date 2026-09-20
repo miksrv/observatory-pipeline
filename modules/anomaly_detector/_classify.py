@@ -30,6 +30,51 @@ logger = logging.getLogger(__name__)
 # Per-source classification (using prefetched data)
 # ---------------------------------------------------------------------------
 
+def _could_be_a_new_bright_object(
+    history: list[dict],
+    n_coverage: int,
+    near_edge: bool,
+    elongation: float,
+) -> bool:
+    """
+    Whether a saturated, uncatalogued detection has enough circumstantial
+    evidence to be a genuinely new bright object — a nova, a bright outburst,
+    a fireball — rather than the bright-star artifact such a detection almost
+    always is.
+
+    The suppression this qualifies was unconditional, and structurally could
+    not let such an object through: by definition it has no catalog match yet,
+    and if it is bright enough to matter it is bright enough to saturate
+    (audit 2026-08-18, finding M4). The exemption cannot lean on
+    `_from_subtraction` either, which would otherwise be the obvious evidence:
+    `modules/subtraction.py` masks the vicinity of every saturated pixel out
+    of the difference image, so a saturated transient never becomes a
+    subtraction candidate in the first place.
+
+    What is left is circumstantial, and all of it is required:
+
+    * **prior coverage, and nothing ever detected here.** A diffraction spike
+      or a bloomed column belongs to a star that is in the frame every night,
+      so the position has history. A genuinely new object does not — and the
+      area must have been imaged before, or "nothing was here" says nothing.
+    * **not near the frame edge**, where the aberrations that manufacture
+      spurious detections are worst.
+    * **star-like in shape.** A spike or a bleed trail is elongated; a real
+      point source, saturated or not, is round.
+
+    A source that qualifies still carries no usable magnitude —
+    `modules/photometry.py` never measures a saturated core — so it is
+    reported as an UNKNOWN alert for a human to look at, which is exactly what
+    a candidate nova warrants.
+    """
+    return (
+        not history
+        and n_coverage > 0
+        and not near_edge
+        and 0.0 < elongation <= config.STAR_ELONGATION_MAX
+    )
+
+
 def _delta_mag_noise(source: dict, same_filter_history: list[dict]) -> float | None:
     """
     How much this source's magnitude is expected to wander from measurement
@@ -199,6 +244,13 @@ def _classify_source_sync(
     history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
     n_history = len(history)
 
+    # Coverage is read here rather than in Priority 3 where it is mainly used:
+    # the saturated-artifact suppression below needs it too, to tell a bright
+    # object that genuinely was not there before from one that is there every
+    # night (audit 2026-08-18, finding M4).
+    coverage = coverage_by_tile.get(tile, [])
+    n_coverage = len(coverage)
+
     # ------------------------------------------------------------------
     # Priority 1 — MPC-matched moving objects
     # ------------------------------------------------------------------
@@ -239,14 +291,29 @@ def _classify_source_sync(
         # classified normally, just without a computed magnitude (see
         # photometry.py, which never measures a saturated source).
         if bool(source.get("saturated")):
-            logger.debug(
-                "Suppressed: saturated + uncatalogued detection ra=%.4f dec=%.4f "
-                "— treated as bright-star/subtraction artifact, not a real "
-                "transient (see docs/ISSUES.md #1, #2)",
-                ra, dec,
-                extra=extra,
-            )
-            return None
+            if _could_be_a_new_bright_object(history, n_coverage, near_edge, elongation):
+                # Falls through to the ordinary stationary-source path below,
+                # which reports it as an UNKNOWN alert — see
+                # _could_be_a_new_bright_object() for the evidence required
+                # and why a blanket suppression could never let a nova
+                # through.
+                logger.warning(
+                    "Saturated + uncatalogued detection at ra=%.4f dec=%.4f is "
+                    "round, interior, and has no history in %d covering "
+                    "frame(s) — classifying it rather than suppressing it as "
+                    "an artifact. Its magnitude is unmeasurable (saturated core)",
+                    ra, dec, n_coverage,
+                    extra=extra,
+                )
+            else:
+                logger.debug(
+                    "Suppressed: saturated + uncatalogued detection ra=%.4f dec=%.4f "
+                    "— treated as bright-star/subtraction artifact, not a real "
+                    "transient (see docs/ISSUES.md #1, #2)",
+                    ra, dec,
+                    extra=extra,
+                )
+                return None
 
         # Wide-cone (MOVING_CONE_ARCSEC) history — candidates for "this used
         # to be somewhere nearby". _is_position_shifted() itself gates on
@@ -378,10 +445,6 @@ def _classify_source_sync(
     # ------------------------------------------------------------------
     # Priority 3 — Stationary source classification
     # ------------------------------------------------------------------
-
-    # Get coverage from prefetched data
-    coverage = coverage_by_tile.get(tile, [])
-    n_coverage = len(coverage)
 
     # `history`/`n_history` (MATCH_CONE_ARCSEC cone) were already computed
     # above — needed regardless of catalog-match status: unmatched sources
