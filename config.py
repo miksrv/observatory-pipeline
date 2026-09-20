@@ -381,6 +381,24 @@ SUBTRACTION_REF_MAX_FWHM_RATIO: float = float(_get("SUBTRACTION_REF_MAX_FWHM_RAT
 SUBTRACTION_EDGE_ELONGATION_MAX: float = float(_get("SUBTRACTION_EDGE_ELONGATION_MAX", "1.3"))
 SUBTRACTION_EDGE_SNR_MIN: float = float(_get("SUBTRACTION_EDGE_SNR_MIN", "10.0"))
 
+# --- Correlated noise in the difference image ------------------------------
+# A candidate's significance was computed as flux / (rms * sqrt(npix)), which
+# assumes each pixel's noise is independent of its neighbours'. It is not: a
+# reference frame goes through one or two interpolation passes (the optional
+# pre-rotation, then astroalign's own resampling), and interpolation spreads
+# each input pixel's noise across several output pixels. The aperture then
+# holds fewer independent measurements than it holds pixels, so the real
+# significance is lower than the formula says — systematically, and worst
+# after a large pre-rotation (audit 2026-08-18, finding H13).
+#
+# The factor is measured from the frame's own difference image rather than
+# assumed, by comparing its per-pixel scatter against the scatter of a
+# box-averaged copy: for independent noise the second falls as 1/box, and
+# whatever it falls short of that is the correlation. This caps how large a
+# correction that measurement is allowed to produce; 1.0 disables it and
+# restores the previous formula exactly.
+SUBTRACTION_NOISE_CORR_MAX: float = float(_get("SUBTRACTION_NOISE_CORR_MAX", "4.0"))
+
 # ---------------------------------------------------------------------------
 # Photometry — sensor gain
 # ---------------------------------------------------------------------------
@@ -715,6 +733,7 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_REF_MAX_FWHM_RATIO": float,
     "SUBTRACTION_EDGE_ELONGATION_MAX": float,
     "SUBTRACTION_EDGE_SNR_MIN": float,
+    "SUBTRACTION_NOISE_CORR_MAX": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
     "FORCED_PHOTOMETRY_MAG_LIMIT": float,

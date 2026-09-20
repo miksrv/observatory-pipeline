@@ -885,7 +885,19 @@ entry at all, at any position).
    frame (audit 2026-08-18, finding H12). `modules/astrometry/_extraction.py` re-measures the same
    way, for the same reason: there the RMS is both the threshold's scale and the denominator of
    every source's SNR.
-5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry/_extraction.py`), since `sep.extract()` doesn't return a native `fwhm` field.
+5. Detects sources on the (masked) difference image via `sep.Background` + `sep.extract`, with
+   threshold `SUBTRACTION_DETECT_SIGMA × background_rms`. Each candidate's `snr` is
+   `flux / (rms × sqrt(npix) × noise_corr)` — that last factor because `rms × sqrt(npix)` is the
+   aperture noise only when neighbouring pixels' noise is independent, and interpolation makes it
+   otherwise: `astroalign` resamples every reference onto this frame's grid (and
+   `_prerotate_reference()` may interpolate once more before it), spreading each input pixel's
+   noise across several output ones, so the aperture holds fewer independent measurements than
+   pixels and the uncorrected figure overstates significance — worst exactly after a large
+   pre-rotation (audit 2026-08-18, finding H13). `_noise_correlation_factor()` measures it from
+   this frame's own difference image rather than assuming a value, by comparing its per-pixel
+   MAD scatter against that of a box-averaged copy (independent noise falls as `1/box`; whatever
+   it falls short of that is the correlation), capped by `SUBTRACTION_NOISE_CORR_MAX` — `1.0`
+   restores the previous formula. `fwhm`/`elongation` per candidate are derived from `sep`'s `a`/`b` second-moment axes (same Gaussian approximation as `modules/astrometry/_extraction.py`), since `sep.extract()` doesn't return a native `fwhm` field.
 5.5. Rejects any candidate whose `fwhm` is below `psf_fwhm_arcsec / 1.5` (converted to pixels via
    the frame's plate scale — same ratio `modules/astrometry/_extraction.py` uses for its own lower FWHM bound;
    see that module's section above), where `psf_fwhm_arcsec` is `pipeline.py`'s forwarded

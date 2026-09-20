@@ -672,6 +672,76 @@ class TestDetectDiffSources:
 # Uses real (unmocked) sep, same style as TestDetectDiffSources above.
 # ---------------------------------------------------------------------------
 
+class TestCorrelatedNoiseCorrection:
+    """
+    Audit 2026-08-18, finding H13: a candidate's significance was
+    flux / (rms * sqrt(npix)), which assumes each pixel's noise is
+    independent of its neighbours'. Astroalign's resampling — and the
+    optional pre-rotation before it — spreads each input pixel's noise across
+    several output pixels, so the aperture holds fewer independent
+    measurements than pixels and the figure overstates significance.
+    """
+
+    def _white(self, scale=5.0, size=(300, 300)):
+        rng = np.random.default_rng(0)
+        return rng.normal(0.0, scale, size)
+
+    def _correlated(self, scale=5.0, size=(300, 300)):
+        from scipy.ndimage import gaussian_filter
+        img = gaussian_filter(self._white(scale, size), sigma=1.2)
+        return img * (scale / img.std())
+
+    def _rms(self, img):
+        return 1.4826 * float(np.median(np.abs(img - np.median(img))))
+
+    def test_uncorrelated_noise_needs_no_correction(self):
+        img = self._white()
+        factor = subtraction._noise_correlation_factor(img, None, self._rms(img))
+
+        assert factor == pytest.approx(1.0, abs=0.1)
+
+    def test_correlated_noise_is_detected(self):
+        img = self._correlated()
+        factor = subtraction._noise_correlation_factor(img, None, self._rms(img))
+
+        assert factor > 1.5
+
+    def test_the_factor_is_capped(self, monkeypatch):
+        monkeypatch.setattr(config, "SUBTRACTION_NOISE_CORR_MAX", 1.5)
+        img = self._correlated()
+
+        factor = subtraction._noise_correlation_factor(img, None, self._rms(img))
+
+        assert factor == pytest.approx(1.5)
+
+    def test_a_cap_of_one_disables_the_correction(self, monkeypatch):
+        monkeypatch.setattr(config, "SUBTRACTION_NOISE_CORR_MAX", 1.0)
+        img = self._correlated()
+
+        assert subtraction._noise_correlation_factor(img, None, self._rms(img)) == 1.0
+
+    def test_too_small_an_image_returns_one(self):
+        img = self._white(size=(8, 8))
+
+        assert subtraction._noise_correlation_factor(img, None, self._rms(img)) == 1.0
+
+    def test_reported_snr_drops_on_a_correlated_diff_image(self, monkeypatch):
+        """
+        End to end: the same blob on the same per-pixel RMS must be reported
+        at a lower significance when the noise around it is correlated.
+        """
+        yy, xx = np.mgrid[0:300, 0:300]
+        blob = 400.0 * np.exp(-(((xx - 150) ** 2 + (yy - 150) ** 2) / (2 * 3.0 ** 2)))
+
+        white_snr = subtraction._detect_diff_sources(self._white() + blob)
+        corr_snr = subtraction._detect_diff_sources(self._correlated() + blob)
+
+        white_hit = next(c for c in white_snr if abs(c["x"] - 150) < 3)
+        corr_hit = next(c for c in corr_snr if abs(c["x"] - 150) < 3)
+
+        assert corr_hit["snr"] < white_hit["snr"]
+
+
 class TestBackgroundReMeasuredAfterStreakMasking:
     """
     Audit 2026-08-18, finding H12: the streak mask can only be found on an

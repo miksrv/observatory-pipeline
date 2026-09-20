@@ -805,6 +805,69 @@ def _build_streak_mask(
 # Difference-image source detection
 # ---------------------------------------------------------------------------
 
+_NOISE_CORR_BOX: int = 4
+
+
+def _noise_correlation_factor(
+    sub: np.ndarray,
+    mask: Optional[np.ndarray],
+    rms: float,
+) -> float:
+    """
+    How much the difference image's noise is correlated between neighbouring
+    pixels, as the factor by which ``rms * sqrt(npix)`` understates the noise
+    in an aperture.
+
+    Independent per-pixel noise averaged over a box of side `k` falls as
+    `1/k`. Interpolation does not average independent samples: astroalign
+    resamples every reference onto this frame's grid (and `_prerotate_reference()`
+    may interpolate once more before it), which spreads each input pixel's
+    noise across several output pixels. The box-averaged scatter then falls
+    short of `1/k`, and the ratio of what it actually is to what it would be
+    is exactly the correction an aperture's noise needs (audit 2026-08-18,
+    finding H13).
+
+    Measured from this frame's own difference image rather than assumed,
+    because it depends on the interpolation each individual stack went
+    through. Both scatters are MAD-derived so that the real sources in the
+    image — which are not noise — don't set the answer.
+
+    Returns 1.0 (the previous, uncorrected behaviour) when the measurement
+    can't be made, comes out below 1, or SUBTRACTION_NOISE_CORR_MAX is at or
+    below 1; and never returns more than that cap.
+    """
+    cap = config.SUBTRACTION_NOISE_CORR_MAX
+    if cap <= 1.0 or rms <= 0:
+        return 1.0
+
+    try:
+        from scipy.ndimage import uniform_filter  # noqa: PLC0415
+
+        sample = sub if mask is None else sub[~mask]
+        if sample.size < _NOISE_CORR_BOX ** 2 * 16:
+            return 1.0
+
+        smoothed = uniform_filter(sub, size=_NOISE_CORR_BOX)
+        smoothed_sample = smoothed if mask is None else smoothed[~mask]
+
+        median = float(np.median(smoothed_sample))
+        mad = float(np.median(np.abs(smoothed_sample - median)))
+        sigma_box = 1.4826 * mad
+        if sigma_box <= 0:
+            return 1.0
+
+        # Expected box-averaged scatter if every pixel were independent.
+        expected = rms / _NOISE_CORR_BOX
+        factor = sigma_box / expected
+    except Exception as exc:
+        logger.debug("Subtraction: correlated-noise measurement failed (%s)", exc)
+        return 1.0
+
+    if not math.isfinite(factor) or factor <= 1.0:
+        return 1.0
+    return min(factor, cap)
+
+
 def _detect_diff_sources(
     diff: np.ndarray,
     mask: Optional[np.ndarray] = None,
@@ -892,6 +955,17 @@ def _detect_diff_sources(
             rms = rms_masked
             use_mask = combined
 
+        # How far the aperture noise exceeds rms * sqrt(npix) because
+        # neighbouring pixels' noise is not independent after resampling —
+        # see _noise_correlation_factor(). Measured once per frame.
+        noise_corr = _noise_correlation_factor(sub, use_mask, rms)
+        if noise_corr > 1.0:
+            logger.info(
+                "Subtraction: difference-image noise is correlated by a factor "
+                "of %.2f (resampling) — candidate SNRs divided by it",
+                noise_corr,
+            )
+
         thresh = config.SUBTRACTION_DETECT_SIGMA * rms
         try:
             objs = sep.extract(sub, thresh=thresh, minarea=5)
@@ -926,7 +1000,11 @@ def _detect_diff_sources(
             # Gaussian approximation used in modules/astrometry/_extraction.py.
             flux = float(obj["flux"])
             npix = int(obj["npix"])
-            snr = flux / (rms * math.sqrt(npix)) if npix > 0 else 0.0
+            # rms * sqrt(npix) is the aperture noise only if each pixel's
+            # noise is independent of its neighbours'. Resampling makes it
+            # otherwise, so the aperture holds fewer independent measurements
+            # than pixels and the uncorrected figure overstates significance.
+            snr = flux / (rms * math.sqrt(npix) * noise_corr) if npix > 0 else 0.0
             a_axis = float(obj["a"])
             b_axis = max(float(obj["b"]), 0.001)
             fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0) * (a_axis ** 2 + b_axis ** 2) / 2.0)
