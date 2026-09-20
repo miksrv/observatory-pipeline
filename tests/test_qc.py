@@ -18,6 +18,7 @@ All tests are async because qc.analyze() is declared async.
 from __future__ import annotations
 
 import os
+import pathlib
 import shutil
 from contextlib import contextmanager
 from typing import Any
@@ -554,6 +555,69 @@ class TestRejectedFileMoved:
         assert os.path.isfile(rejected_path)
         assert os.path.basename(rejected_path) == f"TRAIL_{src_file.name}"
         assert not src_file.exists(), "Source file should have been moved"
+
+    @pytest.mark.asyncio
+    async def test_existing_rejected_file_is_not_overwritten(self, tmp_path):
+        """
+        Audit 2026-08-18, finding C12: shutil.move() overwrites silently on
+        POSIX, so re-rejecting the same original filename destroyed the
+        earlier file outright — in the one subsystem whose whole purpose is to
+        keep a rejected frame around for manual review.
+        """
+        import config
+
+        src_file = tmp_path / "frame_test.fits"
+        src_file.write_bytes(b"SECOND REJECTION")
+
+        rejected_root = tmp_path / "rejected"
+        object_dir = rejected_root / "NGC_1234"
+        object_dir.mkdir(parents=True)
+        existing = object_dir / "TRAIL_frame_test.fits"
+        existing.write_bytes(b"FIRST REJECTION")
+
+        sources = _make_sources(_N_SOURCES, _A_TRAIL, _B_TRAIL)
+        header_info = {"object_name": "NGC_1234", "instrument": {"focal_length_mm": None}}
+
+        with (
+            patch("modules.qc.fits.open", return_value=_make_hdu_mock(_make_image(), {})),
+            patch("modules.qc.sep.Background", return_value=_make_bkg_mock()),
+            patch("modules.qc.sep.extract",    side_effect=_make_sep_extract_side_effect(sources)),
+            patch("modules.qc.sep.sum_circle",
+                  return_value=_sum_circle_return(len(sources))),
+            patch("modules.qc.astroscrappy.detect_cosmics",
+                  return_value=(np.zeros(_IMAGE_SHAPE, bool), _make_image().astype(np.float32))),
+            patch("modules.qc.extract_headers", return_value=header_info),
+            patch.object(config, "FITS_REJECTED", str(rejected_root)),
+        ):
+            result = await qc.analyze(str(src_file))
+
+        assert existing.read_bytes() == b"FIRST REJECTION"
+        assert os.path.basename(result["rejected_path"]) == "TRAIL_frame_test_1.fits"
+        assert pathlib.Path(result["rejected_path"]).read_bytes() == b"SECOND REJECTION"
+
+
+class TestUniqueDestination:
+
+    def test_free_path_is_returned_unchanged(self, tmp_path):
+        target = str(tmp_path / "BLUR_frame.fits")
+
+        assert qc._unique_destination(target) == target
+
+    def test_suffixes_count_up_past_every_existing_file(self, tmp_path):
+        (tmp_path / "BLUR_frame.fits").write_bytes(b"a")
+        (tmp_path / "BLUR_frame_1.fits").write_bytes(b"b")
+        (tmp_path / "BLUR_frame_2.fits").write_bytes(b"c")
+
+        result = qc._unique_destination(str(tmp_path / "BLUR_frame.fits"))
+
+        assert os.path.basename(result) == "BLUR_frame_3.fits"
+
+    def test_suffix_goes_before_the_extension(self, tmp_path):
+        (tmp_path / "BLUR_frame.fits").write_bytes(b"a")
+
+        result = qc._unique_destination(str(tmp_path / "BLUR_frame.fits"))
+
+        assert result.endswith(".fits")
 
 
 # ---------------------------------------------------------------------------

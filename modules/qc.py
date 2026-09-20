@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import shutil
+from datetime import datetime
 from typing import Any
 
 import astropy.io.fits as fits
@@ -771,11 +772,46 @@ def _cleanup_empty_incoming_parents(moved_path: str) -> None:
         parent = os.path.dirname(parent)
 
 
+# Upper bound on the numeric suffixes _unique_destination() will try before
+# falling back to a timestamp. Reaching it means something is looping; a
+# bounded probe keeps that from becoming an unbounded one.
+_MAX_REJECTED_SUFFIX = 1000
+
+
+def _unique_destination(dest_path: str) -> str:
+    """
+    Return *dest_path*, or a non-colliding variant of it when a file is
+    already there: ``BLUR_frame.fits`` → ``BLUR_frame_1.fits`` → ``_2`` …
+
+    `shutil.move()` overwrites silently on POSIX, which destroyed the earlier
+    file outright — in the one subsystem whose entire purpose is to keep a
+    rejected frame around for manual review (audit 2026-08-18, finding C12).
+    A collision is not exotic: a re-run against the same original filename, a
+    test retry, or two frames that normalize to the same name all produce one.
+
+    The probe is not atomic, but the pipeline has a single writer per file and
+    the fallback below terminates regardless.
+    """
+    if not os.path.exists(dest_path):
+        return dest_path
+
+    stem, ext = os.path.splitext(dest_path)
+    for n in range(1, _MAX_REJECTED_SUFFIX):
+        candidate = f"{stem}_{n}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+
+    # Practically unreachable; guarantees a terminating, still-unique answer.
+    return f"{stem}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}{ext}"
+
+
 def _move_rejected(fits_path: str, flag: str, object_name: str) -> str | None:
     """
     Move a rejected FITS file to the configured rejected directory.
 
-    Destination: {FITS_REJECTED}/{object_name}/{flag}_{original_filename}
+    Destination: {FITS_REJECTED}/{object_name}/{flag}_{original_filename},
+    with a numeric suffix appended on collision rather than overwriting
+    whatever is already there — see _unique_destination().
 
     Returns the destination path, or None if the move fails (logged as error).
     """
@@ -792,6 +828,15 @@ def _move_rejected(fits_path: str, flag: str, object_name: str) -> str | None:
     original_filename = os.path.basename(fits_path)
     dest_filename = f"{flag}_{original_filename}"
     dest_path = os.path.join(dest_dir, dest_filename)
+
+    unique_path = _unique_destination(dest_path)
+    if unique_path != dest_path:
+        logger.warning(
+            "QC: %s already exists — storing this rejection as %s instead of "
+            "overwriting it",
+            dest_path, os.path.basename(unique_path),
+        )
+        dest_path = unique_path
 
     try:
         shutil.move(fits_path, dest_path)

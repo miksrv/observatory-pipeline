@@ -529,7 +529,11 @@ and "Why QC-failed frames are registered, not dropped" below) — a non-`OK` fla
 the file gets moved to `/fits/rejected/` at all in the production pipeline; it means the frame is
 registered with that flag and archived normally. `move_on_reject=True` (the default `analyze()` itself falls back to when no argument is given)
 still does move the file straight to `/fits/rejected/{object}/{FLAG}_filename.fits` — kept for any
-ad hoc/test caller that invokes `qc.analyze()` directly rather than through `pipeline.py`.
+ad hoc/test caller that invokes `qc.analyze()` directly rather than through `pipeline.py`. A
+destination that already exists gets a numeric suffix (`{FLAG}_filename_1.fits`) rather than
+being overwritten: `shutil.move()` overwrites silently on POSIX, which destroyed the earlier
+file outright in the one subsystem whose whole purpose is to keep a rejected frame for manual
+review (audit 2026-08-18, finding C12).
 `modules/catalog_preview.py` (the `PREVIEW_CATALOG_MATCH` task type) also always passes
 `move_on_reject=False`, for the same reason as `pipeline.py`: it must never move/touch its input
 frame — see that module's section below.
