@@ -584,7 +584,11 @@ async def measure(
                                             config.PHOTOMETRY_MIN_SNR, whose
                                             aperture numbers are still
                                             reported
-        edge_flag           bool           True when centroid is within 10 px of edge
+        edge_flag           bool           True when the centroid is inside
+                                            the config.EDGE_MARGIN_FRAC zone —
+                                            the same definition as "near_edge",
+                                            and copied from it when the source
+                                            already carries one
         zero_point          float | None   frame-level ZP (same for all sources)
         zero_point_err      float | None   robust scatter of the reference
                                             stars about the fitted solution
@@ -749,13 +753,30 @@ async def measure(
             output.append(out)
             continue
 
-        # Edge flag: within 10 px of any border
-        out["edge_flag"] = (
-            x_px < 10.0
-            or y_px < 10.0
-            or x_px > naxis1 - 10.0
-            or y_px > naxis2 - 10.0
-        )
+        # Edge flag — the SAME definition as "near_edge" (config.EDGE_MARGIN_FRAC,
+        # a fraction of the frame's own size), not the fixed 10 px this used
+        # to be. Both fields travel to the API under near-identical names and
+        # were quietly measuring different things: on a 4000 px frame 10 px is
+        # 0.25% while EDGE_MARGIN_FRAC is 5%, so a source could be near_edge
+        # and not edge_flag at the same time, and no reader had a way to know
+        # which of the two to believe (audit 2026-08-18, finding M13).
+        #
+        # A source that already carries near_edge — everything from
+        # astrometry.py and subtraction.py does — keeps that value rather than
+        # having it recomputed, so the two fields cannot disagree even if a
+        # future caller changes how it measures.
+        existing_near_edge = src.get("near_edge")
+        if existing_near_edge is not None:
+            out["edge_flag"] = bool(existing_near_edge)
+        else:
+            margin_x = config.EDGE_MARGIN_FRAC * naxis1
+            margin_y = config.EDGE_MARGIN_FRAC * naxis2
+            out["edge_flag"] = (
+                x_px < margin_x
+                or y_px < margin_y
+                or x_px > naxis1 - margin_x
+                or y_px > naxis2 - margin_y
+            )
 
         # Saturated sources (flagged upstream by astrometry.py / carried
         # through by subtraction.py) never get a magnitude measurement:

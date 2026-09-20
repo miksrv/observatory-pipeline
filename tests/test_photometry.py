@@ -501,7 +501,7 @@ class TestEdgeFlag:
 
     async def test_source_near_edge_is_flagged(self):
         """
-        A source at pixel (5, 5) — within 10 px of the left and bottom border —
+        A source at pixel (5, 5) — deep inside the EDGE_MARGIN_FRAC zone —
         must have edge_flag == True.
 
         We map pixel (5, 5) back to sky coords using the known WCS, then feed
@@ -514,6 +514,46 @@ class TestEdgeFlag:
         srcs = [_make_source(ra=ra_edge, dec=dec_edge)]
         with _patch_photometry(wcs=wcs):
             result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert result[0]["edge_flag"] is True
+
+
+class TestEdgeFlagMatchesNearEdge:
+    """
+    Audit 2026-08-18, finding M13: edge_flag was a fixed 10 px while near_edge
+    is a fraction of the frame's own size. Both travel to the API under
+    near-identical names and were quietly measuring different things — on a
+    4000 px frame 10 px is 0.25% against EDGE_MARGIN_FRAC's 5% — so a source
+    could be one and not the other, with no way for a reader to know which to
+    believe.
+    """
+
+    async def test_a_source_carrying_near_edge_keeps_that_value(self):
+        wcs = _make_wcs(ra=202.47, dec=47.20)
+        src = _make_source(ra=202.47, dec=47.20)   # dead centre
+        src["near_edge"] = True
+
+        with _patch_photometry(wcs=wcs):
+            result = await photometry.measure(_FITS_PATH, [src])
+
+        assert result[0]["edge_flag"] is True
+
+    async def test_a_source_without_one_uses_the_same_definition(self):
+        """
+        A position inside EDGE_MARGIN_FRAC but well beyond the old fixed
+        10 px — the range where the two definitions used to disagree.
+        """
+        wcs = _make_wcs(ra=202.47, dec=47.20, scale_deg=0.000278)
+        naxis1 = 1024
+        x_px = config.EDGE_MARGIN_FRAC * naxis1 / 2.0
+        assert x_px > 10.0, "fixture must exercise the disputed range"
+
+        sky = wcs.all_pix2world([[x_px, 512.0]], 0)
+        src = _make_source(ra=float(sky[0][0]), dec=float(sky[0][1]))
+        src.pop("near_edge", None)
+
+        with _patch_photometry(wcs=wcs):
+            result = await photometry.measure(_FITS_PATH, [src])
 
         assert result[0]["edge_flag"] is True
 

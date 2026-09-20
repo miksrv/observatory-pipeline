@@ -818,6 +818,12 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   `pipeline.py` (`_color_term`/`_color_ref`/`_color_scatter`, read off a measured source the way
   `zero_point` already is) and applies it identically.
 - Adds the following fields to each source: `flux_aperture`, `flux_err`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `snr`, `calibrated` (bool), `edge_flag`, `zero_point`, `zero_point_err`
+- `edge_flag` is the **same** definition as `near_edge` (`EDGE_MARGIN_FRAC`, a fraction of the
+  frame's own size), and is copied straight from it when the source already carries one — which
+  everything from `astrometry.py`/`subtraction.py` does. It used to be a fixed 10 px, so on a
+  4000 px frame the two fields meant 0.25% and 5% of the frame while travelling to the API under
+  near-identical names, and a source could be one and not the other with nothing to say which a
+  reader should believe (audit 2026-08-18, finding M13).
 - `flux_err` is `sqrt(|net_flux| / gain + ap_area × sky_sigma²)`. The aperture sum is in ADU,
   but photon shot noise is Poissonian in **electrons** — `N_e = net_flux × gain`, whose variance
   converts back to ADU as `N_e / gain² = net_flux / gain`. Using `net_flux` itself as the
