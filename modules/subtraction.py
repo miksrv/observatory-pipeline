@@ -519,22 +519,41 @@ def _median_reference(
     whatever the stack happened to hold — is precisely the false residual this
     is avoiding.
 
-    Falls back to a plain median when no reference supplied a footprint, i.e.
-    the behaviour before footprints were kept.
+    A non-finite value in a reference is excluded the same way, and for the
+    same reason: `np.median()` does not ignore NaN, it propagates it, so one
+    NaN pixel in one archived file — not rare, masked pixels from a previous
+    calibration pass leave them — nulled the reference at that position and
+    the difference image with it (audit 2026-08-18, finding H9). Silently, and
+    for every frame that archive is ever a reference for.
+
+    Falls back to a plain median when nothing needs excluding at all, i.e. the
+    behaviour before footprints were kept.
     """
-    if not any(fp is not None for fp in footprints):
+    nonfinite = ~np.isfinite(stack)
+    has_footprints = any(fp is not None for fp in footprints)
+
+    if not has_footprints and not nonfinite.any():
         return np.median(stack, axis=0).astype(np.float32)
 
-    invalid = np.zeros(stack.shape, dtype=bool)
+    invalid = nonfinite
     for i, fp in enumerate(footprints):
         if fp is not None and fp.shape == stack.shape[1:]:
-            invalid[i] = fp
+            invalid[i] |= fp
+
+    n_nonfinite = int(nonfinite.sum())
+    if n_nonfinite:
+        logger.warning(
+            "Subtraction: %d non-finite pixel value(s) across %d reference "
+            "frame(s) excluded from the median stack — one such pixel would "
+            "otherwise null the reference at that position",
+            n_nonfinite, stack.shape[0],
+        )
 
     n_invalid = int(invalid.sum())
     if n_invalid:
         logger.info(
-            "Subtraction: excluding %d uncovered pixel value(s) across %d "
-            "reference frame(s) from the median stack",
+            "Subtraction: excluding %d uncovered or non-finite pixel value(s) "
+            "across %d reference frame(s) from the median stack",
             n_invalid, stack.shape[0],
         )
 
@@ -550,6 +569,11 @@ def _median_reference(
             int(uncovered.sum()),
         )
         reference[uncovered] = new_data[uncovered]
+    # A pixel the new frame itself has no value for leaves the difference
+    # non-finite whatever the reference says; run() masks those out of
+    # detection, and zeroing the reference here keeps the arithmetic itself
+    # well-defined.
+    reference[~np.isfinite(reference)] = 0.0
 
     return reference
 
@@ -1354,6 +1378,22 @@ async def run(
             int(sat_mask.sum()),
             radius_px,
         )
+
+    # A non-finite pixel in the NEW frame survives everything above — the
+    # reference stack can't repair it — and would otherwise reach sep, whose
+    # background/RMS estimate it corrupts for the whole frame. Fold it into
+    # the same detection mask the saturation vicinity uses and zero it in the
+    # difference, so it is simply a place nothing can be found (audit
+    # 2026-08-18, finding H9).
+    nonfinite_diff = ~np.isfinite(diff)
+    if nonfinite_diff.any():
+        logger.warning(
+            "Subtraction: %d non-finite pixel(s) in the difference image "
+            "(the new frame carries no value there) — excluded from detection",
+            int(nonfinite_diff.sum()),
+        )
+        diff = np.where(nonfinite_diff, 0.0, diff).astype(np.float32)
+        sat_mask = nonfinite_diff if sat_mask is None else (sat_mask | nonfinite_diff)
 
     # ------------------------------------------------------------------
     # Minimum-FWHM floor for candidate shape — see psf_fwhm_arcsec's

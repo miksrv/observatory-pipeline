@@ -832,6 +832,13 @@ entry at all, at any position).
    masks them out; a pixel no reference covered at all takes the new frame's own value, so the
    difference there is exactly zero and nothing can be detected in it. A reference whose
    footprint is missing or unusable counts as fully valid, i.e. the previous behaviour.
+   **Non-finite** reference values are excluded by the same mask: `np.median()` propagates NaN
+   rather than ignoring it, so one NaN pixel in one archived file (masked pixels from a previous
+   calibration pass leave them) nulled the reference at that position — silently, and for every
+   frame that archive is ever a reference for (audit 2026-08-18, finding H9). A pixel the *new*
+   frame has no value for can't be repaired by any reference, so `run()` zeroes it in the
+   difference and folds it into the same detection mask the saturated vicinity uses, keeping it
+   out of `sep`'s background/RMS estimate for the whole frame.
 4. Masks the vicinity (`SATURATION_MASK_RADIUS_ARCSEC`, converted to pixels via the frame's WCS
    plate scale, dilated with `scipy.ndimage.binary_dilation`) of any pixel at or above
    `SATURATION_ADU` in the new frame **or any aligned reference frame** — `astroalign` resampling

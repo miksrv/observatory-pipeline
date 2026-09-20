@@ -384,6 +384,102 @@ class TestAlignmentFootprint:
 
 
 # ---------------------------------------------------------------------------
+# NaN handling — audit 2026-08-18, finding H9
+# ---------------------------------------------------------------------------
+
+class TestNonFiniteHandling:
+    """
+    np.median() does not ignore NaN, it propagates it. One NaN pixel in one
+    archived file — not rare; masked pixels from a previous calibration pass
+    leave them — nulled the reference at that position and the difference
+    image with it, silently, for every frame that archive is ever a reference
+    for.
+    """
+
+    def test_one_nan_reference_pixel_does_not_null_the_median(self):
+        stack = np.stack([
+            np.full((4, 4), 100.0, dtype=np.float32),
+            np.full((4, 4), 100.0, dtype=np.float32),
+            np.full((4, 4), 100.0, dtype=np.float32),
+        ])
+        stack[0, 2, 2] = np.nan
+        new_data = np.zeros((4, 4), dtype=np.float32)
+
+        reference = subtraction._median_reference(stack, [None, None, None], new_data)
+
+        assert np.isfinite(reference).all()
+        assert reference[2, 2] == pytest.approx(100.0)
+
+    def test_an_infinite_reference_pixel_is_excluded_too(self):
+        stack = np.stack([
+            np.full((4, 4), 100.0, dtype=np.float32),
+            np.full((4, 4), 100.0, dtype=np.float32),
+            np.full((4, 4), 100.0, dtype=np.float32),
+        ])
+        stack[1, 1, 1] = np.inf
+        new_data = np.zeros((4, 4), dtype=np.float32)
+
+        reference = subtraction._median_reference(stack, [None, None, None], new_data)
+
+        assert reference[1, 1] == pytest.approx(100.0)
+
+    def test_a_pixel_nan_in_every_reference_falls_back_to_the_new_frame(self):
+        stack = np.stack([
+            np.full((4, 4), 100.0, dtype=np.float32),
+            np.full((4, 4), 100.0, dtype=np.float32),
+        ])
+        stack[:, 3, 3] = np.nan
+        new_data = np.full((4, 4), 7.0, dtype=np.float32)
+
+        reference = subtraction._median_reference(stack, [None, None], new_data)
+
+        assert reference[3, 3] == pytest.approx(7.0)
+        assert (new_data - reference)[3, 3] == pytest.approx(0.0)
+
+    async def test_a_nan_in_the_new_frame_is_excluded_from_detection(
+        self, monkeypatch, tmp_path,
+    ):
+        """
+        The reference stack cannot repair a pixel the new frame has no value
+        for. Left alone it reaches sep, whose background/RMS estimate it
+        corrupts for the whole frame — so it is zeroed and added to the same
+        detection mask the saturated vicinity uses.
+        """
+        shape = (20, 20)
+        new_data = np.ones(shape, dtype=np.float32)
+        new_data[5, 5] = np.nan
+
+        def fake_load(path):
+            return new_data if path.endswith("new.fits") else np.ones(shape, dtype=np.float32)
+
+        seen: dict = {}
+
+        def fake_detect(diff, mask=None, fwhm_min_px=None, pixel_scale_arcsec=None):
+            seen["diff"] = diff
+            seen["mask"] = mask
+            return []
+
+        monkeypatch.setattr(
+            subtraction, "_find_archive_frames",
+            lambda d, f, pa=None: ["a.fits", "b.fits", "c.fits"],
+        )
+        monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
+        monkeypatch.setattr(
+            subtraction, "_align_frame",
+            lambda s, t: (np.ones(shape, dtype=np.float32), None),
+        )
+        monkeypatch.setattr(subtraction, "_detect_diff_sources", fake_detect)
+        monkeypatch.setattr(subtraction, "_pixel_to_sky", lambda cands, path, wcs=None: [])
+
+        result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
+
+        assert result["performed"] is True
+        assert np.isfinite(seen["diff"]).all()
+        assert seen["mask"] is not None
+        assert bool(seen["mask"][5, 5]) is True
+
+
+# ---------------------------------------------------------------------------
 # _detect_diff_sources
 # ---------------------------------------------------------------------------
 
