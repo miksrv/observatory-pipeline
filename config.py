@@ -128,6 +128,28 @@ NARROWBAND_FILTERS: frozenset[str] = frozenset(
 STAR_FWHM_MIN_ARCSEC: float = float(_get("STAR_FWHM_MIN_ARCSEC", "2.5"))
 STAR_FWHM_MAX_ARCSEC: float = float(_get("STAR_FWHM_MAX_ARCSEC", "8.0"))
 STAR_ELONGATION_MAX: float = float(_get("STAR_ELONGATION_MAX", "1.5"))
+# Upper elongation bound for the LOOSE `sources_all` list that
+# modules/astrometry/_extraction.py feeds to catalog matching and anomaly
+# detection — deliberately far above STAR_ELONGATION_MAX, since a trailed
+# detection is exactly what modules/anomaly_detector/ needs to see in order
+# to classify SPACE_DEBRIS at all.
+#
+# It must stay comfortably ABOVE SPACE_DEBRIS_EDGE_ELONGATION_MIN (see that
+# setting below). As a hardcoded 5.0 it sat below the 6.0 edge threshold, so
+# a trailed source near the frame edge was cut at extraction time and the
+# edge branch of the SPACE_DEBRIS classification could never fire on
+# anything — the exact case that threshold was raised to handle (audit
+# 2026-08-18, finding C2). modules/astrometry/_extraction.py logs a warning
+# when a deployment configures the two into that dead state again.
+#
+# The default leaves room for a genuinely short trail: the streak pre-pass
+# (STREAK_* below) already masks out anything both highly elongated AND
+# longer than STREAK_MIN_LENGTH_ARCSEC, so what reaches this bound is a
+# sub-30" trail — a fast NEO or a short debris streak — whose a/b ratio
+# scales with how narrow this frame's PSF is. The bound still rejects the
+# degenerate ratios a near-zero minor axis produces (_extraction.py clamps
+# `b` to 1e-6 rather than dividing by zero).
+SOURCES_ALL_ELONGATION_MAX: float = float(_get("SOURCES_ALL_ELONGATION_MAX", "15.0"))
 STAR_SNR_MIN: float = float(_get("STAR_SNR_MIN", "50.0"))
 
 # SEP source extraction parameters
@@ -495,6 +517,7 @@ _OVERRIDABLE: dict[str, type] = {
     "STAR_FWHM_MIN_ARCSEC": float,
     "STAR_FWHM_MAX_ARCSEC": float,
     "STAR_ELONGATION_MAX": float,
+    "SOURCES_ALL_ELONGATION_MAX": float,
     "STAR_SNR_MIN": float,
     # SEP extraction
     "SEP_DETECT_THRESH": float,

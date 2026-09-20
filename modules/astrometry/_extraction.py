@@ -266,15 +266,45 @@ def _extract_sources(
         #     PSF estimate is available, multi-pixel hot/warm pixel clusters
         #     too, even when their measured FWHM clears the static
         #     STAR_FWHM_MIN_ARCSEC default)
-        #   - elongation < 5.0  (rejects strongly trailed cosmic rays)
+        #   - elongation < SOURCES_ALL_ELONGATION_MAX (rejects the
+        #     degenerate a/b ratios a near-zero minor axis produces, and
+        #     hairline cosmic-ray tracks, while still admitting the trailed
+        #     detections anomaly_detector needs — see below)
         #   - positive flux
         #
         # Used by: catalog_matcher (more sources → better WCS correction),
         #          anomaly_detector (detects moving/transient objects),
         #          API post_sources (complete detection record).
         # Photometry calibration still uses `sources` (strict stars only).
+        #
+        # This bound used to be a hardcoded 5.0, which sat BELOW
+        # SPACE_DEBRIS_EDGE_ELONGATION_MIN (6.0) — the deliberately raised
+        # bar modules/anomaly_detector/ applies to a `near_edge` source,
+        # where coma alone can already stretch an ordinary star past the
+        # ordinary 3.0 threshold. A trailed source near the frame edge was
+        # therefore cut here, at extraction time, and never reached the
+        # classifier in any form: not as SPACE_DEBRIS, not even as UNKNOWN.
+        # The edge branch was structurally unreachable (audit 2026-08-18,
+        # finding C2). Since `sources_all` is the ONLY detection list
+        # catalog_matcher and anomaly_detector ever see (pipeline.py's
+        # step 6), there was no second chance anywhere downstream.
         # ----------------------------------------------------------
-        mask_all = mask_fwhm_min & (elongations < 5.0) & mask_flux
+        if config.SOURCES_ALL_ELONGATION_MAX <= config.SPACE_DEBRIS_EDGE_ELONGATION_MIN:
+            logger.warning(
+                "SOURCES_ALL_ELONGATION_MAX=%.1f is not above "
+                "SPACE_DEBRIS_EDGE_ELONGATION_MIN=%.1f — a trailed near-edge "
+                "source is cut here before anomaly_detector can classify it, "
+                "making the edge SPACE_DEBRIS branch unreachable  file=%s",
+                config.SOURCES_ALL_ELONGATION_MAX,
+                config.SPACE_DEBRIS_EDGE_ELONGATION_MIN,
+                fits_filename,
+            )
+
+        mask_all = (
+            mask_fwhm_min
+            & (elongations < config.SOURCES_ALL_ELONGATION_MAX)
+            & mask_flux
+        )
         n_all = int(np.sum(mask_all))
 
         sources_all = [

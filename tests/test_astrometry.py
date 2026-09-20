@@ -879,6 +879,92 @@ class TestWcsPropagated:
 # Test 8 — Zero minor-axis guard (degenerate sources)
 # ---------------------------------------------------------------------------
 
+class TestSourcesAllElongationBound:
+    """
+    Audit finding C2 — `sources_all` is the ONLY detection list
+    catalog_matcher and anomaly_detector ever receive (pipeline.py's step 6),
+    so its elongation ceiling decides what the SPACE_DEBRIS classification
+    can ever see. A hardcoded 5.0 sat below SPACE_DEBRIS_EDGE_ELONGATION_MIN
+    (6.0), the deliberately raised bar for a `near_edge` source, making that
+    branch structurally unreachable: a trailed source near the frame edge was
+    cut here and never reached the classifier as anything, not even UNKNOWN.
+
+    A trailed a=7/b=1 detection is used throughout: elongation 7.0 sits above
+    the edge threshold and below the new default ceiling of 15.0.
+    """
+
+    async def test_trailed_source_above_the_edge_threshold_survives(self):
+        trail = _make_sources(n=3, a=7.0, b=1.0)
+        with _patch_astrometry(sources=trail):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert len(result["sources_all"]) == 3
+        assert all(
+            src["elongation"] > config.SPACE_DEBRIS_EDGE_ELONGATION_MIN
+            for src in result["sources_all"]
+        )
+
+    async def test_trailed_source_is_still_kept_out_of_the_strict_list(self):
+        """`sources` stays a star list — the loosened ceiling applies only to
+        `sources_all`, and photometric calibration still runs off `sources`."""
+        trail = _make_sources(n=3, a=7.0, b=1.0)
+        with _patch_astrometry(sources=trail):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"] == []
+
+    async def test_degenerate_elongation_is_still_rejected(self):
+        """
+        A near-zero minor axis is clamped to 1e-6 rather than dividing by
+        zero, producing an absurd a/b ratio. The ceiling must still cut those
+        — admitting them would hand anomaly_detector a guaranteed
+        SPACE_DEBRIS trigger on a numerical artifact.
+        """
+        degenerate = _make_sources(n=5, a=2.0, b=0.0)
+        with _patch_astrometry(sources=degenerate):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources_all"] == []
+
+    async def test_ceiling_is_config_driven(self, monkeypatch):
+        """The bound is no longer hardcoded — lowering it past the trail's
+        own elongation drops the same detection."""
+        monkeypatch.setattr(config, "SOURCES_ALL_ELONGATION_MAX", 3.0)
+        trail = _make_sources(n=3, a=7.0, b=1.0)
+        with _patch_astrometry(sources=trail):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources_all"] == []
+
+    async def test_warns_when_configured_back_into_the_dead_state(self, monkeypatch, caplog):
+        """
+        Configuring the ceiling at or below SPACE_DEBRIS_EDGE_ELONGATION_MIN
+        reinstates exactly the defect this finding is about. It stays
+        possible — an operator may have a reason — but it must not be silent.
+        """
+        monkeypatch.setattr(config, "SOURCES_ALL_ELONGATION_MAX", 5.0)
+        monkeypatch.setattr(config, "SPACE_DEBRIS_EDGE_ELONGATION_MIN", 6.0)
+
+        with caplog.at_level("WARNING", logger="modules.astrometry._extraction"):
+            with _patch_astrometry(sources=_make_sources(n=3)):
+                await astrometry.solve(_FITS_PATH)
+
+        assert any(
+            "SPACE_DEBRIS branch unreachable" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    async def test_no_warning_with_the_default_configuration(self, caplog):
+        with caplog.at_level("WARNING", logger="modules.astrometry._extraction"):
+            with _patch_astrometry(sources=_make_sources(n=3)):
+                await astrometry.solve(_FITS_PATH)
+
+        assert not any(
+            "SOURCES_ALL_ELONGATION_MAX" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+
 class TestDegenerateSource:
     async def test_zero_b_axis_does_not_raise(self):
         """
