@@ -344,6 +344,20 @@ SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 # absorbs a small residual angle, and rotating (interpolating) the reference
 # array for a fraction of a degree only adds blur for no real benefit.
 SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG", "2.0"))
+# Worst reference seeing worth stacking, as a multiple of the NEW frame's own
+# measured FWHM. Differencing a sharp frame against a blurred reference leaves
+# the classic ring-shaped residual at every star in the field — a mismatched
+# PSF, not a transient — and also raises the noise floor that the real faint
+# transients have to clear. Since QC-failed frames are archived rather than
+# dropped, the per-object directory the reference stack is drawn from now
+# mixes BLUR/TRAIL frames in with good ones (audit 2026-08-18, finding H10).
+#
+# The comparison uses the QCFWHM header pipeline.py stamps at archive time; a
+# frame carrying no such key (archived before that existed, or placed there by
+# hand) is kept, since it cannot be judged either way. Screening never costs
+# the frame its subtraction: if it would leave fewer than
+# SUBTRACTION_MIN_FRAMES, the unscreened set is used instead.
+SUBTRACTION_REF_MAX_FWHM_RATIO: float = float(_get("SUBTRACTION_REF_MAX_FWHM_RATIO", "1.5"))
 
 # ---------------------------------------------------------------------------
 # Photometry — sensor gain
@@ -676,6 +690,7 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_MIN_FRAMES": int,
     "SUBTRACTION_DETECT_SIGMA": float,
     "SUBTRACTION_PREROTATE_MIN_DEG": float,
+    "SUBTRACTION_REF_MAX_FWHM_RATIO": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
     "FORCED_PHOTOMETRY_MAG_LIMIT": float,

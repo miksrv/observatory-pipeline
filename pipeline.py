@@ -786,6 +786,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
         if solved_wcs is not None:
             _write_solved_wcs(fits_path, solved_wcs)
 
+        # Stamp this frame's own QC verdict into the header too, so that a
+        # LATER frame's subtraction can tell what it is about to stack
+        # without an API round-trip — see _write_qc_headers()'s docstring.
+        _write_qc_headers(fits_path, qc_result)
+
         # Use object name for directory structure (normalized if normalization enabled)
         dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
         os.makedirs(dest_dir, exist_ok=True)
@@ -1799,6 +1804,51 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
         return True
     except Exception as exc:
         logger.warning("Could not write solved WCS into %s: %s", fits_path, exc)
+        return False
+
+
+def _write_qc_headers(fits_path: str, qc_result: dict) -> bool:
+    """
+    Stamp this frame's own QC verdict into its header, right before it is
+    archived.
+
+    Since QC-failed frames are archived rather than dropped (see "Why QC-failed
+    frames are registered, not dropped"), the per-object archive directory now
+    mixes `BLUR`/`TRAIL` frames in with good ones — and
+    modules/subtraction.py picks its reference stack out of exactly that
+    directory, by recency, with no notion of quality at all. Differencing a
+    sharp new frame against a blurred reference leaves the classic ring-shaped
+    residual at every star in the field (audit 2026-08-18, finding H10).
+
+    The pipeline has no database access, and the API cannot see the
+    observatory's filesystem, so the frame's own header is the only place the
+    two can meet: this writes `QCFLAG` and, when it is in arcsec rather than
+    raw pixels, `QCFWHM`. Reading them back costs subtraction one header read
+    per candidate — no pixel data, no network.
+
+    Best-effort, like _write_solved_wcs() above: any failure is logged and
+    returns False, never blocking the archive move. A frame archived before
+    this existed simply carries neither key, and subtraction treats that as
+    "unknown, keep it" rather than excluding it.
+    """
+    try:
+        from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+        flag = qc_result.get("quality_flag")
+        fwhm = qc_result.get("fwhm_median") if qc_result.get("fwhm_unit") == "arcsec" else None
+
+        if flag is None and fwhm is None:
+            return False
+
+        with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
+            header = hdul[0].header
+            if flag is not None:
+                header["QCFLAG"] = (str(flag), "observatory-pipeline QC verdict")
+            if fwhm is not None:
+                header["QCFWHM"] = (float(fwhm), "observatory-pipeline median FWHM [arcsec]")
+        return True
+    except Exception as exc:
+        logger.warning("Could not write QC headers into %s: %s", fits_path, exc)
         return False
 
 

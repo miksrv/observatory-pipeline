@@ -292,7 +292,11 @@ Orchestrates processing of a single FITS file in order:
     catalog-matched and photometrically calibrated); returns `source_ids` (positionally parallel
     to `sources`), which this step zips back onto each source dict as `_source_id` so
     `anomaly_detector.py` can populate `anomalies[].source_id`.
-12.5. Move file to `/fits/archive/{object_name}/` directory. Runs immediately after step 12, NOT
+12.5. Move file to `/fits/archive/{object_name}/` directory. Just before the move,
+     `_write_solved_wcs()` bakes astap's verified solve into the file's own header and
+     `_write_qc_headers()` stamps `QCFLAG`/`QCFWHM` beside it — both so that a *later* frame
+     reading this one back off disk (finder charts for the WCS, subtraction's reference screen
+     for the QC verdict) doesn't have to re-derive or re-ask for what this run already knew. Runs immediately after step 12, NOT
      after anomaly detection (an earlier revision of this file ran it later, between steps 14 and
      15) — anomaly detection never touches the local file at all, so there was no reason to delay
      archiving behind it, and doing so would have blocked decoupling anomaly detection into a task
@@ -783,7 +787,19 @@ entry at all, at any position).
 
 1. Looks in `/fits/archive/{object}/` for ≥`SUBTRACTION_MIN_FRAMES` previously archived frames
    of the same object (same filter preferred; falls back to any filter if there aren't enough
-   same-filter frames). Both the frame type and the filter are read out of the filename
+   same-filter frames). Candidates are also **screened on quality** (`_screen_by_quality()`):
+   a frame whose stamped `QCFLAG` is anything but `OK` is excluded, as is one whose stamped
+   `QCFWHM` exceeds the new frame's own measured FWHM by more than
+   `SUBTRACTION_REF_MAX_FWHM_RATIO`. Selection used to be recency (plus PA-closeness) alone,
+   which was harmless while QC-failed frames went to `/fits/rejected` — but they are archived
+   now, into this very directory, and differencing a sharp frame against a blurred reference
+   leaves the classic ring-shaped residual at every star plus a noise floor raised enough to bury
+   the faint real transients (audit 2026-08-18, finding H10). Those two keywords are stamped into
+   each frame's own header by `pipeline.py`'s `_write_qc_headers()` at archive time: the pipeline
+   has no database and the API has no filesystem access, so the frame's header is the only place
+   the two can meet. A frame carrying neither (archived before this existed, or placed there by
+   hand) is kept, and if screening would leave fewer than `SUBTRACTION_MIN_FRAMES` the unscreened
+   set is used instead with a warning. Both the frame type and the filter are read out of the filename
    **positionally** (`_parse_normalized_filename()`), not as a substring: the fields are anchored
    on the DateTime token and counted leftward from it, since the object name itself may contain
    underscores (`Andromeda_Galaxy`, `4_Vesta`). Two things this fixes (audit 2026-08-18, finding

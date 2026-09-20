@@ -161,6 +161,7 @@ def _find_archive_frames(
     archive_dir: str,
     filter_name: Optional[str],
     new_position_angle_deg: Optional[float] = None,
+    psf_fwhm_arcsec: Optional[float] = None,
 ) -> list[str]:
     """
     Return up to _MAX_FRAMES FITS paths from archive_dir, sorted newest-first.
@@ -180,6 +181,13 @@ def _find_archive_frames(
         Absolute path to the per-object archive directory.
     filter_name:
         Normalized filter string (e.g. "Ha", "R", "L") or None.
+    psf_fwhm_arcsec:
+        The new frame's own measured stellar FWHM in arcsec (qc.analyze()'s
+        fwhm_median, as forwarded by pipeline.py). When given, a candidate
+        whose own archived QCFWHM is worse than
+        SUBTRACTION_REF_MAX_FWHM_RATIO times it is excluded — see
+        _passes_quality_screen(). None leaves only the QCFLAG half of the
+        screen in force.
     new_position_angle_deg:
         The new frame's own WCS-derived position angle (run()'s own
         _position_angle_deg(wcs) — see that helper's docstring). When given,
@@ -228,6 +236,8 @@ def _find_archive_frames(
             n_calibration, archive_dir,
         )
 
+    science_files = _screen_by_quality(science_files, psf_fwhm_arcsec)
+
     candidates = science_files
     if filter_name:
         token = f"_{filter_name.upper()}_"
@@ -260,6 +270,103 @@ def _find_archive_frames(
         candidates = _sort_by_pa_closeness(candidates, new_position_angle_deg)
 
     return candidates[:_MAX_FRAMES]
+
+
+def _read_qc_headers(path: str) -> tuple[Optional[str], Optional[float]]:
+    """
+    Read the QCFLAG/QCFWHM pair pipeline.py stamps into a frame's header at
+    archive time. Either or both are None for a frame archived before those
+    existed, or one placed in the directory by hand.
+
+    A header-only read: no pixel data is touched, so screening the whole
+    candidate list costs a handful of small reads.
+    """
+    try:
+        header = fits.getheader(path)
+    except Exception as exc:
+        logger.debug("Subtraction: could not read QC headers from %s: %s", path, exc)
+        return None, None
+
+    flag = header.get("QCFLAG")
+    flag_str = str(flag).strip().upper() if flag is not None else None
+
+    fwhm: Optional[float] = None
+    raw = header.get("QCFWHM")
+    if raw is not None:
+        try:
+            value = float(raw)
+            if math.isfinite(value) and value > 0:
+                fwhm = value
+        except (TypeError, ValueError):
+            pass
+
+    return flag_str, fwhm
+
+
+def _screen_by_quality(
+    paths: list[str],
+    psf_fwhm_arcsec: Optional[float],
+) -> list[str]:
+    """
+    Drop reference candidates that would damage the difference image: frames
+    their own QC marked as failed, and frames whose seeing is far worse than
+    the new frame's.
+
+    Reference selection used to be recency (plus PA-closeness) alone and never
+    looked at quality at all. That was harmless while QC-failed frames were
+    moved to /fits/rejected, but they are archived now — into the very
+    directory the reference stack is drawn from (audit 2026-08-18, finding
+    H10). Differencing a sharp new frame against a blurred reference leaves
+    the classic ring-shaped residual at every star in the field: a PSF
+    mismatch, reported as a crowd of transients, on top of a noise floor
+    raised enough to bury the faint real ones.
+
+    A candidate with no QC headers at all is kept — it cannot be judged, and
+    an archive written before those headers existed must not lose subtraction
+    over it. Screening never costs the frame its subtraction either: if it
+    would leave fewer than SUBTRACTION_MIN_FRAMES, the unscreened list is
+    returned with a warning, on the same reasoning as photometry.py's
+    zero-point reference screen — an imperfect reference stack beats none.
+    """
+    if not paths:
+        return paths
+
+    limit = None
+    if psf_fwhm_arcsec is not None and psf_fwhm_arcsec > 0:
+        limit = psf_fwhm_arcsec * config.SUBTRACTION_REF_MAX_FWHM_RATIO
+
+    kept: list[str] = []
+    n_failed_qc = 0
+    n_blurred = 0
+
+    for path in paths:
+        flag, fwhm = _read_qc_headers(path)
+        if flag is not None and flag != "OK":
+            n_failed_qc += 1
+            continue
+        if limit is not None and fwhm is not None and fwhm > limit:
+            n_blurred += 1
+            continue
+        kept.append(path)
+
+    if not (n_failed_qc or n_blurred):
+        return paths
+
+    if len(kept) < config.SUBTRACTION_MIN_FRAMES:
+        logger.warning(
+            "Subtraction: only %d of %d reference candidate(s) pass the quality "
+            "screen (%d failed QC, %d blurred beyond %.2f\") — stacking the "
+            "unscreened set instead, so expect PSF-mismatch residuals",
+            len(kept), len(paths), n_failed_qc, n_blurred, limit or 0.0,
+        )
+        return paths
+
+    logger.info(
+        "Subtraction: excluded %d QC-failed and %d blurred reference "
+        "candidate(s) of %d",
+        n_failed_qc, n_blurred, len(paths),
+    )
+    return kept
 
 
 def _sort_by_pa_closeness(paths: list[str], new_position_angle_deg: float) -> list[str]:
@@ -1249,7 +1356,9 @@ async def run(
     # only selection and no pre-rotation, exactly like before this feature.
     new_position_angle_deg = _position_angle_deg(wcs) if wcs is not None else None
 
-    archive_files = _find_archive_frames(archive_dir, filter_name, new_position_angle_deg)
+    archive_files = _find_archive_frames(
+        archive_dir, filter_name, new_position_angle_deg, psf_fwhm_arcsec,
+    )
     # Exclude the new frame's own file from its candidate reference stack —
     # re-analyzing an already-archived frame (see pipeline.py's
     # _resolve_bare_filename()) passes a fits_path that may already be

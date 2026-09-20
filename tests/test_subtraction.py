@@ -461,7 +461,7 @@ class TestNonFiniteHandling:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["a.fits", "b.fits", "c.fits"],
+            lambda d, f, pa=None, fwhm=None: ["a.fits", "b.fits", "c.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(
@@ -1081,6 +1081,89 @@ def _write_frame(path, exptime=None, egain=None, gain=None, value=1.0, shape=(8,
     return str(path)
 
 
+def _write_qc_frame(path, flag=None, fwhm=None, shape=(8, 8)):
+    """Write a tiny FITS file carrying the QC headers pipeline.py stamps."""
+    hdu = fits.PrimaryHDU(np.ones(shape, dtype=np.float32))
+    if flag is not None:
+        hdu.header["QCFLAG"] = flag
+    if fwhm is not None:
+        hdu.header["QCFWHM"] = fwhm
+    hdu.writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestReferenceQualityScreen:
+    """
+    Audit 2026-08-18, finding H10: reference selection was recency (plus
+    PA-closeness) only and never looked at quality. Harmless while QC-failed
+    frames went to /fits/rejected — but they are archived now, into the very
+    directory the reference stack is drawn from, and differencing a sharp
+    frame against a blurred one leaves a ring residual at every star.
+    """
+
+    def test_a_qc_failed_reference_is_excluded(self, tmp_path):
+        good = [_write_qc_frame(tmp_path / f"good{i}.fits", flag="OK", fwhm=3.0) for i in range(3)]
+        bad = _write_qc_frame(tmp_path / "blur.fits", flag="BLUR", fwhm=3.0)
+
+        kept = subtraction._screen_by_quality(good + [bad], psf_fwhm_arcsec=3.0)
+
+        assert bad not in kept
+        assert set(kept) == set(good)
+
+    def test_a_reference_far_blurrier_than_the_new_frame_is_excluded(self, tmp_path):
+        good = [_write_qc_frame(tmp_path / f"good{i}.fits", flag="OK", fwhm=3.0) for i in range(3)]
+        blurry = _write_qc_frame(tmp_path / "soft.fits", flag="OK", fwhm=9.0)
+
+        kept = subtraction._screen_by_quality(good + [blurry], psf_fwhm_arcsec=3.0)
+
+        assert blurry not in kept
+
+    def test_comparable_seeing_is_kept(self, tmp_path):
+        good = [_write_qc_frame(tmp_path / f"good{i}.fits", flag="OK", fwhm=3.0) for i in range(3)]
+        similar = _write_qc_frame(tmp_path / "similar.fits", flag="OK", fwhm=4.0)
+
+        kept = subtraction._screen_by_quality(good + [similar], psf_fwhm_arcsec=3.0)
+
+        assert similar in kept
+
+    def test_a_frame_with_no_qc_headers_is_kept(self, tmp_path):
+        """An archive written before those headers existed must not lose subtraction."""
+        good = [_write_qc_frame(tmp_path / f"good{i}.fits", flag="OK", fwhm=3.0) for i in range(3)]
+        legacy = _write_qc_frame(tmp_path / "legacy.fits")
+
+        kept = subtraction._screen_by_quality(good + [legacy], psf_fwhm_arcsec=3.0)
+
+        assert legacy in kept
+
+    def test_no_new_frame_fwhm_leaves_only_the_flag_half_in_force(self, tmp_path):
+        good = [_write_qc_frame(tmp_path / f"good{i}.fits", flag="OK", fwhm=3.0) for i in range(3)]
+        blurry = _write_qc_frame(tmp_path / "soft.fits", flag="OK", fwhm=9.0)
+        bad = _write_qc_frame(tmp_path / "blur.fits", flag="TRAIL", fwhm=3.0)
+
+        kept = subtraction._screen_by_quality(good + [blurry, bad], psf_fwhm_arcsec=None)
+
+        assert blurry in kept
+        assert bad not in kept
+
+    def test_screening_below_the_minimum_falls_back_to_the_unscreened_set(self, tmp_path):
+        """An imperfect reference stack beats losing subtraction entirely."""
+        paths = [_write_qc_frame(tmp_path / f"b{i}.fits", flag="BLUR", fwhm=3.0) for i in range(4)]
+
+        kept = subtraction._screen_by_quality(paths, psf_fwhm_arcsec=3.0)
+
+        assert kept == paths
+
+    def test_find_archive_frames_applies_the_screen(self, tmp_path):
+        for i in range(3):
+            _write_qc_frame(tmp_path / f"M51_Light_L_60_2024-03-1{i}T00-00-00.fits", flag="OK", fwhm=3.0)
+        _write_qc_frame(tmp_path / "M51_Light_L_60_2024-03-20T00-00-00.fits", flag="BLUR", fwhm=3.0)
+
+        found = subtraction._find_archive_frames(str(tmp_path), "L", None, 3.0)
+
+        assert len(found) == 3
+        assert all("2024-03-20" not in os.path.basename(f) for f in found)
+
+
 class TestFluxScaleKeys:
 
     def test_reads_exptime_and_egain(self, tmp_path):
@@ -1177,7 +1260,7 @@ class TestReferenceNormalizationInRun:
         for ref_path in ref_paths:
             data_by_path[ref_path] = frame(ref_exptime)
 
-        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ref_paths)
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None: ref_paths)
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (s, None))
 
@@ -1243,7 +1326,7 @@ class TestReferenceNormalizationInRun:
         for ref_path in ref_paths:
             data_by_path[ref_path] = ref_data
 
-        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ref_paths)
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None: ref_paths)
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (s, None))
         monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path, wcs=None: 1.0)
@@ -1270,7 +1353,7 @@ class TestReferenceNormalizationInRun:
 class TestRun:
 
     async def test_skips_when_too_few_archive_frames(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None: ["a.fits", "b.fits"])
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None: ["a.fits", "b.fits"])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
 
@@ -1279,7 +1362,7 @@ class TestRun:
     async def test_skips_when_new_frame_unloadable(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["a.fits", "b.fits", "c.fits"],
+            lambda d, f, pa=None, fwhm=None: ["a.fits", "b.fits", "c.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: None)
 
@@ -1313,7 +1396,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
@@ -1328,7 +1411,7 @@ class TestRun:
     async def test_skips_when_alignment_fails_for_all_frames(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones((10, 10), dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: None)
@@ -1343,7 +1426,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.ones(shape, dtype=np.float32), None))
@@ -1382,7 +1465,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(
             subtraction, "_load_frame_data",
@@ -1412,7 +1495,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.full(shape, 100.0, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.full(shape, 100.0, dtype=np.float32), None))
@@ -1443,7 +1526,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.ones(shape, dtype=np.float32), None))
@@ -1485,7 +1568,7 @@ class TestRun:
         new_path = str(tmp_path / "new.fits")
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: [new_path, "ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None: [new_path, "ref1.fits", "ref2.fits", "ref3.fits"],
         )
 
         loaded_paths: list[str] = []
@@ -1543,7 +1626,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None: list(wcs_by_path.keys()),
+            lambda d, f, pa=None, fwhm=None: list(wcs_by_path.keys()),
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: raw_ref_data.copy())
         monkeypatch.setattr(subtraction, "_open_wcs", lambda p: wcs_by_path.get(p))

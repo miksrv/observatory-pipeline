@@ -554,6 +554,54 @@ async def test_archived_file_gets_solved_wcs(mock_modules, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_archived_file_gets_qc_headers(mock_modules, tmp_path):
+    """
+    Audit 2026-08-18, finding H10: a later frame's subtraction picks its
+    reference stack out of this same archive directory and has no way to ask
+    the API what it is about to stack — the pipeline has no database access
+    and the API cannot see the observatory's filesystem. The frame's own
+    header is where the two meet, so the QC verdict is stamped there before
+    the archive move.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFLAG"] == "OK"
+        assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
+
+
+@pytest.mark.asyncio
+async def test_qc_fwhm_header_omitted_when_the_unit_is_pixels(mock_modules, tmp_path):
+    """
+    qc.analyze() reports FWHM in raw pixels when the frame's headers don't
+    carry enough to derive a plate scale. Writing that number under a
+    keyword documented as arcsec would make a later subtraction compare two
+    incompatible quantities, so it is simply not written.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    pipeline.qc.analyze.return_value = {**_GOOD_QC, "fwhm_unit": "pixels"}
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFLAG"] == "OK"
+        assert "QCFWHM" not in hdul[0].header
+
+
+@pytest.mark.asyncio
 async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
     """
     Regression test for Known Issues #11: the archive move (step 14.5) must
