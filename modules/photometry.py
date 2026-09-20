@@ -97,6 +97,82 @@ def _inject_nulls(
     return result
 
 
+# Plausible range for a real sensor's electrons-per-ADU conversion factor.
+# CCDs sit around 0.5-2 e-/ADU and CMOS sensors from well under 1 to a few;
+# nothing real reaches either end of this window. A header value outside it
+# is not a conversion factor at all — overwhelmingly it is a CMOS camera's
+# own gain SETTING in arbitrary vendor units written to GAIN (0-500 on a ZWO
+# ASI, for instance), which would corrupt the flux error far worse than the
+# 1.0 assumption it replaced. See config.PHOTOMETRY_GAIN_E_PER_ADU.
+_GAIN_MIN_E_PER_ADU: float = 0.05
+_GAIN_MAX_E_PER_ADU: float = 20.0
+
+
+def _resolve_gain(
+    hdr: Any,
+    fits_filename: str,
+    override: float | None = None,
+) -> float:
+    """
+    Resolve this frame's sensor gain in electrons per ADU, for the Poisson
+    term of the aperture flux error.
+
+    Order of preference: an explicit caller-supplied `override`, then
+    config.PHOTOMETRY_GAIN_E_PER_ADU, then the frame's own header — EGAIN
+    first, GAIN second. That order matters: on most CMOS cameras EGAIN is the
+    true conversion factor while GAIN holds the camera's own gain setting in
+    arbitrary vendor units. Falls back to 1.0 (the value the formula
+    implicitly assumed before this existed) whenever nothing usable is
+    available or the candidate falls outside the plausible e-/ADU range.
+
+    Duplicated by hand in modules/forced_photometry.py rather than imported,
+    the same convention already used for this module's aperture/net-flux
+    formulas there and for the streak-mask helper shared between
+    astrometry/qc/subtraction.
+    """
+    candidates: list[tuple[str, Any]] = []
+    if override is not None:
+        candidates.append(("caller", override))
+    if config.PHOTOMETRY_GAIN_E_PER_ADU is not None:
+        candidates.append(("PHOTOMETRY_GAIN_E_PER_ADU", config.PHOTOMETRY_GAIN_E_PER_ADU))
+    if hdr is not None:
+        for key in ("EGAIN", "GAIN"):
+            try:
+                value = hdr.get(key)
+            except Exception:
+                value = None
+            if value is not None:
+                candidates.append((key, value))
+
+    for origin, value in candidates:
+        try:
+            gain = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(gain):
+            continue
+        if _GAIN_MIN_E_PER_ADU <= gain <= _GAIN_MAX_E_PER_ADU:
+            logger.debug(
+                "photometry: gain=%.4f e-/ADU (from %s)  file=%s",
+                gain, origin, fits_filename,
+            )
+            return gain
+        logger.warning(
+            "photometry: %s=%s is outside the plausible %.2f-%.1f e-/ADU range "
+            "— ignoring it (a CMOS camera's GAIN keyword is usually its gain "
+            "SETTING, not a conversion factor); set PHOTOMETRY_GAIN_E_PER_ADU "
+            "explicitly if you know the real value  file=%s",
+            origin, value, _GAIN_MIN_E_PER_ADU, _GAIN_MAX_E_PER_ADU,
+            fits_filename,
+        )
+
+    logger.debug(
+        "photometry: no usable gain available — assuming 1.0 e-/ADU  file=%s",
+        fits_filename,
+    )
+    return 1.0
+
+
 def _pixel_scale_from_wcs(wcs: WCS) -> float:
     """
     Derive the plate scale in arcsec/pixel from a WCS object.
@@ -175,6 +251,7 @@ async def measure(
     fits_path: str,
     sources: list[dict],
     skip_calibration: bool = False,
+    gain: float | None = None,
 ) -> list[dict]:
     """
     Perform aperture photometry and differential magnitude calibration.
@@ -206,6 +283,11 @@ async def measure(
         every source's ``calibrated`` stays False and ``mag_calibrated``
         stays None — same outward result as "fewer than 3 Gaia references",
         just without ever attempting the (untrustworthy) calibration at all.
+    gain:
+        Sensor gain in electrons per ADU for the Poisson term of the flux
+        error. None (the default) resolves it from
+        config.PHOTOMETRY_GAIN_E_PER_ADU, then from the frame's own
+        EGAIN/GAIN header — see _resolve_gain().
 
     Returns
     -------
@@ -324,6 +406,9 @@ async def measure(
         fits_filename,
     )
 
+    # Sensor gain (e-/ADU) for the Poisson term of the flux error below.
+    gain_e_per_adu: float = _resolve_gain(hdr, fits_filename, override=gain)
+
     # ------------------------------------------------------------------
     # Step 2 — Sky background (sigma-clipped statistics)
     # ------------------------------------------------------------------
@@ -438,9 +523,22 @@ async def measure(
             ap_area: float   = float(aperture.area)
             net_flux: float  = ap_sum - sky_per_px * ap_area
 
-            # Flux uncertainty: Poisson noise + sky noise
+            # Flux uncertainty: Poisson noise + sky noise.
+            #
+            # net_flux is in ADU, but photon shot noise is Poissonian in
+            # ELECTRONS: N_e = net_flux * gain electrons, whose variance
+            # N_e converts back to ADU as N_e / gain**2 = net_flux / gain.
+            # Using net_flux directly as the variance — as this did before
+            # — silently assumed exactly 1 e-/ADU, which real cameras
+            # almost never are, biasing every SNR in the frame in one
+            # direction or the other (audit 2026-08-18, finding C7).
+            #
+            # sky_sigma needs no such conversion: it is the empirical
+            # per-pixel background scatter measured off this frame's own
+            # ADU values, so it already carries read noise and sky shot
+            # noise together in ADU.
             flux_err: float  = math.sqrt(
-                abs(net_flux) + ap_area * sky_sigma ** 2
+                abs(net_flux) / gain_e_per_adu + ap_area * sky_sigma ** 2
             )
 
             out["flux_aperture"] = net_flux

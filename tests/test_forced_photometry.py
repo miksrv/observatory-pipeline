@@ -48,8 +48,12 @@ def _pix_to_world(wcs: AstropyWCS, x: float, y: float) -> tuple[float, float]:
 
 
 class _FakeHDU:
-    def __init__(self, data: np.ndarray) -> None:
+    def __init__(self, data: np.ndarray, header: dict | None = None) -> None:
         self.data = data
+        # run() reads EGAIN/GAIN off this for the Poisson term of the flux
+        # error (_resolve_gain()); an empty header is the "no usable gain
+        # in this frame, assume 1.0 e-/ADU" case.
+        self.header = header if header is not None else {}
 
 
 class _FakeHDUL:
@@ -382,3 +386,72 @@ class TestMeasureAtPixel:
         data_sub = image - 1000.0
         result = fp._measure_at_pixel(data_sub, image, 200.0, 200.0, ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0)
         assert result is None
+
+    def test_gain_divides_the_poisson_term(self):
+        """
+        flux_err = sqrt(|net_flux| / gain + ap_area * sky_sigma**2) — the
+        aperture sum is in ADU but shot noise is Poissonian in electrons
+        (audit finding C7). sky_sigma=0 isolates the Poisson term; the
+        empirical background scatter is already in ADU and is deliberately
+        not gain-converted.
+        """
+        image = _make_image()
+        data_sub = image - 1000.0
+        kwargs = dict(ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=0.0)
+
+        net_unity, err_unity = fp._measure_at_pixel(data_sub, image, 100.0, 100.0, **kwargs)
+        net_gain4, err_gain4 = fp._measure_at_pixel(
+            data_sub, image, 100.0, 100.0, gain_e_per_adu=4.0, **kwargs
+        )
+
+        assert net_gain4 == pytest.approx(net_unity)  # the flux itself is unchanged
+        assert err_unity == pytest.approx(math.sqrt(abs(net_unity)))
+        assert err_gain4 == pytest.approx(math.sqrt(abs(net_unity) / 4.0))
+
+
+class TestRunGain:
+    """
+    run() resolves the gain from the frame's own EGAIN/GAIN header. The
+    consequence that matters here is the one C7 calls out for this module
+    specifically: at gain > 1 the old formula overstated flux_err, so the
+    significance came out understated and real faint recoveries were dropped
+    against FORCED_PHOTOMETRY_MIN_SNR — defeating the point of precovery.
+    """
+
+    @staticmethod
+    def _scene_with_header(monkeypatch, header: dict):
+        image = _make_image()
+        wcs = _make_wcs()
+        monkeypatch.setattr(
+            "modules.forced_photometry.fits.open",
+            lambda *a, **kw: _FakeHDUL(_FakeHDU(image, header)),
+        )
+        return wcs
+
+    async def _recover(self, monkeypatch, header: dict, min_snr: float) -> list[dict]:
+        wcs = self._scene_with_header(monkeypatch, header)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", min_snr)
+        gaia = [_gaia_star(wcs, 100, 100, "gaia-1", mag=17.5)]
+        return await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05,
+            obs_time=None, psf_fwhm_arcsec=None,
+        )
+
+    async def test_header_gain_raises_the_measured_significance(self, monkeypatch):
+        without = await self._recover(monkeypatch, {}, min_snr=0.0)
+        with_gain = await self._recover(monkeypatch, {"EGAIN": 4.0}, min_snr=0.0)
+
+        assert len(without) == 1 and len(with_gain) == 1
+        assert with_gain[0]["flux_err"] < without[0]["flux_err"]
+        assert with_gain[0]["flux_aperture"] == pytest.approx(without[0]["flux_aperture"])
+
+    async def test_implausible_gain_header_is_ignored(self, monkeypatch):
+        """A ZWO-style GAIN=120 is a gain setting, not e-/ADU — using it
+        would understate the error by an order of magnitude."""
+        plain = await self._recover(monkeypatch, {}, min_snr=0.0)
+        bogus = await self._recover(monkeypatch, {"GAIN": 120.0}, min_snr=0.0)
+
+        assert bogus[0]["flux_err"] == pytest.approx(plain[0]["flux_err"])

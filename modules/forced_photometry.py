@@ -112,6 +112,54 @@ def _propagate_gaia_position(star: dict, obs_jyear: float | None) -> tuple[float
     return ra + d_ra_deg, dec + d_dec_deg
 
 
+# Plausible range for a real sensor's electrons-per-ADU conversion factor —
+# duplicated from modules/photometry.py, same convention as the aperture /
+# net-flux formulas below. See config.PHOTOMETRY_GAIN_E_PER_ADU.
+_GAIN_MIN_E_PER_ADU: float = 0.05
+_GAIN_MAX_E_PER_ADU: float = 20.0
+
+
+def _resolve_gain(hdr, fits_filename: str, override: float | None = None) -> float:
+    """
+    Resolve this frame's sensor gain in electrons per ADU — a hand-duplicated
+    copy of modules/photometry.py's _resolve_gain(), kept in sync by hand the
+    same way this module's aperture/net-flux formulas already are. See that
+    function's docstring for the EGAIN-before-GAIN preference and why a value
+    outside the plausible range is rejected rather than trusted.
+    """
+    candidates: list[tuple[str, object]] = []
+    if override is not None:
+        candidates.append(("caller", override))
+    if config.PHOTOMETRY_GAIN_E_PER_ADU is not None:
+        candidates.append(("PHOTOMETRY_GAIN_E_PER_ADU", config.PHOTOMETRY_GAIN_E_PER_ADU))
+    if hdr is not None:
+        for key in ("EGAIN", "GAIN"):
+            try:
+                value = hdr.get(key)
+            except Exception:
+                value = None
+            if value is not None:
+                candidates.append((key, value))
+
+    for origin, value in candidates:
+        try:
+            gain = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(gain):
+            continue
+        if _GAIN_MIN_E_PER_ADU <= gain <= _GAIN_MAX_E_PER_ADU:
+            return gain
+        logger.warning(
+            "forced_photometry: %s=%s is outside the plausible %.2f-%.1f "
+            "e-/ADU range — ignoring it  file=%s",
+            origin, value, _GAIN_MIN_E_PER_ADU, _GAIN_MAX_E_PER_ADU,
+            fits_filename,
+        )
+
+    return 1.0
+
+
 def _measure_at_pixel(
     data_sub: np.ndarray,
     raw_data: np.ndarray,
@@ -121,6 +169,7 @@ def _measure_at_pixel(
     annulus_inner: float,
     annulus_outer: float,
     sky_sigma: float,
+    gain_e_per_adu: float = 1.0,
 ) -> tuple[float, float] | None:
     """
     Aperture-photometer a single fixed position. Mirrors modules/photometry.py's
@@ -157,7 +206,14 @@ def _measure_at_pixel(
     ap_area = float(aperture.area)
 
     net_flux = ap_sum - sky_per_px * ap_area
-    flux_err = math.sqrt(abs(net_flux) + ap_area * sky_sigma ** 2)
+    # Poisson term divided by the gain: the aperture sum is in ADU, but shot
+    # noise is Poissonian in electrons — see photometry.py's own comment on
+    # the identical formula, and audit 2026-08-18 finding C7 for what the
+    # implicit gain=1 assumption cost this module specifically (an
+    # overstated flux_err understates the significance, so real faint
+    # recoveries were dropped against FORCED_PHOTOMETRY_MIN_SNR — defeating
+    # the entire point of precovery).
+    flux_err = math.sqrt(abs(net_flux) / gain_e_per_adu + ap_area * sky_sigma ** 2)
     return net_flux, flux_err
 
 
@@ -224,6 +280,7 @@ async def run(
     zero_point_err: float | None,
     obs_time: str | None,
     psf_fwhm_arcsec: float | None = None,
+    gain: float | None = None,
 ) -> list[dict]:
     """
     Force-measure every catalog star/MPC object not already present in
@@ -270,6 +327,11 @@ async def run(
         Sets the fixed aperture/annulus radii, same formula as
         photometry.py. Falls back to a fixed 3-pixel FWHM assumption when
         unavailable (mirrors photometry.py's own fallback).
+    gain:
+        Sensor gain in electrons per ADU for the Poisson term of the flux
+        error. None (the default) resolves it from
+        config.PHOTOMETRY_GAIN_E_PER_ADU, then from the frame's own
+        EGAIN/GAIN header — see _resolve_gain().
 
     Returns
     -------
@@ -318,9 +380,12 @@ async def run(
     try:
         with fits.open(fits_path, mode="readonly", ignore_missing_simple=True) as hdul:
             raw_data = hdul[0].data
+            hdr = hdul[0].header
     except Exception as exc:
         logger.warning("forced_photometry: failed to open %s: %s", fits_path, exc)
         return []
+
+    gain_e_per_adu = _resolve_gain(hdr, fits_filename, override=gain)
 
     if raw_data is None:
         return []
@@ -378,6 +443,7 @@ async def run(
             return None
         measured = _measure_at_pixel(
             data_sub, data, x_px, y_px, ap_radius, annulus_inner, annulus_outer, sky_sigma,
+            gain_e_per_adu,
         )
         if measured is None:
             return None

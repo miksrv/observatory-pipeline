@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 from astropy.wcs import WCS as AstropyWCS
 
+import config
 from modules import photometry
 
 
@@ -370,6 +371,117 @@ class TestAperturePhotometry:
             ):
                 expected = 1.0857 * src["flux_err"] / src["flux_aperture"]
                 assert abs(src["mag_err"] - expected) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Test 2.5 — Sensor gain in the flux-error Poisson term (audit finding C7)
+# ---------------------------------------------------------------------------
+
+class TestGainInFluxError:
+    """
+    flux_err = sqrt(|net_flux| / gain + ap_area * sky_sigma**2).
+
+    The aperture sum is in ADU, but photon shot noise is Poissonian in
+    ELECTRONS: N_e = net_flux * gain, whose variance converts back to ADU as
+    N_e / gain**2 = net_flux / gain. Treating net_flux itself as the variance
+    silently assumed exactly 1 e-/ADU, which real cameras almost never are,
+    so every SNR in the frame was biased in one direction or the other —
+    above 1 e-/ADU the error was overstated and forced photometry dropped
+    real faint recoveries against FORCED_PHOTOMETRY_MIN_SNR (audit finding
+    C7).
+
+    sky_sigma is deliberately NOT gain-converted: it is the empirical
+    per-pixel background scatter measured off this frame's own ADU values,
+    so it already carries read noise and sky shot noise together in ADU.
+    Every test here therefore uses sky_sigma=0.0, isolating the Poisson term.
+    """
+
+    @staticmethod
+    async def _flux_err(header: dict[str, Any] | None = None, **kwargs) -> tuple[float, float]:
+        srcs = _make_sources(n=1, fwhm=3.0)
+        with _patch_photometry(
+            hdul=_make_hdul(header=header),
+            aperture_sum=100000.0,
+            annulus_sky_per_px=0.0,
+            sky_sigma=0.0,
+        ):
+            result = await photometry.measure(_FITS_PATH, srcs, **kwargs)
+        return float(result[0]["flux_aperture"]), float(result[0]["flux_err"])
+
+    async def test_missing_gain_header_assumes_unity(self):
+        """No EGAIN/GAIN anywhere — the pre-existing implicit assumption,
+        preserved so an unheadered frame behaves exactly as before."""
+        net_flux, flux_err = await self._flux_err()
+        assert flux_err == pytest.approx(math.sqrt(net_flux))
+
+    async def test_egain_header_divides_the_poisson_term(self):
+        header = dict(_BASE_HEADER, EGAIN=4.0)
+        net_flux, flux_err = await self._flux_err(header)
+        assert flux_err == pytest.approx(math.sqrt(net_flux / 4.0))
+
+    async def test_egain_is_preferred_over_gain(self):
+        """
+        On most CMOS cameras EGAIN is the true e-/ADU conversion while GAIN
+        holds the camera's own gain SETTING in arbitrary vendor units. This
+        is the one place in the pipeline where that preference matters.
+        """
+        header = dict(_BASE_HEADER, EGAIN=2.0, GAIN=120.0)
+        net_flux, flux_err = await self._flux_err(header)
+        assert flux_err == pytest.approx(math.sqrt(net_flux / 2.0))
+
+    async def test_gain_header_is_used_when_plausible(self):
+        header = dict(_BASE_HEADER, GAIN=0.5)
+        net_flux, flux_err = await self._flux_err(header)
+        assert flux_err == pytest.approx(math.sqrt(net_flux / 0.5))
+
+    async def test_implausible_gain_falls_back_to_unity(self):
+        """
+        A ZWO-style GAIN=120 is a gain setting, not a conversion factor.
+        Dividing by it would understate the error by an order of magnitude —
+        far more wrong than the 1.0 assumption it replaced — so it is
+        rejected outright.
+        """
+        header = dict(_BASE_HEADER, GAIN=120.0)
+        net_flux, flux_err = await self._flux_err(header)
+        assert flux_err == pytest.approx(math.sqrt(net_flux))
+
+    async def test_non_numeric_gain_falls_back_to_unity(self):
+        header = dict(_BASE_HEADER, GAIN="High")
+        net_flux, flux_err = await self._flux_err(header)
+        assert flux_err == pytest.approx(math.sqrt(net_flux))
+
+    async def test_config_override_beats_the_header(self, monkeypatch):
+        monkeypatch.setattr(config, "PHOTOMETRY_GAIN_E_PER_ADU", 3.0)
+        header = dict(_BASE_HEADER, EGAIN=1.0)
+        net_flux, flux_err = await self._flux_err(header)
+        assert flux_err == pytest.approx(math.sqrt(net_flux / 3.0))
+
+    async def test_caller_argument_beats_everything(self, monkeypatch):
+        monkeypatch.setattr(config, "PHOTOMETRY_GAIN_E_PER_ADU", 3.0)
+        header = dict(_BASE_HEADER, EGAIN=1.0)
+        net_flux, flux_err = await self._flux_err(header, gain=5.0)
+        assert flux_err == pytest.approx(math.sqrt(net_flux / 5.0))
+
+    async def test_higher_gain_raises_the_reported_snr(self):
+        """
+        The consequence that matters downstream: at gain > 1 the old formula
+        overstated flux_err, so snr came out understated and
+        forced_photometry.py failed real faint objects against
+        FORCED_PHOTOMETRY_MIN_SNR.
+        """
+        srcs = _make_sources(n=1, fwhm=3.0)
+
+        async def _snr(header):
+            with _patch_photometry(
+                hdul=_make_hdul(header=header),
+                aperture_sum=100000.0,
+                annulus_sky_per_px=0.0,
+                sky_sigma=0.0,
+            ):
+                result = await photometry.measure(_FITS_PATH, list(srcs))
+            return result[0]["snr"]
+
+        assert await _snr(dict(_BASE_HEADER, EGAIN=4.0)) > await _snr(dict(_BASE_HEADER))
 
 
 # ---------------------------------------------------------------------------

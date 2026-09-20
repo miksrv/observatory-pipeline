@@ -315,6 +315,37 @@ SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG", "2.0"))
 
 # ---------------------------------------------------------------------------
+# Photometry — sensor gain
+# ---------------------------------------------------------------------------
+# Sensor gain in electrons per ADU, used for the Poisson term of the aperture
+# flux error in modules/photometry.py and modules/forced_photometry.py. The
+# raw aperture sum is in ADU, but photon shot noise is Poissonian in
+# ELECTRONS: with N_e = flux_adu * gain electrons, the variance back in ADU is
+# N_e / gain**2 = flux_adu / gain. Treating flux_adu itself as the variance —
+# which the formula did before — is only correct at exactly 1 e-/ADU, and real
+# cameras almost never are (CCD ~0.5-2; CMOS anywhere from well under 1 to
+# several). Above 1 the error came out overstated, so the SNR was understated
+# and forced photometry systematically failed real faint objects against
+# FORCED_PHOTOMETRY_MIN_SNR; below 1 the reverse, and noise was reported as a
+# significant detection (audit 2026-08-18, finding C7).
+#
+# Blank (the default) means "read it from each frame's own header". The
+# EGAIN keyword is preferred over GAIN there, and this is the one place in
+# the pipeline where that order matters: on most CMOS cameras EGAIN is the
+# true e-/ADU conversion while GAIN is the camera's own gain SETTING in
+# arbitrary vendor units (0-500 on a ZWO ASI, say). Feeding such a setting
+# into the formula above would be far more wrong than assuming 1.0, so a
+# header value outside the plausible e-/ADU range is rejected with a warning
+# and 1.0 is used instead — see modules/photometry.py's _resolve_gain().
+#
+# Set this explicitly when your capture software writes no usable EGAIN and
+# you know your sensor's real conversion factor.
+_photometry_gain_raw: str = _get("PHOTOMETRY_GAIN_E_PER_ADU", "").strip()
+PHOTOMETRY_GAIN_E_PER_ADU: float | None = (
+    float(_photometry_gain_raw) if _photometry_gain_raw else None
+)
+
+# ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
 # ---------------------------------------------------------------------------
 # A second, independent pass run AFTER catalog_matcher.py's forward matching:

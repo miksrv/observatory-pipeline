@@ -633,6 +633,22 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
 - Aperture photometry via `photutils.aperture`
 - Differential photometry against Gaia reference stars in the field (requires ≥3 Gaia DR3 matches to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations
 - Adds the following fields to each source: `flux_aperture`, `flux_err`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `snr`, `calibrated` (bool), `edge_flag`, `zero_point`, `zero_point_err`
+- `flux_err` is `sqrt(|net_flux| / gain + ap_area × sky_sigma²)`. The aperture sum is in ADU,
+  but photon shot noise is Poissonian in **electrons** — `N_e = net_flux × gain`, whose variance
+  converts back to ADU as `N_e / gain² = net_flux / gain`. Using `net_flux` itself as the
+  variance silently assumed exactly 1 e⁻/ADU, which real cameras almost never are (CCD ~0.5–2;
+  CMOS from well under 1 to several), biasing every `snr` in the frame in one direction or the
+  other (audit 2026-08-18, finding C7). `sky_sigma` needs no such conversion — it is the
+  empirical per-pixel background scatter measured off this frame's own ADU values, so it already
+  carries read noise and sky shot noise together in ADU. The gain comes from
+  `_resolve_gain()`: an explicit `gain=` argument, else `config.PHOTOMETRY_GAIN_E_PER_ADU`, else
+  the frame's own header — **`EGAIN` before `GAIN`**, the one place in the pipeline where that
+  order matters, since on most CMOS cameras `EGAIN` is the true e⁻/ADU conversion while `GAIN`
+  holds the camera's own gain *setting* in arbitrary vendor units (0–500 on a ZWO ASI). A value
+  outside the plausible e⁻/ADU range is rejected with a warning and `1.0` used instead — feeding
+  a gain setting into the formula would be far more wrong than the assumption it replaced.
+  `modules/forced_photometry.py` duplicates the same helper and formula by hand, the convention
+  that module already follows for the rest of this module's photometry math.
 - `snr` is `flux_aperture / flux_err` — the same flux/noise convention already used by
   `modules/qc.py`'s `snr_median` and (as a cruder pixel-space proxy, before real aperture
   photometry has run) `modules/subtraction.py`'s own candidate `snr`. Computed here rather than
@@ -864,7 +880,10 @@ lookup set before any pixel work starts):
   `_query_mpc()` already filters by `MPC_MAG_LIMIT` before these objects ever reach this module.
 
 Aperture photometry at the predicted pixel reuses the same aperture/annulus-sizing and net-flux/
-flux-error formulas as `modules/photometry.py` — duplicated by hand rather than imported, the same
+flux-error formulas as `modules/photometry.py` — including its gain-corrected Poisson term and
+the `_resolve_gain()` helper behind it (see that module's section above; this is the module C7
+hurt most, since an overstated `flux_err` understates the significance and drops real faint
+recoveries against `FORCED_PHOTOMETRY_MIN_SNR`) — duplicated by hand rather than imported, the same
 convention `modules/qc.py`/`modules/subtraction.py` already use for `astrometry.py`'s streak-mask
 helper. A position is rejected outright (not reported at all) when its aperture would fall outside
 the frame, or any pixel under it is at/above `SATURATION_ADU` — a forced measurement on a saturated

@@ -445,6 +445,9 @@ VARIABILITY_SIGMA=3.0
 SUBTRACTION_MIN_FRAMES=3
 SUBTRACTION_DETECT_SIGMA=5.0
 
+# ── Photometry — sensor gain (photometry + forced_photometry modules) ────────
+PHOTOMETRY_GAIN_E_PER_ADU=      # blank = read EGAIN/GAIN from each frame's header
+
 # ── Forced photometry / reverse matching (modules/forced_photometry.py) ───────
 FORCED_PHOTOMETRY_ENABLED=true
 FORCED_PHOTOMETRY_MAG_LIMIT=20.0
@@ -526,6 +529,8 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Image Subtraction** |
 | `SUBTRACTION_MIN_FRAMES` | `3` | No | Minimum number of archived reference frames of the same object required before `modules/subtraction.py` will attempt image subtraction. |
 | `SUBTRACTION_DETECT_SIGMA` | `5.0` | No | Detection threshold on the difference image, in multiples of background RMS. |
+| **Photometry — Sensor Gain** |
+| `PHOTOMETRY_GAIN_E_PER_ADU` | _(blank)_ | No | Sensor gain in electrons per ADU, for the Poisson term of the aperture flux error (`modules/photometry.py`, `modules/forced_photometry.py`). Blank means "read it from each frame's own header", preferring `EGAIN` over `GAIN` — on most CMOS cameras `EGAIN` is the true conversion factor while `GAIN` holds the camera's gain *setting* in arbitrary vendor units. A header value outside the plausible e⁻/ADU range is rejected with a warning and `1.0` is used. Set explicitly when your capture software writes no usable `EGAIN`. |
 | **Forced Photometry / Reverse Matching** |
 | `FORCED_PHOTOMETRY_ENABLED` | `true` | No | Enable/disable the forced-photometry pass (`modules/forced_photometry.py`) entirely. |
 | `FORCED_PHOTOMETRY_MAG_LIMIT` | `20.0` | No | Faintest Gaia DR3 G-band magnitude eligible for forced photometry — tune to a couple of magnitudes above your own setup's typical detection limit. Not applied to MPC objects (already filtered by `MPC_MAG_LIMIT`). |
