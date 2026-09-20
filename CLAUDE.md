@@ -113,7 +113,7 @@ Standard FITS keywords supported (with common aliases):
 | **Telescope** | `TELESCOP` | Telescope name/model |
 | **Optics** | `FOCALLEN`, `APTDIA`, `APERTURE` | Focal length (mm), aperture diameter (mm) |
 | **Sensor** | `CCD-TEMP`, `SET-TEMP`, `CCDTEMP` | Sensor temperature (°C) |
-| **Pixel scale** | `XPIXSZ`, `PIXSIZE`, `PIXSCALE1`, `PIXELSZ`, `PIXSCALE` | Pixel size (µm) or plate scale (arcsec/px); used to estimate FOV before/without plate solving |
+| **Pixel scale** | `XPIXSZ`, `PIXSIZE`, `PIXELSZ` (µm); `PIXSCALE`, `PIXSCALE1` (ambiguous) | Pixel size (µm) or plate scale (arcsec/px); used to estimate FOV before/without plate solving — see "Plate scale" below |
 | **Binning** | `XBINNING`, `YBINNING`, `BINNING` | Pixel binning (e.g., 1x1, 2x2) |
 | **Gain/Offset** | `GAIN`, `EGAIN`, `OFFSET` | Gain (e-/ADU), offset/bias level |
 | **Image size** | `NAXIS1`, `NAXIS2` | Image dimensions in pixels |
@@ -146,6 +146,17 @@ one. Taking the first non-empty key instead — as an earlier revision did — s
 frame of an old-convention night at midnight, an hours-scale epoch error for the SkyBot/Horizons
 queries and for history comparisons (audit 2026-08-18, finding C10). A date-only frame with no
 `TIME-OBS` at all still resolves to midnight, but logs a warning saying so.
+
+**Plate scale.** `resolve_pixel_scale_arcsec()` is the single resolver for "what is this frame's
+arcsec/pixel, from headers alone" — `modules/qc.py` calls it rather than reading the keywords
+itself, one of the few shared helpers in this codebase rather than a hand-duplicated one,
+precisely because the two used to disagree about the same frame (audit 2026-08-18, finding M2).
+`XPIXSZ`/`PIXSIZE`/`PIXELSZ` can only mean microns; `PIXSCALE`/`PIXSCALE1` are genuinely
+ambiguous — some software writes arcsec/px there, some the pixel size, and the ranges overlap (a
+3.76 µm pixel and a 3.76″/px scale are the same number), so no range check can separate them.
+The order is: an unambiguous µm keyword plus `FOCALLEN`, then the ambiguous card's own comment
+when it names a unit, then the value read as arcsec/px — logged as the assumption it is, with
+the microns reading shown alongside.
 
 **Equinox.** The mount's reported RA/Dec is precessed to ICRS when `EQUINOX`/`EPOCH` says it is
 in another equinox (`_to_icrs()`); `RADESYS: ICRS` short-circuits that, since the FITS standard's

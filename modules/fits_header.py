@@ -478,10 +478,118 @@ def _extract_instrument(hdr: fits.Header) -> dict:
     }
 
 
+# Keywords that unambiguously mean "the physical size of a pixel, in microns".
+_PIXEL_SIZE_UM_KEYWORDS: tuple[str, ...] = ("XPIXSZ", "PIXSIZE", "PIXELSZ")
+# Keywords whose unit is genuinely ambiguous — some capture software writes
+# arcsec per pixel there, some writes the pixel size in microns.
+_AMBIGUOUS_SCALE_KEYWORDS: tuple[str, ...] = ("PIXSCALE", "PIXSCALE1")
+# Words a card comment might use to settle that ambiguity.
+_ARCSEC_WORDS: tuple[str, ...] = ("arcsec", "arcsecond", "asec", "\"/p", "arc-sec")
+_MICRON_WORDS: tuple[str, ...] = ("micron", "um", "µm", "micrometre", "micrometer")
+# A plate scale no real instrument falls outside of.
+_PLATE_SCALE_MIN_ARCSEC: float = 0.01
+_PLATE_SCALE_MAX_ARCSEC: float = 200.0
+
+
+def pixel_size_um(hdr: fits.Header) -> float | None:
+    """
+    The physical pixel size in microns, from the keywords that can only mean
+    that.
+
+    `PIXSCALE1` used to be read here as if it were one of them. It is not:
+    like `PIXSCALE`, some software writes arcsec per pixel into it, and the
+    two ranges overlap — a 3.76 micron pixel and a 3.76"/px plate scale are
+    the same number (audit 2026-08-18, finding M2). It is handled by
+    `resolve_pixel_scale_arcsec()` below instead, which has the evidence to
+    decide.
+    """
+    return _to_float(_get(hdr, *_PIXEL_SIZE_UM_KEYWORDS))
+
+
+def _card_unit(hdr: fits.Header, key: str) -> str | None:
+    """"arcsec", "micron", or None — whatever the card's own comment says."""
+    try:
+        comment = str(hdr.comments[key]).lower()
+    except Exception:
+        return None
+    if any(word in comment for word in _ARCSEC_WORDS):
+        return "arcsec"
+    if any(word in comment for word in _MICRON_WORDS):
+        return "micron"
+    return None
+
+
+def _scale_from_pixel_size(pixel_um: float | None, focal_mm: float | None) -> float | None:
+    """206265 x (pixel_um / 1000) / focal_mm, when both are usable."""
+    if pixel_um is None or focal_mm is None or focal_mm <= 0 or pixel_um <= 0:
+        return None
+    scale = 206265.0 * (pixel_um / 1000.0) / focal_mm
+    return scale if _PLATE_SCALE_MIN_ARCSEC <= scale <= _PLATE_SCALE_MAX_ARCSEC else None
+
+
+def resolve_pixel_scale_arcsec(hdr: fits.Header) -> float | None:
+    """
+    The frame's plate scale in arcsec per pixel, derived from its headers
+    alone — what `modules/qc.py` has to work with before anything has plate
+    solved.
+
+    `modules/qc.py` and this module used to read the same ambiguous keywords
+    differently, and both unsafely: one took `PIXSCALE` as arcsec/px whenever
+    it fell in a wide range, the other took `PIXSCALE1` as microns
+    unconditionally. The ranges overlap — a 3.76 micron pixel and a 3.76"/px
+    scale are the same number — so no range check can separate them (audit
+    2026-08-18, finding M2). One resolver now serves both, and it decides from
+    evidence in this order:
+
+    1. An unambiguous pixel-size keyword (`XPIXSZ`/`PIXSIZE`/`PIXELSZ`) with
+       `FOCALLEN`. Nothing beats knowing both quantities outright.
+    2. The ambiguous keyword's own card comment, when it names a unit
+       (`PIXSCALE = 1.23 / arcsec/pixel`).
+    3. Its value read as arcsec/px, if that is a plausible plate scale —
+       logged as the assumption it is, since the same number could be a pixel
+       size, and if `FOCALLEN` is present the microns reading is offered in
+       the same line so an operator can see both.
+
+    Returns None when the headers simply don't carry enough, which is a
+    normal outcome the callers already handle.
+    """
+    focal_mm = _to_float(_get(hdr, "FOCALLEN"))
+
+    derived = _scale_from_pixel_size(pixel_size_um(hdr), focal_mm)
+    if derived is not None:
+        return derived
+
+    for key in _AMBIGUOUS_SCALE_KEYWORDS:
+        value = _to_float(_get(hdr, key))
+        if value is None or value <= 0:
+            continue
+
+        unit = _card_unit(hdr, key)
+        if unit == "micron":
+            from_um = _scale_from_pixel_size(value, focal_mm)
+            if from_um is not None:
+                return from_um
+            continue
+        if unit == "arcsec":
+            return value if _PLATE_SCALE_MIN_ARCSEC <= value <= _PLATE_SCALE_MAX_ARCSEC else None
+
+        if not (_PLATE_SCALE_MIN_ARCSEC <= value <= _PLATE_SCALE_MAX_ARCSEC):
+            continue
+
+        alternative = _scale_from_pixel_size(value, focal_mm)
+        logger.info(
+            "%s=%s carries no unit in its comment — reading it as %.3f\"/px. "
+            "Read instead as a pixel size in microns it would give %s",
+            key, value, value,
+            f"{alternative:.3f}\"/px" if alternative is not None else "no usable scale",
+        )
+        return value
+
+    return None
+
+
 def _extract_sensor(hdr: fits.Header) -> dict:
     binning = _to_int(_get(hdr, "BINNING"))
-    # Pixel size in microns - try multiple keyword variations
-    pixel_size_um = _to_float(_get(hdr, "XPIXSZ", "PIXSIZE", "PIXSCALE1", "PIXELSZ"))
     return {
         "temp_celsius":         _to_float(_get(hdr, "CCD-TEMP", "CCDTEMP")),
         "temp_setpoint_celsius": _to_float(_get(hdr, "SET-TEMP")),
@@ -491,7 +599,7 @@ def _extract_sensor(hdr: fits.Header) -> dict:
         "offset":               _to_float(_get(hdr, "OFFSET")),
         "width_px":             _to_int(_get(hdr, "NAXIS1")),
         "height_px":            _to_int(_get(hdr, "NAXIS2")),
-        "pixel_size_um":        pixel_size_um,
+        "pixel_size_um":        pixel_size_um(hdr),
     }
 
 

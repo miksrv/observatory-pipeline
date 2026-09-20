@@ -30,6 +30,7 @@ import numpy as np
 import sep
 
 import config
+from modules import fits_header
 from modules.fits_header import extract_headers, sanitize_object_name
 from modules.normalizer import is_narrowband
 
@@ -39,55 +40,28 @@ logger = logging.getLogger(__name__)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_PLATE_SCALE_PIXEL_KEYWORDS: tuple[str, ...] = ("XPIXSZ", "PIXSIZE", "PIXSCALE")
-
-
 def _read_pixel_scale(hdr: fits.Header) -> float | None:
     """
     Derive the plate scale in arcsec/pixel from FITS headers.
 
-    Requires both a pixel size (XPIXSZ, PIXSIZE, or PIXSCALE in microns) and a
-    focal length (FOCALLEN in mm).  Some cameras write PIXSCALE directly as
-    arcsec/px — detected when the value is small (< 20) and no pixel size +
-    focal length pair is available.
+    Delegates to `modules.fits_header.resolve_pixel_scale_arcsec()` rather
+    than reading the keywords itself. This module and that one used to
+    interpret the same ambiguous keywords differently, and both unsafely: this
+    one took `PIXSCALE` as arcsec/px whenever it fell in a wide range, while
+    that one took `PIXSCALE1` as microns unconditionally. The two ranges
+    overlap — a 3.76 micron pixel and a 3.76"/px plate scale are the same
+    number — so no range check can tell them apart, and the two modules could
+    reach opposite conclusions about the same frame (audit 2026-08-18,
+    finding M2).
 
-    Returns None when the necessary headers are absent.
+    This is one of the few places this codebase shares a helper rather than
+    hand-duplicating it, precisely because the finding is that the two copies
+    disagreed.
+
+    Returns None when the headers don't carry enough, which the caller
+    already handles.
     """
-    # Direct arcsec/px keyword (written by some capture software)
-    pixscale_direct = hdr.get("PIXSCALE")
-    if pixscale_direct is not None:
-        try:
-            val = float(pixscale_direct)
-            # Sanity-check: a valid plate scale is between 0.01 and 200 arcsec/px
-            if 0.01 <= val <= 200.0:
-                return val
-        except (TypeError, ValueError):
-            pass
-
-    # Derive from pixel size + focal length
-    xpixsz: float | None = None
-    for kw in ("XPIXSZ", "PIXSIZE"):
-        raw = hdr.get(kw)
-        if raw is not None:
-            try:
-                xpixsz = float(raw)
-                break
-            except (TypeError, ValueError):
-                continue
-
-    focal_length: float | None = None
-    raw_fl = hdr.get("FOCALLEN")
-    if raw_fl is not None:
-        try:
-            focal_length = float(raw_fl)
-        except (TypeError, ValueError):
-            pass
-
-    if xpixsz is not None and focal_length is not None and focal_length > 0.0:
-        # plate_scale = 206265 * (pixel_size_um / 1000) / focal_length_mm
-        return 206265.0 * (xpixsz / 1000.0) / focal_length
-
-    return None
+    return fits_header.resolve_pixel_scale_arcsec(hdr)
 
 
 def _build_streak_mask(

@@ -12,6 +12,7 @@ import numpy as np
 import astropy.io.fits as fits
 import pytest
 
+from modules import fits_header
 from modules.fits_header import extract_headers, midpoint_time, sanitize_object_name
 
 
@@ -339,6 +340,74 @@ class TestCoordinateConversion:
             assert ra is None
         finally:
             _cleanup(path)
+
+
+# ---------------------------------------------------------------------------
+# Plate scale resolution — audit 2026-08-18, finding M2
+#
+# modules/qc.py and this module used to read the same ambiguous keywords
+# differently, and both unsafely: one took PIXSCALE as arcsec/px whenever it
+# fell in a wide range, the other took PIXSCALE1 as microns unconditionally.
+# The ranges overlap — a 3.76 micron pixel and a 3.76"/px scale are the same
+# number — so no range check can separate them, and the two modules could
+# reach opposite conclusions about the same frame.
+# ---------------------------------------------------------------------------
+
+class TestPlateScaleResolution:
+    def _hdr(self, cards: dict) -> fits.Header:
+        header = fits.Header()
+        for key, value in cards.items():
+            header[key] = value
+        return header
+
+    def test_pixel_size_and_focal_length_win_outright(self):
+        header = self._hdr({"XPIXSZ": 3.76, "FOCALLEN": 1000.0, "PIXSCALE": 99.0})
+
+        scale = fits_header.resolve_pixel_scale_arcsec(header)
+
+        assert scale == pytest.approx(206265.0 * 0.00376 / 1000.0, rel=1e-6)
+
+    def test_a_comment_naming_arcsec_is_honoured(self):
+        header = fits.Header()
+        header["PIXSCALE"] = (3.76, "plate scale [arcsec/pixel]")
+
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(3.76)
+
+    def test_a_comment_naming_microns_is_honoured(self):
+        header = fits.Header()
+        header["PIXSCALE"] = (3.76, "pixel size in microns")
+        header["FOCALLEN"] = 1000.0
+
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(
+            206265.0 * 0.00376 / 1000.0, rel=1e-6
+        )
+
+    def test_an_unlabelled_value_is_read_as_arcsec(self):
+        """The assumption is made explicitly and logged, not hidden in a range check."""
+        assert fits_header.resolve_pixel_scale_arcsec(self._hdr({"PIXSCALE": 1.23})) == pytest.approx(1.23)
+
+    def test_pixscale1_is_no_longer_taken_for_a_pixel_size(self):
+        """
+        The plain bug half of the finding: PIXSCALE1 was read as microns
+        unconditionally, and fed to the sensor record as one.
+        """
+        header = self._hdr({"PIXSCALE1": 1.23})
+
+        assert fits_header.pixel_size_um(header) is None
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(1.23)
+
+    def test_nothing_usable_returns_none(self):
+        assert fits_header.resolve_pixel_scale_arcsec(self._hdr({"FOCALLEN": 1000.0})) is None
+
+    def test_qc_and_fits_header_agree(self):
+        """
+        The finding itself: two modules, one frame, two different answers.
+        """
+        from modules import qc
+
+        header = self._hdr({"PIXSCALE1": 1.23, "FOCALLEN": 1000.0})
+
+        assert qc._read_pixel_scale(header) == fits_header.resolve_pixel_scale_arcsec(header)
 
 
 # ---------------------------------------------------------------------------
