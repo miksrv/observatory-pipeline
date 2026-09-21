@@ -189,6 +189,32 @@ class TestObjectTypeClassifiers:
     def test_is_galaxy_none(self):
         assert ad._is_galaxy(None) is False
 
+    def test_is_galaxy_matches_the_g_suffix_family(self):
+        """
+        Audit 2026-08-18, finding L2: the docstring used to promise a
+        word-boundary-aware check, under which a token had to stand alone as
+        a word. Simbad puts "G" at the END of a whole family of genuine
+        galaxy codes, so that rule would have rejected every one of these —
+        the substring test is the right shape here, and this pins it.
+        """
+        for otype in ("EmG", "RadioG", "SBG", "H2G", "LSB_G"):
+            assert ad._is_galaxy(otype) is True, f"Expected True for '{otype}'"
+
+    def test_is_galaxy_is_known_to_overmatch_a_globular_cluster(self):
+        """
+        The documented cost of that substring test, pinned so it is a choice
+        rather than a surprise: a bare "G" also matches OTYPEs that merely
+        contain the letter. `GlC` is a globular cluster, not a galaxy, and a
+        new point source projected near one is reported
+        SUPERNOVA_CANDIDATE rather than UNKNOWN — a misnamed alert, not a
+        lost one. See _is_galaxy()'s docstring.
+        """
+        assert ad._is_galaxy("GlC") is True
+
+    def test_is_galaxy_rejects_an_otype_with_no_token_at_all(self):
+        for otype in ("Star", "**", "PN", "HII"):
+            assert ad._is_galaxy(otype) is False, f"Expected False for '{otype}'"
+
 
 class TestHistoryMedianMag:
 

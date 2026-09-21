@@ -5,9 +5,20 @@ The single public entry point is:
 
     await astrometry.solve(fits_path: str) -> dict
 
-It calls the astap binary for plate solving (writing WCS keywords back into
-the FITS file), then reads the WCS, computes the frame centre and FOV, and
-runs sep (SourceExtractor) to build a source list with (RA, Dec) coordinates.
+It calls the astap binary for plate solving, then reads the WCS it produced,
+computes the frame centre and FOV, and runs sep (SourceExtractor) to build a
+source list with (RA, Dec) coordinates.
+
+astap is invoked **without** `-update`, so it never writes into `fits_path`
+itself — the solved WCS lands in a `.wcs` side file next to the frame (plus
+`.ini`/`.log`), or under `output_base` when one is given, and `_wcs.py` reads
+it back from there. This docstring used to say the opposite ("writing WCS
+keywords back into the FITS file"), which matters because it is exactly the
+question `_wcs.py` has to answer — whether the WCS it reads is astap's fresh
+solve or the capture software's mount-pointing estimate that was already in
+the header (the 2026-08-06 UGC_6930 incident; audit 2026-08-18, finding L3).
+The frame's header does get a WCS written into it eventually, but by
+`pipeline.py`'s `_write_solved_wcs()` at archive time, not by astap.
 
 Returns an empty dict on any failure so the pipeline can detect and handle
 the error without crashing.

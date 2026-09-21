@@ -277,6 +277,22 @@ Orchestrates processing of a single FITS file in order:
      track chart are built from (audit 2026-08-18, finding M14); a static star cancels in the
      difference image and never becomes a candidate there, so the subtraction detection is the one
      that can be the mover. Among two of the same kind, the brighter one (higher flux) is kept.
+8.5b. `_dedupe_uncatalogued_subtraction_pair(sources, extra)` → the same collapse for an
+     object with **no** catalog identity to key on, which step 8.5 therefore cannot touch: its
+     ordinary sep detection and its own subtraction candidate both survive as separate entries,
+     are posted as two `source_observations` rows for one real observation, and are classified
+     twice (real incident, 2026-08-11, `C_2020_R4_ATLAS`: every frame produced two
+     `MOVING_UNKNOWN` anomalies ~1″ apart for one comet — SkyBot has no ephemeris for it, so
+     neither detection ever got an identity). Deliberately narrower than "merge any two nearby
+     uncatalogued sources", which would collapse genuinely different faint objects in a crowded
+     field: it pairs one `_from_subtraction=True` entry with one that isn't, within
+     `MATCH_CONE_ARCSEC`, and reuses step 8.5's own `_prefer_candidate()`.
+8.6. `_dedupe_unmatched_near_matched(sources, extra)` → positional dedup: an **unmatched**
+     source sitting within `MATCH_CONE_ARCSEC` of a **matched** one is a deblending artifact of
+     that same star, not a second object, and is dropped. Subtraction candidates are exempt —
+     they carry catalog-free pixel-level evidence that something changed there, and dropping
+     them here lost real transients flaring in projection near a catalogued star (audit
+     2026-08-18, finding C6).
 9. `photometry.measure(fits_path, sources)` → returns calibrated magnitudes
 9.5. `forced_photometry.run(fits_path, sources, gaia_stars, mpc_objects, wcs=astro_result["wcs"],
      zero_point=..., obs_time=...)` → a second, independent detection path (**"forced
@@ -311,6 +327,18 @@ Orchestrates processing of a single FITS file in order:
     magnitudes reaching the API whenever a whole frame failed to calibrate). This is the
     field the API payload documents and the one `anomaly_detector.py` reads for
     magnitude-change comparisons.
+10.5. `_dedupe_cross_catalog_duplicates(sources, extra)` → the last of the four dedup passes,
+    and the one step 9.5 makes necessary: forced photometry decides a catalog entry is "already
+    recovered" by looking for **its own** `catalog_id` in `sources`, so a star that step 8 had
+    already claimed under an *earlier* catalog in the sequential-exclusive order (Simbad → Gaia
+    DR3 → 2MASS → Pan-STARRS → MPC) looks unrecovered to it and gets appended a second time
+    under its Gaia DR3 identity, at essentially the same position (real incident, 2026-08-12,
+    `IC3322A`: 16 Simbad/Gaia DR3 pairs under 3″ apart in one frame — every bright named star in
+    the field registered twice). Only two **matched** sources within `MATCH_CONE_ARCSEC` from
+    **different** catalogs collapse here; two entries of the same catalog are step 8.5's job, and
+    an uncatalogued source beside a matched one is step 8.6's. The survivor is whichever catalog
+    ranks earlier in `_CATALOG_PRIORITY` — the one `catalog_matcher.match()` would itself have
+    kept, had both detections reached it as a single candidate.
 11. `api_client.post_frame(frame_data)` → registers the frame, gets back `frame_id`. `frame_data`
     (`pipeline._build_frame_payload()`) also carries `pointing_error_arcsec`/
     `pointing_error_ra_arcsec`/`pointing_error_dec_arcsec` — the mount's pointing error, computed by
