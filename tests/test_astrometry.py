@@ -1156,15 +1156,36 @@ class TestSourcesAllElongationBound:
 
         assert result["sources"] == []
 
-    async def test_degenerate_elongation_is_still_rejected(self):
+    async def test_degenerate_minor_axis_reads_as_a_one_pixel_wide_feature(self):
         """
-        A near-zero minor axis is clamped to 1e-6 rather than dividing by
-        zero, producing an absurd a/b ratio. The ceiling must still cut those
-        — admitting them would hand anomaly_detector a guaranteed
-        SPACE_DEBRIS trigger on a numerical artifact.
+        Audit 2026-08-18, finding L4: a minor axis below the pixel grid's own
+        resolution limit is clamped to that limit (1/sqrt(12) px), not to an
+        epsilon. The reported elongation is then "how elongated this feature
+        would be if it were exactly one pixel wide" — a shape that could
+        actually exist — instead of the 10^6 an epsilon produced, which was
+        not a measurement of anything and cleared every elongation threshold
+        in the pipeline on its way to being persisted as the source's shape.
         """
         degenerate = _make_sources(n=5, a=2.0, b=0.0)
         with _patch_astrometry(sources=degenerate):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert len(result["sources_all"]) == 5
+        for src in result["sources_all"]:
+            assert src["elongation"] == pytest.approx(2.0 * math.sqrt(12.0), rel=1e-6)
+
+    async def test_a_realistic_degenerate_fit_is_still_cut_by_the_ceiling(self):
+        """
+        The clamp does not quietly open the gate the ceiling was closing by
+        accident. At SEP_MIN_AREA=15 a sub-pixel-wide detection has to be a
+        line of at least ~15 pixels, whose semi-major axis is ~15/sqrt(12);
+        clamped, that reads as an elongation of ~15 and the default ceiling
+        still cuts it. What changes is that the ceiling now cuts it for a
+        reason a reader can check, rather than because the divisor was
+        arbitrary.
+        """
+        line = _make_sources(n=5, a=15.0 / math.sqrt(12.0), b=0.0)
+        with _patch_astrometry(sources=line):
             result = await astrometry.solve(_FITS_PATH)
 
         assert result["sources_all"] == []
@@ -1220,7 +1241,9 @@ class TestDegenerateSource:
 
         # Should succeed without raising ZeroDivisionError
         assert isinstance(result, dict)
-        # All sources are filtered out because elongation = a/1e-6 >> 2.0
+        # Still filtered out of the strict star list: clamped at the pixel
+        # grid's resolution limit the ratio is a/(1/sqrt(12)) ~= 6.9, which
+        # is a physically possible shape but nothing like a star.
         assert len(result.get("sources", [])) == 0
 
 
@@ -1356,6 +1379,38 @@ class TestStreakMasking:
         streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(999.0)]
         assert len(streaks) == 1
         assert streaks[0]["elongation"] > config.SOURCES_ALL_ELONGATION_MAX
+
+    async def test_a_degenerate_streaks_elongation_stays_physical(self):
+        """
+        Audit 2026-08-18, finding L4: a re-emitted streak is the one source
+        that bypasses SOURCES_ALL_ELONGATION_MAX entirely, so whatever
+        elongation the coarse pass computed for it travels untouched into
+        anomaly_detector.py and onto the wire. A coarse fit with b=0 used to
+        make that 10^6; clamped at the pixel grid's resolution limit it is
+        a/(1/sqrt(12)) — large, because a trail genuinely is, but a shape
+        that could exist.
+        """
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=300.0, b=0.0, xmin=10, xmax=10, ymin=10, ymax=600,
+                    x=10.0, y=305.0, flux=999.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:600, 10] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                result = await astrometry.solve(_FITS_PATH)
+
+        streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(999.0)]
+        assert len(streaks) == 1
+        assert streaks[0]["elongation"] == pytest.approx(
+            300.0 * math.sqrt(12.0), rel=1e-6
+        )
 
     async def test_short_elongated_feature_is_not_masked(self):
         """A coarse candidate elongated enough but far shorter than

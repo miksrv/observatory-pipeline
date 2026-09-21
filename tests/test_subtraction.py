@@ -893,6 +893,66 @@ class TestDetectDiffSourcesStreakMasking:
 
 
 # ---------------------------------------------------------------------------
+# Degenerate minor axis (audit 2026-08-18, finding L4)
+# ---------------------------------------------------------------------------
+
+class TestDegenerateMinorAxis:
+    @staticmethod
+    def _one_object(a: float, b: float) -> np.ndarray:
+        obj = np.zeros(1, dtype=[
+            ("x", np.float64), ("y", np.float64),
+            ("a", np.float64), ("b", np.float64),
+            ("flux", np.float64), ("npix", np.int32),
+        ])
+        obj["x"], obj["y"] = 150.0, 150.0
+        obj["a"], obj["b"] = a, b
+        obj["flux"], obj["npix"] = 5000.0, 9
+        return obj
+
+    def test_zero_minor_axis_reads_as_a_one_pixel_wide_feature(self, monkeypatch):
+        """
+        `sep` reports b=0 for a degenerate second-moment fit. Dividing by the
+        old 0.001 epsilon made the candidate's elongation 1000x its semi-major
+        axis — a number that is not a measurement, and that
+        anomaly_detector.py reads straight off the candidate as evidence of a
+        SPACE_DEBRIS trail. Clamped at the pixel grid's own resolution limit
+        it reads as the most elongated the feature could honestly be.
+        """
+        def _extract(data, *args, **kwargs):
+            if kwargs.get("segmentation_map"):
+                raise RuntimeError("no coarse pass in this test")
+            return self._one_object(a=2.0, b=0.0)
+
+        monkeypatch.setattr(subtraction.sep, "extract", _extract)
+
+        rng = np.random.default_rng(3)
+        candidates = subtraction._detect_diff_sources(
+            rng.normal(loc=0.0, scale=5.0, size=(300, 300))
+        )
+
+        assert len(candidates) == 1
+        assert candidates[0]["elongation"] == pytest.approx(
+            2.0 * math.sqrt(12.0), rel=1e-6
+        )
+
+    def test_a_measurable_minor_axis_is_left_alone(self, monkeypatch):
+        """The clamp is a floor, not a rescaling — a real b passes through."""
+        def _extract(data, *args, **kwargs):
+            if kwargs.get("segmentation_map"):
+                raise RuntimeError("no coarse pass in this test")
+            return self._one_object(a=6.0, b=2.0)
+
+        monkeypatch.setattr(subtraction.sep, "extract", _extract)
+
+        rng = np.random.default_rng(3)
+        candidates = subtraction._detect_diff_sources(
+            rng.normal(loc=0.0, scale=5.0, size=(300, 300))
+        )
+
+        assert candidates[0]["elongation"] == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------
 # _build_saturation_mask (docs/ISSUES.md #1, #2)
 # ---------------------------------------------------------------------------
 

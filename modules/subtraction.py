@@ -56,6 +56,29 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# The narrowest second-moment semi-minor axis a pixel grid can express:
+# 1/sqrt(12) px, the standard deviation of a uniform distribution across one
+# pixel. `sep` can report a smaller — even exactly zero — `b` for a
+# degenerate fit (a detection lying along a single pixel row, a cosmic-ray
+# track, a bad column), and `a / b` then depends entirely on whatever
+# epsilon is substituted to avoid dividing by zero. The old sentinels (1e-6
+# here, 0.001 in _detect_diff_sources) turned such a fit into an elongation
+# of 10^3-10^6, a number that is not a measurement of anything but clears
+# every elongation threshold in the pipeline on the way to being persisted
+# as the source's shape (audit 2026-08-18, finding L4).
+#
+# Clamping at the pixel limit instead caps the ratio at `a / 0.2887` — how
+# elongated the feature would be if it were exactly one pixel wide, which is
+# the most elongated it can honestly be claimed to be. A feature now has to
+# be genuinely long in `a` to read as a trail, which is what the thresholds
+# were written to mean.
+#
+# Hand-duplicated across modules/qc.py, modules/subtraction.py,
+# modules/astrometry/_streak.py and modules/astrometry/_extraction.py, the
+# same convention those four already follow for the streak-mask helper
+# itself. Keep them in sync.
+_MIN_SEMI_MINOR_PX: float = 1.0 / math.sqrt(12.0)   # ~= 0.2887
+
 _MAX_FRAMES = 10
 # How many of the most-recent same-filter (or, failing that, any-filter)
 # candidates _find_archive_frames() is willing to open just to read their
@@ -765,7 +788,7 @@ def _build_streak_mask(
     if len(objs) == 0:
         return None
 
-    safe_b = np.where(objs["b"] > 0, objs["b"], 1e-6)
+    safe_b = np.where(objs["b"] > _MIN_SEMI_MINOR_PX, objs["b"], _MIN_SEMI_MINOR_PX)
     elongation = objs["a"] / safe_b
     bbox_diag_px = np.sqrt(
         (objs["xmax"] - objs["xmin"]).astype(np.float64) ** 2
@@ -1010,7 +1033,7 @@ def _detect_diff_sources(
             # than pixels and the uncorrected figure overstates significance.
             snr = flux / (rms * math.sqrt(npix) * noise_corr) if npix > 0 else 0.0
             a_axis = float(obj["a"])
-            b_axis = max(float(obj["b"]), 0.001)
+            b_axis = max(float(obj["b"]), _MIN_SEMI_MINOR_PX)
             fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0) * (a_axis ** 2 + b_axis ** 2) / 2.0)
 
             # Reject candidates far sharper than the frame's own stellar PSF —

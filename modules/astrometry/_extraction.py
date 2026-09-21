@@ -21,6 +21,29 @@ from ._streak import _build_streak_mask
 
 logger = logging.getLogger(__name__)
 
+# The narrowest second-moment semi-minor axis a pixel grid can express:
+# 1/sqrt(12) px, the standard deviation of a uniform distribution across one
+# pixel. `sep` can report a smaller — even exactly zero — `b` for a
+# degenerate fit (a detection lying along a single pixel row, a cosmic-ray
+# track, a bad column), and `a / b` then depends entirely on whatever
+# epsilon is substituted to avoid dividing by zero. The old sentinels (1e-6
+# here, 0.001 in _detect_diff_sources) turned such a fit into an elongation
+# of 10^3-10^6, a number that is not a measurement of anything but clears
+# every elongation threshold in the pipeline on the way to being persisted
+# as the source's shape (audit 2026-08-18, finding L4).
+#
+# Clamping at the pixel limit instead caps the ratio at `a / 0.2887` — how
+# elongated the feature would be if it were exactly one pixel wide, which is
+# the most elongated it can honestly be claimed to be. A feature now has to
+# be genuinely long in `a` to read as a trail, which is what the thresholds
+# were written to mean.
+#
+# Hand-duplicated across modules/qc.py, modules/subtraction.py,
+# modules/astrometry/_streak.py and modules/astrometry/_extraction.py, the
+# same convention those four already follow for the streak-mask helper
+# itself. Keep them in sync.
+_MIN_SEMI_MINOR_PX: float = 1.0 / math.sqrt(12.0)   # ~= 0.2887
+
 
 def _extract_sources(
     fits_path: str,
@@ -125,8 +148,11 @@ def _extract_sources(
         )
         fwhm_arcsec: np.ndarray = fwhm_px * pixel_scale_arcsec
 
-        # Guard against zero minor axis (degenerate sources)
-        safe_b: np.ndarray = np.where(objects["b"] > 0, objects["b"], 1e-6)
+        # Clamp the minor axis at the pixel grid's own resolution limit,
+        # not at an epsilon — see _MIN_SEMI_MINOR_PX above.
+        safe_b: np.ndarray = np.where(
+            objects["b"] > _MIN_SEMI_MINOR_PX, objects["b"], _MIN_SEMI_MINOR_PX
+        )
         elongations: np.ndarray = objects["a"] / safe_b
 
         # SNR calculation using peak value over background RMS
