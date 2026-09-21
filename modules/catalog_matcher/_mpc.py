@@ -9,6 +9,7 @@ Internal helpers only — not part of this package's public surface, except
 from __future__ import annotations
 
 import logging
+import math
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
@@ -26,6 +27,21 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
 
     Uses IMCCE SkyBot service which provides cone search for solar system objects
     at a specific epoch. Falls back gracefully on any error.
+
+    The radius is `fov_deg × sqrt(2)/2` — the frame's half-diagonal, the same
+    strategy every other catalog here uses — **plus** `MOVING_CONE_ARCSEC`.
+    That last term is this catalog's own: `_match_mpc()` pairs an ephemeris
+    position with a source up to 120" away, far wider than the 5" every
+    stellar catalog matches within, so an object that legitimately matches a
+    corner source can sit that much outside the frame and still has to be in
+    the result set.
+
+    The full `fov_deg` used until the 2026-08-18 audit (finding L1) was ~1.41x
+    the half-diagonal, i.e. about twice the sky area, on every frame. It was
+    never a match-loss bug — it over-covered — but IMCCE is a shared public
+    service and SkyBot is the one catalog here whose cache key includes the
+    exact observation epoch, so a night of frames re-queries it far more often
+    than it re-queries Gaia or Simbad.
 
     Returns a list of dicts with keys: ra, dec, designation, object_type.
     """
@@ -52,14 +68,19 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
 
         coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
         epoch = Time(obs_time)
-        fov_arcmin = (fov_deg + _cache_radius_margin_deg()) * 60.0
+        radius_deg = (
+            fov_deg * math.sqrt(2) / 2.0
+            + config.MOVING_CONE_ARCSEC / 3600.0
+            + _cache_radius_margin_deg()
+        )
+        radius_arcmin = radius_deg * 60.0
 
         logger.info(
             "SkyBot query: ra=%.4f dec=%.4f radius=%.1f' epoch=%s (UTC)",
-            key_ra, key_dec, fov_arcmin, epoch.utc.iso,
+            key_ra, key_dec, radius_arcmin, epoch.utc.iso,
         )
 
-        result = Skybot.cone_search(coord, rad=fov_arcmin * u.arcmin, epoch=epoch)
+        result = Skybot.cone_search(coord, rad=radius_arcmin * u.arcmin, epoch=epoch)
 
         if result is None or len(result) == 0:
             logger.info(

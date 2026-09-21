@@ -1784,6 +1784,12 @@ is the per-catalog reference (source, depth, access method, rate limit).
 - Source: IAU Minor Planet Center / IMCCE SkyBot
 - Content: all known asteroids and comets with orbital elements
 - Access: `astroquery.imcce.Skybot.cone_search()` at observation epoch
+- Query radius: the frame's half-diagonal (`fov_deg × √2/2`, same as every other catalog here)
+  **plus `MOVING_CONE_ARCSEC`** — this is the one catalog whose matching cone is 120″ rather than
+  5″, so an object that legitimately matches a corner source can sit that far outside the frame.
+  It used a plain `fov_deg` until the 2026-08-18 audit (finding L1): never a match loss, but about
+  twice the sky area on every frame, from a shared public service whose cache key includes the
+  exact observation epoch and so is re-queried far more often than Gaia's or Simbad's
 
 ### JPL Horizons
 - Source: NASA Jet Propulsion Laboratory

@@ -36,6 +36,7 @@ import pytest
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
 
+import config
 import modules.catalog_matcher as cm
 
 
@@ -415,6 +416,63 @@ class TestMpcMatching:
         assert source["catalog_name"] == "MPC"
         assert source["catalog_id"]   == "2024 AB1"
         assert source["object_type"]  == "ASTEROID"
+
+    def test_mpc_radius_is_the_half_diagonal_plus_its_own_match_cone(self):
+        """
+        Audit 2026-08-18, finding L1: SkyBot was queried with the full
+        `fov_deg` as its radius while every other catalog uses the frame's
+        half-diagonal — about twice the sky area, on every frame, from a
+        shared public service whose cache key includes the exact epoch and
+        so is re-hit far more often than Gaia's or Simbad's.
+
+        It keeps one term the others don't need: `_match_mpc()` pairs an
+        ephemeris position with a source up to MOVING_CONE_ARCSEC away, so
+        an object that legitimately matches a corner source can sit that far
+        outside the frame.
+        """
+        fov_deg = 1.0
+        captured: dict = {}
+
+        class _FakeSkybot:
+            @staticmethod
+            def cone_search(coord, rad, epoch):
+                captured["rad"] = rad
+                return None
+
+        with patch("astroquery.imcce.Skybot", _FakeSkybot):
+            cm._query_mpc(_RA, _DEC, "2024-03-15T22:01:34", fov_deg)
+
+        expected_deg = (
+            fov_deg * math.sqrt(2) / 2.0
+            + config.MOVING_CONE_ARCSEC / 3600.0
+            + cm._cache_radius_margin_deg()
+        )
+        assert captured["rad"].to(u.deg).value == pytest.approx(expected_deg)
+        # Strictly smaller than the old full-fov radius it replaces.
+        assert expected_deg < fov_deg + cm._cache_radius_margin_deg()
+
+    def test_mpc_radius_still_reaches_a_corner_sources_whole_match_cone(self):
+        """
+        The property the radius has to guarantee, for the worst-placed frame
+        that can share this tile's cache key: an MPC object sitting a full
+        MOVING_CONE_ARCSEC beyond that frame's furthest corner is still
+        inside what was queried.
+        """
+        fov_deg = 1.0
+        queried = (
+            fov_deg * math.sqrt(2) / 2.0
+            + config.MOVING_CONE_ARCSEC / 3600.0
+            + cm._cache_radius_margin_deg()
+        )
+
+        offset = 0.05  # frame centre at the tile's own corner
+        worst_case = (
+            math.hypot(offset, offset)
+            + fov_deg * math.sqrt(2) / 2.0
+            + config.MOVING_CONE_ARCSEC / 3600.0
+        )
+
+        assert worst_case <= queried + 1e-9
 
     def test_mpc_error_returns_empty_list(self):
         """If SkyBot query fails, _query_mpc returns [] without crashing."""
