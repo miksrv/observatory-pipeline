@@ -11,7 +11,6 @@ import logging
 import math
 
 import astropy.units as u
-import numpy as np
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS
 
@@ -80,10 +79,32 @@ def _frame_center_and_scale(
     Compute the frame centre (RA, Dec), field of view, pixel scale, and
     position angle from a solved WCS.
 
-    pixel_scale_matrix is [[CD1_1, CD1_2], [CD2_1, CD2_2]] in deg/px. The
-    true plate scale along each axis is the norm of each column (handles
-    rotation and shear). We use column 0 (RA axis) which carries the
-    dominant scale factor.
+    pixel_scale_matrix is [[CD1_1, CD1_2], [CD2_1, CD2_2]] in deg/px, where
+    column *j* is the derivative of world position with respect to pixel
+    axis *j*. The true plate scale along each pixel axis is therefore the
+    norm of that axis' own column (which handles rotation and shear), and
+    the two columns are only equal for square sky pixels.
+
+    Both are computed here rather than only column 0 (audit 2026-08-18,
+    finding M15). Anisotropic sky pixels are not exotic: `XBINNING` and
+    `YBINNING` can legitimately differ, and a camera/reducer combination
+    can leave a small residual scale difference between the axes. Using
+    the x-axis scale for everything then went wrong in two distinct ways:
+    `fov_deg` multiplied the *larger image dimension* by it even when that
+    dimension was y (a portrait frame), so a frame's reported field of
+    view — and with it every catalog query radius derived from it — was
+    off by the axis ratio; and the single `pixel_scale_arcsec` the rest of
+    the pipeline treats as isotropic silently meant "the x one" rather
+    than anything representative.
+
+    `fov_deg` is each axis' own length times its own scale, maximised;
+    `pixel_scale_arcsec` is the geometric mean of the two, which is the
+    honest single number for a converter applied to `sep`'s a/b second
+    moments (themselves a geometric-mean-like quantity) and is exactly the
+    column-0 norm again whenever the pixels are square, i.e. for virtually
+    every real frame. A deployment where the two axes genuinely differ
+    gets a warning, since everything downstream of this function still
+    assumes one scale.
 
     Returns
     -------
@@ -97,12 +118,26 @@ def _frame_center_and_scale(
     dec_center: float = float(sky[0][1])
 
     ps_matrix = wcs.pixel_scale_matrix   # shape (2, 2), units deg/px
-    pixel_scale_deg: float = float(
-        np.sqrt(ps_matrix[0, 0] ** 2 + ps_matrix[1, 0] ** 2)
-    )
+    scale_x_deg: float = float(math.hypot(ps_matrix[0, 0], ps_matrix[1, 0]))
+    scale_y_deg: float = float(math.hypot(ps_matrix[0, 1], ps_matrix[1, 1]))
+    pixel_scale_deg: float = float(math.sqrt(scale_x_deg * scale_y_deg))
     pixel_scale_arcsec: float = pixel_scale_deg * 3600.0
 
-    fov_deg: float = float(max(naxis1, naxis2) * pixel_scale_deg)
+    fov_deg: float = float(max(naxis1 * scale_x_deg, naxis2 * scale_y_deg))
+
+    if scale_x_deg > 0.0 and scale_y_deg > 0.0:
+        anisotropy = max(scale_x_deg, scale_y_deg) / min(scale_x_deg, scale_y_deg)
+        if anisotropy > 1.01:
+            logger.warning(
+                "Anisotropic plate scale for %s: %.4f\"/px along x vs %.4f\"/px "
+                "along y (ratio %.3f). Reporting their geometric mean %.4f\"/px "
+                "as this frame's single pixel scale; every downstream conversion "
+                "(FWHM in arcsec, streak lengths, aperture radii) treats it as "
+                "isotropic and is approximate by that ratio.",
+                fits_filename,
+                scale_x_deg * 3600.0, scale_y_deg * 3600.0,
+                anisotropy, pixel_scale_arcsec,
+            )
 
     position_angle_deg = _position_angle_deg(wcs, cx, cy)
 

@@ -30,7 +30,10 @@ from astropy.wcs import WCS as AstropyWCS
 
 import config
 from modules import astrometry
-from modules.astrometry._frame_geometry import _position_angle_deg
+from modules.astrometry._frame_geometry import (
+    _frame_center_and_scale,
+    _position_angle_deg,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +469,94 @@ class TestPositionAngle:
 
         assert result["position_angle_deg"] == pytest.approx(180.0, abs=1e-2)
 
+
+# ---------------------------------------------------------------------------
+# Frame geometry — per-axis plate scale (audit 2026-08-18, finding M15)
+# ---------------------------------------------------------------------------
+
+def _make_anisotropic_wcs(scale_x_deg: float, scale_y_deg: float) -> AstropyWCS:
+    """A TAN WCS whose two pixel axes have genuinely different scales."""
+    w = AstropyWCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crpix = [512.0, 512.0]
+    w.wcs.crval = [202.47, 47.20]
+    w.wcs.cdelt = [-scale_x_deg, scale_y_deg]
+    w.wcs.set()
+    return w
+
+
+class TestAnisotropicPlateScale:
+    def test_square_pixels_are_unchanged(self):
+        """
+        The overwhelmingly common case must behave exactly as before the
+        per-axis split: with square sky pixels the geometric mean of the
+        two column norms IS the column-0 norm.
+        """
+        scale_deg = 0.000278
+        wcs = _make_wcs(scale_deg=scale_deg)
+
+        _, _, fov_deg, pixel_scale_arcsec, _ = _frame_center_and_scale(
+            wcs, 1024, 768, "square.fits"
+        )
+
+        assert pixel_scale_arcsec == pytest.approx(scale_deg * 3600.0, rel=1e-9)
+        assert fov_deg == pytest.approx(1024 * scale_deg, rel=1e-9)
+
+    def test_portrait_frame_fov_uses_the_long_axis_own_scale(self):
+        """
+        Finding M15: a portrait frame (NAXIS2 > NAXIS1) with 2x1 binning
+        has its long dimension along y, but fov_deg used to multiply that
+        dimension by the *x* axis' scale — under-reporting the field of
+        view by the axis ratio, and with it every catalog query radius
+        derived from fov_deg.
+        """
+        scale_x_deg = 0.000278          # 1"/px, the binned-2x axis
+        scale_y_deg = 0.000139          # 0.5"/px
+        wcs = _make_anisotropic_wcs(scale_x_deg, scale_y_deg)
+        naxis1, naxis2 = 1024, 4096
+
+        _, _, fov_deg, _, _ = _frame_center_and_scale(
+            wcs, naxis1, naxis2, "portrait.fits"
+        )
+
+        assert fov_deg == pytest.approx(
+            max(naxis1 * scale_x_deg, naxis2 * scale_y_deg), rel=1e-9
+        )
+        # The old formula multiplied the larger *dimension* by the x scale.
+        assert fov_deg != pytest.approx(max(naxis1, naxis2) * scale_x_deg, rel=1e-6)
+
+    def test_pixel_scale_is_the_geometric_mean_of_both_axes(self):
+        scale_x_deg = 0.000278
+        scale_y_deg = 0.000139
+        wcs = _make_anisotropic_wcs(scale_x_deg, scale_y_deg)
+
+        _, _, _, pixel_scale_arcsec, _ = _frame_center_and_scale(
+            wcs, 1024, 1024, "aniso.fits"
+        )
+
+        assert pixel_scale_arcsec == pytest.approx(
+            math.sqrt(scale_x_deg * scale_y_deg) * 3600.0, rel=1e-9
+        )
+
+    def test_anisotropy_is_warned_about(self, caplog):
+        """
+        Everything downstream treats the returned scale as isotropic, so a
+        frame where that is materially untrue has to say so.
+        """
+        wcs = _make_anisotropic_wcs(0.000278, 0.000139)
+
+        with caplog.at_level("WARNING", logger="modules.astrometry._frame_geometry"):
+            _frame_center_and_scale(wcs, 1024, 1024, "aniso.fits")
+
+        assert any("Anisotropic plate scale" in r.message for r in caplog.records)
+
+    def test_square_pixels_are_not_warned_about(self, caplog):
+        wcs = _make_wcs()
+
+        with caplog.at_level("WARNING", logger="modules.astrometry._frame_geometry"):
+            _frame_center_and_scale(wcs, 1024, 1024, "square.fits")
+
+        assert not any("Anisotropic plate scale" in r.message for r in caplog.records)
 
 # ---------------------------------------------------------------------------
 # Test 2 — Source dict shape and types

@@ -105,7 +105,11 @@ async def solve(
     On success, a dict with keys:
         ra_center   float   – frame centre RA in decimal degrees
         dec_center  float   – frame centre Dec in decimal degrees
-        fov_deg     float   – field of view (larger image dimension) in degrees
+        fov_deg     float   – field of view in degrees: the larger of the
+                              two axes' own angular extents (each axis'
+                              pixel count times that axis' own plate
+                              scale — they differ under anisotropic
+                              binning; see _frame_geometry.py)
         position_angle_deg  float | None – this frame's own orientation on the
                               sky (0 = North up, increasing clockwise toward
                               +X — see _frame_geometry._position_angle_deg()'s
