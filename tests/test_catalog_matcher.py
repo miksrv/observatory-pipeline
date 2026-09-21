@@ -389,14 +389,32 @@ class TestSimbadMatching:
 # TestMpcMatching
 # ===========================================================================
 
+# Separations for the MPC tests below, expressed as fractions of the two
+# configured cones rather than as literal arcseconds.
+#
+# `MOVING_CONE_ARCSEC` is deployment-tunable and the two env files this repo
+# ships disagree about it: `.env.test`, which CI copies over `.env`, sets 30"
+# while a working `.env` commonly has the 120" default. A literal "60 arcsec,
+# comfortably inside the wide cone" is therefore true on a dev machine and
+# false in CI — that is exactly how
+# test_mpc_prefers_an_unclaimed_source_beyond_the_tight_cone came to pass
+# locally and fail on the PR, with three of its neighbours passing in CI only
+# because their "inside the wide cone" source had fallen outside it and the
+# branch under test never ran at all.
+_TIGHT_CONE = config.MATCH_CONE_ARCSEC
+_WIDE_CONE = config.MOVING_CONE_ARCSEC
+# Both are beyond the tight cone and inside the wide one, with NEAR closer.
+_NEAR_IN_WIDE_CONE = _TIGHT_CONE + (_WIDE_CONE - _TIGHT_CONE) * 0.35
+_FAR_IN_WIDE_CONE = _TIGHT_CONE + (_WIDE_CONE - _TIGHT_CONE) * 0.70
+
+
 class TestMpcMatching:
     def test_mpc_uses_wider_cone(self):
         """
-        Source between MATCH_CONE_ARCSEC (5") and MOVING_CONE_ARCSEC (30")
-        must be matched by MPC but would NOT be matched by Gaia/Simbad.
+        A source between MATCH_CONE_ARCSEC and MOVING_CONE_ARCSEC must be
+        matched by MPC but would NOT be matched by Gaia/Simbad.
         """
-        # 15 arcsec away — inside MOVING_CONE (30") but outside MATCH_CONE (5")
-        shifted_ra, shifted_dec = _offset_ra_exact(_RA, _DEC, 15.0)
+        shifted_ra, shifted_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
 
         source = _make_source(ra=_RA, dec=_DEC)
         source["catalog_name"] = None
@@ -515,11 +533,11 @@ class TestMpcMatching:
     def test_mpc_leaves_a_distant_catalogued_source_alone(self):
         """
         Beyond MATCH_CONE_ARCSEC, an established identification is never
-        overwritten: MOVING_CONE_ARCSEC (120") is wide enough that some
-        catalogued star is almost always inside it, whether or not it has
-        anything to do with the moving object.
+        overwritten: MOVING_CONE_ARCSEC is wide enough that some catalogued
+        star is almost always inside it, whether or not it has anything to do
+        with the moving object.
         """
-        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 40.0)
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
         source = _make_source(ra=star_ra, dec=star_dec)
         source["catalog_name"] = "Gaia DR3"
         source["catalog_id"]   = "GAIA_STAR_ID"
@@ -544,13 +562,13 @@ class TestMpcMatching:
         nearest *unclaimed* source within MOVING_CONE_ARCSEC — even though a
         catalogued one sits closer.
         """
-        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 40.0)
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
         star = _make_source(ra=star_ra, dec=star_dec)
         star["catalog_name"] = "Gaia DR3"
         star["catalog_id"]   = "GAIA_STAR_ID"
         star["object_type"]  = "STAR"
 
-        free_ra, free_dec = _offset_ra_exact(_RA, _DEC, 60.0)
+        free_ra, free_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
         free = _make_source(ra=free_ra, dec=free_dec)
         free["catalog_name"] = None
         free["catalog_id"]   = None
@@ -572,17 +590,17 @@ class TestMpcMatching:
         """
         The second half of finding C3: once the real (blended) detection was
         out of reach, the MPC object was handed to whatever unmatched source
-        happened to be nearest within the 120" cone — a false stationary
+        happened to be nearest within the wide cone — a false stationary
         "asteroid" on top of the real miss. The blended detection must win,
         and the bystander must stay uncatalogued.
         """
-        blend_ra, blend_dec = _offset_ra_exact(_RA, _DEC, 1.0)
+        blend_ra, blend_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.2)
         blend = _make_source(ra=blend_ra, dec=blend_dec)
         blend["catalog_name"] = "Gaia DR3"
         blend["catalog_id"]   = "GAIA_STAR_ID"
         blend["object_type"]  = "STAR"
 
-        bystander_ra, bystander_dec = _offset_ra_exact(_RA, _DEC, 80.0)
+        bystander_ra, bystander_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
         bystander = _make_source(ra=bystander_ra, dec=bystander_dec)
         bystander["catalog_name"] = None
         bystander["catalog_id"]   = None
@@ -660,10 +678,10 @@ class TestMpcMatching:
         source["catalog_name"] = None
         source["catalog_id"] = None
 
-        # MPC object A: 5" away (closer)
-        mpc_a_ra, mpc_a_dec = _offset_ra_exact(_RA, _DEC, 5.0)
-        # MPC object B: 30" away (further)
-        mpc_b_ra, mpc_b_dec = _offset_ra_exact(_RA, _DEC, 30.0)
+        # MPC object A: inside the tight cone (closer)
+        mpc_a_ra, mpc_a_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.5)
+        # MPC object B: further, but still genuinely competing inside the wide cone
+        mpc_b_ra, mpc_b_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
 
         mpc_objects = [
             {"ra": mpc_b_ra, "dec": mpc_b_dec, "designation": "2024 XY", "object_type": "ASTEROID"},
@@ -672,7 +690,7 @@ class TestMpcMatching:
 
         cm._match_mpc([source], mpc_objects)
 
-        # The closer MPC object (2024 AB at 5") wins
+        # The closer MPC object (2024 AB) wins
         assert source["catalog_name"] == "MPC"
         assert source["catalog_id"] == "2024 AB"
 

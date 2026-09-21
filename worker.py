@@ -11,7 +11,7 @@ task's items to the matching pipeline.py stage function:
     DELETE_FRAME           -> pipeline.move_archived_file_to_rejected(filename, object_name)
     RESTART                -> clean exit (Docker restarts the container with fresh settings)
 
-DELETE_FRAME is operator-initiated (observatory-api's Web\FramesController,
+DELETE_FRAME is operator-initiated (observatory-api's Web\\FramesController,
 same frame-selection UI as ANALYZE/DETECT_ANOMALIES) — the file is only
 relocated to FITS_REJECTED, never deleted; observatory-api performs the
 actual DB-side cascade delete once the move is reported DONE.
