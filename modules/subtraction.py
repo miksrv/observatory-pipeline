@@ -80,13 +80,6 @@ logger = logging.getLogger(__name__)
 _MIN_SEMI_MINOR_PX: float = 1.0 / math.sqrt(12.0)   # ~= 0.2887
 
 _MAX_FRAMES = 10
-# How many of the most-recent same-filter (or, failing that, any-filter)
-# candidates _find_archive_frames() is willing to open just to read their
-# WCS for PA-based ranking (see _sort_by_pa_closeness()) — bounds the extra
-# header-only I/O to a small, fixed cost regardless of how large the whole
-# archive directory is, rather than opening every archived frame ever taken
-# of this object.
-_PA_CANDIDATE_POOL = _MAX_FRAMES * 3
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +211,10 @@ def _find_archive_frames(
         _MAX_FRAMES, the final _MAX_FRAMES selection prefers frames whose
         own orientation is CLOSEST to this one over merely-most-recent
         ones — a reference needing less geometric correction is a mildly
-        better bet for alignment quality. This is a soft, non-exclusionary
+        better bet for alignment quality. The whole candidate list is
+        ranked, however far back in the archive it reaches; see
+        _sort_by_pa_closeness() for why it used to be only the 30 newest
+        and why that bounded nothing. This is a soft, non-exclusionary
         preference, not a hard filter: run()'s _prerotate_reference() step
         already coarse-corrects for whatever orientation difference remains
         in whichever frames end up selected here, including a ~180deg
@@ -399,16 +395,30 @@ def _sort_by_pa_closeness(paths: list[str], new_position_angle_deg: float) -> li
     the existing recency order as the tiebreaker (Python's sort is stable),
     not replacing it outright.
 
-    Only opens the first _PA_CANDIDATE_POOL entries' WCS (cheap, header-only
-    reads) to bound the I/O cost regardless of archive size — a candidate
-    outside that recency-based shortlist is left in place after it, never
-    pulled forward purely for having a better-matching angle. A candidate
-    whose own WCS/PA can't be determined sorts last (treated as the worst
-    case, same as an unknown new_position_angle_deg would be for it).
-    """
-    pool = paths[:_PA_CANDIDATE_POOL]
-    rest = paths[_PA_CANDIDATE_POOL:]
+    Every candidate is ranked, not just a shortlist of the most recent ones.
+    This used to open only the 30 newest candidates' WCS, to bound the extra
+    I/O, which quietly defeated the ranking in exactly the case it exists
+    for (audit 2026-08-18, finding L5): an archive that splits into two
+    orientation clusters — the ordinary result of a German equatorial
+    mount's meridian flip — can easily have its 30 newest frames all on one
+    side of the flip, so a new frame taken on the other side saw no
+    well-oriented reference at all and every frame it stacked needed the
+    full ~180deg pre-rotation. The better-matched frames were sitting in the
+    same directory, never opened.
 
+    The I/O that cap was protecting is already being spent: _screen_by_quality()
+    above reads every science candidate's header on every run to check its
+    QCFLAG/QCFWHM (finding H10, added after this cap). So the cap was
+    bounding a second, marginal read of files the same call had just read —
+    at the cost of the frames the ranking is meant to find. Reading the rest
+    costs one more header-level open per candidate, the same order of
+    magnitude as the screen itself and nothing beside astap and astroalign.
+
+    A candidate whose own WCS/PA can't be determined sorts last (treated as
+    the worst case, same as an unknown new_position_angle_deg would be for
+    it), which for an archive with no WCS headers at all leaves the recency
+    order exactly as it was.
+    """
     def _pa_distance(path: str) -> float:
         wcs = _open_wcs(path)
         pa = _position_angle_deg(wcs) if wcs is not None else None
@@ -418,12 +428,16 @@ def _sort_by_pa_closeness(paths: list[str], new_position_angle_deg: float) -> li
         return min(d, 360.0 - d)
 
     try:
-        pool_sorted = sorted(pool, key=_pa_distance)
+        ranked = sorted(paths, key=_pa_distance)
     except Exception as exc:
         logger.debug("Subtraction: PA-based reference ranking failed (%s) — falling back to recency order", exc)
         return paths
 
-    return pool_sorted + rest
+    logger.debug(
+        "Subtraction: ranked %d reference candidate(s) by orientation against PA=%.1f°",
+        len(paths), new_position_angle_deg,
+    )
+    return ranked
 
 
 # ---------------------------------------------------------------------------

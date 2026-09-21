@@ -1286,6 +1286,15 @@ class TestPrerotateReference:
         assert result is data
 
 
+_MTIME_SEQ = [1_700_000_000.0]
+
+
+def _mtime_counter() -> float:
+    """Monotonically increasing mtime, so files written in order look ordered."""
+    _MTIME_SEQ[0] += 1.0
+    return _MTIME_SEQ[0]
+
+
 class TestFindArchiveFramesPositionAngle:
 
     def test_none_pa_preserves_recency_only_order(self, tmp_path):
@@ -1332,6 +1341,42 @@ class TestFindArchiveFramesPositionAngle:
         assert sum("good" in p for p in result) == len(good_names)
         first_bad_idx = next(i for i, p in enumerate(result) if "bad" in p)
         assert all("good" in p for p in result[:first_bad_idx])
+
+    def test_a_well_oriented_frame_deep_in_the_archive_is_reached(
+        self, tmp_path, monkeypatch,
+    ):
+        """
+        Audit 2026-08-18, finding L5: ranking used to open only the 30 newest
+        candidates' WCS, so an archive whose recent frames all sit on one
+        side of a meridian flip hid every well-oriented reference behind
+        that cutoff — the new frame stacked 10 references all needing the
+        full ~180deg pre-rotation while better-matched ones sat unopened in
+        the same directory.
+
+        40 newest frames at PA=179, 6 older ones at PA=0. The old pool
+        (_MAX_FRAMES * 3 = 30) could not see past the first 30.
+        """
+        recent = [f"flip{i:03d}.fits" for i in range(40)]
+        older = [f"aligned{i}.fits" for i in range(6)]
+        # Written oldest-first so mtime order matches the intended recency.
+        for name in older + recent:
+            path = tmp_path / name
+            path.write_bytes(b"x")
+            os.utime(path, (_mtime_counter(), _mtime_counter()))
+
+        monkeypatch.setattr(
+            subtraction, "_open_wcs", lambda path: "aligned" if "aligned" in path else "flipped",
+        )
+        monkeypatch.setattr(
+            subtraction, "_position_angle_deg", lambda wcs: 0.0 if wcs == "aligned" else 179.0,
+        )
+
+        result = subtraction._find_archive_frames(
+            str(tmp_path), None, new_position_angle_deg=0.0,
+        )
+
+        assert len(result) == subtraction._MAX_FRAMES
+        assert sum("aligned" in p for p in result) == len(older)
 
 
 # ---------------------------------------------------------------------------

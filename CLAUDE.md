@@ -1097,7 +1097,14 @@ instead, both soft/best-effort — see that module's own section above for the e
    marking through its own resampling into the footprint `_median_reference()` already excludes.
    `_find_archive_frames()` additionally uses PA-closeness as a *soft* tiebreaker when there are more
    candidate references than `_MAX_FRAMES` (a reference needing less correction is a marginally
-   safer bet), never as a hard filter.
+   safer bet), never as a hard filter. The tiebreaker ranks the **whole** candidate list, however far
+   back in the archive it reaches — it used to open only the 30 newest, which defeated it in exactly
+   the case it exists for: an archive split into two orientation clusters by a meridian flip can
+   easily have its 30 newest frames all on one side, so a frame taken on the other side saw no
+   well-oriented reference at all while the better-matched ones sat unopened in the same directory
+   (audit 2026-08-18, finding L5). That cap bounded no real I/O anyway — `_screen_by_quality()`
+   already reads every candidate's header on every run (finding H10, added later), so it only
+   avoided a second, marginal read of files the same call had just read.
 
 **What this does *not* fix**: coma/optical-aberration residuals near bright stars after
 differencing are a property of the aberration pattern being fixed to the *sensor*, not the sky —
