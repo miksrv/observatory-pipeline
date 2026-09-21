@@ -15,6 +15,7 @@ import config
 
 from ._geometry import _find_sources_within_radius, _tile_key
 from ._history import (
+    _history_mag_epochs,
     _history_mag_scatter,
     _history_median_mag,
     _same_filter_history,
@@ -745,7 +746,11 @@ def _classify_source_sync(
         # classification came from the light curve rather than from a
         # catalog, so the distinction survives for an operator.
         scatter = _history_mag_scatter(same_filter_history)
-        n_same_filter = len(same_filter_history)
+        # Epochs that actually carry a magnitude, not rows: an epoch whose
+        # photometry never calibrated contributes nothing to `scatter`, so
+        # counting it here would let VARIABILITY_MIN_EPOCHS be satisfied by a
+        # baseline shorter than the one the scatter was measured over.
+        n_same_filter = _history_mag_epochs(same_filter_history)
 
         if (
             scatter is not None

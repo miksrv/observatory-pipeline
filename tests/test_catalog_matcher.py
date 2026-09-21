@@ -126,6 +126,14 @@ def _offset_ra(ra: float, dec: float, arcsec: float) -> tuple[float, float]:
     return ra + delta_deg, dec
 
 
+def _queried_radius_deg(mock_gaia) -> float:
+    """The radius, in degrees, of the most recent Gaia cone_search call."""
+    radius = mock_gaia.cone_search.call_args.kwargs.get("radius")
+    if radius is None:
+        radius = mock_gaia.cone_search.call_args.args[1]
+    return radius.to(u.deg).value
+
+
 def _offset_ra_exact(ra: float, dec: float, arcsec: float) -> tuple[float, float]:
     """
     Return a new (ra, dec) that is exactly `arcsec` arcseconds from (ra, dec)
@@ -215,6 +223,86 @@ class TestCacheTileGeometry:
             cm._query_gaia(_RA + 0.02, _DEC - 0.02, 1.0)
 
         assert mock_gaia.cone_search.call_count == 1
+
+    def test_the_fov_bucket_rounds_up(self):
+        """
+        Rounding to NEAREST is what made the cached cone stop being a function
+        of its key: 0.96 and 1.04 deg share the bucket, and whichever arrived
+        first decided how much sky was fetched. Rounding up guarantees the
+        bucket is at least as wide as every frame in it.
+        """
+        assert cm._cache_fov_deg(0.96) == pytest.approx(1.0)
+        assert cm._cache_fov_deg(1.04) == pytest.approx(1.1)
+        assert cm._cache_fov_deg(1.0) == pytest.approx(1.0)
+
+    def test_a_narrow_frame_does_not_shrink_the_cone_a_wider_one_reuses(self):
+        """
+        The failure this guards: the 0.96 deg frame fills the bucket, the 1.04
+        deg frame hits it, and every Gaia star near the wider frame's edge is
+        simply gone — purely because of which frame arrived first. Rounding up
+        puts the two in different buckets, so the wider one queries its own
+        cone instead of inheriting the narrower one's.
+        """
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 0.96)
+            narrow = _queried_radius_deg(mock_gaia)
+            cm._query_gaia(_RA, _DEC, 1.04)
+            wide = _queried_radius_deg(mock_gaia)
+
+        assert mock_gaia.cone_search.call_count == 2
+        assert wide > narrow
+
+    def test_the_queried_cone_covers_the_widest_frame_in_its_bucket(self):
+        """
+        The property the bucket has to guarantee: a hit always covers its
+        requester, however wide a frame the bucket admits.
+        """
+        fov_deg = 0.96
+        bucket = cm._cache_fov_deg(fov_deg)
+        table = _gaia_table(_RA, _DEC)
+
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, fov_deg)
+            queried_deg = _queried_radius_deg(mock_gaia)
+
+        widest_half_diagonal = bucket * math.sqrt(2) / 2.0
+        assert bucket >= fov_deg
+        assert queried_deg >= widest_half_diagonal - 1e-9
+
+    def test_two_frames_in_one_fov_bucket_make_one_query(self):
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 0.96)
+            cm._query_gaia(_RA, _DEC, 0.92)
+
+        assert mock_gaia.cone_search.call_count == 1
+
+    def test_the_skybot_key_separates_frames_of_different_widths(self):
+        """
+        The MPC key omitted fov_deg entirely although its radius depends on
+        it, so a narrow frame's result satisfied a wider frame at the same
+        tile and epoch — whose own edge, moving margin included, had never
+        been queried.
+        """
+        epoch = "2024-03-15T22:01:34"
+        radii: list[float] = []
+
+        class _FakeSkybot:
+            @staticmethod
+            def cone_search(coord, rad, epoch):
+                radii.append(rad.to(u.deg).value)
+                return None
+
+        with patch("astroquery.imcce.Skybot", _FakeSkybot):
+            cm._query_mpc(_RA, _DEC, epoch, 0.5)
+            cm._query_mpc(_RA, _DEC, epoch, 2.0)
+
+        assert len(radii) == 2
+        assert radii[1] > radii[0]
 
 
 # ===========================================================================
@@ -693,6 +781,63 @@ class TestMpcMatching:
         # The closer MPC object (2024 AB) wins
         assert source["catalog_name"] == "MPC"
         assert source["catalog_id"] == "2024 AB"
+
+    def test_a_loser_falls_back_to_its_next_nearest_eligible_source(self):
+        """
+        Two MPC objects competing for the same source used to cost the loser
+        its match entirely: only one proposal was ever built per object (its
+        own nearest source), so once that source was claimed the object had
+        nothing to fall back to — even with another perfectly eligible
+        unclaimed source of its own inside the cone. A real MPC detection was
+        lost to nothing more than the order the objects happened to be in.
+        """
+        near = _make_source(ra=_RA, dec=_DEC)
+        near["catalog_name"] = None
+        near["catalog_id"] = None
+
+        spare_ra, spare_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
+        spare = _make_source(ra=spare_ra, dec=spare_dec)
+        spare["catalog_name"] = None
+        spare["catalog_id"] = None
+
+        # Both objects sit nearest to `near`; B is the closer of the two, so A
+        # is the one that has to fall back onto `spare`.
+        a_ra, a_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.9)
+        b_ra, b_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.2)
+
+        mpc_objects = [
+            {"ra": a_ra, "dec": a_dec, "designation": "2024 AA", "object_type": "ASTEROID"},
+            {"ra": b_ra, "dec": b_dec, "designation": "2024 BB", "object_type": "ASTEROID"},
+        ]
+
+        cm._match_mpc([near, spare], mpc_objects)
+
+        assert near["catalog_id"] == "2024 BB"
+        assert spare["catalog_id"] == "2024 AA"
+
+    def test_one_object_never_claims_two_sources(self):
+        """
+        The assignment is one-to-one in both directions: an object that has
+        already taken a source does not go on to claim a second one just
+        because that one is also inside its cone.
+        """
+        first = _make_source(ra=_RA, dec=_DEC)
+        first["catalog_name"] = None
+        first["catalog_id"] = None
+
+        second_ra, second_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
+        second = _make_source(ra=second_ra, dec=second_dec)
+        second["catalog_name"] = None
+        second["catalog_id"] = None
+
+        mpc_objects = [
+            {"ra": _RA, "dec": _DEC, "designation": "2024 AA", "object_type": "ASTEROID"},
+        ]
+
+        cm._match_mpc([first, second], mpc_objects)
+
+        assert first["catalog_id"] == "2024 AA"
+        assert second["catalog_name"] is None
 
 
 # ===========================================================================

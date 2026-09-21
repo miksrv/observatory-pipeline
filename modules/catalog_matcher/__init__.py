@@ -72,6 +72,7 @@ from __future__ import annotations
 from ._2mass import _match_2mass, _query_2mass
 from ._cache import (
     _cache,
+    _cache_fov_deg,
     _cache_get,
     _cache_position,
     _cache_radius_margin_deg,

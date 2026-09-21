@@ -72,13 +72,21 @@ async def query(designation: str, obs_time: str) -> dict | None:
 
         horizons = Horizons(id=designation, location=location, epochs=jd)
 
-        # Off the event loop and under a wall-clock budget: the call below is
-        # a blocking HTTP round trip with no timeout of its own. Running it
-        # inline made _resolve_ephemerides()' asyncio.gather() concurrent in
-        # name only, and left an unresponsive Horizons able to stall the
-        # worker for as long as it liked. On timeout the thread is abandoned
-        # (a thread cannot be cancelled) — harmless, since it holds nothing
-        # but its own HTTP socket and its result is simply discarded.
+        # The budget is enforced at the HTTP layer first: astroquery passes
+        # this straight to requests as its own socket timeout, so an
+        # unresponsive Horizons ends the *thread* too, not just our wait on
+        # it. That distinction matters because asyncio.to_thread() runs on the
+        # loop's shared default executor, whose pool is small and bounded — a
+        # thread abandoned by asyncio.wait_for() keeps occupying a slot for as
+        # long as its socket blocks, and enough of them starve every other
+        # to_thread() user (astap's subprocess call among them) of workers.
+        horizons.TIMEOUT = config.EPHEMERIS_TIMEOUT_SEC
+
+        # asyncio.wait_for() stays as the outer bound: the HTTP timeout covers
+        # each socket operation, not the total call (redirects, retries and
+        # astropy's own table parsing all sit outside it), so this is what
+        # guarantees a wall-clock ceiling. It is now a backstop for a call
+        # that is already killable rather than the only line of defence.
         eph = await asyncio.wait_for(
             asyncio.to_thread(horizons.ephemerides),
             timeout=config.EPHEMERIS_TIMEOUT_SEC,

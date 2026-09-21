@@ -391,8 +391,13 @@ async def _get_source_tracks_batch_with_retry(source_ids: list[str]) -> dict:
         resp_json = response.json()
 
     # Documented format: {"results": {"<source_id>": [epoch, ...], ...}}
-    # Also accepted: {"results": [[...], [...], ...]} — see _normalize_batch_results.
-    return _normalize_batch_results(resp_json)
+    # Also accepted: {"results": [[...], [...], ...]} — see
+    # _normalize_batch_results. Unlike the near/covering batches, this
+    # endpoint's results are addressed by source_id rather than by request
+    # position, so the array form is re-keyed by the ids that were asked for:
+    # modules/finder_chart looks each track up as `tracks.get(source_id)`, and
+    # positional "0"/"1" keys would leave every source with no epochs.
+    return _normalize_batch_results(resp_json, keys=source_ids)
 
 
 async def get_source_tracks_batch(source_ids: list[str]) -> dict:

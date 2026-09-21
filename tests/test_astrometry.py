@@ -31,6 +31,7 @@ from astropy.wcs import WCS as AstropyWCS
 
 import config
 from modules import astrometry
+from modules.astrometry import _wcs as _wcs_mod
 from modules.astrometry._frame_geometry import (
     _frame_center_and_scale,
     _position_angle_deg,
@@ -1090,6 +1091,24 @@ class TestWcsPlausibility:
 # celestial axes — so a header WCS that merely *looked* valid, but was off
 # by ~178", was silently trusted over astap's own freshly-solved output.
 # ---------------------------------------------------------------------------
+
+class TestSidecarPcCdeltCleanup:
+    """
+    astap writes BOTH CD* and PC*+CDELT* into its .wcs sidecar, and astropy
+    multiplies the two — so the PC/CDELT pair is stripped when CD is present.
+    That cleanup matched by PREFIX, and "PC" is also the first two letters of
+    PCOUNT, a structural HDU keyword with nothing to do with the WCS. Only
+    indexed cards belong to the transform.
+    """
+
+    def test_it_matches_indexed_pc_and_cdelt_cards(self):
+        for card in ("PC1_1", "PC2_1", "PC1_1A", "CDELT1", "CDELT2", "CDELT1A"):
+            assert _wcs_mod._PC_CDELT_CARD_RE.match(card), card
+
+    def test_it_leaves_pcount_and_other_cards_alone(self):
+        for card in ("PCOUNT", "GCOUNT", "CD1_1", "CDELTA", "PC", "CCDTEMP"):
+            assert not _wcs_mod._PC_CDELT_CARD_RE.match(card), card
+
 
 class TestPrefersFreshWcsSidecarOverStaleHeader:
     async def test_sidecar_wcs_wins_over_celestial_header_wcs(self):

@@ -225,6 +225,23 @@ class TestEphemerisQuery:
 
         assert result is None
 
+    async def test_the_budget_reaches_astroquery_as_an_http_timeout(self):
+        """
+        asyncio.wait_for() only stops *awaiting* the call — it cannot cancel
+        the thread, which keeps a slot on asyncio's small shared default
+        executor for as long as its socket blocks. Enough hung Horizons
+        requests starve every other to_thread() caller, astap's subprocess
+        among them. The budget therefore has to reach the HTTP layer too,
+        where it actually ends the request.
+        """
+        instance = MagicMock()
+        instance.ephemerides.side_effect = lambda: [_make_eph_row()]
+
+        with patch("modules.ephemeris.Horizons", MagicMock(return_value=instance)):
+            await ephemeris.query(_DESIGNATION, _OBS_TIME)
+
+        assert instance.TIMEOUT == config.EPHEMERIS_TIMEOUT_SEC
+
     async def test_query_runs_the_blocking_call_off_the_event_loop(self):
         """
         The same finding's other half: run inline, the blocking HTTP round

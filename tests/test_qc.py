@@ -17,6 +17,7 @@ All tests are async because qc.analyze() is declared async.
 
 from __future__ import annotations
 
+import math
 import os
 import pathlib
 import shutil
@@ -31,6 +32,7 @@ import pytest_asyncio
 # ---------------------------------------------------------------------------
 # Module under test
 # ---------------------------------------------------------------------------
+import config
 from modules import qc
 
 
@@ -1101,4 +1103,34 @@ class TestMediansUseTheStarPopulation:
             result = await qc.analyze(_FITS_PATH, move_on_reject=False)
 
         assert result["elongation_median"] == pytest.approx(10.0)
+        assert result["quality_flag"] in ("TRAIL", "BAD")
+
+
+class TestDegenerateMinorAxisIsClamped:
+    """
+    `sep` reports a zero (or near-zero) semi-minor axis for a degenerate fit —
+    a detection lying along a single pixel row, a cosmic-ray track, a bad
+    column. QC substituted an elongation of exactly 1.0 for those, which reads
+    as PERFECTLY ROUND: the artifact was admitted into the round population
+    fwhm_median is taken over, and TRAIL was structurally unable to fire on
+    the very shape it exists to catch. The three other extraction paths clamp
+    the minor axis at the narrowest width a pixel grid can express; QC now
+    does the same.
+    """
+
+    def test_the_clamp_matches_the_other_extraction_paths(self):
+        assert qc._MIN_SEMI_MINOR_PX == pytest.approx(1.0 / math.sqrt(12.0))
+
+    @pytest.mark.asyncio
+    async def test_a_zero_minor_axis_reads_as_elongated_not_round(self):
+        """A line-like artifact must not be reported as a round star."""
+        sources = _make_sources(_N_SOURCES, a=5.0, b=0.0)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        # a / (1/sqrt(12)) — how elongated the feature would be if it were
+        # exactly one pixel wide, which is the most it can honestly claim.
+        assert result["elongation_median"] == pytest.approx(5.0 / qc._MIN_SEMI_MINOR_PX)
+        assert result["elongation_median"] > config.QC_ELONGATION_MAX
         assert result["quality_flag"] in ("TRAIL", "BAD")

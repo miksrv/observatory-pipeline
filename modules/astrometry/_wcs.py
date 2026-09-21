@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 
 import astropy.io.fits as fits
 import numpy as np
@@ -129,6 +130,14 @@ def _is_plausible_wcs(wcs: WCS, naxis1: int, naxis2: int, fits_filename: str) ->
     return True
 
 
+# Indexed PC matrix / CDELT scale cards, with an optional alternate-WCS
+# suffix letter. Matched as whole card names rather than by prefix: a bare
+# "PC" also matches `PCOUNT`, a structural HDU keyword that has nothing to do
+# with the WCS, so prefix matching would silently drop non-WCS metadata while
+# reconciling astap's sidecar.
+_PC_CDELT_CARD_RE = re.compile(r"^PC\d+_\d+[A-Z]?$|^CDELT\d+[A-Z]?$")
+
+
 def _read_wcs(fits_path: str, output_base: str | None) -> tuple[WCS, int, int] | None:
     """
     Read the WCS for a just-solved frame, preferring astap's own fresh
@@ -189,7 +198,7 @@ def _read_wcs(fits_path: str, output_base: str | None) -> tuple[WCS, int, int] |
                 # authoritative representation from astap's solver.
                 if "CD1_1" in wcs_hdr:
                     for key in list(wcs_hdr.keys()):
-                        if key.startswith("PC") or key.startswith("CDELT"):
+                        if _PC_CDELT_CARD_RE.match(key.upper()):
                             del wcs_hdr[key]
                 _log_astap_solve_report(wcs_hdr, fits_filename)
                 wcs_candidate = WCS(wcs_hdr)

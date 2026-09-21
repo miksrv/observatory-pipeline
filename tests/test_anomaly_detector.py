@@ -110,7 +110,7 @@ def _make_source(
 def _make_hist_source(
     ra: float = _RA,
     dec: float = _DEC,
-    mag: float = 14.5,
+    mag: float | None = 14.5,
     filter: str | None = "L",
 ) -> dict:
     return {"ra": ra, "dec": dec, "mag": mag, "filter": filter}
@@ -858,6 +858,24 @@ class TestDetectLightCurveVariability:
             _make_hist_source(mag=14.52, filter="R"),
             _make_hist_source(mag=14.48, filter="R"),
             _make_hist_source(mag=14.51, filter="R"),
+        ]
+
+        assert await self._run(source, hist) == []
+
+    async def test_epochs_without_a_magnitude_do_not_count_toward_the_baseline(self):
+        """
+        VARIABILITY_MIN_EPOCHS gates on a PHOTOMETRIC baseline, so it must
+        count the same rows the scatter is computed from. A detection whose
+        photometry never calibrated is still recorded, and counting rows
+        rather than magnitudes let three same-filter detections carrying only
+        two usable magnitudes satisfy the threshold — classifying off a
+        baseline shorter than the one the scatter was measured over.
+        """
+        source = _make_source(mag=12.0, catalog_name="Gaia DR3", object_type="STAR")
+        hist = [
+            _make_hist_source(mag=14.50),
+            _make_hist_source(mag=14.52),
+            _make_hist_source(mag=None),
         ]
 
         assert await self._run(source, hist) == []

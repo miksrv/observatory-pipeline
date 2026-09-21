@@ -15,7 +15,13 @@ from astroquery.simbad import Simbad
 
 import config
 
-from ._cache import _cache_get, _cache_position, _cache_radius_margin_deg, _cache_set
+from ._cache import (
+    _cache_fov_deg,
+    _cache_get,
+    _cache_position,
+    _cache_radius_margin_deg,
+    _cache_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +51,13 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
     # not contain that one's edge region at all (audit 2026-08-18, finding
     # M5). See _cache._cache_position().
     key_ra, key_dec = _cache_position(ra_center, dec_center)
-    cache_key = f"simbad:{key_ra:.1f}:{key_dec:.1f}:{fov_deg:.1f}"
+    # The FOV is bucketed UPWARD to the same 0.1 deg resolution, and the query
+    # below uses the bucket rather than this frame's exact FOV — otherwise the
+    # cached cone is not a function of the key it is stored under, and a
+    # narrower frame filling the bucket first leaves a wider one's edge
+    # unqueried. See _cache._cache_fov_deg().
+    key_fov = _cache_fov_deg(fov_deg)
+    cache_key = f"simbad:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -55,7 +67,7 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
         simbad.add_votable_fields("otype")
 
         coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
-        radius = ((fov_deg * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()) * u.deg
+        radius = ((key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()) * u.deg
         result = simbad.query_region(coord, radius=radius)
 
         if result is None:

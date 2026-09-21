@@ -296,6 +296,41 @@ class TestRunRecovery:
 
         assert len(result) == 2
 
+    async def test_blend_neighbours_are_taken_at_the_observation_epoch(self, scene, monkeypatch):
+        """
+        The blend index held every Gaia neighbour at its CATALOG epoch while
+        the forced targets themselves are propagated to the frame's epoch, so
+        the two sides of the comparison described different instants. The
+        lookup's own "the position itself is in the catalog, discount its zero
+        separation" invariant then breaks, and a high-proper-motion star that
+        has long since moved away still blocks whatever sits at the position
+        it used to occupy.
+
+        Here a stationary star shares the frame with an HPM star whose 2016
+        position coincides with it but which has moved ~8" north by the
+        observation — well outside the 2 x 3" blend radius. The stationary
+        star is isolated at this epoch and must be measured.
+        """
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        stationary = _gaia_star(wcs, 100, 100, "stationary", mag=17.5)
+        mover = _gaia_star(wcs, 100, 100, "mover", mag=17.6)
+        # 1000 mas/yr in dec over 2016.0 -> 2024.0 is 8", past the 6" radius.
+        mover["pmra"] = 0.0
+        mover["pmdec"] = 1000.0
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=[stationary, mover], mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05,
+            obs_time="2024-01-01T00:00:00", psf_fwhm_arcsec=3.0,
+        )
+
+        assert "stationary" in [r["catalog_id"] for r in result]
+
     async def test_skips_star_already_matched_in_sources(self, scene, monkeypatch):
         _, wcs = scene
         monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)

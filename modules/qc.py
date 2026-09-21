@@ -513,10 +513,16 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         [_compute_fwhm_pixels(float(o["a"]), float(o["b"])) for o in objects],
         dtype=np.float64,
     )
-    elongation_arr: np.ndarray = np.array(
-        [float(o["a"]) / float(o["b"]) if float(o["b"]) > 0.0 else 1.0 for o in objects],
-        dtype=np.float64,
+    # Minor axis clamped at the pixel limit, never replaced by a sentinel:
+    # substituting 1.0 for a degenerate `b == 0` fit reported a line-like
+    # artifact (a cosmic-ray track, a bad column) as perfectly ROUND, which
+    # both admitted it into the FWHM population this very block is filtering
+    # and made TRAIL structurally unable to fire on it. The three other
+    # extraction paths already clamp the same way — see _MIN_SEMI_MINOR_PX.
+    b_clamped: np.ndarray = np.maximum(
+        objects["b"].astype(np.float64), _MIN_SEMI_MINOR_PX
     )
+    elongation_arr: np.ndarray = objects["a"].astype(np.float64) / b_clamped
 
     mask_flux: np.ndarray = objects["flux"] > 0
     mask_round: np.ndarray = elongation_arr < config.STAR_ELONGATION_MAX

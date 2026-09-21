@@ -714,6 +714,35 @@ async def test_archived_file_carries_only_one_wcs_representation(mock_modules, t
         assert header["CRVAL1"] == pytest.approx(202.47, abs=1e-6)
 
 
+def test_stripping_the_wcs_leaves_non_wcs_cards_alone():
+    """
+    The cleanup matched by PREFIX, and "PC" is also the first two letters of
+    PCOUNT — a structural keyword describing an HDU's parameter count, not a
+    WCS matrix term at all. Deleting it while replacing a WCS corrupts the
+    very header this helper exists to leave well-defined. Only indexed cards
+    (PCi_j, CDi_j, CDELTi, CROTAi, with an optional alternate-WCS suffix)
+    belong to a linear transform.
+    """
+    header = fits.Header()
+    header["PC1_1"] = 1.0
+    header["PC1_2"] = 0.0
+    header["CD2_1"] = 0.0
+    header["CDELT1"] = -0.001
+    header["CROTA2"] = 12.0
+    header["CD1_1A"] = 0.5          # alternate-WCS suffix — still a WCS card
+    header["PCOUNT"] = 0            # structural, not WCS
+    header["GCOUNT"] = 1
+    header["CCDTEMP"] = -10.0
+
+    pipeline._strip_wcs_representation(header)
+
+    for gone in ("PC1_1", "PC1_2", "CD2_1", "CDELT1", "CROTA2", "CD1_1A"):
+        assert gone not in header
+    assert header["PCOUNT"] == 0
+    assert header["GCOUNT"] == 1
+    assert header["CCDTEMP"] == pytest.approx(-10.0)
+
+
 @pytest.mark.asyncio
 async def test_archived_file_gets_qc_headers(mock_modules, tmp_path):
     """

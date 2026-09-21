@@ -70,6 +70,7 @@ import glob
 import logging
 import math
 import os
+import re
 import shutil
 
 import config
@@ -2040,7 +2041,15 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
 # The two interchangeable ways FITS can express a pixel-to-world linear
 # transform, plus the rotation keyword that predates both. A header is only
 # well-defined if it carries one of them.
-_WCS_LINEAR_PREFIXES: tuple[str, ...] = ("CD", "PC", "CDELT", "CROTA")
+#
+# Matched as INDEXED cards (`CD1_1`, `PC2_1`, `CDELT1`, `CROTA2`, plus an
+# optional alternate-WCS suffix letter), never as a bare prefix: `PC` alone
+# also matches `PCOUNT`, the structural keyword an extension/random-groups HDU
+# carries, which is not a WCS term at all — stripping it corrupts the very
+# header this function exists to leave well-defined.
+_WCS_LINEAR_CARD_RE = re.compile(
+    r"^(?:CD|PC)\d+_\d+[A-Z]?$|^(?:CDELT|CROTA)\d+[A-Z]?$"
+)
 
 
 def _strip_wcs_representation(header) -> None:
@@ -2069,7 +2078,7 @@ def _strip_wcs_representation(header) -> None:
     for key in list(header.keys()):
         if not key:
             continue
-        if key.upper().startswith(_WCS_LINEAR_PREFIXES):
+        if _WCS_LINEAR_CARD_RE.match(key.upper()):
             try:
                 del header[key]
             except KeyError:

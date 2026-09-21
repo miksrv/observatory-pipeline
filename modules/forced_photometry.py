@@ -581,12 +581,20 @@ async def run(
     # Every catalog entry in this field, for the blend check below — the
     # neighbour that contaminates an aperture need not be one this pass is
     # forcing; an already-detected star is just as bright.
+    #
+    # Gaia neighbours are propagated to the observation epoch exactly as the
+    # forced targets themselves are, a few lines down. At their catalog epoch
+    # a high-proper-motion star's own entry can sit further from where it is
+    # being measured than the blend radius, so the lookup stops recognising
+    # the self-match — and then rejects the measurement as "blended" against
+    # the star's own stale position. Both sides of the comparison have to be
+    # at the same epoch for it to mean anything.
     blend_radius = _blend_radius_arcsec(psf_fwhm_arcsec)
     neighbour_positions: list[tuple[float, float]] = []
     if blend_radius > 0:
         for star in gaia_stars:
             try:
-                neighbour_positions.append((float(star["ra"]), float(star["dec"])))
+                neighbour_positions.append(_propagate_gaia_position(star, obs_jyear))
             except (KeyError, TypeError, ValueError):
                 continue
         for obj in mpc_objects:

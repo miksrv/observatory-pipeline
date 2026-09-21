@@ -608,13 +608,16 @@ SITE_LAT: float = float(_get("SITE_LAT", "0.0"))   # degrees, positive = North
 SITE_LON: float = float(_get("SITE_LON", "0.0"))   # degrees, positive = East
 SITE_ELEV: int  = int(_get("SITE_ELEV", "0"))      # metres above sea level
 
-# Wall-clock budget for a single JPL Horizons ephemeris lookup
-# (modules/ephemeris.py). astroquery's Horizons client is fully synchronous
-# with no timeout of its own, so an unresponsive Horizons would otherwise
-# stall the worker indefinitely — the query runs in a worker thread and is
-# abandoned after this many seconds. An ephemeris is supplementary detail on
-# an anomaly that has already been classified without it, so giving up is
-# always preferable to blocking the frame.
+# Budget for a single JPL Horizons ephemeris lookup (modules/ephemeris.py).
+# astroquery's Horizons client is fully synchronous and carries no timeout by
+# default, so an unresponsive Horizons would otherwise stall the worker
+# indefinitely. Applied in two places: as astroquery's own HTTP timeout, so a
+# hung request ends the worker thread rather than leaving it occupying a slot
+# on asyncio's small shared executor where it would eventually starve every
+# other to_thread() caller, and as the outer asyncio.wait_for() ceiling that
+# bounds the total call. An ephemeris is supplementary detail on an anomaly
+# that has already been classified without it, so giving up is always
+# preferable to blocking the frame.
 EPHEMERIS_TIMEOUT_SEC: float = float(_get("EPHEMERIS_TIMEOUT_SEC", "30"))
 
 # ---------------------------------------------------------------------------

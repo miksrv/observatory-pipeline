@@ -76,6 +76,22 @@ def _same_filter_history(history: list[dict], filter_name: str | None) -> list[d
     return [src for src in history if src.get("filter") == filter_name]
 
 
+def _history_mag_epochs(history: list[dict]) -> int:
+    """
+    How many of these historical detections actually carry a usable magnitude
+    — the photometric baseline's real length.
+
+    `len(history)` is not that number: a detection is recorded whether or not
+    photometry could calibrate it, so a position observed three times with
+    only two measured magnitudes would still clear VARIABILITY_MIN_EPOCHS
+    while `_history_mag_scatter()` below had only two values to work with.
+    The light-curve VARIABLE_STAR branch gates on a *photometric* baseline
+    being long enough to trust its own scatter, so it must count the same
+    rows the scatter is computed from.
+    """
+    return sum(1 for src in history if _extract_mag(src) is not None)
+
+
 def _history_mag_scatter(history: list[dict]) -> float | None:
     """
     Robust scatter (1-sigma equivalent) of a source's OWN historical

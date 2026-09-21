@@ -16,7 +16,13 @@ from astropy.coordinates import SkyCoord
 
 import config
 
-from ._cache import _cache_get, _cache_position, _cache_radius_margin_deg, _cache_set
+from ._cache import (
+    _cache_fov_deg,
+    _cache_get,
+    _cache_position,
+    _cache_radius_margin_deg,
+    _cache_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +57,15 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
     # epoch, same tile) can sit up to a tile diagonal away, and a circle drawn
     # around THIS frame need not contain that one's edge region at all (audit
     # 2026-08-18, finding M5). See _cache._cache_position().
+    # The FOV belongs in the key for the same reason: the radius below is
+    # derived from it, so two frames of different widths at the same tile and
+    # epoch do NOT share a cone — omitting it entirely (as this key did) let a
+    # narrow frame's result satisfy a wider one, whose own edge region, moving
+    # margin included, had never been queried. Bucketed upward so a hit always
+    # covers its requester. See _cache._cache_fov_deg().
     key_ra, key_dec = _cache_position(ra_center, dec_center)
-    cache_key = f"mpc:{key_ra:.1f}:{key_dec:.1f}:{obs_time}"
+    key_fov = _cache_fov_deg(fov_deg)
+    cache_key = f"mpc:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}:{obs_time}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
@@ -69,7 +82,7 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
         coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
         epoch = Time(obs_time)
         radius_deg = (
-            fov_deg * math.sqrt(2) / 2.0
+            key_fov * math.sqrt(2) / 2.0
             + config.MOVING_CONE_ARCSEC / 3600.0
             + _cache_radius_margin_deg()
         )
@@ -194,7 +207,11 @@ def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
     observation time.
 
     One-to-one matching: each MPC object is assigned to at most ONE detected
-    source (the nearest candidate within the threshold). The original
+    source, and each source to at most one object. The assignment is greedy
+    over EVERY eligible (object, source) pair ordered by separation, not over
+    one nearest proposal per object — so an object that loses its nearest
+    source to a closer competitor still gets its next-nearest eligible one
+    rather than going unmatched. The original
     implementation matched in the opposite direction (for each source, find
     the nearest MPC object) which allowed multiple sources to claim the same
     MPC designation — then _dedupe_by_catalog_identity() kept the brightest,
@@ -248,41 +265,50 @@ def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
         dec=[s["dec"] for s in sources] * u.deg,
     )
 
-    # Nearest source of any kind, per MPC object — the takeover candidate.
-    all_idx, all_sep, _ = mpc_coords.match_to_catalog_sky(all_coords)
+    # Whether a source was already claimed by an earlier catalog, captured
+    # BEFORE this pass starts reassigning anything — the eligibility rule
+    # below asks about the state _match_mpc() was handed, not the one it is
+    # building.
+    unclaimed = [s["catalog_name"] is None for s in sources]
 
-    # Nearest *unclaimed* source, per MPC object — the ordinary candidate.
-    unmatched_pos = [i for i, s in enumerate(sources) if s["catalog_name"] is None]
-    un_idx = un_sep = None
-    if unmatched_pos:
-        un_coords = SkyCoord(
-            ra=[sources[i]["ra"] for i in unmatched_pos] * u.deg,
-            dec=[sources[i]["dec"] for i in unmatched_pos] * u.deg,
-        )
-        un_idx, un_sep, _ = mpc_coords.match_to_catalog_sky(un_coords)
+    # EVERY (mpc object, source) pair inside the widest cone this stage can
+    # use, not just each object's own nearest source. A single nearest
+    # proposal per object cannot be retried: when two objects proposed the
+    # same source, the loser was dropped outright even with another perfectly
+    # eligible unclaimed source of its own inside the cone, and a real MPC
+    # detection was lost to an ordering accident. Building the full edge set
+    # and assigning greedily over it gives every loser its next-nearest
+    # eligible source instead.
+    idx_mpc, idx_src, sep2d, _ = all_coords.search_around_sky(
+        mpc_coords, config.MOVING_CONE_ARCSEC * u.arcsec
+    )
 
-    # (separation_arcsec, mpc_index, source_index) — one proposal per MPC object.
+    # (separation_arcsec, mpc_index, source_index) for every eligible edge.
+    # Eligibility is the same positional rule as before: the tight cone
+    # permits a takeover of an already-identified source, the wide one only
+    # reaches sources no other catalog claimed.
     proposals: list[tuple[float, int, int]] = []
-    for mpc_idx in range(len(mpc_objects)):
-        sep_any = float(all_sep[mpc_idx].arcsec)
-        src_any = int(all_idx[mpc_idx])
-        if sep_any <= config.MATCH_CONE_ARCSEC:
-            proposals.append((sep_any, mpc_idx, src_any))
-            continue
-        if un_idx is not None:
-            sep_un = float(un_sep[mpc_idx].arcsec)
-            if sep_un < config.MOVING_CONE_ARCSEC:
-                proposals.append((sep_un, mpc_idx, unmatched_pos[int(un_idx[mpc_idx])]))
+    for edge in range(len(idx_mpc)):
+        mpc_idx = int(idx_mpc[edge])
+        src_idx = int(idx_src[edge])
+        sep_arcsec = float(sep2d[edge].arcsec)
+        if sep_arcsec <= config.MATCH_CONE_ARCSEC or (
+            unclaimed[src_idx] and sep_arcsec < config.MOVING_CONE_ARCSEC
+        ):
+            proposals.append((sep_arcsec, mpc_idx, src_idx))
 
-    # Nearest proposal first, so a closer MPC object always wins over a more
-    # distant one when two of them compete for the same source.
+    # Nearest edge first, so a closer MPC object always wins over a more
+    # distant one when two of them compete for the same source — and the
+    # loser simply falls through to its own next edge in this same list.
     proposals.sort(key=lambda p: p[0])
 
     claimed: set[int] = set()
+    assigned_mpc: set[int] = set()
     for sep_arcsec, mpc_idx, src_idx in proposals:
-        if src_idx in claimed:
+        if src_idx in claimed or mpc_idx in assigned_mpc:
             continue
         claimed.add(src_idx)
+        assigned_mpc.add(mpc_idx)
 
         source = sources[src_idx]
         obj = mpc_objects[mpc_idx]

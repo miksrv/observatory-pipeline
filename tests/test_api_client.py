@@ -588,7 +588,7 @@ class TestGetSourceTracksBatch:
 
         assert result == {}
 
-    async def test_list_shaped_results_are_indexed_positionally(self):
+    async def test_list_shaped_results_are_keyed_by_requested_source_id(self):
         """
         docs/API.md documents "results" as an object keyed by source_id, but
         PHP's json_encode() serializes any array with sequential integer keys
@@ -596,6 +596,12 @@ class TestGetSourceTracksBatch:
         results array normally has. _normalize_batch_results() accepts both
         shapes; coercing the list form to {} (as it once did) discarded every
         batch result on every call. See its docstring.
+
+        This endpoint is addressed by source_id, not by request position:
+        modules/finder_chart reads each track back as `tracks.get(source_id)`,
+        so the array form must be re-keyed by the ids that were asked for.
+        Positional "0"/"1" keys would leave every source with no epochs and
+        no chart.
         """
         resp = _mock_response(
             status_code=200,
@@ -604,7 +610,7 @@ class TestGetSourceTracksBatch:
         with _patch_client(post_response=resp):
             result = await get_source_tracks_batch(["src1", "src2"])
 
-        assert result == {"0": [{"ra": 1.0}], "1": []}
+        assert result == {"src1": [{"ra": 1.0}], "src2": []}
 
     async def test_returns_empty_dict_when_results_is_neither_dict_nor_list(self):
         """A "results" that is neither shape carries nothing usable."""

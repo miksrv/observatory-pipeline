@@ -483,6 +483,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **API** |
 | `API_BASE_URL` | — | Yes | Base URL of the observatory-api (e.g., `https://your-cloud-host.com/api/v1`) |
 | `API_KEY` | — | Yes | Secret API key for authentication |
+| `API_RECOVERY_MAX_ATTEMPTS` | `2` | No | How many times a frame whose `POST /sources` or `POST /anomalies` exhausted its retries may re-queue itself as a recovery task. A 4xx is never retried, so without a bound such a frame would re-queue forever; past it the exact item is logged at ERROR for manual submission. |
 | **FITS Directories** |
 | `FITS_INCOMING` | `/fits/incoming` | No | Directory to watch for new FITS files |
 | `FITS_ARCHIVE` | `/fits/archive` | No | Directory for successfully processed frames |
@@ -491,6 +492,13 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `ASTAP_BINARY` | `/usr/local/bin/astap` | No | Path to the astap executable |
 | `ASTAP_CATALOGS` | `/astap/catalogs` | No | Path to ASTAP star catalog directory |
 | `ASTAP_FOV_HINT` | `0` | No | Field-of-view hint in degrees for faster plate solving. Set to 0 for auto-detection from FITS headers. Providing your telescope's approximate FOV (e.g., `1.5`) significantly speeds up plate solving. |
+| `ASTAP_TIMEOUT_SEC` | `60` | No | Wall-clock limit for one ordinary (narrow-search) astap invocation. The subprocess is killed and the solve reported as failed past this. |
+| `ASTAP_RETRY_WIDE_SEARCH` | `true` | No | Retry a failed narrow solve with a blind wide search instead of giving up. Costs a much longer solve on frames that were never going to solve, so turn it off if throughput matters more than recovering badly-pointed frames. |
+| `ASTAP_WIDE_SEARCH_RADIUS_DEG` | `30` | No | Search radius in degrees for that wide retry. |
+| `ASTAP_WIDE_SEARCH_TIMEOUT_SEC` | `240` | No | Wall-clock limit for the wide retry, separate from `ASTAP_TIMEOUT_SEC` because a blind search legitimately takes far longer. |
+| **Astrometry — Solve Validation** |
+| `ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC` | `0.05` | No | Lower bound of the plate scale a solved WCS must imply to be accepted. The WCS is authoritative for every downstream position, and nothing further down has anything to compare it against, so an implausible solve (most likely a false star-pattern match from the wide retry) is rejected outright rather than becoming a systematic frame-wide position error. |
+| `ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC` | `60.0` | No | Upper bound of the same check. Widen both if your setup's real plate scale sits outside this range. |
 | **Quality Control** |
 | `QC_FWHM_MAX_ARCSEC` | `8.0` | No | Maximum acceptable median FWHM in arcseconds. Frames exceeding this are rejected as `BLUR`. |
 | `QC_ELONGATION_MAX` | `2.0` | No | Maximum acceptable PSF elongation ratio (major/minor axis). Values >2.0 indicate star trailing due to tracking issues. |
@@ -519,6 +527,9 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Cross-Matching** |
 | `MATCH_CONE_ARCSEC` | `5.0` | No | Cone search radius in arcseconds for point-source catalog matching (Simbad, Gaia, 2MASS, Pan-STARRS). |
 | `MOVING_CONE_ARCSEC` | `120.0` | No | Wider cone radius in arcseconds for moving-object (MPC) detection. Widened from an earlier default of `30.0` because fast movers like Vesta travel ~60"/hr. `.env.example` is up to date with this value — see the note above. |
+| `MOVING_RATE_ARCSEC_PER_MIN` | `30.0` | No | How fast a moving object is assumed to be able to travel when `modules/anomaly_detector/` looks for its *previous* position. The wide history cone is sized per candidate as this rate times the gap to the historical detection, with `MOVING_CONE_ARCSEC` as its floor — a constant radius cannot express "how far could it have gone since then". |
+| `MOVING_EXTEND_MAX_GAP_MIN` | `30.0` | No | The extension above only applies to a historical detection no older than this many minutes. Beyond it the cone stays at `MOVING_CONE_ARCSEC`. |
+| `MOVING_CONE_MAX_ARCSEC` | `600.0` | No | Hard ceiling on the extended cone. Both bounds exist because a cone's false-positive risk grows with its area; without them the extension degenerates into a permanently wide cone. |
 | `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
 | `VARIABILITY_MIN_EPOCHS` | `3` | No | Minimum number of same-filter historical detections a source needs before `modules/anomaly_detector/` will judge a magnitude change against its own light curve. Below this, a change that no catalog explains is not reported. |
 | `VARIABILITY_SIGMA` | `3.0` | No | How many times its own historical scatter a source's magnitude must depart from its same-filter baseline to be reported as a `VARIABLE_STAR` candidate without any catalog classifying it as one. Keeps intrinsically noisy sources quiet; `DELTA_MAG_ALERT` still applies as an absolute floor. |
@@ -529,19 +540,38 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Image Subtraction** |
 | `SUBTRACTION_MIN_FRAMES` | `3` | No | Minimum number of archived reference frames of the same object required before `modules/subtraction.py` will attempt image subtraction. |
 | `SUBTRACTION_DETECT_SIGMA` | `5.0` | No | Detection threshold on the difference image, in multiples of background RMS. |
+| `SUBTRACTION_REF_MAX_FWHM_RATIO` | `1.5` | No | A reference frame is excluded when its stamped `QCFWHM` exceeds the new frame's own measured FWHM by more than this factor. QC-failed frames are archived rather than dropped, so the reference directory mixes them in with good ones, and differencing a sharp frame against a blurred reference leaves a ring residual at every star. |
+| `SUBTRACTION_EDGE_ELONGATION_MAX` | `1.3` | No | A difference-image candidate inside the `EDGE_MARGIN_FRAC` zone survives only if it is this round *and* at least `SUBTRACTION_EDGE_SNR_MIN` strong. Deliberately stricter than the whole-frame equivalents — coma residuals near the edge are elongated and usually weak, and that is where the false positives concentrate. |
+| `SUBTRACTION_EDGE_SNR_MIN` | `10.0` | No | See `SUBTRACTION_EDGE_ELONGATION_MAX` above. |
+| `SUBTRACTION_PREROTATE_MIN_DEG` | `2.0` | No | Coarse-rotate a reference frame toward the new frame's own orientation before handing it to `astroalign`, whenever their position angles differ by at least this much (e.g. after a meridian flip). Below it the interpolation isn't worth the cost. |
+| `SUBTRACTION_NOISE_CORR_MAX` | `4.0` | No | Cap on the noise-correlation factor a candidate's SNR is divided by. Resampling spreads each input pixel's noise across several output ones, so an aperture holds fewer independent measurements than pixels; the factor is measured from the frame's own difference image, and `1.0` restores the uncorrected formula. |
 | **Photometry — Sensor Gain** |
 | `PHOTOMETRY_GAIN_E_PER_ADU` | _(blank)_ | No | Sensor gain in electrons per ADU, for the Poisson term of the aperture flux error (`modules/photometry.py`, `modules/forced_photometry.py`). Blank means "read it from each frame's own header", preferring `EGAIN` over `GAIN` — on most CMOS cameras `EGAIN` is the true conversion factor while `GAIN` holds the camera's gain *setting* in arbitrary vendor units. A header value outside the plausible e⁻/ADU range is rejected with a warning and `1.0` is used. Set explicitly when your capture software writes no usable `EGAIN`. |
+| **Photometry — Calibration** |
+| `PHOTOMETRY_MIN_SNR` | `3.0` | No | Below this significance a measurement keeps its aperture numbers but is left uncalibrated (`mag_calibrated` stays `None`), so no magnitude-change branch can fire on a source at the detection limit. Same line `FORCED_PHOTOMETRY_MIN_SNR` draws on the other detection path. |
+| `PHOTOMETRY_SKY_SIGMA_CLIP` | `3.0` | No | Sigma clipping applied to each source's sky annulus before its median is taken — the ring routinely catches a neighbouring star, a cosmic ray, or a supernova candidate's own host galaxy. Non-positive restores the unclipped median. |
+| `PHOTOMETRY_REF_MAX_RUWE` | `1.4` | No | Maximum Gaia RUWE for a zero-point reference star. Above it the astrometric solution fits badly — usually an unresolved binary or a blend whose aperture holds two stars' flux. Gaia-flagged variable and `duplicated_source` stars are screened out alongside this. |
+| `PHOTOMETRY_COLOR_TERM_ENABLED` | `true` | No | Fit a colour term (`zp + k × (BP−RP − color_ref)`) instead of a single median offset. A star's instrumental magnitude differs from Gaia's broadband G by an amount depending on its own colour, so one constant leaves a bias that drifts night to night with the field's mix of red and blue references. |
+| `PHOTOMETRY_COLOR_TERM_MIN_REFS` | `10` | No | Minimum reference stars carrying a Gaia colour before the fit is attempted; below it the plain median is used. |
+| `PHOTOMETRY_COLOR_TERM_MIN_SPAN` | `0.5` | No | Minimum BP−RP span those references must cover for the slope to be constrained. |
+| `PHOTOMETRY_COLOR_TERM_MAX` | `1.5` | No | A fitted `k` beyond this magnitude-per-colour is treated as implausible and the fit discarded. |
 | **Forced Photometry / Reverse Matching** |
 | `FORCED_PHOTOMETRY_ENABLED` | `true` | No | Enable/disable the forced-photometry pass (`modules/forced_photometry.py`) entirely. |
 | `FORCED_PHOTOMETRY_MAG_LIMIT` | `20.0` | No | Faintest Gaia DR3 G-band magnitude eligible for forced photometry — tune to a couple of magnitudes above your own setup's typical detection limit. Not applied to MPC objects (already filtered by `MPC_MAG_LIMIT`). |
 | `FORCED_PHOTOMETRY_MIN_SNR` | `3.0` | No | Minimum significance (net_flux / flux_err) for a forced measurement to be reported; below this it's a genuine non-detection and is dropped. |
+| `FORCED_PHOTOMETRY_BLEND_FWHM` | `2.0` | No | A forced position with another catalog entry closer than this many frame FWHM is skipped: two stars that close share most of their light, so the aperture measures the pair and reports it as one star's magnitude. `0` disables the check, as does an unknown frame FWHM. |
 | **Finder Charts** |
 | `CHART_ENABLED` | `true` | No | Enable/disable per-source finder-chart generation (`modules/finder_chart.py`). |
 | `CHART_STAMP_SIZE_ARCSEC` | `60.0` | No | Half-width of the per-epoch crop for the `stamp_strip` style (stationary anomalies), in arcseconds. |
 | `CHART_MAX_EPOCHS` | `12` | No | Cap on the number of epochs drawn on one chart (oldest dropped first). |
+| `CHART_GIF_ENABLED` | `true` | No | Also render an animated GIF companion (`track_gif` / `stamp_strip_gif`) beside the static chart. A bonus asset — a GIF failure never downgrades the static chart's own result. |
+| `CHART_GIF_FRAME_DURATION_MS` | `700` | No | Milliseconds each GIF frame is shown. |
+| `CHART_PREROTATE_MIN_DEG` | `2.0` | No | Rotate a non-reference epoch's crop toward the most recent epoch's orientation when the two differ by at least this much, so a "blink" comparator shows only astrophysical change and not a meridian flip. |
 | **Watcher Batching** |
 | `WATCHER_DEBOUNCE_SEC` | `5.0` | No | Quiet period after the most recently arrived FITS file before `watcher.py` submits everything buffered so far as one `ANALYZE` task. |
 | `WATCHER_MAX_BATCH_SIZE` | `200` | No | Flush the pending batch immediately once it reaches this many files, instead of waiting out the full debounce window. |
+| `WATCHER_USE_POLLING_OBSERVER` | `false` | No | Force watchdog's polling observer instead of the native filesystem events. Needed where native events don't reach the container — notably Docker Desktop bind mounts on macOS. |
+| `WATCHER_POLLING_INTERVAL_SEC` | `2.0` | No | How often the polling observer rescans, when it is in use. |
 | **Catalog Query Cache** |
 | `CATALOG_CACHE_DIR` | `/cache/catalog` | No | On-disk directory for cached Gaia/Simbad/2MASS/Pan-STARRS/MPC query results. Mount from a host path OUTSIDE the container (see `docker-compose.yml`'s `worker` service) so it survives a container rebuild — important since this gets restarted often during testing. |
 | `CACHE_TTL_HOURS` | `1.0` | No | How long a cached catalog query result stays valid, in hours. |
@@ -552,7 +582,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `SITE_LAT` | `0.0` | No | Observatory latitude in decimal degrees (positive = North). Used for topocentric ephemeris queries to JPL Horizons. |
 | `SITE_LON` | `0.0` | No | Observatory longitude in decimal degrees (positive = East). |
 | `SITE_ELEV` | `0` | No | Observatory elevation in metres above sea level. |
-| `EPHEMERIS_TIMEOUT_SEC` | `30` | No | Wall-clock budget for one JPL Horizons ephemeris lookup. astroquery's Horizons client is synchronous and has no timeout of its own, so the query runs in a worker thread and is abandoned after this long — the anomaly is then kept without its ephemeris rather than the frame stalling. |
+| `EPHEMERIS_TIMEOUT_SEC` | `30` | No | Budget for one JPL Horizons ephemeris lookup. Applied both as astroquery's own HTTP timeout (so an unresponsive Horizons ends the worker thread rather than leaving it parked on the shared executor) and as the outer wall-clock ceiling on the call. On timeout the anomaly is kept without its ephemeris rather than the frame stalling. |
 | **Normalization** |
 | `NORMALIZE_ENABLED` | `true` | No | Enable automatic normalization of FITS header values and filenames. Normalizes object names (`M 51` → `M51`), filter names (`Blue` → `B`, `Luminance` → `L`, `H-Alpha` → `Ha`), frame types (`Light Frame` → `Light`), and renames files to standard format `{Object}_{Type}_{Filter}_{Exp}_{DateTime}.fits`. Ensures consistency across different capture software. |
 | **Logging** |
