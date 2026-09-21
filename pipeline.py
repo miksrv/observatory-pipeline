@@ -418,11 +418,19 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # if it were arcsec would silently corrupt those filters (e.g. all-sky
     # cameras/lenses with no XPIXSZ/FOCALLEN headers), so only pass it on
     # when the unit actually matches.
+    #
+    # This is the provisional anchor, good enough for the solve itself to
+    # start from; it is replaced below by one converted with the scale the
+    # solve actually finds (audit 2026-08-18, finding M16).
     psf_fwhm_arcsec: float | None = (
         qc_result.get("fwhm_median")
         if qc_result.get("fwhm_unit") == "arcsec"
         else None
     )
+    # The same measurement before any plate scale was applied to it, so
+    # every consumer below can convert it with the solved scale instead of
+    # the header's claim about the optical setup.
+    psf_fwhm_px: float | None = qc_result.get("fwhm_median_px")
 
     # ------------------------------------------------------------------
     # Step 3 — Astrometry (optional)
@@ -444,6 +452,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
             astro_result = await astrometry.solve(
                 fits_path,
                 psf_fwhm_arcsec=psf_fwhm_arcsec,
+                psf_fwhm_px=psf_fwhm_px,
             )
             logger.info(
                 "Astrometry: ra=%.4f dec=%.4f sources=%d",
@@ -461,6 +470,44 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
             astro_result = {}
     else:
         logger.debug("Astrometry module not available — skipping", extra=extra)
+
+    # ------------------------------------------------------------------
+    # Re-anchor the PSF estimate onto the solved plate scale.
+    #
+    # QC measured the frame's median PSF in pixels and converted it with
+    # whatever plate scale the headers implied. Every consumer from here on
+    # — subtraction's minimum-FWHM floor, forced photometry's aperture
+    # sizing and blend radius, the QCFWHM this frame is archived with —
+    # converts that arcsec figure straight back into pixels using the
+    # *solved* scale, so a header describing a different optical setup than
+    # the telescope actually had (an unaccounted reducer/Barlow, a swapped
+    # camera, a wrong FOCALLEN) skewed every one of them by the ratio
+    # between the two scales (audit 2026-08-18, finding M16).
+    #
+    # astrometry.solve() has already done this for its own extraction step;
+    # this repeats it for everything downstream of it. A frame whose headers
+    # carried no plate scale at all gets an anchor here for the first time.
+    #
+    # qc_result's own fwhm_median/fwhm_unit are deliberately left alone: they
+    # are the numbers this frame's BLUR verdict was decided on, and that
+    # verdict is not revisited here.
+    # ------------------------------------------------------------------
+    solved_pixel_scale = astro_result.get("pixel_scale_arcsec")
+    if psf_fwhm_px and solved_pixel_scale and solved_pixel_scale > 0:
+        rescaled = psf_fwhm_px * solved_pixel_scale
+        if psf_fwhm_arcsec is None:
+            logger.info(
+                "PSF anchor available for the first time from the solved scale "
+                "(%.4f\"/px): FWHM %.3f\" — the headers carried no plate scale",
+                solved_pixel_scale, rescaled, extra=extra,
+            )
+        elif abs(rescaled - psf_fwhm_arcsec) > 0.05 * psf_fwhm_arcsec:
+            logger.warning(
+                "PSF anchor re-scaled from the header's %.3f\" to the solved %.3f\" "
+                "(%.4f\"/px) for subtraction/forced photometry/QCFWHM",
+                psf_fwhm_arcsec, rescaled, solved_pixel_scale, extra=extra,
+            )
+        psf_fwhm_arcsec = rescaled
 
     # ------------------------------------------------------------------
     # Sources for subtraction / catalog matching / photometry.
@@ -879,7 +926,11 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
         # Stamp this frame's own QC verdict into the header too, so that a
         # LATER frame's subtraction can tell what it is about to stack
         # without an API round-trip — see _write_qc_headers()'s docstring.
-        _write_qc_headers(fits_path, qc_result)
+        # The FWHM stamped is the solved-scale anchor, not qc_result's own
+        # header-scale figure: subtraction screens a reference's QCFWHM
+        # against the new frame's psf_fwhm_arcsec, which is this same
+        # quantity, so the two have to be measured the same way.
+        _write_qc_headers(fits_path, qc_result, fwhm_arcsec=psf_fwhm_arcsec)
 
         # Use object name for directory structure (normalized if normalization enabled)
         dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
@@ -2025,7 +2076,11 @@ def _strip_wcs_representation(header) -> None:
                 pass
 
 
-def _write_qc_headers(fits_path: str, qc_result: dict) -> bool:
+def _write_qc_headers(
+    fits_path: str,
+    qc_result: dict,
+    fwhm_arcsec: float | None = None,
+) -> bool:
     """
     Stamp this frame's own QC verdict into its header, right before it is
     archived.
@@ -2044,6 +2099,15 @@ def _write_qc_headers(fits_path: str, qc_result: dict) -> bool:
     raw pixels, `QCFWHM`. Reading them back costs subtraction one header read
     per candidate — no pixel data, no network.
 
+    `fwhm_arcsec` overrides `qc_result`'s own `fwhm_median` and is what
+    analyze_frame() passes: the PSF anchor re-converted with the *solved*
+    plate scale rather than the one the headers implied (audit 2026-08-18,
+    finding M16). Subtraction compares a reference's stamped `QCFWHM`
+    against the new frame's own anchor, so stamping the header-scale figure
+    would put the two sides of that ratio on different footings. Omitting
+    it falls back to `qc_result`'s value, for an ad hoc caller with no
+    solve of its own.
+
     Best-effort, like _write_solved_wcs() above: any failure is logged and
     returns False, never blocking the archive move. A frame archived before
     this existed simply carries neither key, and subtraction treats that as
@@ -2053,7 +2117,13 @@ def _write_qc_headers(fits_path: str, qc_result: dict) -> bool:
         from astropy.io import fits as astropy_fits  # noqa: PLC0415
 
         flag = qc_result.get("quality_flag")
-        fwhm = qc_result.get("fwhm_median") if qc_result.get("fwhm_unit") == "arcsec" else None
+        fwhm = fwhm_arcsec
+        if fwhm is None:
+            fwhm = (
+                qc_result.get("fwhm_median")
+                if qc_result.get("fwhm_unit") == "arcsec"
+                else None
+            )
 
         if flag is None and fwhm is None:
             return False

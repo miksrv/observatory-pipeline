@@ -270,6 +270,8 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         quality_flag        "OK" | "BLUR" | "TRAIL" | "LOW_STARS" | "HIGH_BACKGROUND" | "BAD"
         fwhm_median         float | None
         fwhm_unit           "arcsec" | "pixels"
+        fwhm_median_px      float | None   (the same measurement in raw
+                            pixels, always — see below)
         elongation_median   float | None
         snr_median          float | None
         sky_background      float | None   (median sky ADU)
@@ -277,6 +279,18 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         star_count          int | None
         cr_fraction         float | None   ([0.0, 1.0])
         rejected_path       str | None     (set when the file was moved)
+
+    `fwhm_median` is this module's own verdict metric: it is what the BLUR
+    threshold is compared against, and it is in arcsec only when the frame's
+    *headers* carried enough to derive a plate scale (`_read_pixel_scale()`).
+    `fwhm_median_px` is the same measurement before that conversion, and is
+    therefore free of any assumption about the optical setup. A caller that
+    will go on to plate-solve the frame should carry the pixel value and
+    convert it with the *solved* scale instead, which is what pipeline.py
+    does for the PSF anchor it hands to astrometry/subtraction/forced
+    photometry (audit 2026-08-18, finding M16). This module cannot do that
+    itself — it runs before the solve, deliberately, since its whole point
+    is to decide whether the frame is worth solving at all.
     """
     logger.info("QC analysis starting: %s", fits_path)
 
@@ -711,6 +725,7 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         quality_flag=quality_flag,
         fwhm_median=fwhm_median,
         fwhm_unit=fwhm_unit,
+        fwhm_median_px=fwhm_px_median,
         elongation_median=elongation_median,
         snr_median=snr_median,
         sky_background=sky_background,
@@ -729,6 +744,7 @@ def _result(
     quality_flag: str = "OK",
     fwhm_median: float | None = None,
     fwhm_unit: str = "pixels",
+    fwhm_median_px: float | None = None,
     elongation_median: float | None = None,
     snr_median: float | None = None,
     sky_background: float | None = None,
@@ -742,6 +758,7 @@ def _result(
         "quality_flag":      quality_flag,
         "fwhm_median":       fwhm_median,
         "fwhm_unit":         fwhm_unit,
+        "fwhm_median_px":    fwhm_median_px,
         "elongation_median": elongation_median,
         "snr_median":        snr_median,
         "sky_background":    sky_background,

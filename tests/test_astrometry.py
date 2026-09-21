@@ -471,6 +471,91 @@ class TestPositionAngle:
 
 
 # ---------------------------------------------------------------------------
+# PSF anchor re-scaled onto the solved plate scale (audit 2026-08-18, M16)
+# ---------------------------------------------------------------------------
+
+class TestPsfAnchorUsesSolvedScale:
+    @contextmanager
+    def _capture_anchor(self):
+        """Run solve() and capture the psf_fwhm_arcsec _extract_sources got."""
+        seen: dict[str, Any] = {}
+
+        def _fake_extract(fits_path, wcs, pixel_scale_arcsec, naxis1, naxis2,
+                          psf_fwhm_arcsec, fits_filename):
+            seen["psf_fwhm_arcsec"] = psf_fwhm_arcsec
+            seen["pixel_scale_arcsec"] = pixel_scale_arcsec
+            return [], []
+
+        with patch("modules.astrometry._extract_sources", side_effect=_fake_extract):
+            yield seen
+
+    async def test_pixel_value_is_converted_with_the_solved_scale(self):
+        """
+        The header claimed 1.0"/px (so QC reported 2.0 px as 2.0"), but the
+        solve found 1.0"/px too here — the point of this case is only that
+        the pixel value is what gets converted.
+        """
+        with _patch_astrometry():                      # _make_wcs() -> ~1.0008"/px
+            with self._capture_anchor() as seen:
+                await astrometry.solve(
+                    _FITS_PATH, psf_fwhm_arcsec=2.0, psf_fwhm_px=2.0,
+                )
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(
+            2.0 * seen["pixel_scale_arcsec"], rel=1e-9
+        )
+
+    async def test_solved_scale_overrides_a_wrong_header_scale(self):
+        """
+        Finding M16: an unaccounted focal reducer makes the header's plate
+        scale disagree with the solve. The FWHM bounds _extract_sources
+        derives from the anchor are compared against source FWHMs computed
+        with the *solved* scale, so a header-derived anchor skewed them by
+        the ratio between the two — rejecting every real star in the frame,
+        or nothing at all.
+        """
+        solved_scale_deg = 0.000556                    # 2.0"/px
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=solved_scale_deg)):
+            with self._capture_anchor() as seen:
+                await astrometry.solve(
+                    _FITS_PATH,
+                    psf_fwhm_arcsec=2.0,               # headers said 1.0"/px
+                    psf_fwhm_px=2.0,
+                )
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(4.0, rel=1e-3)
+
+    async def test_pixel_value_alone_is_enough(self):
+        """
+        A frame whose headers carry no plate scale at all reaches solve()
+        with psf_fwhm_arcsec=None. It now gets an anchor anyway.
+        """
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=0.000556)):
+            with self._capture_anchor() as seen:
+                await astrometry.solve(
+                    _FITS_PATH, psf_fwhm_arcsec=None, psf_fwhm_px=2.0,
+                )
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(4.0, rel=1e-3)
+
+    async def test_arcsec_value_is_used_when_no_pixel_value_is_given(self):
+        """An ad hoc caller with only the arcsec figure keeps working."""
+        with _patch_astrometry():
+            with self._capture_anchor() as seen:
+                await astrometry.solve(_FITS_PATH, psf_fwhm_arcsec=2.0)
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(2.0)
+
+    async def test_solve_returns_the_solved_pixel_scale(self):
+        """
+        pipeline.py re-anchors everything downstream of solve() off this,
+        so it has to travel out of the result dict.
+        """
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=0.000556)):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["pixel_scale_arcsec"] == pytest.approx(2.0, rel=1e-3)
+# ---------------------------------------------------------------------------
 # Frame geometry — per-axis plate scale (audit 2026-08-18, finding M15)
 # ---------------------------------------------------------------------------
 

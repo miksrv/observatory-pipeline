@@ -46,6 +46,10 @@ _GOOD_QC = {
     "quality_flag": "OK",
     "fwhm_median": 3.2,
     "fwhm_unit": "arcsec",
+    # The same measurement before any plate scale was applied — 2.0 px at
+    # _GOOD_ASTRO's solved 1.6"/px is exactly the 3.2" above, so the default
+    # fixture is a frame whose headers and plate solve agree.
+    "fwhm_median_px": 2.0,
     "elongation_median": 1.1,
     "snr_median": 42.0,
     "sky_background": 850.0,
@@ -59,6 +63,7 @@ _GOOD_ASTRO = {
     "ra_center": 202.47,
     "dec_center": 47.20,
     "fov_deg": 1.25,
+    "pixel_scale_arcsec": 1.6,
     "sources": [
         {"ra": 202.47, "dec": 47.20, "flux": 1000.0, "fwhm": 3.0, "elongation": 1.1},
         {"ra": 202.48, "dec": 47.21, "flux": 800.0, "fwhm": 2.8, "elongation": 1.2},
@@ -209,7 +214,9 @@ async def test_qc_ok_all_steps_called(mock_modules, tmp_path):
     fits_path = str(mock_modules)
     await pipeline.run(fits_path)
 
-    pipeline.astrometry.solve.assert_called_once_with(fits_path, psf_fwhm_arcsec=3.2)
+    pipeline.astrometry.solve.assert_called_once_with(
+        fits_path, psf_fwhm_arcsec=3.2, psf_fwhm_px=2.0,
+    )
     pipeline.photometry.measure.assert_called_once()
     pipeline.api_client.post_frame.assert_called_once()
     pipeline.api_client.post_sources.assert_called_once()
@@ -732,12 +739,70 @@ async def test_archived_file_gets_qc_headers(mock_modules, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_qc_fwhm_header_omitted_when_the_unit_is_pixels(mock_modules, tmp_path):
+async def test_qc_fwhm_header_comes_from_the_solved_scale(mock_modules, tmp_path):
     """
-    qc.analyze() reports FWHM in raw pixels when the frame's headers don't
-    carry enough to derive a plate scale. Writing that number under a
-    keyword documented as arcsec would make a later subtraction compare two
-    incompatible quantities, so it is simply not written.
+    Audit 2026-08-18, finding M16: the FWHM stamped under QCFWHM is the PSF
+    anchor re-converted with the plate scale astrometry actually solved for,
+    not qc.analyze()'s own conversion through the header's claimed optical
+    setup. Subtraction screens a reference's stamped QCFWHM against the new
+    frame's anchor, so both sides of that ratio have to be measured the same
+    way.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    # Headers claiming 1.0"/px against a solve that found 1.6"/px — an
+    # unaccounted reducer, a swapped camera, a wrong FOCALLEN.
+    pipeline.qc.analyze.return_value = {
+        **_GOOD_QC, "fwhm_median": 2.0, "fwhm_median_px": 2.0,
+    }
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
+
+
+@pytest.mark.asyncio
+async def test_qc_fwhm_header_written_even_when_headers_had_no_plate_scale(
+    mock_modules, tmp_path,
+):
+    """
+    A frame whose headers carry no plate scale at all (an all-sky lens with
+    no XPIXSZ/FOCALLEN) used to be archived with no QCFWHM whatsoever, and
+    ran subtraction and forced photometry with no PSF anchor. The solve
+    supplies the missing scale, so it now has both (finding M16).
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    pipeline.qc.analyze.return_value = {
+        **_GOOD_QC, "fwhm_median": 2.0, "fwhm_unit": "pixels", "fwhm_median_px": 2.0,
+    }
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
+
+
+@pytest.mark.asyncio
+async def test_qc_fwhm_header_omitted_when_nothing_can_supply_a_scale(
+    mock_modules, tmp_path,
+):
+    """
+    Neither the headers nor the solve know the plate scale — writing a raw
+    pixel count under a keyword documented as arcsec would make a later
+    subtraction compare two incompatible quantities, so it is still simply
+    not written.
     """
     fits_path = mock_modules
 
@@ -746,6 +811,8 @@ async def test_qc_fwhm_header_omitted_when_the_unit_is_pixels(mock_modules, tmp_
     real_hdu.writeto(fits_path, overwrite=True)
 
     pipeline.qc.analyze.return_value = {**_GOOD_QC, "fwhm_unit": "pixels"}
+    solved = {k: v for k, v in _GOOD_ASTRO.items() if k != "pixel_scale_arcsec"}
+    pipeline.astrometry.solve = AsyncMock(return_value=solved)
 
     await pipeline.run(str(fits_path))
 
@@ -753,6 +820,26 @@ async def test_qc_fwhm_header_omitted_when_the_unit_is_pixels(mock_modules, tmp_
     with fits.open(archive_path) as hdul:
         assert hdul[0].header["QCFLAG"] == "OK"
         assert "QCFWHM" not in hdul[0].header
+
+
+@pytest.mark.asyncio
+async def test_solved_scale_reanchors_the_subtraction_psf(mock_modules, tmp_path):
+    """
+    The anchor handed to subtraction (and forced photometry) is the solved
+    one too, not the header's — subtraction divides it straight back by the
+    solved scale to get a pixel floor, so a header-derived arcsec value
+    would be skewed by the ratio between the two scales (finding M16).
+    """
+    fits_path = str(mock_modules)
+
+    pipeline.qc.analyze.return_value = {
+        **_GOOD_QC, "fwhm_median": 2.0, "fwhm_median_px": 2.0,
+    }
+
+    await pipeline.run(fits_path)
+
+    _, kwargs = pipeline.subtraction.run.call_args
+    assert kwargs["psf_fwhm_arcsec"] == pytest.approx(3.2)
 
 
 @pytest.mark.asyncio

@@ -801,6 +801,7 @@ class TestResultHasAllKeys:
         "star_count",
         "cr_fraction",
         "rejected_path",
+        "fwhm_median_px",
     })
 
     @pytest.mark.asyncio
