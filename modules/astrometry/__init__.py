@@ -177,7 +177,7 @@ async def solve(
     # ------------------------------------------------------------------
     # Step 1 — Run astap plate solver
     # ------------------------------------------------------------------
-    if not _run_astap(fits_path, output_base):
+    if not await _run_astap(fits_path, output_base):
         return {}
 
     # ------------------------------------------------------------------

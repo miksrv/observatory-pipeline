@@ -714,7 +714,13 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   classify an unknown one.
 - Calls `astap` binary as a subprocess via `xvfb-run` (astap needs a display even headless) for plate solving,
   invoked without `-update` — astap therefore never writes into the FITS file itself, only into a `.wcs` side
-  file (plus `.ini`/`.log`) next to it, or under an optional `output_base` (`-o`) path
+  file (plus `.ini`/`.log`) next to it, or under an optional `output_base` (`-o`) path. The subprocess runs on
+  a worker thread (`asyncio.to_thread`), not inline on the event loop — the same treatment
+  `modules/ephemeris.py` gives its own blocking call. Nothing depends on it today, since `worker.py` drains
+  one item at a time, but a seconds-to-minutes blocking call inside an `async def` is a trap for whoever
+  first gathers several solves: they would run strictly one after another while the code reads as if they
+  don't (audit 2026-08-18, finding L6). `subprocess.run`'s own `timeout=` is kept rather than an
+  `asyncio.wait_for` around the thread — only the former actually kills and reaps the astap child
 - Validates the resulting WCS for plausibility before returning it (`_wcs.py`'s
   `_is_plausible_wcs()`): reference coordinates on the sphere, a plate scale between
   `ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC` and `ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC`, a non-degenerate

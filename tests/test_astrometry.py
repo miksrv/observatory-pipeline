@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import threading
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -856,7 +857,7 @@ from modules.astrometry._astap import _run_astap, _run_astap_attempt  # noqa: E4
 
 class TestAstapTimeoutBudgets:
 
-    def test_narrow_attempt_uses_astap_timeout_sec(self, monkeypatch):
+    async def test_narrow_attempt_uses_astap_timeout_sec(self, monkeypatch):
         monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 42.0)
         monkeypatch.setattr(config, "ASTAP_WIDE_SEARCH_TIMEOUT_SEC", 999.0)
 
@@ -864,12 +865,12 @@ class TestAstapTimeoutBudgets:
             returncode=0, stdout="Solution found", stderr="",
         ))
         with patch("modules.astrometry.subprocess.run", run_mock):
-            outcome = _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
+            outcome = await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
 
         assert outcome == "solved"
         assert run_mock.call_args.kwargs["timeout"] == 42.0
 
-    def test_wide_attempt_uses_astap_wide_search_timeout_sec(self, monkeypatch):
+    async def test_wide_attempt_uses_astap_wide_search_timeout_sec(self, monkeypatch):
         """The wide retry must get its OWN, separate (larger) budget — not
         ASTAP_TIMEOUT_SEC, the narrow attempt's own timeout."""
         monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 42.0)
@@ -879,12 +880,12 @@ class TestAstapTimeoutBudgets:
             returncode=0, stdout="Solution found", stderr="",
         ))
         with patch("modules.astrometry.subprocess.run", run_mock):
-            outcome = _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=30.0)
+            outcome = await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=30.0)
 
         assert outcome == "solved"
         assert run_mock.call_args.kwargs["timeout"] == 999.0
 
-    def test_wide_retry_timeout_is_not_further_retried(self, monkeypatch):
+    async def test_wide_retry_timeout_is_not_further_retried(self, monkeypatch):
         """A timeout on the wide retry itself must not trigger yet another
         attempt — "error" (from either attempt) is always terminal."""
         monkeypatch.setattr(config, "ASTAP_RETRY_WIDE_SEARCH", True)
@@ -897,12 +898,12 @@ class TestAstapTimeoutBudgets:
 
         run_mock = MagicMock(side_effect=_side_effect)
         with patch("modules.astrometry.subprocess.run", run_mock):
-            result = _run_astap(_FITS_PATH, None)
+            result = await _run_astap(_FITS_PATH, None)
 
         assert result is False
         assert run_mock.call_count == 2  # narrow (no_solution), then wide (timeout) — no third attempt
 
-    def test_full_retry_flow_uses_distinct_timeouts_for_each_attempt(self, monkeypatch):
+    async def test_full_retry_flow_uses_distinct_timeouts_for_each_attempt(self, monkeypatch):
         """End-to-end through _run_astap(): narrow attempt reports no
         solution, is retried wide, and each subprocess.run call carries its
         own attempt's configured timeout, not the other one's."""
@@ -918,10 +919,49 @@ class TestAstapTimeoutBudgets:
 
         run_mock = MagicMock(side_effect=_side_effect)
         with patch("modules.astrometry.subprocess.run", run_mock):
-            result = _run_astap(_FITS_PATH, None)
+            result = await _run_astap(_FITS_PATH, None)
 
         assert result is True
         assert [c.kwargs["timeout"] for c in run_mock.call_args_list] == [42.0, 999.0]
+
+    async def test_the_subprocess_does_not_run_on_the_event_loop_thread(self):
+        """
+        Audit 2026-08-18, finding L6: astap is a seconds-to-minutes blocking
+        call inside an `async def`. Run inline it pins the event loop for
+        its whole duration — harmless while the worker drains one item at a
+        time, but it means a caller that gathers several solves gets them
+        strictly one after another while the code reads as if it doesn't.
+        """
+        loop_thread = threading.get_ident()
+        seen: list[int] = []
+
+        def _record(cmd, **kwargs):
+            seen.append(threading.get_ident())
+            return MagicMock(returncode=0, stdout="Solution found", stderr="")
+
+        with patch("modules.astrometry.subprocess.run", MagicMock(side_effect=_record)):
+            assert await _run_astap_attempt(
+                _FITS_PATH, None, wide_radius_deg=None,
+            ) == "solved"
+
+        assert seen and all(tid != loop_thread for tid in seen)
+
+    async def test_timeout_still_kills_the_child_via_subprocess_run(self, monkeypatch):
+        """
+        The budget stays on subprocess.run's own `timeout=` rather than an
+        asyncio.wait_for around the thread: only the former actually kills
+        and reaps the astap child. A TimeoutExpired raised inside the worker
+        thread must still surface as this attempt's "error".
+        """
+        monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 7.0)
+
+        def _timeout(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="astap", timeout=kwargs["timeout"])
+
+        with patch("modules.astrometry.subprocess.run", MagicMock(side_effect=_timeout)):
+            outcome = await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
+
+        assert outcome == "error"
 
 
 # ---------------------------------------------------------------------------
