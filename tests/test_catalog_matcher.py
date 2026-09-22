@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +37,7 @@ import pytest
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
 
+import config
 import modules.catalog_matcher as cm
 
 
@@ -125,6 +127,14 @@ def _offset_ra(ra: float, dec: float, arcsec: float) -> tuple[float, float]:
     return ra + delta_deg, dec
 
 
+def _queried_radius_deg(mock_gaia) -> float:
+    """The radius, in degrees, of the most recent Gaia cone_search call."""
+    radius = mock_gaia.cone_search.call_args.kwargs.get("radius")
+    if radius is None:
+        radius = mock_gaia.cone_search.call_args.args[1]
+    return radius.to(u.deg).value
+
+
 def _offset_ra_exact(ra: float, dec: float, arcsec: float) -> tuple[float, float]:
     """
     Return a new (ra, dec) that is exactly `arcsec` arcseconds from (ra, dec)
@@ -155,6 +165,166 @@ class TestCacheLogic:
         cm._cache["stale_key"] = {"data": "old_data", "fetched_at": two_hours_ago}
         result = cm._cache_get("stale_key")
         assert result is None
+
+    def test_a_pre_versioned_disk_entry_is_not_read_back(self, tmp_path, monkeypatch):
+        """
+        A disk file written before the cache's key meaning changed (M5) must
+        not be served as a hit under a coinciding new key.
+        """
+        import importlib
+        # The package re-exports the dict `_cache` under the same name as the
+        # submodule, so fetch the module itself.
+        cache_mod = importlib.import_module("modules.catalog_matcher._cache")
+
+        monkeypatch.setattr(config, "CATALOG_CACHE_DIR", str(tmp_path))
+        key = "gaia:10.0:20.0:1.1"
+        legacy = tmp_path / (key.replace(":", "_") + ".json")
+        legacy.write_text('[{"ra": 10.0, "dec": 20.0}]')
+        cache_mod._cache.pop(key, None)
+
+        assert cache_mod._cache_get(key) is None
+        assert os.path.basename(cache_mod._cache_file_path(key)).startswith(
+            cache_mod._CACHE_FORMAT_VERSION + "_"
+        )
+
+
+# ===========================================================================
+# TestCacheTileGeometry — audit 2026-08-18, finding M5
+#
+# Every catalog queried around its frame's actual centre but cached under the
+# centre rounded to 0.1 deg. A key is therefore a tile, not a point: a second
+# frame sharing it can sit up to a tile diagonal away, and the circle drawn
+# around the FIRST frame need not contain the second one's edge region at all.
+# ===========================================================================
+
+
+class TestCacheTileGeometry:
+    def test_nearby_centres_share_one_tile(self):
+        a = cm._cache_position(_RA, _DEC)
+        b = cm._cache_position(_RA + 0.02, _DEC - 0.02)
+
+        assert a == b
+
+    def test_the_margin_covers_the_tile_half_diagonal(self):
+        assert cm._cache_radius_margin_deg() == pytest.approx(0.1 * math.sqrt(2) / 2.0)
+
+    def test_the_query_is_centred_on_the_tile_not_the_frame(self):
+        """
+        This is what makes the cached content a function of the key, which is
+        what a key is supposed to mean.
+        """
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 1.0)
+
+        coord = mock_gaia.cone_search.call_args.args[0]
+        key_ra, key_dec = cm._cache_position(_RA, _DEC)
+        assert coord.ra.deg == pytest.approx(key_ra)
+        assert coord.dec.deg == pytest.approx(key_dec)
+
+    def test_every_frame_in_the_tile_is_inside_the_queried_circle(self):
+        """
+        The property the fix has to guarantee: the worst-placed frame sharing
+        this key still has its whole footprint inside what was queried.
+        """
+        fov_deg = 1.0
+        queried_radius = fov_deg * math.sqrt(2) / 2.0 + cm._cache_radius_margin_deg()
+
+        # Worst case: a frame centre at the tile's own corner.
+        offset = 0.05
+        worst_case_distance = math.hypot(offset, offset) + fov_deg * math.sqrt(2) / 2.0
+
+        assert worst_case_distance <= queried_radius + 1e-9
+
+    def test_two_frames_in_one_tile_make_one_query(self):
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 1.0)
+            cm._query_gaia(_RA + 0.02, _DEC - 0.02, 1.0)
+
+        assert mock_gaia.cone_search.call_count == 1
+
+    def test_the_fov_bucket_rounds_up(self):
+        """
+        Rounding to NEAREST is what made the cached cone stop being a function
+        of its key: 0.96 and 1.04 deg share the bucket, and whichever arrived
+        first decided how much sky was fetched. Rounding up guarantees the
+        bucket is at least as wide as every frame in it.
+        """
+        assert cm._cache_fov_deg(0.96) == pytest.approx(1.0)
+        assert cm._cache_fov_deg(1.04) == pytest.approx(1.1)
+        assert cm._cache_fov_deg(1.0) == pytest.approx(1.0)
+
+    def test_a_narrow_frame_does_not_shrink_the_cone_a_wider_one_reuses(self):
+        """
+        The failure this guards: the 0.96 deg frame fills the bucket, the 1.04
+        deg frame hits it, and every Gaia star near the wider frame's edge is
+        simply gone — purely because of which frame arrived first. Rounding up
+        puts the two in different buckets, so the wider one queries its own
+        cone instead of inheriting the narrower one's.
+        """
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 0.96)
+            narrow = _queried_radius_deg(mock_gaia)
+            cm._query_gaia(_RA, _DEC, 1.04)
+            wide = _queried_radius_deg(mock_gaia)
+
+        assert mock_gaia.cone_search.call_count == 2
+        assert wide > narrow
+
+    def test_the_queried_cone_covers_the_widest_frame_in_its_bucket(self):
+        """
+        The property the bucket has to guarantee: a hit always covers its
+        requester, however wide a frame the bucket admits.
+        """
+        fov_deg = 0.96
+        bucket = cm._cache_fov_deg(fov_deg)
+        table = _gaia_table(_RA, _DEC)
+
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, fov_deg)
+            queried_deg = _queried_radius_deg(mock_gaia)
+
+        widest_half_diagonal = bucket * math.sqrt(2) / 2.0
+        assert bucket >= fov_deg
+        assert queried_deg >= widest_half_diagonal - 1e-9
+
+    def test_two_frames_in_one_fov_bucket_make_one_query(self):
+        table = _gaia_table(_RA, _DEC)
+        with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:
+            mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+            cm._query_gaia(_RA, _DEC, 0.96)
+            cm._query_gaia(_RA, _DEC, 0.92)
+
+        assert mock_gaia.cone_search.call_count == 1
+
+    def test_the_skybot_key_separates_frames_of_different_widths(self):
+        """
+        The MPC key omitted fov_deg entirely although its radius depends on
+        it, so a narrow frame's result satisfied a wider frame at the same
+        tile and epoch — whose own edge, moving margin included, had never
+        been queried.
+        """
+        epoch = "2024-03-15T22:01:34"
+        radii: list[float] = []
+
+        class _FakeSkybot:
+            @staticmethod
+            def cone_search(coord, rad, epoch):
+                radii.append(rad.to(u.deg).value)
+                return None
+
+        with patch("astroquery.imcce.Skybot", _FakeSkybot):
+            cm._query_mpc(_RA, _DEC, epoch, 0.5)
+            cm._query_mpc(_RA, _DEC, epoch, 2.0)
+
+        assert len(radii) == 2
+        assert radii[1] > radii[0]
 
 
 # ===========================================================================
@@ -206,6 +376,48 @@ class TestGaiaMatching:
         cm._match_gaia([source], gaia_stars)
 
         assert source["catalog_name"] is None
+
+    def test_a_simbad_claimed_star_still_gets_its_gaia_colour(self):
+        """
+        The catalog that names a source must not decide how its magnitude is
+        calibrated: the same star, Simbad-claimed one night and recovered
+        under its Gaia identity another, was 0.9 mag apart between epochs
+        purely from the colour term being applied only the second time.
+        """
+        star = _make_source(ra=_RA, dec=_DEC)
+        star["catalog_name"] = "Simbad"
+        star["catalog_id"]   = "2MASS J12241242+0704552"
+        star["object_type"]  = "PM*"
+        gaia_stars = [{
+            "ra": _RA, "dec": _DEC, "source_id": "3901036404599908224",
+            "phot_g_mean_mag": 13.65, "bp_rp": 2.4, "ruwe": 1.0,
+        }]
+
+        cm._match_gaia([star], gaia_stars)      # leaves a claimed source alone
+        n = cm._attach_gaia_color([star], gaia_stars)
+
+        assert n == 1
+        assert star["catalog_name"] == "Simbad"  # identity untouched
+        assert star["_catalog_color"] == pytest.approx(2.4)
+        assert star["_catalog_flags"]["ruwe"] == pytest.approx(1.0)
+
+    def test_colour_attachment_respects_the_match_cone_and_existing_colours(self):
+        far_ra, far_dec = _offset_ra_exact(_RA, _DEC, 3 * config.MATCH_CONE_ARCSEC)
+        distant = _make_source(ra=_RA, dec=_DEC)
+        distant["catalog_name"] = "Simbad"
+        already = _make_source(ra=far_ra, dec=far_dec)
+        already["catalog_name"] = "2MASS"
+        already["_catalog_color"] = 0.7
+        mpc = _make_source(ra=far_ra, dec=far_dec)
+        mpc["catalog_name"] = "MPC"
+        gaia_stars = [{"ra": far_ra, "dec": far_dec, "source_id": "1", "phot_g_mean_mag": 15.0, "bp_rp": 1.9}]
+
+        n = cm._attach_gaia_color([distant, already, mpc], gaia_stars)
+
+        assert n == 0
+        assert "_catalog_color" not in distant
+        assert already["_catalog_color"] == pytest.approx(0.7)
+        assert "_catalog_color" not in mpc
 
     def test_gaia_error_returns_empty_list(self):
         """If the Gaia query raises, _query_gaia returns []."""
@@ -291,6 +503,28 @@ class TestSimbadMatching:
 
         assert result == []
 
+    def test_simbad_radius_covers_the_frame_diagonal(self):
+        """
+        Audit 2026-08-18, finding H2: Simbad was the one catalog querying a
+        circle inscribed in the frame (fov_deg / 2) rather than one covering
+        its corners, leaving ~29% of a square frame's area never searched for
+        named objects — and a named object missed there loses the OTYPE every
+        VARIABLE_STAR/BINARY_STAR/SUPERNOVA_CANDIDATE branch gates on.
+        """
+        with patch("modules.catalog_matcher._simbad.Simbad") as mock_simbad_cls:
+            instance = MagicMock()
+            instance.query_region.return_value = None
+            mock_simbad_cls.return_value = instance
+
+            cm._query_simbad(_RA, _DEC, 1.0)
+
+        radius = instance.query_region.call_args.kwargs["radius"]
+        # Plus the cache tile's half-diagonal, so the cached result covers
+        # every frame that rounds to the same key (finding M5).
+        assert radius.to(u.deg).value == pytest.approx(
+            math.sqrt(2) / 2.0 + cm._cache_radius_margin_deg()
+        )
+
     def test_simbad_error_returns_empty_list(self):
         """If Simbad query raises, _query_simbad returns [] with no crash."""
         with patch("modules.catalog_matcher._simbad.Simbad") as mock_simbad_cls:
@@ -307,14 +541,32 @@ class TestSimbadMatching:
 # TestMpcMatching
 # ===========================================================================
 
+# Separations for the MPC tests below, expressed as fractions of the two
+# configured cones rather than as literal arcseconds.
+#
+# `MOVING_CONE_ARCSEC` is deployment-tunable and the two env files this repo
+# ships disagree about it: `.env.test`, which CI copies over `.env`, sets 30"
+# while a working `.env` commonly has the 120" default. A literal "60 arcsec,
+# comfortably inside the wide cone" is therefore true on a dev machine and
+# false in CI — that is exactly how
+# test_mpc_prefers_an_unclaimed_source_beyond_the_tight_cone came to pass
+# locally and fail on the PR, with three of its neighbours passing in CI only
+# because their "inside the wide cone" source had fallen outside it and the
+# branch under test never ran at all.
+_TIGHT_CONE = config.MATCH_CONE_ARCSEC
+_WIDE_CONE = config.MOVING_CONE_ARCSEC
+# Both are beyond the tight cone and inside the wide one, with NEAR closer.
+_NEAR_IN_WIDE_CONE = _TIGHT_CONE + (_WIDE_CONE - _TIGHT_CONE) * 0.35
+_FAR_IN_WIDE_CONE = _TIGHT_CONE + (_WIDE_CONE - _TIGHT_CONE) * 0.70
+
+
 class TestMpcMatching:
     def test_mpc_uses_wider_cone(self):
         """
-        Source between MATCH_CONE_ARCSEC (5") and MOVING_CONE_ARCSEC (30")
-        must be matched by MPC but would NOT be matched by Gaia/Simbad.
+        A source between MATCH_CONE_ARCSEC and MOVING_CONE_ARCSEC must be
+        matched by MPC but would NOT be matched by Gaia/Simbad.
         """
-        # 15 arcsec away — inside MOVING_CONE (30") but outside MATCH_CONE (5")
-        shifted_ra, shifted_dec = _offset_ra_exact(_RA, _DEC, 15.0)
+        shifted_ra, shifted_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
 
         source = _make_source(ra=_RA, dec=_DEC)
         source["catalog_name"] = None
@@ -335,6 +587,63 @@ class TestMpcMatching:
         assert source["catalog_id"]   == "2024 AB1"
         assert source["object_type"]  == "ASTEROID"
 
+    def test_mpc_radius_is_the_half_diagonal_plus_its_own_match_cone(self):
+        """
+        Audit 2026-08-18, finding L1: SkyBot was queried with the full
+        `fov_deg` as its radius while every other catalog uses the frame's
+        half-diagonal — about twice the sky area, on every frame, from a
+        shared public service whose cache key includes the exact epoch and
+        so is re-hit far more often than Gaia's or Simbad's.
+
+        It keeps one term the others don't need: `_match_mpc()` pairs an
+        ephemeris position with a source up to MOVING_CONE_ARCSEC away, so
+        an object that legitimately matches a corner source can sit that far
+        outside the frame.
+        """
+        fov_deg = 1.0
+        captured: dict = {}
+
+        class _FakeSkybot:
+            @staticmethod
+            def cone_search(coord, rad, epoch):
+                captured["rad"] = rad
+                return None
+
+        with patch("astroquery.imcce.Skybot", _FakeSkybot):
+            cm._query_mpc(_RA, _DEC, "2024-03-15T22:01:34", fov_deg)
+
+        expected_deg = (
+            fov_deg * math.sqrt(2) / 2.0
+            + config.MOVING_CONE_ARCSEC / 3600.0
+            + cm._cache_radius_margin_deg()
+        )
+        assert captured["rad"].to(u.deg).value == pytest.approx(expected_deg)
+        # Strictly smaller than the old full-fov radius it replaces.
+        assert expected_deg < fov_deg + cm._cache_radius_margin_deg()
+
+    def test_mpc_radius_still_reaches_a_corner_sources_whole_match_cone(self):
+        """
+        The property the radius has to guarantee, for the worst-placed frame
+        that can share this tile's cache key: an MPC object sitting a full
+        MOVING_CONE_ARCSEC beyond that frame's furthest corner is still
+        inside what was queried.
+        """
+        fov_deg = 1.0
+        queried = (
+            fov_deg * math.sqrt(2) / 2.0
+            + config.MOVING_CONE_ARCSEC / 3600.0
+            + cm._cache_radius_margin_deg()
+        )
+
+        offset = 0.05  # frame centre at the tile's own corner
+        worst_case = (
+            math.hypot(offset, offset)
+            + fov_deg * math.sqrt(2) / 2.0
+            + config.MOVING_CONE_ARCSEC / 3600.0
+        )
+
+        assert worst_case <= queried + 1e-9
+
     def test_mpc_error_returns_empty_list(self):
         """If SkyBot query fails, _query_mpc returns [] without crashing."""
         # Test with invalid obs_time that will cause Time parsing to fail
@@ -342,9 +651,70 @@ class TestMpcMatching:
         result = cm._query_mpc(_RA, _DEC, "invalid-time-format", 1.0)
         assert result == []
 
-    def test_mpc_skips_already_matched_sources(self):
-        """Source already matched by Gaia must not be overwritten by MPC."""
-        source = _make_source(ra=_RA, dec=_DEC)
+    def test_mpc_takes_over_a_coincident_catalogued_source(self):
+        """
+        Audit 2026-08-18, finding C3: a solar system object projecting within
+        MATCH_CONE_ARCSEC of a background star used to be permanently tagged
+        with that star's identity, because MPC only ever saw the sources no
+        earlier catalog had claimed. A tight positional coincidence now hands
+        the source to MPC instead — the ASTEROID/COMET classification and its
+        ephemeris are the far costlier thing to lose.
+        """
+        # Gaia-matched star 2" from the ephemeris position — inside the tight cone
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 2.0)
+        source = _make_source(ra=star_ra, dec=star_dec)
+        source["catalog_name"] = "Gaia DR3"
+        source["catalog_id"]   = "GAIA_STAR_ID"
+        source["catalog_mag"]  = 13.0
+        source["object_type"]  = "STAR"
+
+        mpc_objects = [{
+            "ra":          _RA,
+            "dec":         _DEC,
+            "designation": "2024 AB1",
+            "object_type": "ASTEROID",
+        }]
+
+        cm._match_mpc([source], mpc_objects)
+
+        assert source["catalog_name"] == "MPC"
+        assert source["catalog_id"]   == "2024 AB1"
+        assert source["object_type"]  == "ASTEROID"
+        assert source["catalog_mag"]  is None
+
+    def test_a_takeover_drops_the_displaced_stars_gaia_fields(self):
+        """
+        The displaced star's BP-RP must not follow the source into MPC:
+        photometry applies _catalog_color through the colour term regardless
+        of catalog_name, which would correct the asteroid's magnitude with the
+        background star's colour.
+        """
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 2.0)
+        source = _make_source(ra=star_ra, dec=star_dec)
+        source["catalog_name"]   = "Gaia DR3"
+        source["catalog_id"]     = "GAIA_STAR_ID"
+        source["catalog_mag"]    = 13.0
+        source["object_type"]    = "STAR"
+        source["_catalog_color"] = 2.7
+        source["_catalog_flags"] = {"ruwe": 1.0}
+
+        mpc_objects = [{"ra": _RA, "dec": _DEC, "designation": "2024 AB1", "object_type": "ASTEROID"}]
+
+        cm._match_mpc([source], mpc_objects)
+
+        assert source["catalog_name"] == "MPC"
+        assert "_catalog_color" not in source
+        assert "_catalog_flags" not in source
+
+    def test_mpc_leaves_a_distant_catalogued_source_alone(self):
+        """
+        Beyond MATCH_CONE_ARCSEC, an established identification is never
+        overwritten: MOVING_CONE_ARCSEC is wide enough that some catalogued
+        star is almost always inside it, whether or not it has anything to do
+        with the moving object.
+        """
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
+        source = _make_source(ra=star_ra, dec=star_dec)
         source["catalog_name"] = "Gaia DR3"
         source["catalog_id"]   = "GAIA_STAR_ID"
         source["catalog_mag"]  = 13.0
@@ -360,6 +730,69 @@ class TestMpcMatching:
         cm._match_mpc([source], mpc_objects)
 
         assert source["catalog_name"] == "Gaia DR3"
+        assert source["catalog_id"]   == "GAIA_STAR_ID"
+
+    def test_mpc_prefers_an_unclaimed_source_beyond_the_tight_cone(self):
+        """
+        With no tight coincidence available, the MPC object falls back to the
+        nearest *unclaimed* source within MOVING_CONE_ARCSEC — even though a
+        catalogued one sits closer.
+        """
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
+        star = _make_source(ra=star_ra, dec=star_dec)
+        star["catalog_name"] = "Gaia DR3"
+        star["catalog_id"]   = "GAIA_STAR_ID"
+        star["object_type"]  = "STAR"
+
+        free_ra, free_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
+        free = _make_source(ra=free_ra, dec=free_dec)
+        free["catalog_name"] = None
+        free["catalog_id"]   = None
+
+        mpc_objects = [{
+            "ra":          _RA,
+            "dec":         _DEC,
+            "designation": "2024 AB1",
+            "object_type": "ASTEROID",
+        }]
+
+        cm._match_mpc([star, free], mpc_objects)
+
+        assert star["catalog_name"] == "Gaia DR3"
+        assert free["catalog_name"] == "MPC"
+        assert free["catalog_id"]   == "2024 AB1"
+
+    def test_mpc_blend_does_not_displace_the_designation_onto_a_bystander(self):
+        """
+        The second half of finding C3: once the real (blended) detection was
+        out of reach, the MPC object was handed to whatever unmatched source
+        happened to be nearest within the wide cone — a false stationary
+        "asteroid" on top of the real miss. The blended detection must win,
+        and the bystander must stay uncatalogued.
+        """
+        blend_ra, blend_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.2)
+        blend = _make_source(ra=blend_ra, dec=blend_dec)
+        blend["catalog_name"] = "Gaia DR3"
+        blend["catalog_id"]   = "GAIA_STAR_ID"
+        blend["object_type"]  = "STAR"
+
+        bystander_ra, bystander_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
+        bystander = _make_source(ra=bystander_ra, dec=bystander_dec)
+        bystander["catalog_name"] = None
+        bystander["catalog_id"]   = None
+
+        mpc_objects = [{
+            "ra":          _RA,
+            "dec":         _DEC,
+            "designation": "2024 AB1",
+            "object_type": "ASTEROID",
+        }]
+
+        cm._match_mpc([blend, bystander], mpc_objects)
+
+        assert blend["catalog_name"] == "MPC"
+        assert blend["catalog_id"]   == "2024 AB1"
+        assert bystander["catalog_name"] is None
 
     def test_mpc_empty_obs_time_returns_empty(self):
         """If obs_time is empty, _query_mpc returns [] immediately."""
@@ -421,10 +854,10 @@ class TestMpcMatching:
         source["catalog_name"] = None
         source["catalog_id"] = None
 
-        # MPC object A: 5" away (closer)
-        mpc_a_ra, mpc_a_dec = _offset_ra_exact(_RA, _DEC, 5.0)
-        # MPC object B: 30" away (further)
-        mpc_b_ra, mpc_b_dec = _offset_ra_exact(_RA, _DEC, 30.0)
+        # MPC object A: inside the tight cone (closer)
+        mpc_a_ra, mpc_a_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.5)
+        # MPC object B: further, but still genuinely competing inside the wide cone
+        mpc_b_ra, mpc_b_dec = _offset_ra_exact(_RA, _DEC, _NEAR_IN_WIDE_CONE)
 
         mpc_objects = [
             {"ra": mpc_b_ra, "dec": mpc_b_dec, "designation": "2024 XY", "object_type": "ASTEROID"},
@@ -433,9 +866,66 @@ class TestMpcMatching:
 
         cm._match_mpc([source], mpc_objects)
 
-        # The closer MPC object (2024 AB at 5") wins
+        # The closer MPC object (2024 AB) wins
         assert source["catalog_name"] == "MPC"
         assert source["catalog_id"] == "2024 AB"
+
+    def test_a_loser_falls_back_to_its_next_nearest_eligible_source(self):
+        """
+        Two MPC objects competing for the same source used to cost the loser
+        its match entirely: only one proposal was ever built per object (its
+        own nearest source), so once that source was claimed the object had
+        nothing to fall back to — even with another perfectly eligible
+        unclaimed source of its own inside the cone. A real MPC detection was
+        lost to nothing more than the order the objects happened to be in.
+        """
+        near = _make_source(ra=_RA, dec=_DEC)
+        near["catalog_name"] = None
+        near["catalog_id"] = None
+
+        spare_ra, spare_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
+        spare = _make_source(ra=spare_ra, dec=spare_dec)
+        spare["catalog_name"] = None
+        spare["catalog_id"] = None
+
+        # Both objects sit nearest to `near`; B is the closer of the two, so A
+        # is the one that has to fall back onto `spare`.
+        a_ra, a_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.9)
+        b_ra, b_dec = _offset_ra_exact(_RA, _DEC, _TIGHT_CONE * 0.2)
+
+        mpc_objects = [
+            {"ra": a_ra, "dec": a_dec, "designation": "2024 AA", "object_type": "ASTEROID"},
+            {"ra": b_ra, "dec": b_dec, "designation": "2024 BB", "object_type": "ASTEROID"},
+        ]
+
+        cm._match_mpc([near, spare], mpc_objects)
+
+        assert near["catalog_id"] == "2024 BB"
+        assert spare["catalog_id"] == "2024 AA"
+
+    def test_one_object_never_claims_two_sources(self):
+        """
+        The assignment is one-to-one in both directions: an object that has
+        already taken a source does not go on to claim a second one just
+        because that one is also inside its cone.
+        """
+        first = _make_source(ra=_RA, dec=_DEC)
+        first["catalog_name"] = None
+        first["catalog_id"] = None
+
+        second_ra, second_dec = _offset_ra_exact(_RA, _DEC, _FAR_IN_WIDE_CONE)
+        second = _make_source(ra=second_ra, dec=second_dec)
+        second["catalog_name"] = None
+        second["catalog_id"] = None
+
+        mpc_objects = [
+            {"ra": _RA, "dec": _DEC, "designation": "2024 AA", "object_type": "ASTEROID"},
+        ]
+
+        cm._match_mpc([first, second], mpc_objects)
+
+        assert first["catalog_id"] == "2024 AA"
+        assert second["catalog_name"] is None
 
 
 # ===========================================================================
@@ -470,6 +960,41 @@ class TestMatchOrchestrator:
             result = await cm.match(sources, _FRAME_META)
 
         assert len(result) == 5
+
+    async def test_skybot_is_queried_at_the_exposure_midpoint(self):
+        """
+        Audit 2026-08-18, finding C9: DATE-OBS is shutter-open, so a fast
+        mover is already tens of arcsec from its start-of-exposure position
+        by mid-exposure. The MPC stage — and only it, every other catalog
+        here being stationary on this timescale — runs at the midpoint the
+        caller supplies.
+        """
+        sources = [_make_source()]
+        frame_meta = dict(_FRAME_META, obs_time_mid="2024-03-15T22:03:34")
+
+        gaia_t = _gaia_table(_RA + 10, _DEC + 10)
+        with (
+            patch("modules.catalog_matcher._gaia.Gaia", self._make_gaia_mock(gaia_t)),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]) as mock_mpc,
+        ):
+            await cm.match(sources, frame_meta)
+
+        assert mock_mpc.call_args[0][2] == "2024-03-15T22:03:34"
+
+    async def test_skybot_falls_back_to_the_start_time(self):
+        """A caller that computed no midpoint keeps the previous behaviour."""
+        sources = [_make_source()]
+
+        gaia_t = _gaia_table(_RA + 10, _DEC + 10)
+        with (
+            patch("modules.catalog_matcher._gaia.Gaia", self._make_gaia_mock(gaia_t)),
+            patch("modules.catalog_matcher._simbad.Simbad", self._make_simbad_mock(None)),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]) as mock_mpc,
+        ):
+            await cm.match(sources, _FRAME_META)
+
+        assert mock_mpc.call_args[0][2] == _FRAME_META["obs_time"]
 
     async def test_all_catalog_keys_present(self):
         """Every source in the output must have all four catalog keys."""
@@ -819,3 +1344,125 @@ class TestPublicCatalogAccessors:
 
         mock_query.assert_called_once_with(_RA, _DEC, _FRAME_META["obs_time"], 1.0)
         assert result == [{"designation": "2019 XY3"}]
+
+
+# ===========================================================================
+# TestGaiaProperMotionPropagation — audit 2026-08-18, finding H1
+#
+# Gaia DR3's positions are at J2016.0. A high-proper-motion star has drifted
+# several arcsec by now — comparable to MATCH_CONE_ARCSEC itself — so matching
+# and the WCS-offset accumulator both have to see the star where it actually
+# is at the observation epoch, not where it was a decade ago.
+# ===========================================================================
+
+
+class TestGaiaProperMotionPropagation:
+    def test_high_proper_motion_star_is_moved_to_the_observation_epoch(self):
+        """500 mas/yr over ~8 years is 4" — enough to miss a 5" cone."""
+        star = {
+            "ra":              _RA,
+            "dec":             _DEC,
+            "source_id":       "1",
+            "phot_g_mean_mag": 14.5,
+            "pmra":            500.0,
+            "pmdec":           -500.0,
+            "ref_epoch":       2016.0,
+        }
+        out = cm._propagate_to_epoch([star], "2024-01-01T00:00:00")
+
+        moved = SkyCoord(ra=out[0]["ra"] * u.deg, dec=out[0]["dec"] * u.deg)
+        original = SkyCoord(ra=_RA * u.deg, dec=_DEC * u.deg)
+        sep = moved.separation(original).to(u.arcsec).value
+        assert sep == pytest.approx(math.hypot(4.0, 4.0), abs=0.2)
+
+    def test_pmra_is_divided_back_out_by_cos_dec(self):
+        """
+        pmra is Gaia's mu_alpha* (already × cos(dec)); the RA coordinate
+        offset is therefore larger than pmra × dt by 1/cos(dec).
+        """
+        dec = 60.0  # cos(dec) = 0.5 — a factor-of-two effect, easy to see
+        star = {
+            "ra": _RA, "dec": dec, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": 3600.0, "pmdec": 0.0, "ref_epoch": 2016.0,
+        }
+        out = cm._propagate_to_epoch([star], "2017-01-01T00:00:00")
+
+        d_ra_arcsec = (out[0]["ra"] - _RA) * 3600.0
+        assert d_ra_arcsec == pytest.approx(3.6 / math.cos(math.radians(dec)), rel=0.02)
+        assert out[0]["dec"] == pytest.approx(dec)
+
+    def test_star_without_a_proper_motion_solution_is_left_alone(self):
+        star = {
+            "ra": _RA, "dec": _DEC, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": None, "pmdec": None, "ref_epoch": 2016.0,
+        }
+        out = cm._propagate_to_epoch([star], "2024-01-01T00:00:00")
+
+        assert out[0]["ra"] == _RA
+        assert out[0]["dec"] == _DEC
+
+    def test_unparseable_obs_time_degrades_to_the_catalog_position(self):
+        star = {
+            "ra": _RA, "dec": _DEC, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": 500.0, "pmdec": 500.0, "ref_epoch": 2016.0,
+        }
+        for bad in ("", None, "not-a-date"):
+            out = cm._propagate_to_epoch([star], bad)
+            assert out[0]["ra"] == _RA
+            assert out[0]["dec"] == _DEC
+
+    def test_cached_catalog_list_is_never_mutated_in_place(self):
+        """
+        _query_gaia() hands back the cached list itself, and the same sky
+        region is re-used by frames from other epochs within the cache TTL —
+        propagating in place would write one frame's epoch into every later
+        frame's catalog.
+        """
+        star = {
+            "ra": _RA, "dec": _DEC, "source_id": "1", "phot_g_mean_mag": 14.5,
+            "pmra": 500.0, "pmdec": 500.0, "ref_epoch": 2016.0,
+        }
+        cached = [star]
+        cm._propagate_to_epoch(cached, "2024-01-01T00:00:00")
+
+        assert cached[0]["ra"] == _RA
+        assert cached[0]["dec"] == _DEC
+
+    async def test_match_finds_a_star_that_has_drifted_out_of_the_cone(self):
+        """
+        End-to-end: a star whose J2016.0 position is 8" from the detection
+        (beyond MATCH_CONE_ARCSEC) but whose propagated position lands on it
+        must match Gaia rather than staying uncatalogued.
+        """
+        detected_ra, detected_dec = _RA, _DEC
+        # Catalog position 8" west in RA; +1000 mas/yr in RA over 8 years
+        # carries it back onto the detection.
+        cat_ra = detected_ra - 8.0 / 3600.0 / math.cos(math.radians(_DEC))
+        pmra = 1000.0
+
+        table = Table({
+            "ra":              [cat_ra],
+            "dec":             [detected_dec],
+            "source_id":       [777],
+            "phot_g_mean_mag": [14.5],
+            "pmra":            [pmra],
+            "pmdec":           [0.0],
+            "ref_epoch":       [2016.0],
+        })
+        mock_gaia = MagicMock()
+        mock_gaia.cone_search.return_value = _mock_gaia_job(table)
+
+        sources = [_make_source(detected_ra, detected_dec)]
+        frame_meta = dict(_FRAME_META, obs_time="2024-01-01T00:00:00")
+
+        with (
+            patch("modules.catalog_matcher._gaia.Gaia", mock_gaia),
+            patch("modules.catalog_matcher._simbad._query_simbad", return_value=[]),
+            patch("modules.catalog_matcher._2mass._query_2mass", return_value=[]),
+            patch("modules.catalog_matcher._panstarrs._query_panstarrs", return_value=[]),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
+        ):
+            result = await cm.match(sources, frame_meta)
+
+        assert result[0]["catalog_name"] == "Gaia DR3"
+        assert result[0]["catalog_id"] == "777"

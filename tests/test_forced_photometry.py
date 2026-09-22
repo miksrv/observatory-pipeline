@@ -48,8 +48,12 @@ def _pix_to_world(wcs: AstropyWCS, x: float, y: float) -> tuple[float, float]:
 
 
 class _FakeHDU:
-    def __init__(self, data: np.ndarray) -> None:
+    def __init__(self, data: np.ndarray, header: dict | None = None) -> None:
         self.data = data
+        # run() reads EGAIN/GAIN off this for the Poisson term of the flux
+        # error (_resolve_gain()); an empty header is the "no usable gain
+        # in this frame, assume 1.0 e-/ADU" case.
+        self.header = header if header is not None else {}
 
 
 class _FakeHDUL:
@@ -105,6 +109,10 @@ def scene(monkeypatch):
         "modules.forced_photometry.fits.open",
         lambda *a, **kw: _FakeHDUL(_FakeHDU(image)),
     )
+    # These fixtures use an arbitrary zero point and catalog magnitudes, so
+    # the catalog-consistency cut would reject every recovery; it has its own
+    # tests (TestCatalogConsistency) and is switched off everywhere else.
+    monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", 0.0)
     return image, wcs
 
 
@@ -200,6 +208,132 @@ class TestRunRecovery:
         assert rec["mag_calibrated"] == pytest.approx(rec["mag_instrumental"] + 24.0)
         assert rec["saturated"] is False
         assert rec["_forced_photometry"] is True
+
+    async def test_skips_a_blended_pair(self, scene, monkeypatch):
+        """
+        Audit 2026-08-18, finding M8: a fixed aperture is measured at a
+        catalog position without ever asking what else is in it. Two stars
+        within a couple of FWHM share most of their light, so the measurement
+        is really the pair's combined flux, reported as one star's magnitude
+        with nothing on the wire to say otherwise.
+        """
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        # Two catalog stars two pixels apart, with the frame's FWHM given as
+        # 3" at ~1"/px — comfortably inside the 2xFWHM blend radius.
+        gaia = [
+            _gaia_star(wcs, 100, 100, "blend-a", mag=17.5),
+            _gaia_star(wcs, 102, 100, "blend-b", mag=17.6),
+        ]
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=3.0,
+        )
+
+        assert result == []
+
+    async def test_an_isolated_star_is_unaffected_by_the_blend_check(self, scene, monkeypatch):
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        gaia = [
+            _gaia_star(wcs, 100, 100, "isolated", mag=17.5),
+            _gaia_star(wcs, 150, 100, "far-away", mag=17.6),
+        ]
+        sources = [{"ra": 0.0, "dec": 0.0, "catalog_name": "Gaia DR3", "catalog_id": "far-away"}]
+
+        result = await fp.run(
+            _FITS_PATH, sources=sources, gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=3.0,
+        )
+
+        assert [r["catalog_id"] for r in result] == ["isolated"]
+
+    async def test_the_blend_check_can_be_disabled(self, scene, monkeypatch):
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 0.0)
+
+        gaia = [
+            _gaia_star(wcs, 100, 100, "blend-a", mag=17.5),
+            _gaia_star(wcs, 102, 100, "blend-b", mag=17.6),
+        ]
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=3.0,
+        )
+
+        assert len(result) == 2
+
+    async def test_an_unknown_frame_fwhm_disables_the_blend_check(self, scene, monkeypatch):
+        """Without a PSF width there is no scale to judge "close" against."""
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        gaia = [
+            _gaia_star(wcs, 100, 100, "blend-a", mag=17.5),
+            _gaia_star(wcs, 102, 100, "blend-b", mag=17.6),
+        ]
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=None,
+        )
+
+        assert len(result) == 2
+
+    async def test_blend_neighbours_are_taken_at_the_observation_epoch(self, scene, monkeypatch):
+        """
+        The blend index held every Gaia neighbour at its CATALOG epoch while
+        the forced targets themselves are propagated to the frame's epoch, so
+        the two sides of the comparison described different instants. The
+        lookup's own "the position itself is in the catalog, discount its zero
+        separation" invariant then breaks, and a high-proper-motion star that
+        has long since moved away still blocks whatever sits at the position
+        it used to occupy.
+
+        Here a stationary star shares the frame with an HPM star whose 2016
+        position coincides with it but which has moved ~8" north by the
+        observation — well outside the 2 x 3" blend radius. The stationary
+        star is isolated at this epoch and must be measured.
+        """
+        _, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_BLEND_FWHM", 2.0)
+
+        stationary = _gaia_star(wcs, 100, 100, "stationary", mag=17.5)
+        mover = _gaia_star(wcs, 100, 100, "mover", mag=17.6)
+        # 1000 mas/yr in dec over 2016.0 -> 2024.0 is 8", past the 6" radius.
+        mover["pmra"] = 0.0
+        mover["pmdec"] = 1000.0
+
+        result = await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=[stationary, mover], mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05,
+            obs_time="2024-01-01T00:00:00", psf_fwhm_arcsec=3.0,
+        )
+
+        assert "stationary" in [r["catalog_id"] for r in result]
 
     async def test_skips_star_already_matched_in_sources(self, scene, monkeypatch):
         _, wcs = scene
@@ -328,6 +462,48 @@ class TestRunRecovery:
 # ---------------------------------------------------------------------------
 
 
+class TestCatalogConsistency:
+    """
+    A forced recovery asserts "this flux is that catalog star's". On the
+    2026-09-22 IC3322A test run most recoveries of G~19-20 stars came out
+    2+ mag off their own G — the aperture was measuring galaxy light or a
+    neighbour's wing — and fed false VARIABLE_STAR alerts.
+    """
+
+    async def _recover(self, scene, monkeypatch, catalog_mag: float, limit: float) -> list[dict]:
+        image, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 25.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", limit)
+        gaia = [_gaia_star(wcs, 100, 100, "gaia-1", mag=catalog_mag)]
+        return await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=None,
+        )
+
+    async def test_a_recovery_far_from_its_catalog_magnitude_is_dropped(self, scene, monkeypatch):
+        # The synthetic star measures ~11.8 mag at zero_point=24; the catalog says 17.5.
+        assert await self._recover(scene, monkeypatch, catalog_mag=17.5, limit=1.5) == []
+
+    async def test_a_consistent_recovery_is_kept(self, scene, monkeypatch):
+        probe = await self._recover(scene, monkeypatch, catalog_mag=17.5, limit=0.0)
+        measured = probe[0]["mag_calibrated"]
+
+        kept = await self._recover(scene, monkeypatch, catalog_mag=measured + 0.4, limit=1.5)
+
+        assert len(kept) == 1
+
+    async def test_zero_disables_the_check(self, scene, monkeypatch):
+        assert len(await self._recover(scene, monkeypatch, catalog_mag=17.5, limit=0.0)) == 1
+
+    def test_undecidable_cases_are_not_inconsistent(self):
+        assert fp._inconsistent_with_catalog(None, 15.0) is False
+        assert fp._inconsistent_with_catalog(15.0, None) is False
+        assert fp._inconsistent_with_catalog(float("nan"), 15.0) is False
+
+
 class TestPropagateGaiaPosition:
     def test_no_correction_without_obs_jyear(self):
         star = {"ra": 10.0, "dec": 20.0, "pmra": 100.0, "pmdec": 100.0, "ref_epoch": 2016.0}
@@ -382,3 +558,108 @@ class TestMeasureAtPixel:
         data_sub = image - 1000.0
         result = fp._measure_at_pixel(data_sub, image, 200.0, 200.0, ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0)
         assert result is None
+
+    def test_a_saturated_pixel_outside_the_aperture_is_tolerated(self):
+        """
+        Audit 2026-08-18, finding M7: the check scanned the square bounding
+        the ANNULUS, nearly twice the area of the aperture circle and with
+        most of the surplus in the corners — the part of the neighbourhood
+        that contributes nothing to the flux. A bright star there discarded a
+        perfectly good recovery over a pixel the measurement never touches.
+        """
+        image = _make_image()
+        # A saturated pixel 10 px away: inside the annulus' bounding square
+        # for these radii, well outside the 6 px photometric aperture.
+        image[100, 110] = 65000.0
+        data_sub = image - 1000.0
+
+        result = fp._measure_at_pixel(
+            data_sub, image, 100.0, 100.0,
+            ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0,
+        )
+
+        assert result is not None
+
+    def test_a_saturated_pixel_inside_the_aperture_still_rejects(self):
+        """The core of the measurement is what must not be clipped."""
+        image = _make_image()
+        image[100, 103] = 65000.0
+        data_sub = image - 1000.0
+
+        result = fp._measure_at_pixel(
+            data_sub, image, 100.0, 100.0,
+            ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0,
+        )
+
+        assert result is None
+
+    def test_gain_divides_the_poisson_term(self):
+        """
+        flux_err = sqrt(|net_flux| / gain + ap_area * sky_sigma**2) — the
+        aperture sum is in ADU but shot noise is Poissonian in electrons
+        (audit finding C7). sky_sigma=0 isolates the Poisson term; the
+        empirical background scatter is already in ADU and is deliberately
+        not gain-converted.
+        """
+        image = _make_image()
+        data_sub = image - 1000.0
+        kwargs = dict(ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=0.0)
+
+        net_unity, err_unity = fp._measure_at_pixel(data_sub, image, 100.0, 100.0, **kwargs)
+        net_gain4, err_gain4 = fp._measure_at_pixel(
+            data_sub, image, 100.0, 100.0, gain_e_per_adu=4.0, **kwargs
+        )
+
+        assert net_gain4 == pytest.approx(net_unity)  # the flux itself is unchanged
+        assert err_unity == pytest.approx(math.sqrt(abs(net_unity)))
+        assert err_gain4 == pytest.approx(math.sqrt(abs(net_unity) / 4.0))
+
+
+class TestRunGain:
+    """
+    run() resolves the gain from the frame's own EGAIN/GAIN header. The
+    consequence that matters here is the one C7 calls out for this module
+    specifically: at gain > 1 the old formula overstated flux_err, so the
+    significance came out understated and real faint recoveries were dropped
+    against FORCED_PHOTOMETRY_MIN_SNR — defeating the point of precovery.
+    """
+
+    @staticmethod
+    def _scene_with_header(monkeypatch, header: dict):
+        image = _make_image()
+        wcs = _make_wcs()
+        monkeypatch.setattr(
+            "modules.forced_photometry.fits.open",
+            lambda *a, **kw: _FakeHDUL(_FakeHDU(image, header)),
+        )
+        return wcs
+
+    async def _recover(self, monkeypatch, header: dict, min_snr: float) -> list[dict]:
+        wcs = self._scene_with_header(monkeypatch, header)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", min_snr)
+        # Arbitrary zero point/catalog magnitude — see the `scene` fixture.
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", 0.0)
+        gaia = [_gaia_star(wcs, 100, 100, "gaia-1", mag=17.5)]
+        return await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05,
+            obs_time=None, psf_fwhm_arcsec=None,
+        )
+
+    async def test_header_gain_raises_the_measured_significance(self, monkeypatch):
+        without = await self._recover(monkeypatch, {}, min_snr=0.0)
+        with_gain = await self._recover(monkeypatch, {"EGAIN": 4.0}, min_snr=0.0)
+
+        assert len(without) == 1 and len(with_gain) == 1
+        assert with_gain[0]["flux_err"] < without[0]["flux_err"]
+        assert with_gain[0]["flux_aperture"] == pytest.approx(without[0]["flux_aperture"])
+
+    async def test_implausible_gain_header_is_ignored(self, monkeypatch):
+        """A ZWO-style GAIN=120 is a gain setting, not e-/ADU — using it
+        would understate the error by an order of magnitude."""
+        plain = await self._recover(monkeypatch, {}, min_snr=0.0)
+        bogus = await self._recover(monkeypatch, {"GAIN": 120.0}, min_snr=0.0)
+
+        assert bogus[0]["flux_err"] == pytest.approx(plain[0]["flux_err"])

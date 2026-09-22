@@ -46,6 +46,10 @@ _GOOD_QC = {
     "quality_flag": "OK",
     "fwhm_median": 3.2,
     "fwhm_unit": "arcsec",
+    # The same measurement before any plate scale was applied — 2.0 px at
+    # _GOOD_ASTRO's solved 1.6"/px is exactly the 3.2" above, so the default
+    # fixture is a frame whose headers and plate solve agree.
+    "fwhm_median_px": 2.0,
     "elongation_median": 1.1,
     "snr_median": 42.0,
     "sky_background": 850.0,
@@ -59,6 +63,7 @@ _GOOD_ASTRO = {
     "ra_center": 202.47,
     "dec_center": 47.20,
     "fov_deg": 1.25,
+    "pixel_scale_arcsec": 1.6,
     "sources": [
         {"ra": 202.47, "dec": 47.20, "flux": 1000.0, "fwhm": 3.0, "elongation": 1.1},
         {"ra": 202.48, "dec": 47.21, "flux": 800.0, "fwhm": 2.8, "elongation": 1.2},
@@ -97,8 +102,11 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
     # api_client
     api_mock = MagicMock()
     api_mock.post_frame = AsyncMock(return_value="frame-42")
-    api_mock.post_sources = AsyncMock(return_value=None)
-    api_mock.post_anomalies = AsyncMock(return_value=None)
+    # [] rather than None: None now means "the sources did not reach the API"
+    # and triggers a recovery re-queue (audit 2026-08-18, finding H19), which
+    # is not what most of these tests are exercising.
+    api_mock.post_sources = AsyncMock(return_value=[])
+    api_mock.post_anomalies = AsyncMock(return_value=True)
     monkeypatch.setattr("pipeline.api_client", api_mock)
 
     # astrometry
@@ -153,7 +161,7 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
 
     # photometry — returns sources with photometry fields added
     phot_mock = MagicMock()
-    async def mock_measure(fits_path, sources, skip_calibration=False):
+    async def mock_measure(fits_path, sources, skip_calibration=False, **kwargs):
         for s in sources:
             s.setdefault("flux_aperture", 1000.0)
             s.setdefault("mag_instrumental", -7.5)
@@ -206,7 +214,9 @@ async def test_qc_ok_all_steps_called(mock_modules, tmp_path):
     fits_path = str(mock_modules)
     await pipeline.run(fits_path)
 
-    pipeline.astrometry.solve.assert_called_once_with(fits_path, psf_fwhm_arcsec=3.2)
+    pipeline.astrometry.solve.assert_called_once_with(
+        fits_path, psf_fwhm_arcsec=3.2, psf_fwhm_px=2.0,
+    )
     pipeline.photometry.measure.assert_called_once()
     pipeline.api_client.post_frame.assert_called_once()
     pipeline.api_client.post_sources.assert_called_once()
@@ -306,6 +316,24 @@ def test_from_wire_source_defaults_near_edge_to_false():
     assert result["near_edge"] is False
 
 
+def test_from_wire_source_reconstructs_mag_err_and_snr():
+    """
+    A standalone DETECT_ANOMALIES re-run judges a source on the same terms as
+    the in-process one: M3's significance gate reads mag_err, and H11's
+    _survives_edge_zone() reads snr (audit 2026-08-18).
+    """
+    api_source = {"ra": 1.0, "dec": 2.0, "mag": 14.5, "mag_err": 0.05, "snr": 12.3}
+    result = pipeline._from_wire_source(api_source)
+    assert result["mag_err"] == pytest.approx(0.05)
+    assert result["snr"] == pytest.approx(12.3)
+
+
+def test_from_wire_source_defaults_mag_err_and_snr_to_none():
+    result = pipeline._from_wire_source({"ra": 1.0, "dec": 2.0, "mag": 14.5})
+    assert result["mag_err"] is None
+    assert result["snr"] is None
+
+
 @pytest.mark.asyncio
 async def test_detect_anomalies_for_frame_id_propagates_frame_filter(monkeypatch):
     """
@@ -334,6 +362,37 @@ async def test_detect_anomalies_for_frame_id_propagates_frame_filter(monkeypatch
 
     detect_call_sources = pipeline.anomaly_detector.detect.call_args.args[1]
     assert detect_call_sources[0]["_filter"] == "Ha"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frame_extra", [
+    {"exptime": 120},                    # flattened (docs/API.md shape)
+    {"observation": {"exptime": 120}},   # nested shape some API versions return
+])
+async def test_detect_anomalies_for_frame_id_recomputes_the_midpoint(monkeypatch, frame_extra):
+    """
+    Audit 2026-08-18, finding C9: the standalone path has no local FITS, so
+    it rebuilds obs_time_mid from the stored obs_time + exptime.
+    """
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(return_value={
+        "filename": "M51_Light_V_120_2024-03-15T22-00-00.fits",
+        "obs_time": "2024-03-15T22:00:00",
+        **frame_extra,
+    })
+    api_mock.get_frame_sources = AsyncMock(return_value=[])
+    api_mock.post_anomalies = AsyncMock(return_value=True)
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+
+    anom_mock = MagicMock()
+    anom_mock.detect = AsyncMock(return_value=[])
+    monkeypatch.setattr("pipeline.anomaly_detector", anom_mock)
+
+    await pipeline.detect_anomalies_for_frame_id("frame-123")
+
+    frame_meta = anom_mock.detect.call_args.args[3]
+    assert frame_meta["obs_time"] == "2024-03-15T22:00:00"
+    assert frame_meta["obs_time_mid"].startswith("2024-03-15T22:01:00")
 
 
 @pytest.mark.asyncio
@@ -551,6 +610,335 @@ async def test_archived_file_gets_solved_wcs(mock_modules, tmp_path):
     with fits.open(archive_path) as hdul:
         assert hdul[0].header["CRVAL1"] == pytest.approx(202.47, abs=1e-6)
         assert hdul[0].header["CRVAL2"] == pytest.approx(47.20, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Recovering a lost science payload — audit 2026-08-18, finding H19
+#
+# The frame record survives an API outage: POST /frames has already succeeded
+# and the file is archived. What is lost once the 3-attempt retry on POST
+# /sources or POST /anomalies is exhausted is that run's entire source or
+# anomaly list — no re-post, no "needs re-analysis" flag, nothing afterwards
+# to show anything is missing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_post_sources_queues_an_analyze_task(mock_modules):
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_awaited_once()
+    task_type, = pipeline.api_client.create_task.call_args.args
+    items = pipeline.api_client.create_task.call_args.kwargs["items"]
+    assert task_type == "ANALYZE"
+    # Queued against the ARCHIVE path — that is where the file will be by the
+    # time the worker picks the task up.
+    assert items[0]["filename"].endswith(_NORMALIZED_FILENAME)
+    assert config.FITS_ARCHIVE in items[0]["filename"]
+    assert items[0]["payload"]["recovery_attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_falls_back_to_the_incoming_path_when_archiving_fails(mock_modules, monkeypatch):
+    """
+    A failed archive move leaves the file where it arrived; the lost source
+    list must still be re-queued, against that path.
+    """
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    def failing_move(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pipeline.shutil, "move", failing_move)
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_awaited_once()
+    items = pipeline.api_client.create_task.call_args.kwargs["items"]
+    assert items[0]["filename"] == str(mock_modules)
+
+
+@pytest.mark.asyncio
+async def test_a_successful_post_queues_nothing(mock_modules):
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_stops_at_the_attempt_limit(mock_modules, monkeypatch):
+    """
+    Not every failure is transient: the retry decorator deliberately does not
+    retry a 4xx, and such a frame would otherwise re-queue itself forever.
+    """
+    monkeypatch.setattr(config, "API_RECOVERY_MAX_ATTEMPTS", 2)
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules), 2)
+
+    pipeline.api_client.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_can_be_disabled(mock_modules, monkeypatch):
+    monkeypatch.setattr(config, "API_RECOVERY_MAX_ATTEMPTS", 0)
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recovery_task_is_not_fatal(mock_modules):
+    """
+    If the API is down hard enough to lose the payload it is probably down
+    hard enough to refuse the task too. That must be logged, not raised.
+    """
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value=None)
+
+    result = await pipeline.analyze_frame(str(mock_modules))
+
+    assert result is not None
+    assert result["frame_id"] == "frame-42"
+
+
+@pytest.mark.asyncio
+async def test_failed_post_anomalies_queues_a_detect_task(mock_modules):
+    pipeline.api_client.post_anomalies = AsyncMock(return_value=False)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-11"})
+    pipeline.anomaly_detector.detect = AsyncMock(return_value=[{"anomaly_type": "UNKNOWN"}])
+
+    await pipeline.detect_anomalies_for_frame_data(
+        "frame-42", [], {"obs_time": "2024-03-15T22:01:34"}, post_filename="f.fits",
+    )
+
+    pipeline.api_client.create_task.assert_awaited_once()
+    task_type, = pipeline.api_client.create_task.call_args.args
+    items = pipeline.api_client.create_task.call_args.kwargs["items"]
+    assert task_type == "DETECT_ANOMALIES"
+    assert items[0]["frame_id"] == "frame-42"
+    assert items[0]["payload"]["recovery_attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_archived_file_carries_only_one_wcs_representation(mock_modules, tmp_path):
+    """
+    Audit 2026-08-18, finding H17: WCS.to_header() emits PC+CDELT even when
+    the WCS came from a CD matrix, and header.update() only sets the keys it
+    is given — it does not remove the ones it isn't. An incoming file whose
+    capture software wrote a CD matrix from mount pointing would keep those
+    cards alongside astap's fresh PC+CDELT, describing two transforms at once.
+    What a reader does with that is not guaranteed: _read_wcs() had to be
+    taught to strip PC/CDELT when CD is present, after astropy multiplied the
+    two and turned 0.78"/px into 0.0002"/px.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    # A mount-pointing estimate in the older CD representation.
+    real_hdu.header["CTYPE1"] = "RA---TAN"
+    real_hdu.header["CTYPE2"] = "DEC--TAN"
+    real_hdu.header["CRVAL1"] = 100.0
+    real_hdu.header["CRVAL2"] = 10.0
+    real_hdu.header["CRPIX1"] = 5.0
+    real_hdu.header["CRPIX2"] = 5.0
+    real_hdu.header["CD1_1"] = -0.001
+    real_hdu.header["CD1_2"] = 0.0
+    real_hdu.header["CD2_1"] = 0.0
+    real_hdu.header["CD2_2"] = 0.001
+    real_hdu.header["CROTA2"] = 12.0
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    solved_wcs = AstropyWCS(naxis=2)
+    solved_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    solved_wcs.wcs.crval = [202.47, 47.20]
+    solved_wcs.wcs.crpix = [5, 5]
+    solved_wcs.wcs.cdelt = [-0.001, 0.001]
+    solved_wcs.wcs.set()
+
+    pipeline.astrometry.solve = AsyncMock(
+        return_value={**copy.deepcopy(_GOOD_ASTRO), "wcs": solved_wcs}
+    )
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        header = hdul[0].header
+        has_cd = any(k.startswith("CD1_") or k.startswith("CD2_") for k in header)
+        has_pc = any(k.startswith("PC") for k in header)
+        assert not (has_cd and has_pc), "archived header carries two WCS representations"
+        assert "CROTA2" not in header
+        # And the solve that survived is astap's, not the mount's.
+        assert header["CRVAL1"] == pytest.approx(202.47, abs=1e-6)
+
+
+def test_stripping_the_wcs_leaves_non_wcs_cards_alone():
+    """
+    The cleanup matched by PREFIX, and "PC" is also the first two letters of
+    PCOUNT — a structural keyword describing an HDU's parameter count, not a
+    WCS matrix term at all. Deleting it while replacing a WCS corrupts the
+    very header this helper exists to leave well-defined. Only indexed cards
+    (PCi_j, CDi_j, CDELTi, CROTAi, with an optional alternate-WCS suffix)
+    belong to a linear transform.
+    """
+    header = fits.Header()
+    header["PC1_1"] = 1.0
+    header["PC1_2"] = 0.0
+    header["CD2_1"] = 0.0
+    header["CDELT1"] = -0.001
+    header["CROTA2"] = 12.0
+    header["CD1_1A"] = 0.5          # alternate-WCS suffix — still a WCS card
+    header["PCOUNT"] = 0            # structural, not WCS
+    header["GCOUNT"] = 1
+    header["CCDTEMP"] = -10.0
+
+    pipeline._strip_wcs_representation(header)
+
+    for gone in ("PC1_1", "PC1_2", "CD2_1", "CDELT1", "CROTA2", "CD1_1A"):
+        assert gone not in header
+    assert header["PCOUNT"] == 0
+    assert header["GCOUNT"] == 1
+    assert header["CCDTEMP"] == pytest.approx(-10.0)
+
+
+@pytest.mark.asyncio
+async def test_archived_file_gets_qc_headers(mock_modules, tmp_path):
+    """
+    Audit 2026-08-18, finding H10: a later frame's subtraction picks its
+    reference stack out of this same archive directory and has no way to ask
+    the API what it is about to stack — the pipeline has no database access
+    and the API cannot see the observatory's filesystem. The frame's own
+    header is where the two meet, so the QC verdict is stamped there before
+    the archive move.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFLAG"] == "OK"
+        assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
+
+
+@pytest.mark.asyncio
+async def test_qc_fwhm_header_comes_from_the_solved_scale(mock_modules, tmp_path):
+    """
+    Audit 2026-08-18, finding M16: the FWHM stamped under QCFWHM is the PSF
+    anchor re-converted with the plate scale astrometry actually solved for,
+    not qc.analyze()'s own conversion through the header's claimed optical
+    setup. Subtraction screens a reference's stamped QCFWHM against the new
+    frame's anchor, so both sides of that ratio have to be measured the same
+    way.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    # Headers claiming 1.0"/px against a solve that found 1.6"/px — an
+    # unaccounted reducer, a swapped camera, a wrong FOCALLEN.
+    pipeline.qc.analyze.return_value = {
+        **_GOOD_QC, "fwhm_median": 2.0, "fwhm_median_px": 2.0,
+    }
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
+
+
+@pytest.mark.asyncio
+async def test_qc_fwhm_header_written_even_when_headers_had_no_plate_scale(
+    mock_modules, tmp_path,
+):
+    """
+    A frame whose headers carry no plate scale at all (an all-sky lens with
+    no XPIXSZ/FOCALLEN) used to be archived with no QCFWHM whatsoever, and
+    ran subtraction and forced photometry with no PSF anchor. The solve
+    supplies the missing scale, so it now has both (finding M16).
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    pipeline.qc.analyze.return_value = {
+        **_GOOD_QC, "fwhm_median": 2.0, "fwhm_unit": "pixels", "fwhm_median_px": 2.0,
+    }
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
+
+
+@pytest.mark.asyncio
+async def test_qc_fwhm_header_omitted_when_nothing_can_supply_a_scale(
+    mock_modules, tmp_path,
+):
+    """
+    Neither the headers nor the solve know the plate scale — writing a raw
+    pixel count under a keyword documented as arcsec would make a later
+    subtraction compare two incompatible quantities, so it is still simply
+    not written.
+    """
+    fits_path = mock_modules
+
+    real_hdu = fits.PrimaryHDU(data=np.zeros((10, 10), dtype=np.float32))
+    real_hdu.header["OBJECT"] = "M51"
+    real_hdu.writeto(fits_path, overwrite=True)
+
+    pipeline.qc.analyze.return_value = {**_GOOD_QC, "fwhm_unit": "pixels"}
+    solved = {k: v for k, v in _GOOD_ASTRO.items() if k != "pixel_scale_arcsec"}
+    pipeline.astrometry.solve = AsyncMock(return_value=solved)
+
+    await pipeline.run(str(fits_path))
+
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    with fits.open(archive_path) as hdul:
+        assert hdul[0].header["QCFLAG"] == "OK"
+        assert "QCFWHM" not in hdul[0].header
+
+
+@pytest.mark.asyncio
+async def test_solved_scale_reanchors_the_subtraction_psf(mock_modules, tmp_path):
+    """
+    The anchor handed to subtraction (and forced photometry) is the solved
+    one too, not the header's — subtraction divides it straight back by the
+    solved scale to get a pixel floor, so a header-derived arcsec value
+    would be skewed by the ratio between the two scales (finding M16).
+    """
+    fits_path = str(mock_modules)
+
+    pipeline.qc.analyze.return_value = {
+        **_GOOD_QC, "fwhm_median": 2.0, "fwhm_median_px": 2.0,
+    }
+
+    await pipeline.run(fits_path)
+
+    _, kwargs = pipeline.subtraction.run.call_args
+    assert kwargs["psf_fwhm_arcsec"] == pytest.approx(3.2)
 
 
 @pytest.mark.asyncio
@@ -787,7 +1175,10 @@ async def test_optional_modules_absent(monkeypatch, fits_file, tmp_path):
 
     api_mock.post_frame.assert_called_once()
     api_mock.post_sources.assert_called_once()
-    api_mock.post_anomalies.assert_called_once()
+    # Anomaly classification never ran, so there is no result to post. An
+    # empty set would REPLACE whatever the API already holds for this frame
+    # (docs/API.md) — see test_anomaly_detection_failure_does_not_replace_anomalies.
+    api_mock.post_anomalies.assert_not_called()
 
     # When normalizer is None, file is archived with original name
     archive_path = os.path.join(
@@ -856,8 +1247,40 @@ async def test_anomaly_detection_exception_continues(mock_modules):
 
     await pipeline.run(str(mock_modules))
 
-    # post_anomalies must still be called (with an empty anomaly list)
+    # The frame is still archived — detection failing is not fatal.
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    assert os.path.exists(archive_path)
+
+
+@pytest.mark.asyncio
+async def test_anomaly_detection_failure_does_not_replace_anomalies(mock_modules):
+    """
+    Audit 2026-08-18, finding C8: POST /frames/{id}/anomalies REPLACES the
+    frame's whole anomaly set, so posting [] because detection FAILED erased
+    every anomaly a previous successful run had stored — one transient
+    Horizons outage turned into permanent data loss. Nothing is posted at all
+    now unless classification actually ran to completion.
+    """
+    pipeline.anomaly_detector.detect.side_effect = RuntimeError("JPL timeout")
+
+    await pipeline.run(str(mock_modules))
+
+    pipeline.api_client.post_anomalies.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_empty_anomaly_result_is_still_posted(mock_modules):
+    """
+    The other half of the same contract: an empty list IS meaningful when
+    detection genuinely found nothing, and must still be posted so a frame
+    whose anomalies were resolved away is cleared.
+    """
+    pipeline.anomaly_detector.detect.return_value = []
+
+    await pipeline.run(str(mock_modules))
+
     pipeline.api_client.post_anomalies.assert_called_once()
+    assert pipeline.api_client.post_anomalies.call_args[0][2] == []
 
 
 @pytest.mark.asyncio
@@ -994,6 +1417,61 @@ async def test_forced_photometry_reuses_cached_catalog_lists(mock_modules):
 
 
 @pytest.mark.asyncio
+async def test_forced_photometry_gets_midpoint_epoch_and_colour_term(mock_modules, monkeypatch):
+    """
+    Forced photometry propagates Gaia proper motion to the exposure MIDPOINT
+    (finding C9), and transforms its magnitudes with the same colour-term
+    solution photometry.measure() fitted (finding H5) — both read by
+    pipeline.py and forwarded, so both are pinned here.
+    """
+    header = dict(_GOOD_HEADER)
+    header["obs_time"] = "2024-03-15T22:00:00"
+    header["obs_time_mid"] = "2024-03-15T22:01:00"
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: header)
+
+    original_measure = pipeline.photometry.measure.side_effect
+
+    async def measure_with_colour(fits_path, sources, skip_calibration=False, **kwargs):
+        sources = await original_measure(fits_path, sources, skip_calibration)
+        for s in sources:
+            s["_color_term"] = 0.12
+            s["_color_ref"] = 0.85
+            s["_color_scatter"] = 0.3
+        return sources
+
+    pipeline.photometry.measure.side_effect = measure_with_colour
+
+    await pipeline.run(str(mock_modules))
+
+    _, kwargs = pipeline.forced_photometry.run.call_args
+    assert kwargs["obs_time"] == "2024-03-15T22:01:00"
+    assert kwargs["color_term"] == pytest.approx(0.12)
+    assert kwargs["color_ref"] == pytest.approx(0.85)
+    assert kwargs["color_scatter"] == pytest.approx(0.3)
+    # The SkyBot accessor must hit the same epoch match() queried with.
+    assert "2024-03-15T22:01:00" in pipeline.catalog_matcher.get_mpc_objects.call_args.args
+
+
+@pytest.mark.asyncio
+async def test_photometry_gets_the_solved_wcs(mock_modules):
+    """
+    photometry.measure() runs before the archive step writes astap's solve
+    into the file, so it must be handed the solved WCS explicitly.
+    """
+    solved_wcs = MagicMock(name="solved_wcs")
+    pipeline.astrometry.solve = AsyncMock(
+        return_value={**copy.deepcopy(_GOOD_ASTRO), "wcs": solved_wcs}
+    )
+
+    await pipeline.run(str(mock_modules))
+
+    assert pipeline.photometry.measure.call_args.kwargs["wcs"] is solved_wcs
+    # ... and the frame's filter, which selects its fixed colour term.
+    assert pipeline.photometry.measure.call_args.kwargs["filter_name"] == \
+        _GOOD_HEADER["observation"]["filter"]
+
+
+@pytest.mark.asyncio
 async def test_forced_photometry_failure_does_not_abort_pipeline(mock_modules):
     """A crash in forced_photometry.run() must not abort the pipeline."""
     pipeline.forced_photometry.run.side_effect = RuntimeError("aperture photometry blew up")
@@ -1083,7 +1561,7 @@ async def test_mag_field_is_none_when_uncalibrated(mock_modules):
     values for entire uncalibrated frames in production.
     """
 
-    async def mock_measure_uncalibrated(fits_path, sources, skip_calibration=False):
+    async def mock_measure_uncalibrated(fits_path, sources, skip_calibration=False, **kwargs):
         for s in sources:
             s["flux_aperture"] = 100.0
             s["mag_instrumental"] = -5.0
@@ -1104,7 +1582,7 @@ async def test_mag_field_is_none_when_uncalibrated(mock_modules):
 async def test_mag_field_uses_calibrated_value_when_available(mock_modules):
     """When photometry did calibrate a source, "mag" must be mag_calibrated."""
 
-    async def mock_measure_calibrated(fits_path, sources, skip_calibration=False):
+    async def mock_measure_calibrated(fits_path, sources, skip_calibration=False, **kwargs):
         for s in sources:
             s["flux_aperture"]   = 100.0
             s["mag_instrumental"] = -5.0
@@ -1131,6 +1609,71 @@ async def test_mag_field_uses_calibrated_value_when_available(mock_modules):
 # posted as a separate `sources` observation and classified as a separate
 # duplicate ASTEROID/COMET anomaly.
 # ---------------------------------------------------------------------------
+
+
+class TestPreferCandidateSeparation:
+    """
+    Audit 2026-08-18, finding M14: the dedup preference always kept the blind
+    detection over the subtraction candidate. Only the MPC stage matches
+    within the wide MOVING_CONE_ARCSEC (120"), so at that separation the pair
+    is a moving object and an unrelated star that fell in the same cone — and
+    keeping the "ordinary" one substituted the star's position for the
+    mover's, in the very record the ephemeris and the track chart are built
+    from.
+    """
+
+    def _pair(self, separation_deg: float) -> tuple[dict, dict]:
+        blind = {
+            "ra": 167.274, "dec": 17.359, "catalog_name": "MPC",
+            "catalog_id": "Vesta", "flux": 500.0, "_from_subtraction": False,
+        }
+        sub = {
+            "ra": 167.274 + separation_deg, "dec": 17.359, "catalog_name": "MPC",
+            "catalog_id": "Vesta", "flux": 100.0, "_from_subtraction": True,
+        }
+        return blind, sub
+
+    def test_a_close_pair_still_prefers_the_blind_detection(self):
+        """
+        For a stationary object both describe the same thing, and the blind
+        one is measured on the frame's own pixels.
+        """
+        blind, sub = self._pair(separation_deg=1.0 / 3600.0)
+
+        assert pipeline._prefer_candidate(sub, blind) is False
+        assert pipeline._prefer_candidate(blind, sub) is True
+
+    def test_a_distant_pair_prefers_the_subtraction_candidate(self):
+        """
+        A static star cancels in the difference image and never becomes a
+        candidate there, so the subtraction one is the one that can be the
+        mover.
+        """
+        blind, sub = self._pair(separation_deg=100.0 / 3600.0)
+
+        assert pipeline._prefer_candidate(sub, blind) is True
+        assert pipeline._prefer_candidate(blind, sub) is False
+
+    def test_a_missing_position_falls_back_to_the_old_rule(self):
+        blind, sub = self._pair(separation_deg=100.0 / 3600.0)
+        sub.pop("ra")
+
+        assert pipeline._prefer_candidate(sub, blind) is False
+
+    def test_two_of_the_same_kind_are_still_decided_by_flux(self):
+        a = {"ra": 1.0, "dec": 1.0, "flux": 100.0, "_from_subtraction": False}
+        b = {"ra": 1.0, "dec": 1.0, "flux": 500.0, "_from_subtraction": False}
+
+        assert pipeline._prefer_candidate(b, a) is True
+        assert pipeline._prefer_candidate(a, b) is False
+
+    def test_the_distant_pair_survives_the_full_dedup(self):
+        blind, sub = self._pair(separation_deg=100.0 / 3600.0)
+
+        result = pipeline._dedupe_by_catalog_identity([blind, sub], {})
+
+        assert len(result) == 1
+        assert result[0]["_from_subtraction"] is True
 
 
 class TestDedupeByCatalogIdentity:
@@ -1365,6 +1908,70 @@ class TestDedupeUncataloguedSubtractionPair:
 # appended a second time under its Gaia DR3 identity — 16 such pairs found in
 # a single frame.
 # ---------------------------------------------------------------------------
+
+
+class TestDedupeUnmatchedNearMatched:
+    """
+    Step 4.6 suppresses an uncatalogued source sitting on top of a
+    catalogue-matched one — sep splitting a single distorted PSF into two
+    components, one of which lands just outside the catalog cone.
+
+    Audit finding C6: the step had no exemption for a source already
+    confirmed as a real pixel-level change by image subtraction, so a
+    transient flaring in projection near a catalogued star was dropped here,
+    before anomaly_detector.py and before POST /frames/{id}/sources — the
+    event was never stored in any form.
+    """
+
+    def test_no_matched_sources_returns_unchanged(self):
+        only_unmatched = [{"ra": 1.0, "dec": 1.0, "catalog_name": None}]
+        assert pipeline._dedupe_unmatched_near_matched(only_unmatched, {}) is only_unmatched
+
+    def test_deblending_artifact_near_a_matched_star_is_suppressed(self):
+        """The case the step exists for — unchanged by the C6 exemption."""
+        star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
+        artifact = {"ra": 10.0003, "dec": 20.0, "catalog_name": None}  # ~1" away
+
+        result = pipeline._dedupe_unmatched_near_matched([star, artifact], {})
+
+        assert result == [star]
+
+    def test_subtraction_candidate_near_a_matched_star_is_kept(self):
+        """
+        A supernova/nova flaring within MATCH_CONE_ARCSEC of a catalogued
+        star — routine in a dense field, and the expected geometry near a
+        known host galaxy. subtraction.run() has already confirmed the
+        pixel-level change against the object's own archived history, which
+        is evidence of a different kind from "nothing within 5 arcsec
+        claims it".
+        """
+        star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
+        transient = {
+            "ra": 10.0003, "dec": 20.0, "catalog_name": None,
+            "_from_subtraction": True,
+        }
+
+        result = pipeline._dedupe_unmatched_near_matched([star, transient], {})
+
+        assert result == [star, transient]
+
+    def test_distant_unmatched_source_is_kept_either_way(self):
+        star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
+        far = {"ra": 10.5, "dec": 20.0, "catalog_name": None}
+
+        result = pipeline._dedupe_unmatched_near_matched([star, far], {})
+
+        assert result == [star, far]
+
+    def test_matched_sources_are_never_removed(self):
+        """Two catalogued sources at the same position are this step's
+        business only as reference points — neither is ever dropped here."""
+        a = {"ra": 10.0, "dec": 20.0, "catalog_name": "Simbad", "catalog_id": "A"}
+        b = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "B"}
+
+        result = pipeline._dedupe_unmatched_near_matched([a, b], {})
+
+        assert result == [a, b]
 
 
 class TestDedupeCrossCatalogDuplicates:

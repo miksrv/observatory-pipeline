@@ -70,8 +70,15 @@ docstring and `.claude/agent-memory/python-senior-dev/feedback_module_to_package
 from __future__ import annotations
 
 from ._2mass import _match_2mass, _query_2mass
-from ._cache import _cache, _cache_get, _cache_set
-from ._gaia import _match_gaia, _query_gaia, get_gaia_stars
+from ._cache import (
+    _cache,
+    _cache_fov_deg,
+    _cache_get,
+    _cache_position,
+    _cache_radius_margin_deg,
+    _cache_set,
+)
+from ._gaia import _attach_gaia_color, _match_gaia, _propagate_to_epoch, _query_gaia, get_gaia_stars
 from ._match import match
 from ._mpc import _match_mpc, _query_mpc, get_mpc_objects
 from ._panstarrs import _match_panstarrs, _query_panstarrs

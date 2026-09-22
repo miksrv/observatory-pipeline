@@ -9,6 +9,7 @@ Internal helper only — not part of this package's public surface.
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 import sep
@@ -17,12 +18,35 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# The narrowest second-moment semi-minor axis a pixel grid can express:
+# 1/sqrt(12) px, the standard deviation of a uniform distribution across one
+# pixel. `sep` can report a smaller — even exactly zero — `b` for a
+# degenerate fit (a detection lying along a single pixel row, a cosmic-ray
+# track, a bad column), and `a / b` then depends entirely on whatever
+# epsilon is substituted to avoid dividing by zero. The old sentinels (1e-6
+# here, 0.001 in _detect_diff_sources) turned such a fit into an elongation
+# of 10^3-10^6, a number that is not a measurement of anything but clears
+# every elongation threshold in the pipeline on the way to being persisted
+# as the source's shape (audit 2026-08-18, finding L4).
+#
+# Clamping at the pixel limit instead caps the ratio at `a / 0.2887` — how
+# elongated the feature would be if it were exactly one pixel wide, which is
+# the most elongated it can honestly be claimed to be. A feature now has to
+# be genuinely long in `a` to read as a trail, which is what the thresholds
+# were written to mean.
+#
+# Hand-duplicated across modules/qc.py, modules/subtraction.py,
+# modules/astrometry/_streak.py and modules/astrometry/_extraction.py, the
+# same convention those four already follow for the streak-mask helper
+# itself. Keep them in sync.
+_MIN_SEMI_MINOR_PX: float = 1.0 / math.sqrt(12.0)   # ~= 0.2887
+
 
 def _build_streak_mask(
     data_sub: np.ndarray,
     rms: float,
     pixel_scale_arcsec: float | None,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray, list[dict]] | None:
     """
     Coarse, low-threshold, non-deblended pre-pass that finds long thin
     streaks — satellite/aircraft trails crossing a single exposure, and
@@ -71,10 +95,25 @@ def _build_streak_mask(
 
     Returns
     -------
-    np.ndarray | None
-        Boolean mask, same shape as data_sub, or None when nothing
-        streak-like was found (the common case) or the coarse pass itself
-        failed — callers should treat None as "nothing to mask".
+    tuple[np.ndarray, list[dict]] | None
+        The boolean mask (same shape as data_sub) and one dict per masked
+        feature, carrying its own centroid, flux, axes, elongation and length
+        in pixels. None when nothing streak-like was found (the common case)
+        or the coarse pass itself failed — callers should treat None as
+        "nothing to mask".
+
+        The feature list exists because masking alone deletes evidence. The
+        two thresholds here cannot geometrically tell a satellite trail from a
+        genuine fast NEO trailing within a single exposure — a 30" streak at
+        elongation 5 is exactly what both look like — so the pixels of a real
+        moving object were erased before `sep.extract()` ever ran, and with
+        no second chance: the frame is not re-analysed from other data (audit
+        2026-08-18, finding H16). `_extraction.py` turns each of these back
+        into one detection at the streak's own centroid, which is enough for
+        the MPC cone search to identify a known object there and for the
+        SPACE_DEBRIS branch to classify an unknown one, while the masking
+        still does its real job of stopping the trail from fragmenting into
+        several false "stars".
     """
     if rms is None or rms <= 0:
         return None
@@ -95,7 +134,7 @@ def _build_streak_mask(
     if len(objs) == 0:
         return None
 
-    safe_b = np.where(objs["b"] > 0, objs["b"], 1e-6)
+    safe_b = np.where(objs["b"] > _MIN_SEMI_MINOR_PX, objs["b"], _MIN_SEMI_MINOR_PX)
     elongation = objs["a"] / safe_b
     bbox_diag_px = np.sqrt(
         (objs["xmax"] - objs["xmin"]).astype(np.float64) ** 2
@@ -128,9 +167,22 @@ def _build_streak_mask(
             "Streak mask dilation failed (%s) — using un-dilated mask", exc
         )
 
+    features: list[dict] = []
+    for i in streak_idx:
+        features.append({
+            "x":            float(objs["x"][i]),
+            "y":            float(objs["y"][i]),
+            "flux":         float(objs["flux"][i]),
+            "peak":         float(objs["peak"][i]),
+            "a":            float(objs["a"][i]),
+            "b":            float(objs["b"][i]),
+            "elongation":   float(elongation[i]),
+            "length_px":    float(bbox_diag_px[i]),
+        })
+
     logger.info(
         "Streak masking: %d streak-like feature(s) found (elongation>=%.1f, "
         "length>=%.0fpx), masking %d pixel(s)",
         len(streak_idx), config.STREAK_ELONGATION_MIN, min_len_px, int(mask.sum()),
     )
-    return mask
+    return mask, features

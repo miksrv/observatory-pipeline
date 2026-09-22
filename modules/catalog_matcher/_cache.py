@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import os
 import tempfile
 from typing import Any
@@ -31,14 +32,85 @@ logger = logging.getLogger(__name__)
 # CATALOG_CACHE_DIR on why this must be mounted from outside the container.
 # ---------------------------------------------------------------------------
 
+# The sky-position resolution every catalog's cache key rounds to. A key is
+# therefore a TILE, not a point: two frames up to its diagonal apart share one.
+_CACHE_TILE_DEG: float = 0.1
+# Half that tile's diagonal — the furthest any frame centre can be from the
+# key position it rounds to.
+_CACHE_TILE_MARGIN_DEG: float = _CACHE_TILE_DEG * 1.41421356 / 2.0
+
+
+def _cache_position(ra_center: float, dec_center: float) -> tuple[float, float]:
+    """
+    The tile centre a frame's own centre rounds to for cache purposes.
+
+    Every catalog queried around its frame's actual centre but cached under
+    the rounded one, so a second frame sharing the key got back a circle drawn
+    around somewhere else — up to a tile diagonal away — and its own edge
+    region could fall outside what was ever queried (audit 2026-08-18, finding
+    M5). Querying around the tile centre instead makes the cached content a
+    function of the key, which is what a key is supposed to mean.
+    """
+    return (
+        round(ra_center / _CACHE_TILE_DEG) * _CACHE_TILE_DEG,
+        round(dec_center / _CACHE_TILE_DEG) * _CACHE_TILE_DEG,
+    )
+
+
+def _cache_fov_deg(fov_deg: float) -> float:
+    """
+    The field-of-view bucket a frame's own FOV rounds UP to for cache purposes.
+
+    Every catalog's key carried the FOV rounded to the nearest tile
+    (`f"{fov_deg:.1f}"`) while the query behind it used the exact FOV, so the
+    cached content was not a function of the key: a 0.96 deg frame and a 1.04
+    deg one share the bucket "1.0", and whichever arrived first decided how
+    much sky was actually fetched. When that was the smaller one, the larger
+    frame got a cone that never reached its own edge and simply lost every
+    catalog entry out there — the same failure `_cache_position()` fixes for
+    the centre, in the radius instead.
+
+    Rounding UP rather than to nearest is what makes a hit always cover its
+    requester: every frame in a bucket is at most as wide as the bucket, so
+    querying the bucket's own width covers all of them. The surplus is the
+    same bounded, harmless over-fetch `_cache_radius_margin_deg()` already
+    accepts — matching is positional and cone-bounded, so an entry outside a
+    given frame matches nothing in it.
+    """
+    if not fov_deg or fov_deg <= 0:
+        return _CACHE_TILE_DEG
+    return math.ceil(fov_deg / _CACHE_TILE_DEG) * _CACHE_TILE_DEG
+
+
+def _cache_radius_margin_deg() -> float:
+    """
+    How much to widen a query radius so its result covers every frame that
+    rounds to the same tile — the tile's own half-diagonal.
+
+    The over-fetch is bounded and harmless: matching is positional and
+    `MATCH_CONE_ARCSEC`-bounded, so a catalog entry outside a given frame
+    simply matches nothing in it.
+    """
+    return _CACHE_TILE_MARGIN_DEG
+
+
 _cache: dict[str, dict[str, Any]] = {}
 _CACHE_TTL = datetime.timedelta(hours=config.CACHE_TTL_HOURS)
+
+
+# Bumped whenever what a key MEANS changes, so an on-disk entry written under
+# the old meaning is never read back as a hit. v2: the tile-centred query with
+# a tile-diagonal margin (audit 2026-08-18, finding M5) — a pre-M5 file under
+# a key that happens to coincide holds a circle drawn around some other
+# frame's own centre with no margin, exactly the edge loss M5 fixes, and Gaia
+# entries from then also lack the bp_rp/ruwe/flag columns H5/H6 read.
+_CACHE_FORMAT_VERSION = "v2"
 
 
 def _cache_file_path(key: str) -> str:
     """Filesystem-safe path under CATALOG_CACHE_DIR for a given cache key."""
     safe_key = key.replace("/", "_").replace(":", "_")
-    return os.path.join(config.CATALOG_CACHE_DIR, f"{safe_key}.json")
+    return os.path.join(config.CATALOG_CACHE_DIR, f"{_CACHE_FORMAT_VERSION}_{safe_key}.json")
 
 
 def _cache_get(key: str) -> Any | None:

@@ -82,6 +82,36 @@ class TestHandleAnalyzeItem:
         analyze_mock.assert_not_called()
 
 
+class TestRecoveryAttemptCounter:
+    """
+    Audit 2026-08-18, finding H19: pipeline._queue_recovery_task() writes a
+    running count into a re-queued item's payload. Reading it back is what
+    bounds the loop — without it, a permanently failing frame would re-queue
+    itself forever.
+    """
+
+    def test_absent_payload_is_a_first_attempt(self):
+        assert worker._recovery_attempt({"id": "i1"}) == 0
+
+    def test_counter_is_read_from_the_payload(self):
+        assert worker._recovery_attempt({"id": "i1", "payload": {"recovery_attempt": 2}}) == 2
+
+    def test_unreadable_values_count_as_zero(self):
+        assert worker._recovery_attempt({"id": "i1", "payload": "nonsense"}) == 0
+        assert worker._recovery_attempt({"id": "i1", "payload": {"recovery_attempt": "x"}}) == 0
+        assert worker._recovery_attempt({"id": "i1", "payload": {"recovery_attempt": -3}}) == 0
+
+    async def test_the_counter_reaches_analyze_frame(self, monkeypatch):
+        analyze = AsyncMock(return_value={"frame_id": "f1"})
+        monkeypatch.setattr(worker.pipeline, "analyze_frame", analyze)
+
+        await worker._handle_analyze_item(
+            {"id": "i1", "filename": "/fits/a.fits", "payload": {"recovery_attempt": 1}}
+        )
+
+        assert analyze.await_args.args == ("/fits/a.fits", 1)
+
+
 # ---------------------------------------------------------------------------
 # _run_detect_task
 # ---------------------------------------------------------------------------
@@ -91,7 +121,7 @@ class TestRunDetectTask:
     async def test_processes_all_items_and_reports_progress(self, monkeypatch):
         """All frame items are processed sequentially, each reporting progress."""
 
-        async def fake_detect(frame_id):
+        async def fake_detect(frame_id, recovery_attempt=0):
             return [
                 {"anomaly_type": "UNKNOWN", "source_id": "src-a", "_designation": None},
             ]
@@ -124,7 +154,7 @@ class TestRunDetectTask:
         """DETECT_ANOMALIES must NOT auto-create a follow-up GENERATE_CHARTS task.
         The operator creates chart tasks manually from the UI."""
 
-        async def fake_detect(frame_id):
+        async def fake_detect(frame_id, recovery_attempt=0):
             return [{"anomaly_type": "UNKNOWN", "source_id": "src-a", "_designation": None}]
 
         monkeypatch.setattr(worker.pipeline, "detect_anomalies_for_frame_id", AsyncMock(side_effect=fake_detect))
@@ -141,7 +171,7 @@ class TestRunDetectTask:
         create_task_mock.assert_not_called()
 
     async def test_item_failure_does_not_block_others(self, monkeypatch):
-        async def fake_detect(frame_id):
+        async def fake_detect(frame_id, recovery_attempt=0):
             if frame_id == "frame-bad":
                 raise RuntimeError("API down")
             return [{"anomaly_type": "UNKNOWN", "source_id": "src-ok", "_designation": None}]

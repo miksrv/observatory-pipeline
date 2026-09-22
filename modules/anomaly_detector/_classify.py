@@ -9,12 +9,18 @@ Internal helpers only — not part of this package's public surface.
 from __future__ import annotations
 
 import logging
+import math
 
 import config
 
-from ._geometry import _find_sources_within_radius, _tile_key
-from ._history import _history_median_mag, _same_filter_history
-from ._movement import _is_position_shifted
+from ._geometry import _find_sources_within_radius, _haversine_arcsec, _tile_key
+from ._history import (
+    _history_mag_epochs,
+    _history_mag_scatter,
+    _history_median_mag,
+    _same_filter_history,
+)
+from ._movement import _find_wide_history, _is_position_shifted
 from ._otypes import _is_binary_star, _is_galaxy, _is_variable_star
 from .types import AnomalyType
 
@@ -25,6 +31,224 @@ logger = logging.getLogger(__name__)
 # Per-source classification (using prefetched data)
 # ---------------------------------------------------------------------------
 
+def _could_be_a_new_bright_object(
+    history: list[dict],
+    n_coverage: int,
+    near_edge: bool,
+    elongation: float,
+) -> bool:
+    """
+    Whether a saturated, uncatalogued detection has enough circumstantial
+    evidence to be a genuinely new bright object — a nova, a bright outburst,
+    a fireball — rather than the bright-star artifact such a detection almost
+    always is.
+
+    The suppression this qualifies was unconditional, and structurally could
+    not let such an object through: by definition it has no catalog match yet,
+    and if it is bright enough to matter it is bright enough to saturate
+    (audit 2026-08-18, finding M4). The exemption cannot lean on
+    `_from_subtraction` either, which would otherwise be the obvious evidence:
+    `modules/subtraction.py` masks the vicinity of every saturated pixel out
+    of the difference image, so a saturated transient never becomes a
+    subtraction candidate in the first place.
+
+    What is left is circumstantial, and all of it is required:
+
+    * **prior coverage, and nothing ever detected here.** A diffraction spike
+      or a bloomed column belongs to a star that is in the frame every night,
+      so the position has history. A genuinely new object does not — and the
+      area must have been imaged before, or "nothing was here" says nothing.
+    * **not near the frame edge**, where the aberrations that manufacture
+      spurious detections are worst.
+    * **star-like in shape.** A spike or a bleed trail is elongated; a real
+      point source, saturated or not, is round.
+
+    A source that qualifies still carries no usable magnitude —
+    `modules/photometry.py` never measures a saturated core — so it is
+    reported as an UNKNOWN alert for a human to look at, which is exactly what
+    a candidate nova warrants.
+    """
+    return (
+        not history
+        and n_coverage > 0
+        and not near_edge
+        and 0.0 < elongation <= config.STAR_ELONGATION_MAX
+    )
+
+
+def _delta_mag_noise(source: dict, same_filter_history: list[dict]) -> float | None:
+    """
+    How much this source's magnitude is expected to wander from measurement
+    error alone, as a 1-sigma value — the source's own `mag_err` and its
+    historical scatter added in quadrature.
+
+    `DELTA_MAG_ALERT` is a flat 0.5 mag applied to every source equally, which
+    is the wrong shape for the question twice over: a faint source at the
+    detection limit wanders further than that on noise alone and alerts every
+    night, while a bright, well-measured star can change by 0.3 mag —
+    unmistakable at its own precision — and never be looked at (audit
+    2026-08-18, finding M3).
+
+    Returns None when neither term is available, in which case the caller
+    keeps the flat threshold on its own, exactly as before.
+    """
+    terms: list[float] = []
+
+    mag_err = source.get("mag_err")
+    if mag_err is not None:
+        try:
+            value = float(mag_err)
+            if math.isfinite(value) and value > 0:
+                terms.append(value)
+        except (TypeError, ValueError):
+            pass
+
+    scatter = _history_mag_scatter(same_filter_history)
+    if scatter is not None and scatter > 0:
+        terms.append(scatter)
+
+    if not terms:
+        return None
+    return math.sqrt(sum(term ** 2 for term in terms))
+
+
+def _is_significant_delta(
+    delta_mag: float,
+    source: dict,
+    same_filter_history: list[dict],
+) -> bool:
+    """
+    Whether a magnitude change is large enough to be worth reporting: past the
+    absolute `DELTA_MAG_ALERT` floor AND past `VARIABILITY_SIGMA` times what
+    this particular source's own noise would produce.
+
+    The floor stays because a change smaller than it is not astronomically
+    interesting however precisely it was measured; the significance test is
+    what stops the floor from meaning wildly different things for a bright
+    star and a faint one. `VARIABILITY_SIGMA` is reused rather than given a
+    setting of its own — it already answers exactly this question for the
+    catalog-independent VARIABLE_STAR branch, and two separate knobs for one
+    idea would only drift apart.
+
+    With no usable noise estimate — no `mag_err`, no same-filter history to
+    take a scatter from — the floor applies alone, which is the previous
+    behaviour.
+    """
+    if abs(delta_mag) <= config.DELTA_MAG_ALERT:
+        return False
+
+    noise = _delta_mag_noise(source, same_filter_history)
+    if noise is None:
+        return True
+
+    return abs(delta_mag) > config.VARIABILITY_SIGMA * noise
+
+
+def _survives_edge_zone(source: dict) -> bool:
+    """
+    Whether a near-edge **subtraction** candidate is compact and strong enough
+    to be worth reporting rather than suppressed as an aberration residual.
+
+    Every `near_edge` source used to be suppressed outright, on the strength
+    of a real incident (2026-08-10: 53 of 80 UNKNOWN alerts were
+    `from_subtraction` + `near_edge`, every one a coma residual of an ordinary
+    catalogued star). But that also means a genuine transient landing near the
+    frame edge — which a dithering pattern makes routine — can never be
+    reported, whatever it looks like (audit 2026-08-18, finding H11).
+
+    What separates the two is shape and strength, not position. Coma and the
+    other off-axis aberrations stretch a PSF into an arc, and it is the
+    *mismatch* between two such arcs that the median reference stack fails to
+    cancel, so a residual is elongated and usually weak. A round, strong
+    residual is not that shape at all.
+
+    The same two thresholds `modules/subtraction.py` applies at extraction
+    time (`SUBTRACTION_EDGE_ELONGATION_MAX`, `SUBTRACTION_EDGE_SNR_MIN`) are
+    re-applied here rather than trusted from there, because the standalone
+    `DETECT_ANOMALIES` path reconstructs its sources from the API and may
+    carry rows a previous, looser revision of that module wrote. A source that
+    did NOT come from subtraction never qualifies: its near-edge suppression
+    rests on a different mechanism — a coma-shifted centroid that made catalog
+    matching miss — which shape cannot rule out.
+    """
+    if not source.get("_from_subtraction"):
+        return False
+
+    try:
+        elongation = float(source.get("elongation") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not (0.0 < elongation <= config.SUBTRACTION_EDGE_ELONGATION_MAX):
+        return False
+
+    snr = source.get("snr")
+    if snr is None:
+        return False
+    try:
+        return float(snr) >= config.SUBTRACTION_EDGE_SNR_MIN
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_residual_of_catalogued_star(
+    source: dict,
+    catalogued_frame_sources: list[tuple[float, float, float]],
+) -> bool:
+    """
+    Whether an uncatalogued subtraction candidate is a catalogued star's own
+    residual rather than a transient: a catalogued source of about the same
+    measured brightness (within SUBTRACTION_RESIDUAL_MAX_DMAG) lies within
+    SUBTRACTION_RESIDUAL_RADIUS_FWHM times the candidate's own FWHM of it in
+    this same frame — in FWHM rather than arcseconds because the pipeline
+    serves several telescopes, and how far a residual lands from its star
+    scales with the PSF. Never less than MATCH_CONE_ARCSEC (inside it the
+    source would have been matched); twice that cone when the FWHM is unknown.
+
+    A coma-shifted or imperfectly cancelled stellar PSF leaves a difference
+    residual whose centroid can land just outside MATCH_CONE_ARCSEC, so it
+    reaches here uncatalogued; photometered on the new frame at that
+    position, its aperture holds mostly the star itself, which is why the two
+    magnitudes agree. Seen on the 2026-09-22 IC3322A test run: 10 of 11
+    UNKNOWN alerts were 5-7" from a star of the same magnitude, recurring at
+    the same positions across sessions.
+
+    The magnitude condition is what keeps the finding-C6 case alive — a
+    transient flaring beside a star of clearly different brightness. A
+    transient much FAINTER than a neighbour this close is lost, since its
+    measured magnitude is then essentially the star's; that is the accepted
+    cost. No magnitude on the candidate, or the check disabled, decides
+    nothing.
+    """
+    factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
+    if factor <= 0 or not catalogued_frame_sources:
+        return False
+    if not source.get("_from_subtraction") or source.get("catalog_name") is not None:
+        return False
+    try:
+        ra, dec, mag = float(source["ra"]), float(source["dec"]), float(source["mag"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (math.isfinite(ra) and math.isfinite(dec) and math.isfinite(mag)):
+        return False
+
+    try:
+        fwhm = float(source.get("fwhm") or 0.0)
+    except (TypeError, ValueError):
+        fwhm = 0.0
+    radius = factor * fwhm if fwhm > 0 else 2.0 * config.MATCH_CONE_ARCSEC
+    radius = max(radius, config.MATCH_CONE_ARCSEC)
+
+    for c_ra, c_dec, c_mag in catalogued_frame_sources:
+        if abs(c_dec - dec) * 3600.0 > radius:
+            continue
+        if (
+            abs(c_mag - mag) <= config.SUBTRACTION_RESIDUAL_MAX_DMAG
+            and _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius
+        ):
+            return True
+    return False
+
+
 def _classify_source_sync(
     source: dict,
     frame_id: str,
@@ -32,6 +256,8 @@ def _classify_source_sync(
     history_by_tile: dict[tuple, list],
     coverage_by_tile: dict[tuple, list],
     current_frame_positions: list[tuple[float, float]],
+    obs_time: str = "",
+    catalogued_frame_sources: list[tuple[float, float, float]] | None = None,
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).
@@ -79,6 +305,13 @@ def _classify_source_sync(
     history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
     n_history = len(history)
 
+    # Coverage is read here rather than in Priority 3 where it is mainly used:
+    # the saturated-artifact suppression below needs it too, to tell a bright
+    # object that genuinely was not there before from one that is there every
+    # night (audit 2026-08-18, finding M4).
+    coverage = coverage_by_tile.get(tile, [])
+    n_coverage = len(coverage)
+
     # ------------------------------------------------------------------
     # Priority 1 — MPC-matched moving objects
     # ------------------------------------------------------------------
@@ -119,14 +352,29 @@ def _classify_source_sync(
         # classified normally, just without a computed magnitude (see
         # photometry.py, which never measures a saturated source).
         if bool(source.get("saturated")):
-            logger.debug(
-                "Suppressed: saturated + uncatalogued detection ra=%.4f dec=%.4f "
-                "— treated as bright-star/subtraction artifact, not a real "
-                "transient (see docs/ISSUES.md #1, #2)",
-                ra, dec,
-                extra=extra,
-            )
-            return None
+            if _could_be_a_new_bright_object(history, n_coverage, near_edge, elongation):
+                # Falls through to the ordinary stationary-source path below,
+                # which reports it as an UNKNOWN alert — see
+                # _could_be_a_new_bright_object() for the evidence required
+                # and why a blanket suppression could never let a nova
+                # through.
+                logger.warning(
+                    "Saturated + uncatalogued detection at ra=%.4f dec=%.4f is "
+                    "round, interior, and has no history in %d covering "
+                    "frame(s) — classifying it rather than suppressing it as "
+                    "an artifact. Its magnitude is unmeasurable (saturated core)",
+                    ra, dec, n_coverage,
+                    extra=extra,
+                )
+            else:
+                logger.debug(
+                    "Suppressed: saturated + uncatalogued detection ra=%.4f dec=%.4f "
+                    "— treated as bright-star/subtraction artifact, not a real "
+                    "transient (see docs/ISSUES.md #1, #2)",
+                    ra, dec,
+                    extra=extra,
+                )
+                return None
 
         # Wide-cone (MOVING_CONE_ARCSEC) history — candidates for "this used
         # to be somewhere nearby". _is_position_shifted() itself gates on
@@ -135,7 +383,18 @@ def _classify_source_sync(
         # occupied by anything in THIS frame — see its docstring for why
         # "any nearby historical detection" alone is not sufficient evidence
         # of a mover (docs/ISSUES.md #1).
-        wide_history = _find_sources_within_radius(ra, dec, config.MOVING_CONE_ARCSEC, tile_sources)
+        # Radius is per-candidate, not one number for the whole search: a
+        # historical detection from a few minutes ago is admitted out to a
+        # fast mover's reach over that gap, while an older one is held to the
+        # plain MOVING_CONE_ARCSEC. A fixed 120" cone left MOVING_UNKNOWN
+        # structurally unreachable for anything that moved further than that
+        # between frames — its own previous position was outside the search
+        # entirely, so "shifted" could never be confirmed and the object fell
+        # through to a generic UNKNOWN or was dropped as FIRST_OBSERVATION
+        # (audit 2026-08-18, finding H3). See _wide_cone_radius_arcsec() for
+        # the two bounds that keep the extension from becoming a permanently
+        # wide cone.
+        wide_history, wide_radius = _find_wide_history(ra, dec, tile_sources, obs_time)
 
         # A trail this elongated is, on its own, sufficient evidence of a
         # fast single-exposure mover (satellite / space debris) — unlike a
@@ -177,8 +436,8 @@ def _classify_source_sync(
         if not history and elongation > trail_elongation_min:
             anomaly_type = AnomalyType.SPACE_DEBRIS
 
-            logger.warning(
-                "ALERT — %s: unmatched trail-like source, elongation alone is "
+            logger.info(
+                "%s: unmatched trail-like source, elongation alone is "
                 "sufficient (no position-shift evidence needed) ra=%.4f dec=%.4f "
                 "elongation=%.2f near_edge=%s threshold=%.2f",
                 anomaly_type, ra, dec, elongation, near_edge, trail_elongation_min,
@@ -238,7 +497,7 @@ def _classify_source_sync(
                 "ephemeris":       None,
                 "notes": (
                     f"No detection within {config.MATCH_CONE_ARCSEC:.1f} arcsec of this position, "
-                    f"but a historical detection within {config.MOVING_CONE_ARCSEC:.1f} arcsec of it "
+                    f"but a historical detection within {wide_radius:.1f} arcsec of it "
                     f"is no longer present in this frame; not matched in MPC. "
                     f"Elongation={elongation:.2f}."
                 ),
@@ -247,10 +506,6 @@ def _classify_source_sync(
     # ------------------------------------------------------------------
     # Priority 3 — Stationary source classification
     # ------------------------------------------------------------------
-
-    # Get coverage from prefetched data
-    coverage = coverage_by_tile.get(tile, [])
-    n_coverage = len(coverage)
 
     # `history`/`n_history` (MATCH_CONE_ARCSEC cone) were already computed
     # above — needed regardless of catalog-match status: unmatched sources
@@ -274,10 +529,12 @@ def _classify_source_sync(
         # reference stack, even though the API has no prior coverage record.
         # However, near-edge subtraction candidates are overwhelmingly coma
         # residuals, not real transients — suppress them here too (defense
-        # in depth: subtraction.py now filters them at extraction time, but
-        # a standalone DETECT_ANOMALIES re-run may still carry old
-        # near_edge + from_subtraction rows from the API).
-        if near_edge:
+        # in depth: subtraction.py applies the same test at extraction time,
+        # but a standalone DETECT_ANOMALIES re-run may still carry old
+        # near_edge + from_subtraction rows from the API). A candidate that
+        # is round and strong is not the shape an aberration residual takes,
+        # and is let through — see _survives_edge_zone().
+        if near_edge and not _survives_edge_zone(source):
             logger.debug(
                 "Suppressed UNKNOWN (subtraction, new area): near_edge "
                 "ra=%.4f dec=%.4f — likely coma residual",
@@ -306,6 +563,15 @@ def _classify_source_sync(
                 "catalog_id=%s ra=%.4f dec=%.4f — known object, not a real "
                 "transient",
                 catalog_name, catalog_id, ra, dec,
+                extra=extra,
+            )
+            return None
+        if _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
+            logger.debug(
+                "Suppressed UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f "
+                "mag=%s sits beside a catalogued star of the same brightness — "
+                "its residual, not a transient",
+                ra, dec, mag,
                 extra=extra,
             )
             return None
@@ -373,11 +639,26 @@ def _classify_source_sync(
         # analysis: 27 of 80 UNKNOWN alerts were non-subtraction near_edge
         # sources — every one a normal star whose centroid was coma-shifted
         # past MATCH_CONE_ARCSEC.
-        if near_edge:
+        #
+        # A round, strong subtraction candidate is exempt: it is not the shape
+        # an aberration residual takes, and unlike an ordinary detection it
+        # carries independent pixel-level evidence that nothing was there
+        # before (see _survives_edge_zone()).
+        if near_edge and not _survives_edge_zone(source):
             logger.debug(
                 "Suppressed UNKNOWN: near_edge uncatalogued source ra=%.4f "
                 "dec=%.4f mag=%s — likely coma-shifted centroid, not a real "
                 "transient",
+                ra, dec, mag,
+                extra=extra,
+            )
+            return None
+
+        if _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
+            logger.debug(
+                "Suppressed UNKNOWN: subtraction candidate ra=%.4f dec=%.4f "
+                "mag=%s sits beside a catalogued star of the same brightness — "
+                "its residual, not a transient",
                 ra, dec, mag,
                 extra=extra,
             )
@@ -420,15 +701,19 @@ def _classify_source_sync(
     # Magnitude comparison uses only same-filter history — see
     # _same_filter_history()'s docstring. `history` itself (the existence
     # check above, n_history) stays filter-agnostic on purpose.
-    median_hist_mag = _history_median_mag(_same_filter_history(history, source_filter))
+    same_filter_history = _same_filter_history(history, source_filter)
+    median_hist_mag = _history_median_mag(same_filter_history)
     delta_mag: float | None = None
 
     if mag is not None and median_hist_mag is not None:
         delta_mag = mag - median_hist_mag  # negative = brighter than history
 
+    # Not a flat threshold any more: past DELTA_MAG_ALERT *and* past what
+    # this source's own measurement error and historical scatter would
+    # produce — see _is_significant_delta() (audit 2026-08-18, finding M3).
     mag_changed = (
         delta_mag is not None
-        and abs(delta_mag) > config.DELTA_MAG_ALERT
+        and _is_significant_delta(delta_mag, source, same_filter_history)
     )
 
     if mag_changed:
@@ -508,6 +793,89 @@ def _classify_source_sync(
                     f"delta_mag={delta_mag:.3f} (threshold "
                     f"{config.DELTA_MAG_ALERT:.2f}). "
                     f"object_type='{object_type}'."
+                ),
+            }
+
+        # --- VARIABLE_STAR (catalog-independent) — the source's OWN light
+        # curve says it changed. Reached only when none of the OTYPE-gated
+        # branches above fired, which for any star known solely through
+        # Gaia DR3/2MASS/Pan-STARRS is every time: those three modules
+        # hardcode the generic object_type "STAR", and no OTYPE classifier
+        # matches it. Before this branch existed, such a source — the
+        # overwhelming majority of every field — was silently dropped here
+        # no matter how far it had moved in magnitude, so the Δmag detector
+        # could only ever re-confirm variability Simbad already knew about
+        # and could never discover any (audit 2026-08-18, finding C1).
+        #
+        # The evidence used instead of a catalog label is the source's own
+        # same-filter history: a long enough, tight enough baseline, and a
+        # current magnitude that departs from it by more than
+        # VARIABILITY_SIGMA times that baseline's own scatter. An
+        # intrinsically noisy source (low SNR, blended neighbour, variable
+        # seeing) therefore stays quiet — a large Δmag is unremarkable
+        # against a large scatter — while a genuinely quiescent star that
+        # suddenly brightens or fades is reported. DELTA_MAG_ALERT is still
+        # required on top (`mag_changed`, above), so an implausibly tight
+        # history cannot alert on a photometrically meaningless change.
+        #
+        # Reported as VARIABLE_STAR rather than a new anomaly_type of its
+        # own: the enum is mirrored as an ENUM column constraint in
+        # observatory-api, and a new member cannot be introduced from this
+        # repository alone. The notes field states explicitly that the
+        # classification came from the light curve rather than from a
+        # catalog, so the distinction survives for an operator.
+        scatter = _history_mag_scatter(same_filter_history)
+        # Epochs that actually carry a magnitude, not rows: an epoch whose
+        # photometry never calibrated contributes nothing to `scatter`, so
+        # counting it here would let VARIABILITY_MIN_EPOCHS be satisfied by a
+        # baseline shorter than the one the scatter was measured over.
+        n_same_filter = _history_mag_epochs(same_filter_history)
+
+        # An extended object is not a candidate here: a galaxy's or cluster's
+        # aperture magnitude moves with seeing, focus and the aperture radius
+        # (sized from the detection's own FWHM), not with the object. Its
+        # brightening is the SUPERNOVA_CANDIDATE branch above; its "fading"
+        # is measurement, and was reported as VARIABLE_STAR for NGC 4370 and
+        # NGC 4341 on the 2026-09-22 IC3322A test run.
+        if _is_galaxy(object_type):
+            logger.debug(
+                "No light-curve variability check for extended object_type=%s "
+                "at ra=%.4f dec=%.4f",
+                object_type, ra, dec,
+                extra=extra,
+            )
+            return None
+
+        if (
+            scatter is not None
+            and n_same_filter >= config.VARIABILITY_MIN_EPOCHS
+            and abs(delta_mag) > config.VARIABILITY_SIGMA * scatter
+        ):
+            logger.warning(
+                "VARIABLE_STAR (light-curve based): ra=%.4f dec=%.4f "
+                "delta_mag=%.3f scatter=%.3f epochs=%d catalog=%s object_type=%s",
+                ra, dec, delta_mag, scatter, n_same_filter, catalog_name, object_type,
+                extra=extra,
+            )
+            return {
+                "anomaly_type":    AnomalyType.VARIABLE_STAR,
+                "source_id":       source_id,
+                "ra":              ra,
+                "dec":             dec,
+                "magnitude":       mag,
+                "delta_mag":       delta_mag,
+                "mpc_designation": None,
+                "ephemeris":       None,
+                "notes": (
+                    f"Brightness change delta_mag={delta_mag:.3f} (threshold "
+                    f"{config.DELTA_MAG_ALERT:.2f}) exceeds "
+                    f"{config.VARIABILITY_SIGMA:.1f}x this source's own "
+                    f"historical scatter ({scatter:.3f} mag over "
+                    f"{n_same_filter} same-filter epochs). Variability "
+                    f"candidate identified from its own light curve, not "
+                    f"from a catalog classification "
+                    f"(catalog_name='{catalog_name}', "
+                    f"object_type='{object_type}')."
                 ),
             }
 

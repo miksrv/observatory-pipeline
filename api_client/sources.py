@@ -9,6 +9,8 @@ See docs/API.md sections 2, 4, 6, 8, 9, 11.
 from __future__ import annotations
 
 import logging
+import math
+import numbers
 
 import config
 from ._shared import (
@@ -67,6 +69,25 @@ def _to_wire_source(source: dict) -> dict:
     wire = {k: v for k, v in source.items() if not k.startswith("_")}
     if source.get("_from_subtraction"):
         wire["from_subtraction"] = True
+
+    # JSON has no NaN/Infinity: one such value anywhere in the batch makes
+    # the whole POST fail to serialize, the frame loses every source, and a
+    # recovery re-run fails identically because the value is deterministic
+    # (2026-09-22 test run, IC3322A). A measurement that came out non-finite
+    # is no measurement, so it travels as null — logged, so the producer can
+    # be found and fixed rather than silently papered over.
+    nonfinite = [
+        k for k, v in wire.items()
+        if isinstance(v, numbers.Real) and not isinstance(v, numbers.Integral)
+        and not math.isfinite(v)
+    ]
+    if nonfinite:
+        logger.warning(
+            "Non-finite value(s) in %s for source at ra=%s dec=%s — sent as null",
+            ", ".join(sorted(nonfinite)), source.get("ra"), source.get("dec"),
+        )
+        for k in nonfinite:
+            wire[k] = None
     return wire
 
 
@@ -109,11 +130,15 @@ async def _post_sources_with_retry(
         resp_json = response.json()
 
     # API.md documents "source_ids" as positionally parallel to the request's
-    # "sources" array — see FramesController::saveSources. Missing/malformed
-    # is treated as "the API didn't tell us" rather than an error: callers
-    # must already tolerate None (e.g. an old API version predating this field).
+    # "sources" array — see FramesController::saveSources. Missing or
+    # malformed is treated as "the API didn't tell us" rather than an error
+    # (e.g. an old API version predating this field), and comes back as an
+    # empty list rather than None: the POST itself succeeded, and the caller
+    # re-queues the frame when it did not (audit 2026-08-18, finding H19).
+    # The existing length-mismatch branch in pipeline.py already covers the
+    # "posted, but no usable ids" case.
     source_ids = resp_json.get("source_ids") if isinstance(resp_json, dict) else None
-    return source_ids if isinstance(source_ids, list) else None
+    return source_ids if isinstance(source_ids, list) else []
 
 
 async def post_sources(frame_id: str, filename: str, sources: list) -> list | None:
@@ -134,9 +159,13 @@ async def post_sources(frame_id: str, filename: str, sources: list) -> list | No
     list | None
         The API's `source_ids` array — positionally parallel to `sources`
         (same length/order), each entry the resolved `sources.id` or `None`
-        for a skipped entry. Returns `None` (not a list of Nones) if the API
-        call failed entirely or didn't return the field, so callers can tell
-        "we don't know any source ids" apart from "every source was skipped".
+        for a skipped entry. `None` means the sources did **not** reach the
+        API: an exhausted retry or a 4xx rejection. A successful POST whose
+        response carried no usable `source_ids` returns `[]` instead, so that
+        "we don't know any source ids" stays distinguishable from "every
+        source was skipped" while the caller can still tell an accepted batch
+        from a lost one and re-queue the frame (audit 2026-08-18, finding
+        H19).
     """
     logger.info(
         "Posting %d sources for frame_id=%s",
@@ -383,8 +412,13 @@ async def _get_source_tracks_batch_with_retry(source_ids: list[str]) -> dict:
         resp_json = response.json()
 
     # Documented format: {"results": {"<source_id>": [epoch, ...], ...}}
-    # Also accepted: {"results": [[...], [...], ...]} — see _normalize_batch_results.
-    return _normalize_batch_results(resp_json)
+    # Also accepted: {"results": [[...], [...], ...]} — see
+    # _normalize_batch_results. Unlike the near/covering batches, this
+    # endpoint's results are addressed by source_id rather than by request
+    # position, so the array form is re-keyed by the ids that were asked for:
+    # modules/finder_chart looks each track up as `tracks.get(source_id)`, and
+    # positional "0"/"1" keys would leave every source with no epochs.
+    return _normalize_batch_results(resp_json, keys=source_ids)
 
 
 async def get_source_tracks_batch(source_ids: list[str]) -> dict:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import threading
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -30,7 +31,11 @@ from astropy.wcs import WCS as AstropyWCS
 
 import config
 from modules import astrometry
-from modules.astrometry._frame_geometry import _position_angle_deg
+from modules.astrometry import _wcs as _wcs_mod
+from modules.astrometry._frame_geometry import (
+    _frame_center_and_scale,
+    _position_angle_deg,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +320,9 @@ def _patch_astrometry(
             stderr=""
         )
 
-    def _sep_background(data):
+    def _sep_background(data, mask=None):
+        # mask= is passed by the second, streak-excluded background pass
+        # (_extraction.py re-measures the RMS once a trail has been masked).
         if sep_background_raises:
             raise RuntimeError("sep.Background intentional failure")
         return fake_bkg
@@ -466,6 +473,179 @@ class TestPositionAngle:
 
 
 # ---------------------------------------------------------------------------
+# PSF anchor re-scaled onto the solved plate scale (audit 2026-08-18, M16)
+# ---------------------------------------------------------------------------
+
+class TestPsfAnchorUsesSolvedScale:
+    @contextmanager
+    def _capture_anchor(self):
+        """Run solve() and capture the psf_fwhm_arcsec _extract_sources got."""
+        seen: dict[str, Any] = {}
+
+        def _fake_extract(fits_path, wcs, pixel_scale_arcsec, naxis1, naxis2,
+                          psf_fwhm_arcsec, fits_filename):
+            seen["psf_fwhm_arcsec"] = psf_fwhm_arcsec
+            seen["pixel_scale_arcsec"] = pixel_scale_arcsec
+            return [], []
+
+        with patch("modules.astrometry._extract_sources", side_effect=_fake_extract):
+            yield seen
+
+    async def test_pixel_value_is_converted_with_the_solved_scale(self):
+        """
+        The header claimed 1.0"/px (so QC reported 2.0 px as 2.0"), but the
+        solve found 1.0"/px too here — the point of this case is only that
+        the pixel value is what gets converted.
+        """
+        with _patch_astrometry():                      # _make_wcs() -> ~1.0008"/px
+            with self._capture_anchor() as seen:
+                await astrometry.solve(
+                    _FITS_PATH, psf_fwhm_arcsec=2.0, psf_fwhm_px=2.0,
+                )
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(
+            2.0 * seen["pixel_scale_arcsec"], rel=1e-9
+        )
+
+    async def test_solved_scale_overrides_a_wrong_header_scale(self):
+        """
+        Finding M16: an unaccounted focal reducer makes the header's plate
+        scale disagree with the solve. The FWHM bounds _extract_sources
+        derives from the anchor are compared against source FWHMs computed
+        with the *solved* scale, so a header-derived anchor skewed them by
+        the ratio between the two — rejecting every real star in the frame,
+        or nothing at all.
+        """
+        solved_scale_deg = 0.000556                    # 2.0"/px
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=solved_scale_deg)):
+            with self._capture_anchor() as seen:
+                await astrometry.solve(
+                    _FITS_PATH,
+                    psf_fwhm_arcsec=2.0,               # headers said 1.0"/px
+                    psf_fwhm_px=2.0,
+                )
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(4.0, rel=1e-3)
+
+    async def test_pixel_value_alone_is_enough(self):
+        """
+        A frame whose headers carry no plate scale at all reaches solve()
+        with psf_fwhm_arcsec=None. It now gets an anchor anyway.
+        """
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=0.000556)):
+            with self._capture_anchor() as seen:
+                await astrometry.solve(
+                    _FITS_PATH, psf_fwhm_arcsec=None, psf_fwhm_px=2.0,
+                )
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(4.0, rel=1e-3)
+
+    async def test_arcsec_value_is_used_when_no_pixel_value_is_given(self):
+        """An ad hoc caller with only the arcsec figure keeps working."""
+        with _patch_astrometry():
+            with self._capture_anchor() as seen:
+                await astrometry.solve(_FITS_PATH, psf_fwhm_arcsec=2.0)
+
+        assert seen["psf_fwhm_arcsec"] == pytest.approx(2.0)
+
+    async def test_solve_returns_the_solved_pixel_scale(self):
+        """
+        pipeline.py re-anchors everything downstream of solve() off this,
+        so it has to travel out of the result dict.
+        """
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=0.000556)):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["pixel_scale_arcsec"] == pytest.approx(2.0, rel=1e-3)
+# ---------------------------------------------------------------------------
+# Frame geometry — per-axis plate scale (audit 2026-08-18, finding M15)
+# ---------------------------------------------------------------------------
+
+def _make_anisotropic_wcs(scale_x_deg: float, scale_y_deg: float) -> AstropyWCS:
+    """A TAN WCS whose two pixel axes have genuinely different scales."""
+    w = AstropyWCS(naxis=2)
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    w.wcs.crpix = [512.0, 512.0]
+    w.wcs.crval = [202.47, 47.20]
+    w.wcs.cdelt = [-scale_x_deg, scale_y_deg]
+    w.wcs.set()
+    return w
+
+
+class TestAnisotropicPlateScale:
+    def test_square_pixels_are_unchanged(self):
+        """
+        The overwhelmingly common case must behave exactly as before the
+        per-axis split: with square sky pixels the geometric mean of the
+        two column norms IS the column-0 norm.
+        """
+        scale_deg = 0.000278
+        wcs = _make_wcs(scale_deg=scale_deg)
+
+        _, _, fov_deg, pixel_scale_arcsec, _ = _frame_center_and_scale(
+            wcs, 1024, 768, "square.fits"
+        )
+
+        assert pixel_scale_arcsec == pytest.approx(scale_deg * 3600.0, rel=1e-9)
+        assert fov_deg == pytest.approx(1024 * scale_deg, rel=1e-9)
+
+    def test_portrait_frame_fov_uses_the_long_axis_own_scale(self):
+        """
+        Finding M15: a portrait frame (NAXIS2 > NAXIS1) with 2x1 binning
+        has its long dimension along y, but fov_deg used to multiply that
+        dimension by the *x* axis' scale — under-reporting the field of
+        view by the axis ratio, and with it every catalog query radius
+        derived from fov_deg.
+        """
+        scale_x_deg = 0.000278          # 1"/px, the binned-2x axis
+        scale_y_deg = 0.000139          # 0.5"/px
+        wcs = _make_anisotropic_wcs(scale_x_deg, scale_y_deg)
+        naxis1, naxis2 = 1024, 4096
+
+        _, _, fov_deg, _, _ = _frame_center_and_scale(
+            wcs, naxis1, naxis2, "portrait.fits"
+        )
+
+        assert fov_deg == pytest.approx(
+            max(naxis1 * scale_x_deg, naxis2 * scale_y_deg), rel=1e-9
+        )
+        # The old formula multiplied the larger *dimension* by the x scale.
+        assert fov_deg != pytest.approx(max(naxis1, naxis2) * scale_x_deg, rel=1e-6)
+
+    def test_pixel_scale_is_the_geometric_mean_of_both_axes(self):
+        scale_x_deg = 0.000278
+        scale_y_deg = 0.000139
+        wcs = _make_anisotropic_wcs(scale_x_deg, scale_y_deg)
+
+        _, _, _, pixel_scale_arcsec, _ = _frame_center_and_scale(
+            wcs, 1024, 1024, "aniso.fits"
+        )
+
+        assert pixel_scale_arcsec == pytest.approx(
+            math.sqrt(scale_x_deg * scale_y_deg) * 3600.0, rel=1e-9
+        )
+
+    def test_anisotropy_is_warned_about(self, caplog):
+        """
+        Everything downstream treats the returned scale as isotropic, so a
+        frame where that is materially untrue has to say so.
+        """
+        wcs = _make_anisotropic_wcs(0.000278, 0.000139)
+
+        with caplog.at_level("WARNING", logger="modules.astrometry._frame_geometry"):
+            _frame_center_and_scale(wcs, 1024, 1024, "aniso.fits")
+
+        assert any("Anisotropic plate scale" in r.message for r in caplog.records)
+
+    def test_square_pixels_are_not_warned_about(self, caplog):
+        wcs = _make_wcs()
+
+        with caplog.at_level("WARNING", logger="modules.astrometry._frame_geometry"):
+            _frame_center_and_scale(wcs, 1024, 1024, "square.fits")
+
+        assert not any("Anisotropic plate scale" in r.message for r in caplog.records)
+
+# ---------------------------------------------------------------------------
 # Test 2 — Source dict shape and types
 # ---------------------------------------------------------------------------
 
@@ -564,8 +744,8 @@ class TestSaturationFlag:
 
 class TestNearEdgeFlag:
     """
-    A 1024x1024 frame with the default EDGE_MARGIN_FRAC=0.1 has a 102.4px
-    margin on every side — sources inside [102.4, 921.6] on both axes are
+    A 1024x1024 frame with the default EDGE_MARGIN_FRAC=0.05 has a 51.2px
+    margin on every side — sources inside [51.2, 972.8] on both axes are
     "central", everything else is "near_edge".
     """
 
@@ -599,17 +779,31 @@ class TestNearEdgeFlag:
         assert result["sources_all"]
         assert result["sources_all"][0]["near_edge"] is True
 
-    async def test_margin_scales_with_frame_size(self):
-        """The margin is a FRACTION of NAXIS1/NAXIS2, not a fixed pixel count —
-        x=20 sits inside the 25.6px margin of a 256px-wide frame."""
-        small_frame_edge = _make_sources_at([(20.0, 128.0)])
-        with _patch_astrometry(sources=small_frame_edge, naxis1=256, naxis2=256):
-            result = await astrometry.solve(_FITS_PATH)
+    async def test_margin_scales_with_frame_size(self, monkeypatch):
+        """
+        The margin is a FRACTION of NAXIS1/NAXIS2, not a fixed pixel count:
+        one and the same x=30 is near-edge in a 1024px-wide frame (51.2px
+        margin) yet comfortably interior in a 256px-wide one (12.8px margin).
 
-        assert result["sources"][0]["near_edge"] is True
+        EDGE_MARGIN_FRAC is pinned explicitly rather than relying on the
+        config default, so that tuning that default (as 66cf519 did, from 0.1
+        to 0.05) can't silently invalidate the arithmetic this test asserts.
+        """
+        monkeypatch.setattr(config, "EDGE_MARGIN_FRAC", 0.05)
+
+        with _patch_astrometry(sources=_make_sources_at([(30.0, 512.0)]),
+                               naxis1=1024, naxis2=1024):
+            large = await astrometry.solve(_FITS_PATH)
+
+        with _patch_astrometry(sources=_make_sources_at([(30.0, 128.0)]),
+                               naxis1=256, naxis2=256):
+            small = await astrometry.solve(_FITS_PATH)
+
+        assert large["sources"][0]["near_edge"] is True
+        assert small["sources"][0]["near_edge"] is False
 
     async def test_custom_edge_margin_frac_widens_the_zone(self, monkeypatch):
-        """A source comfortably central under the default 0.1 margin becomes
+        """A source comfortably central under the default 0.05 margin becomes
         near-edge once EDGE_MARGIN_FRAC is widened to cover it."""
         monkeypatch.setattr(config, "EDGE_MARGIN_FRAC", 0.4)
         mid = _make_sources_at([(300.0, 512.0)])  # within 409.6px of the left edge
@@ -664,7 +858,7 @@ from modules.astrometry._astap import _run_astap, _run_astap_attempt  # noqa: E4
 
 class TestAstapTimeoutBudgets:
 
-    def test_narrow_attempt_uses_astap_timeout_sec(self, monkeypatch):
+    async def test_narrow_attempt_uses_astap_timeout_sec(self, monkeypatch):
         monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 42.0)
         monkeypatch.setattr(config, "ASTAP_WIDE_SEARCH_TIMEOUT_SEC", 999.0)
 
@@ -672,12 +866,12 @@ class TestAstapTimeoutBudgets:
             returncode=0, stdout="Solution found", stderr="",
         ))
         with patch("modules.astrometry.subprocess.run", run_mock):
-            outcome = _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
+            outcome = await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
 
         assert outcome == "solved"
         assert run_mock.call_args.kwargs["timeout"] == 42.0
 
-    def test_wide_attempt_uses_astap_wide_search_timeout_sec(self, monkeypatch):
+    async def test_wide_attempt_uses_astap_wide_search_timeout_sec(self, monkeypatch):
         """The wide retry must get its OWN, separate (larger) budget — not
         ASTAP_TIMEOUT_SEC, the narrow attempt's own timeout."""
         monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 42.0)
@@ -687,12 +881,12 @@ class TestAstapTimeoutBudgets:
             returncode=0, stdout="Solution found", stderr="",
         ))
         with patch("modules.astrometry.subprocess.run", run_mock):
-            outcome = _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=30.0)
+            outcome = await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=30.0)
 
         assert outcome == "solved"
         assert run_mock.call_args.kwargs["timeout"] == 999.0
 
-    def test_wide_retry_timeout_is_not_further_retried(self, monkeypatch):
+    async def test_wide_retry_timeout_is_not_further_retried(self, monkeypatch):
         """A timeout on the wide retry itself must not trigger yet another
         attempt — "error" (from either attempt) is always terminal."""
         monkeypatch.setattr(config, "ASTAP_RETRY_WIDE_SEARCH", True)
@@ -705,12 +899,12 @@ class TestAstapTimeoutBudgets:
 
         run_mock = MagicMock(side_effect=_side_effect)
         with patch("modules.astrometry.subprocess.run", run_mock):
-            result = _run_astap(_FITS_PATH, None)
+            result = await _run_astap(_FITS_PATH, None)
 
         assert result is False
         assert run_mock.call_count == 2  # narrow (no_solution), then wide (timeout) — no third attempt
 
-    def test_full_retry_flow_uses_distinct_timeouts_for_each_attempt(self, monkeypatch):
+    async def test_full_retry_flow_uses_distinct_timeouts_for_each_attempt(self, monkeypatch):
         """End-to-end through _run_astap(): narrow attempt reports no
         solution, is retried wide, and each subprocess.run call carries its
         own attempt's configured timeout, not the other one's."""
@@ -726,10 +920,49 @@ class TestAstapTimeoutBudgets:
 
         run_mock = MagicMock(side_effect=_side_effect)
         with patch("modules.astrometry.subprocess.run", run_mock):
-            result = _run_astap(_FITS_PATH, None)
+            result = await _run_astap(_FITS_PATH, None)
 
         assert result is True
         assert [c.kwargs["timeout"] for c in run_mock.call_args_list] == [42.0, 999.0]
+
+    async def test_the_subprocess_does_not_run_on_the_event_loop_thread(self):
+        """
+        Audit 2026-08-18, finding L6: astap is a seconds-to-minutes blocking
+        call inside an `async def`. Run inline it pins the event loop for
+        its whole duration — harmless while the worker drains one item at a
+        time, but it means a caller that gathers several solves gets them
+        strictly one after another while the code reads as if it doesn't.
+        """
+        loop_thread = threading.get_ident()
+        seen: list[int] = []
+
+        def _record(cmd, **kwargs):
+            seen.append(threading.get_ident())
+            return MagicMock(returncode=0, stdout="Solution found", stderr="")
+
+        with patch("modules.astrometry.subprocess.run", MagicMock(side_effect=_record)):
+            assert await _run_astap_attempt(
+                _FITS_PATH, None, wide_radius_deg=None,
+            ) == "solved"
+
+        assert seen and all(tid != loop_thread for tid in seen)
+
+    async def test_timeout_still_kills_the_child_via_subprocess_run(self, monkeypatch):
+        """
+        The budget stays on subprocess.run's own `timeout=` rather than an
+        asyncio.wait_for around the thread: only the former actually kills
+        and reaps the astap child. A TimeoutExpired raised inside the worker
+        thread must still surface as this attempt's "error".
+        """
+        monkeypatch.setattr(config, "ASTAP_TIMEOUT_SEC", 7.0)
+
+        def _timeout(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="astap", timeout=kwargs["timeout"])
+
+        with patch("modules.astrometry.subprocess.run", MagicMock(side_effect=_timeout)):
+            outcome = await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
+
+        assert outcome == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +1016,71 @@ class TestInvalidWcs:
 
 
 # ---------------------------------------------------------------------------
+# WCS plausibility — audit 2026-08-18, finding H15
+#
+# A solved WCS is authoritative by construction: every source position, every
+# catalog match and every anomaly's coordinates come from it, and no
+# downstream module has anything to check it against. Nothing checked it here
+# either, beyond astap reporting a solution and the axes being celestial, so a
+# false star-pattern match — most likely under ASTAP_RETRY_WIDE_SEARCH's blind
+# 30-degree retry — became a systematic position error for the whole frame
+# with no distinguishing log line.
+# ---------------------------------------------------------------------------
+
+class TestWcsPlausibility:
+
+    async def test_an_absurdly_fine_plate_scale_is_rejected(self):
+        """
+        The 2026-08-06 CD/PC double-scaling incident produced exactly this:
+        0.78"/px read back as 0.0002"/px. It was caught then by every FWHM
+        collapsing to zero; here it is caught outright.
+        """
+        absurd = _make_wcs(scale_deg=1e-9)
+        with _patch_astrometry(wcs=absurd):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result == {}
+
+    async def test_an_absurdly_coarse_plate_scale_is_rejected(self):
+        absurd = _make_wcs(scale_deg=1.0)  # 3600"/px
+        with _patch_astrometry(wcs=absurd):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result == {}
+
+    async def test_an_ordinary_plate_scale_is_accepted(self):
+        with _patch_astrometry(wcs=_make_wcs(scale_deg=0.000278)):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result != {}
+        assert result["ra_center"] == pytest.approx(202.47, abs=0.5)
+
+    def test_a_degenerate_transform_is_rejected(self):
+        """A collapsed axis maps the whole frame onto a line."""
+        wcs = _make_wcs()
+        wcs.wcs.cd = np.array([[1e-4, 1e-4], [1e-4, 1e-4]])
+        wcs.wcs.set()
+
+        assert astrometry._wcs._is_plausible_wcs(wcs, 1024, 1024, "frame.fits") is False
+
+    def test_off_sphere_reference_coordinates_are_rejected(self):
+        # astropy refuses to *build* such a WCS, so the value is written in
+        # after construction — which is exactly how a corrupt or
+        # hand-edited .wcs side file would reach this code.
+        wcs = _make_wcs()
+        wcs.wcs.crval = [202.47, 120.0]
+
+        assert astrometry._wcs._is_plausible_wcs(wcs, 1024, 1024, "frame.fits") is False
+
+    def test_the_window_is_configurable(self, monkeypatch):
+        """Widen the bounds for an unusual instrument rather than disabling."""
+        wcs = _make_wcs(scale_deg=1.0)  # 3600"/px
+        monkeypatch.setattr(config, "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC", 7200.0)
+
+        assert astrometry._wcs._is_plausible_wcs(wcs, 1024, 1024, "frame.fits") is True
+
+
+# ---------------------------------------------------------------------------
 # Test 6b — astap's fresh .wcs side file is preferred over a pre-existing,
 # already-celestial WCS in the FITS header itself.
 #
@@ -793,6 +1091,24 @@ class TestInvalidWcs:
 # celestial axes — so a header WCS that merely *looked* valid, but was off
 # by ~178", was silently trusted over astap's own freshly-solved output.
 # ---------------------------------------------------------------------------
+
+class TestSidecarPcCdeltCleanup:
+    """
+    astap writes BOTH CD* and PC*+CDELT* into its .wcs sidecar, and astropy
+    multiplies the two — so the PC/CDELT pair is stripped when CD is present.
+    That cleanup matched by PREFIX, and "PC" is also the first two letters of
+    PCOUNT, a structural HDU keyword with nothing to do with the WCS. Only
+    indexed cards belong to the transform.
+    """
+
+    def test_it_matches_indexed_pc_and_cdelt_cards(self):
+        for card in ("PC1_1", "PC2_1", "PC1_1A", "CDELT1", "CDELT2", "CDELT1A"):
+            assert _wcs_mod._PC_CDELT_CARD_RE.match(card), card
+
+    def test_it_leaves_pcount_and_other_cards_alone(self):
+        for card in ("PCOUNT", "GCOUNT", "CD1_1", "CDELTA", "PC", "CCDTEMP"):
+            assert not _wcs_mod._PC_CDELT_CARD_RE.match(card), card
+
 
 class TestPrefersFreshWcsSidecarOverStaleHeader:
     async def test_sidecar_wcs_wins_over_celestial_header_wcs(self):
@@ -865,6 +1181,113 @@ class TestWcsPropagated:
 # Test 8 — Zero minor-axis guard (degenerate sources)
 # ---------------------------------------------------------------------------
 
+class TestSourcesAllElongationBound:
+    """
+    Audit finding C2 — `sources_all` is the ONLY detection list
+    catalog_matcher and anomaly_detector ever receive (pipeline.py's step 6),
+    so its elongation ceiling decides what the SPACE_DEBRIS classification
+    can ever see. A hardcoded 5.0 sat below SPACE_DEBRIS_EDGE_ELONGATION_MIN
+    (6.0), the deliberately raised bar for a `near_edge` source, making that
+    branch structurally unreachable: a trailed source near the frame edge was
+    cut here and never reached the classifier as anything, not even UNKNOWN.
+
+    A trailed a=7/b=1 detection is used throughout: elongation 7.0 sits above
+    the edge threshold and below the new default ceiling of 15.0.
+    """
+
+    async def test_trailed_source_above_the_edge_threshold_survives(self):
+        trail = _make_sources(n=3, a=7.0, b=1.0)
+        with _patch_astrometry(sources=trail):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert len(result["sources_all"]) == 3
+        assert all(
+            src["elongation"] > config.SPACE_DEBRIS_EDGE_ELONGATION_MIN
+            for src in result["sources_all"]
+        )
+
+    async def test_trailed_source_is_still_kept_out_of_the_strict_list(self):
+        """`sources` stays a star list — the loosened ceiling applies only to
+        `sources_all`, and photometric calibration still runs off `sources`."""
+        trail = _make_sources(n=3, a=7.0, b=1.0)
+        with _patch_astrometry(sources=trail):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"] == []
+
+    async def test_degenerate_minor_axis_reads_as_a_one_pixel_wide_feature(self):
+        """
+        Audit 2026-08-18, finding L4: a minor axis below the pixel grid's own
+        resolution limit is clamped to that limit (1/sqrt(12) px), not to an
+        epsilon. The reported elongation is then "how elongated this feature
+        would be if it were exactly one pixel wide" — a shape that could
+        actually exist — instead of the 10^6 an epsilon produced, which was
+        not a measurement of anything and cleared every elongation threshold
+        in the pipeline on its way to being persisted as the source's shape.
+        """
+        degenerate = _make_sources(n=5, a=2.0, b=0.0)
+        with _patch_astrometry(sources=degenerate):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert len(result["sources_all"]) == 5
+        for src in result["sources_all"]:
+            assert src["elongation"] == pytest.approx(2.0 * math.sqrt(12.0), rel=1e-6)
+
+    async def test_a_realistic_degenerate_fit_is_still_cut_by_the_ceiling(self):
+        """
+        The clamp does not quietly open the gate the ceiling was closing by
+        accident. At SEP_MIN_AREA=15 a sub-pixel-wide detection has to be a
+        line of at least ~15 pixels, whose semi-major axis is ~15/sqrt(12);
+        clamped, that reads as an elongation of ~15 and the default ceiling
+        still cuts it. What changes is that the ceiling now cuts it for a
+        reason a reader can check, rather than because the divisor was
+        arbitrary.
+        """
+        line = _make_sources(n=5, a=15.0 / math.sqrt(12.0), b=0.0)
+        with _patch_astrometry(sources=line):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources_all"] == []
+
+    async def test_ceiling_is_config_driven(self, monkeypatch):
+        """The bound is no longer hardcoded — lowering it past the trail's
+        own elongation drops the same detection."""
+        monkeypatch.setattr(config, "SOURCES_ALL_ELONGATION_MAX", 3.0)
+        trail = _make_sources(n=3, a=7.0, b=1.0)
+        with _patch_astrometry(sources=trail):
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources_all"] == []
+
+    async def test_warns_when_configured_back_into_the_dead_state(self, monkeypatch, caplog):
+        """
+        Configuring the ceiling at or below SPACE_DEBRIS_EDGE_ELONGATION_MIN
+        reinstates exactly the defect this finding is about. It stays
+        possible — an operator may have a reason — but it must not be silent.
+        """
+        monkeypatch.setattr(config, "SOURCES_ALL_ELONGATION_MAX", 5.0)
+        monkeypatch.setattr(config, "SPACE_DEBRIS_EDGE_ELONGATION_MIN", 6.0)
+
+        with caplog.at_level("WARNING", logger="modules.astrometry._extraction"):
+            with _patch_astrometry(sources=_make_sources(n=3)):
+                await astrometry.solve(_FITS_PATH)
+
+        assert any(
+            "SPACE_DEBRIS branch unreachable" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    async def test_no_warning_with_the_default_configuration(self, caplog):
+        with caplog.at_level("WARNING", logger="modules.astrometry._extraction"):
+            with _patch_astrometry(sources=_make_sources(n=3)):
+                await astrometry.solve(_FITS_PATH)
+
+        assert not any(
+            "SOURCES_ALL_ELONGATION_MAX" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+
 class TestDegenerateSource:
     async def test_zero_b_axis_does_not_raise(self):
         """
@@ -877,7 +1300,9 @@ class TestDegenerateSource:
 
         # Should succeed without raising ZeroDivisionError
         assert isinstance(result, dict)
-        # All sources are filtered out because elongation = a/1e-6 >> 2.0
+        # Still filtered out of the strict star list: clamped at the pixel
+        # grid's resolution limit the ratio is a/(1/sqrt(12)) ~= 6.9, which
+        # is a physically possible shape but nothing like a star.
         assert len(result.get("sources", [])) == 0
 
 
@@ -891,14 +1316,31 @@ class TestDegenerateSource:
 # their pixels in data_sub before the real extraction runs.
 # ---------------------------------------------------------------------------
 
-def _make_coarse_object(a: float, xmin: int, xmax: int, ymin: int, ymax: int, b: float = 1.0) -> np.ndarray:
+def _make_coarse_object(
+    a: float, xmin: int, xmax: int, ymin: int, ymax: int, b: float = 1.0,
+    x: float | None = None, y: float | None = None,
+    flux: float = 50_000.0, peak: float = 900.0,
+) -> np.ndarray:
+    """
+    One row of the coarse pre-pass's sep.extract() output.
+
+    Carries x/y/flux/peak as well as the shape fields, because
+    _build_streak_mask() now also hands each masked streak back to
+    _extraction.py as a detection of its own (audit 2026-08-18, finding H16).
+    """
     obj = np.zeros(1, dtype=[
         ("a", np.float64), ("b", np.float64),
+        ("x", np.float64), ("y", np.float64),
+        ("flux", np.float64), ("peak", np.float64),
         ("xmin", np.int32), ("xmax", np.int32),
         ("ymin", np.int32), ("ymax", np.int32),
     ])
     obj["a"] = a
     obj["b"] = b
+    obj["x"] = x if x is not None else (xmin + xmax) / 2.0
+    obj["y"] = y if y is not None else (ymin + ymax) / 2.0
+    obj["flux"] = flux
+    obj["peak"] = peak
     obj["xmin"], obj["xmax"] = xmin, xmax
     obj["ymin"], obj["ymax"] = ymin, ymax
     return obj
@@ -936,6 +1378,136 @@ class TestStreakMasking:
         final_data, final_kwargs = calls[1]
         assert not final_kwargs.get("segmentation_map")
         assert np.all(final_data[10:200, streak_col] == 0.0)
+
+    async def test_a_masked_streak_is_re_emitted_as_a_detection(self):
+        """
+        Audit 2026-08-18, finding H16: the two thresholds behind the mask
+        cannot geometrically tell a satellite trail from a genuine fast NEO
+        trailing within one exposure, so a real moving object's pixels were
+        erased before sep.extract() ever ran — with no second chance, since
+        the frame is never re-analysed from other data. The mask stays (it
+        stops the trail fragmenting into false stars), but the streak comes
+        back as one detection at its own centroid.
+        """
+        streak_col = 10
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=95.0, xmin=streak_col, xmax=streak_col, ymin=10, ymax=200,
+                    x=float(streak_col), y=105.0, flux=123_456.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:200, streak_col] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                result = await astrometry.solve(_FITS_PATH)
+
+        streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(123_456.0)]
+        assert len(streaks) == 1
+        assert streaks[0]["elongation"] == pytest.approx(95.0)
+        # Marked so photometry never sizes a PSF aperture from its length.
+        assert streaks[0]["_streak"] is True
+        # Not a star: it must never reach the photometric reference set.
+        assert not any(s["flux"] == pytest.approx(123_456.0) for s in result["sources"])
+
+    async def test_extraction_uses_the_background_re_measured_without_the_streak(self):
+        """
+        Audit 2026-08-18, finding H12: once the trail is masked, the RMS the
+        real extraction thresholds on must be the one measured with the trail
+        EXCLUDED, not the first pass's trail-inflated figure.
+        """
+        streak_col = 10
+        seen_err: list[float] = []
+        unmasked = _FakeBackground(globalrms=20.0)
+        masked = _FakeBackground(globalrms=7.0)
+
+        def _sep_background(data, mask=None):
+            return unmasked if mask is None else masked
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=95.0, xmin=streak_col, xmax=streak_col, ymin=10, ymax=200,
+                    x=float(streak_col), y=105.0, flux=123_456.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:200, streak_col] = 1
+                return coarse, seg
+            seen_err.append(kwargs.get("err"))
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with (
+                patch("modules.astrometry.sep.extract", side_effect=_sep_extract),
+                patch("modules.astrometry.sep.Background", side_effect=_sep_background),
+            ):
+                await astrometry.solve(_FITS_PATH)
+
+        assert seen_err == [pytest.approx(7.0)]
+
+    async def test_a_streak_bypasses_the_sources_all_elongation_ceiling(self):
+        """
+        SOURCES_ALL_ELONGATION_MAX exists to reject the degenerate a/b of a
+        near-zero minor axis, not a feature deliberately selected for being
+        elongated — a full-frame trail's ratio is far past it.
+        """
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=300.0, b=1.0, xmin=10, xmax=10, ymin=10, ymax=600,
+                    x=10.0, y=305.0, flux=999.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:600, 10] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                result = await astrometry.solve(_FITS_PATH)
+
+        streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(999.0)]
+        assert len(streaks) == 1
+        assert streaks[0]["elongation"] > config.SOURCES_ALL_ELONGATION_MAX
+
+    async def test_a_degenerate_streaks_elongation_stays_physical(self):
+        """
+        Audit 2026-08-18, finding L4: a re-emitted streak is the one source
+        that bypasses SOURCES_ALL_ELONGATION_MAX entirely, so whatever
+        elongation the coarse pass computed for it travels untouched into
+        anomaly_detector.py and onto the wire. A coarse fit with b=0 used to
+        make that 10^6; clamped at the pixel grid's resolution limit it is
+        a/(1/sqrt(12)) — large, because a trail genuinely is, but a shape
+        that could exist.
+        """
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=300.0, b=0.0, xmin=10, xmax=10, ymin=10, ymax=600,
+                    x=10.0, y=305.0, flux=999.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:600, 10] = 1
+                return coarse, seg
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with patch("modules.astrometry.sep.extract", side_effect=_sep_extract):
+                result = await astrometry.solve(_FITS_PATH)
+
+        streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(999.0)]
+        assert len(streaks) == 1
+        assert streaks[0]["elongation"] == pytest.approx(
+            300.0 * math.sqrt(12.0), rel=1e-6
+        )
 
     async def test_short_elongated_feature_is_not_masked(self):
         """A coarse candidate elongated enough but far shorter than

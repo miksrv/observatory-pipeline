@@ -8,6 +8,7 @@ Internal helper only — not part of this package's public surface.
 from __future__ import annotations
 
 import logging
+import math
 
 import astropy.io.fits as fits
 import numpy as np
@@ -19,6 +20,29 @@ import config
 from ._streak import _build_streak_mask
 
 logger = logging.getLogger(__name__)
+
+# The narrowest second-moment semi-minor axis a pixel grid can express:
+# 1/sqrt(12) px, the standard deviation of a uniform distribution across one
+# pixel. `sep` can report a smaller — even exactly zero — `b` for a
+# degenerate fit (a detection lying along a single pixel row, a cosmic-ray
+# track, a bad column), and `a / b` then depends entirely on whatever
+# epsilon is substituted to avoid dividing by zero. The old sentinels (1e-6
+# here, 0.001 in _detect_diff_sources) turned such a fit into an elongation
+# of 10^3-10^6, a number that is not a measurement of anything but clears
+# every elongation threshold in the pipeline on the way to being persisted
+# as the source's shape (audit 2026-08-18, finding L4).
+#
+# Clamping at the pixel limit instead caps the ratio at `a / 0.2887` — how
+# elongated the feature would be if it were exactly one pixel wide, which is
+# the most elongated it can honestly be claimed to be. A feature now has to
+# be genuinely long in `a` to read as a trail, which is what the thresholds
+# were written to mean.
+#
+# Hand-duplicated across modules/qc.py, modules/subtraction.py,
+# modules/astrometry/_streak.py and modules/astrometry/_extraction.py, the
+# same convention those four already follow for the streak-mask helper
+# itself. Keep them in sync.
+_MIN_SEMI_MINOR_PX: float = 1.0 / math.sqrt(12.0)   # ~= 0.2887
 
 
 def _extract_sources(
@@ -58,10 +82,33 @@ def _extract_sources(
     # arms, run BEFORE the real point-source extraction below so they
     # can never fragment into false stars. See config.STREAK_* and
     # _build_streak_mask()'s docstring.
-    streak_mask = _build_streak_mask(data_sub, bkg.globalrms, pixel_scale_arcsec)
+    streak_result = _build_streak_mask(data_sub, bkg.globalrms, pixel_scale_arcsec)
+    streak_mask = streak_result[0] if streak_result is not None else None
+    streak_features = streak_result[1] if streak_result is not None else []
     if streak_mask is not None:
         data_sub = np.array(data_sub, copy=True)
         data_sub[streak_mask] = 0.0
+
+        # Re-measure the background with the trail excluded. The mask can
+        # only be found on an already-background-subtracted image, so the
+        # first pass necessarily measured the RMS with the trail still in
+        # frame — and that RMS is both the detection threshold's scale and
+        # the denominator of every source's SNR, so one satellite track
+        # quietly desensitised the whole frame (audit 2026-08-18, finding
+        # H12, which named the identical ordering in modules/subtraction.py;
+        # the two keep hand-duplicated copies of this pre-pass).
+        if streak_mask.any():
+            bkg_masked = sep.Background(data, mask=streak_mask)
+            if float(bkg_masked.globalrms) > 0:
+                logger.debug(
+                    "SEP extraction: re-measured background with %d streak "
+                    "pixel(s) excluded — RMS %.3f -> %.3f  file=%s",
+                    int(streak_mask.sum()), bkg.globalrms,
+                    bkg_masked.globalrms, fits_filename,
+                )
+                bkg = bkg_masked
+                data_sub = data - bkg
+                data_sub[streak_mask] = 0.0
 
     # Extract sources using configurable thresholds
     # Higher thresh = fewer detections (more conservative)
@@ -101,8 +148,11 @@ def _extract_sources(
         )
         fwhm_arcsec: np.ndarray = fwhm_px * pixel_scale_arcsec
 
-        # Guard against zero minor axis (degenerate sources)
-        safe_b: np.ndarray = np.where(objects["b"] > 0, objects["b"], 1e-6)
+        # Clamp the minor axis at the pixel grid's own resolution limit,
+        # not at an epsilon — see _MIN_SEMI_MINOR_PX above.
+        safe_b: np.ndarray = np.where(
+            objects["b"] > _MIN_SEMI_MINOR_PX, objects["b"], _MIN_SEMI_MINOR_PX
+        )
         elongations: np.ndarray = objects["a"] / safe_b
 
         # SNR calculation using peak value over background RMS
@@ -266,15 +316,45 @@ def _extract_sources(
         #     PSF estimate is available, multi-pixel hot/warm pixel clusters
         #     too, even when their measured FWHM clears the static
         #     STAR_FWHM_MIN_ARCSEC default)
-        #   - elongation < 5.0  (rejects strongly trailed cosmic rays)
+        #   - elongation < SOURCES_ALL_ELONGATION_MAX (rejects the
+        #     degenerate a/b ratios a near-zero minor axis produces, and
+        #     hairline cosmic-ray tracks, while still admitting the trailed
+        #     detections anomaly_detector needs — see below)
         #   - positive flux
         #
         # Used by: catalog_matcher (more sources → better WCS correction),
         #          anomaly_detector (detects moving/transient objects),
         #          API post_sources (complete detection record).
         # Photometry calibration still uses `sources` (strict stars only).
+        #
+        # This bound used to be a hardcoded 5.0, which sat BELOW
+        # SPACE_DEBRIS_EDGE_ELONGATION_MIN (6.0) — the deliberately raised
+        # bar modules/anomaly_detector/ applies to a `near_edge` source,
+        # where coma alone can already stretch an ordinary star past the
+        # ordinary 3.0 threshold. A trailed source near the frame edge was
+        # therefore cut here, at extraction time, and never reached the
+        # classifier in any form: not as SPACE_DEBRIS, not even as UNKNOWN.
+        # The edge branch was structurally unreachable (audit 2026-08-18,
+        # finding C2). Since `sources_all` is the ONLY detection list
+        # catalog_matcher and anomaly_detector ever see (pipeline.py's
+        # step 6), there was no second chance anywhere downstream.
         # ----------------------------------------------------------
-        mask_all = mask_fwhm_min & (elongations < 5.0) & mask_flux
+        if config.SOURCES_ALL_ELONGATION_MAX <= config.SPACE_DEBRIS_EDGE_ELONGATION_MIN:
+            logger.warning(
+                "SOURCES_ALL_ELONGATION_MAX=%.1f is not above "
+                "SPACE_DEBRIS_EDGE_ELONGATION_MIN=%.1f — a trailed near-edge "
+                "source is cut here before anomaly_detector can classify it, "
+                "making the edge SPACE_DEBRIS branch unreachable  file=%s",
+                config.SOURCES_ALL_ELONGATION_MAX,
+                config.SPACE_DEBRIS_EDGE_ELONGATION_MIN,
+                fits_filename,
+            )
+
+        mask_all = (
+            mask_fwhm_min
+            & (elongations < config.SOURCES_ALL_ELONGATION_MAX)
+            & mask_flux
+        )
         n_all = int(np.sum(mask_all))
 
         sources_all = [
@@ -300,4 +380,89 @@ def _extract_sources(
         sources_all = []
         logger.info("Astrometry complete: 0 sources extracted  file=%s", fits_filename)
 
+    # ----------------------------------------------------------
+    # Put the masked streaks back, as detections of their own.
+    #
+    # The mask above exists to stop a trail from fragmenting into several
+    # small round "stars" — a real problem, and it stays solved. But the two
+    # thresholds behind it (elongation and a 30" length) cannot geometrically
+    # tell a satellite or aircraft trail from a genuine fast NEO trailing
+    # within a single exposure; both look exactly like that. So the pixels of
+    # a real moving object were erased before sep.extract() ever ran, and
+    # there is no second chance — the frame is not re-analysed from other
+    # data (audit 2026-08-18, finding H16).
+    #
+    # One detection per streak, at the streak's own centroid, restores the
+    # evidence without restoring the fragmentation: enough for the MPC cone
+    # search to identify a known object there, and for the SPACE_DEBRIS
+    # branch to classify an unknown one. They join sources_all only — a trail
+    # is not a star and must never reach the photometric reference set — and
+    # bypass its elongation ceiling, which exists to reject the degenerate
+    # a/b of a near-zero minor axis, not a feature deliberately selected for
+    # being elongated.
+    if streak_features:
+        sources_all.extend(
+            _streak_sources(streak_features, wcs, pixel_scale_arcsec, naxis1, naxis2, bkg)
+        )
+        logger.info(
+            "Streak masking: re-emitted %d masked streak(s) as detection(s) "
+            "so a genuine fast mover isn't erased  file=%s",
+            len(streak_features), fits_filename,
+        )
+
     return sources, sources_all
+
+
+def _streak_sources(
+    features: list[dict],
+    wcs,
+    pixel_scale_arcsec: float,
+    naxis1: int,
+    naxis2: int,
+    bkg,
+) -> list[dict[str, float]]:
+    """
+    Turn the coarse pre-pass's masked streaks into ordinary source dicts, one
+    per streak, positioned at its own centroid.
+
+    Shaped exactly like any other entry in `sources_all` so it flows through
+    catalog matching, photometry and classification unchanged. `fwhm` uses the
+    same Gaussian approximation over sep's second-moment axes as every other
+    detection here, which for a streak is dominated by its length — that is
+    the honest description of the feature, and nothing downstream treats
+    `fwhm` as a stellar PSF for a source this elongated.
+    """
+    out: list[dict[str, float]] = []
+    margin_x = config.EDGE_MARGIN_FRAC * naxis1
+    margin_y = config.EDGE_MARGIN_FRAC * naxis2
+
+    for feature in features:
+        try:
+            coord = wcs.all_pix2world([[feature["x"], feature["y"]]], 0)[0]
+            ra, dec = float(coord[0]), float(coord[1])
+            if not (math.isfinite(ra) and math.isfinite(dec)):
+                continue
+        except Exception:
+            continue
+
+        fwhm_px = 2.0 * math.sqrt(
+            2.0 * math.log(2.0) * (feature["a"] ** 2 + feature["b"] ** 2) / 2.0
+        )
+        out.append({
+            "ra":         ra,
+            "dec":        dec,
+            "flux":       feature["flux"],
+            "fwhm":       fwhm_px * pixel_scale_arcsec,
+            "elongation": feature["elongation"],
+            "saturated":  bool(feature["peak"] + bkg.globalback >= config.SATURATION_ADU),
+            "near_edge":  bool(
+                feature["x"] < margin_x or feature["x"] > naxis1 - margin_x
+                or feature["y"] < margin_y or feature["y"] > naxis2 - margin_y
+            ),
+            # Internal marker (stripped before the wire): this is a trail,
+            # whose `fwhm` is really its length. modules/photometry.py must
+            # not size a PSF aperture from it — see that module's skip.
+            "_streak":    True,
+        })
+
+    return out

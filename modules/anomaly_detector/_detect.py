@@ -61,6 +61,10 @@ async def detect(
         magnitude, delta_mag, mpc_designation, ephemeris, notes.
     """
     obs_time     = str(frame_meta.get("obs_time", ""))
+    # Ephemerides are computed at the exposure MIDPOINT (see
+    # fits_header.midpoint_time()); the history/coverage queries below keep
+    # the start time, which is what the frame is registered under.
+    obs_time_mid = str(frame_meta.get("obs_time_mid") or obs_time)
     log_filename = str(frame_meta.get("filename", "<unknown>"))
     extra        = {"frame_id": frame_id, "log_filename": log_filename}
 
@@ -100,6 +104,18 @@ async def detect(
         except (TypeError, ValueError):
             continue
 
+    # Catalogued sources with a measured magnitude, for telling a subtraction
+    # candidate that is merely a star's own residual from a transient — see
+    # _classify._is_residual_of_catalogued_star().
+    catalogued_frame_sources: list[tuple[float, float, float]] = []
+    for s in sources:
+        if s.get("catalog_name") is None:
+            continue
+        try:
+            catalogued_frame_sources.append((float(s["ra"]), float(s["dec"]), float(s["mag"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+
     anomalies: list[dict] = []
 
     for source in sources:
@@ -111,6 +127,8 @@ async def detect(
                 history_by_tile=history_by_tile,
                 coverage_by_tile=coverage_by_tile,
                 current_frame_positions=current_frame_positions,
+                obs_time=obs_time,
+                catalogued_frame_sources=catalogued_frame_sources,
             )
             if result is not None:
                 anomalies.append(result)
@@ -122,7 +140,7 @@ async def detect(
             )
 
     # Resolve ephemerides concurrently for all MPC-matched objects
-    await _resolve_ephemerides(anomalies, obs_time, frame_id, log_filename)
+    await _resolve_ephemerides(anomalies, obs_time_mid, frame_id, log_filename)
 
     n_alert = sum(1 for a in anomalies if a["anomaly_type"] in _ALERT_TYPES)
 

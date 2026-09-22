@@ -68,7 +68,9 @@ from __future__ import annotations
 
 import glob
 import logging
+import math
 import os
+import re
 import shutil
 
 import config
@@ -168,7 +170,83 @@ def _cleanup_empty_incoming_parents(moved_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def analyze_frame(fits_path: str) -> dict | None:
+async def _queue_recovery_task(
+    task_type: str,
+    item: dict,
+    attempt: int,
+    reason: str,
+    extra: dict,
+) -> None:
+    """
+    Put a frame's unfinished work back on the task queue after its science
+    payload could not be posted.
+
+    The frame record itself survives an API outage — `POST /frames` has
+    already succeeded and the file is archived — but once the 3-attempt retry
+    on `POST /sources` or `POST /anomalies` is exhausted, that run's entire
+    source or anomaly list is gone, with no re-post, no "needs re-analysis"
+    flag, and nothing afterwards to show anything is missing. That sits badly
+    with the stated rule "do not lose the frame": the frame is not what was
+    lost (audit 2026-08-18, finding H19).
+
+    Both endpoints this recovers are idempotent by design — `POST /frames`
+    upserts on `filename` and returns the same id, `POST /sources` reconciles
+    on `(frame_id, source_id)` (docs/API.md §1, §2) — so re-running the work
+    produces no duplicates.
+
+    `attempt` is carried in the queued item's own `payload` and bounded by
+    `API_RECOVERY_MAX_ATTEMPTS`, because not every failure is transient: the
+    retry decorator deliberately does not retry a 4xx, and a frame that fails
+    that way would otherwise re-queue itself forever.
+
+    Best-effort in the most literal sense — if the API is down hard enough to
+    lose the payload it is probably down hard enough to refuse the task too.
+    That case logs the exact item at ERROR so an operator can submit it by
+    hand, which is the same recovery that existed before, only now with the
+    frame named.
+    """
+    if api_client is None or config.API_RECOVERY_MAX_ATTEMPTS <= 0:
+        return
+
+    if attempt >= config.API_RECOVERY_MAX_ATTEMPTS:
+        logger.error(
+            "%s — giving up after %d recovery attempt(s); this frame's payload "
+            "is not in the API. Re-queue by hand: POST /tasks {\"type\": \"%s\", "
+            "\"items\": [%s]}",
+            reason, attempt, task_type, item,
+            extra=extra,
+        )
+        return
+
+    queued_item = dict(item)
+    payload = dict(queued_item.get("payload") or {})
+    payload["recovery_attempt"] = attempt + 1
+    queued_item["payload"] = payload
+
+    try:
+        task = await api_client.create_task(task_type, items=[queued_item])
+    except Exception as exc:
+        task = None
+        logger.debug("Recovery task creation raised: %s", exc, extra=extra)
+
+    if task is None:
+        logger.error(
+            "%s — and the recovery %s task could not be created either. "
+            "Re-queue by hand: POST /tasks {\"type\": \"%s\", \"items\": [%s]}",
+            reason, task_type, task_type, queued_item,
+            extra=extra,
+        )
+        return
+
+    logger.warning(
+        "%s — queued a %s task (id=%s, attempt %d/%d) to redo it",
+        reason, task_type, task.get("id"), attempt + 1,
+        config.API_RECOVERY_MAX_ATTEMPTS,
+        extra=extra,
+    )
+
+
+async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | None:
     """
     Process a single FITS file through header extraction, QC, astrometry,
     subtraction, catalog matching, photometry, forced photometry, and
@@ -196,6 +274,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
         directory component) is treated as a reference to an
         already-archived frame and resolved against FITS_ARCHIVE first —
         see `_resolve_bare_filename()` below.
+    recovery_attempt:
+        How many times this frame has already been re-queued after a failed
+        `POST /sources` — carried in the task item's own payload and read back
+        by `worker.py`. Bounds the re-queue loop; see
+        `_queue_recovery_task()`.
 
     Returns
     -------
@@ -336,11 +419,19 @@ async def analyze_frame(fits_path: str) -> dict | None:
     # if it were arcsec would silently corrupt those filters (e.g. all-sky
     # cameras/lenses with no XPIXSZ/FOCALLEN headers), so only pass it on
     # when the unit actually matches.
+    #
+    # This is the provisional anchor, good enough for the solve itself to
+    # start from; it is replaced below by one converted with the scale the
+    # solve actually finds (audit 2026-08-18, finding M16).
     psf_fwhm_arcsec: float | None = (
         qc_result.get("fwhm_median")
         if qc_result.get("fwhm_unit") == "arcsec"
         else None
     )
+    # The same measurement before any plate scale was applied to it, so
+    # every consumer below can convert it with the solved scale instead of
+    # the header's claim about the optical setup.
+    psf_fwhm_px: float | None = qc_result.get("fwhm_median_px")
 
     # ------------------------------------------------------------------
     # Step 3 — Astrometry (optional)
@@ -362,6 +453,7 @@ async def analyze_frame(fits_path: str) -> dict | None:
             astro_result = await astrometry.solve(
                 fits_path,
                 psf_fwhm_arcsec=psf_fwhm_arcsec,
+                psf_fwhm_px=psf_fwhm_px,
             )
             logger.info(
                 "Astrometry: ra=%.4f dec=%.4f sources=%d",
@@ -379,6 +471,44 @@ async def analyze_frame(fits_path: str) -> dict | None:
             astro_result = {}
     else:
         logger.debug("Astrometry module not available — skipping", extra=extra)
+
+    # ------------------------------------------------------------------
+    # Re-anchor the PSF estimate onto the solved plate scale.
+    #
+    # QC measured the frame's median PSF in pixels and converted it with
+    # whatever plate scale the headers implied. Every consumer from here on
+    # — subtraction's minimum-FWHM floor, forced photometry's aperture
+    # sizing and blend radius, the QCFWHM this frame is archived with —
+    # converts that arcsec figure straight back into pixels using the
+    # *solved* scale, so a header describing a different optical setup than
+    # the telescope actually had (an unaccounted reducer/Barlow, a swapped
+    # camera, a wrong FOCALLEN) skewed every one of them by the ratio
+    # between the two scales (audit 2026-08-18, finding M16).
+    #
+    # astrometry.solve() has already done this for its own extraction step;
+    # this repeats it for everything downstream of it. A frame whose headers
+    # carried no plate scale at all gets an anchor here for the first time.
+    #
+    # qc_result's own fwhm_median/fwhm_unit are deliberately left alone: they
+    # are the numbers this frame's BLUR verdict was decided on, and that
+    # verdict is not revisited here.
+    # ------------------------------------------------------------------
+    solved_pixel_scale = astro_result.get("pixel_scale_arcsec")
+    if psf_fwhm_px and solved_pixel_scale and solved_pixel_scale > 0:
+        rescaled = psf_fwhm_px * solved_pixel_scale
+        if psf_fwhm_arcsec is None:
+            logger.info(
+                "PSF anchor available for the first time from the solved scale "
+                "(%.4f\"/px): FWHM %.3f\" — the headers carried no plate scale",
+                solved_pixel_scale, rescaled, extra=extra,
+            )
+        elif abs(rescaled - psf_fwhm_arcsec) > 0.05 * psf_fwhm_arcsec:
+            logger.warning(
+                "PSF anchor re-scaled from the header's %.3f\" to the solved %.3f\" "
+                "(%.4f\"/px) for subtraction/forced photometry/QCFWHM",
+                psf_fwhm_arcsec, rescaled, solved_pixel_scale, extra=extra,
+            )
+        psf_fwhm_arcsec = rescaled
 
     # ------------------------------------------------------------------
     # Sources for subtraction / catalog matching / photometry.
@@ -468,6 +598,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 "naxis1": astro_result.get("naxis1"),
                 "naxis2": astro_result.get("naxis2"),
                 "obs_time": header.get("obs_time"),
+                # Exposure MIDPOINT — the epoch SkyBot's cone search is run
+                # at, since DATE-OBS is shutter-open and a moving object has
+                # already travelled by mid-exposure (see
+                # fits_header.midpoint_time()).
+                "obs_time_mid": header.get("obs_time_mid"),
             }
             sources = await catalog_matcher.match(sources, frame_meta)
             matched_count = sum(1 for s in sources if s.get("catalog_name") is not None)
@@ -521,6 +656,10 @@ async def analyze_frame(fits_path: str) -> dict | None:
     # ------------------------------------------------------------------
     # Step 4.6 — Positional dedup: suppress unmatched sources sitting on
     # top of a matched source (deblending artifacts, not real objects).
+    # Subtraction candidates are exempt — they carry independent,
+    # catalog-free pixel-level evidence, and dropping them here lost real
+    # transients flaring in projection near a catalogued star (audit
+    # 2026-08-18, finding C6). See the function's own docstring.
     # ------------------------------------------------------------------
     sources = _dedupe_unmatched_near_matched(sources, extra)
 
@@ -545,7 +684,16 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 normalizer is not None
                 and normalizer.is_narrowband(header.get("observation", {}).get("filter"))
             )
-            sources = await photometry.measure(fits_path, sources, skip_calibration=skip_calibration)
+            # The solved WCS, not the file's own header: that is only
+            # corrected at archive time (step 12.5) and may still hold the
+            # mount-pointing estimate — see photometry.measure()'s `wcs`.
+            sources = await photometry.measure(
+                fits_path,
+                sources,
+                skip_calibration=skip_calibration,
+                wcs=(astro_result or {}).get("wcs"),
+                filter_name=header.get("observation", {}).get("filter"),
+            )
             calibrated_count = sum(1 for s in sources if s.get("calibrated"))
             logger.info(
                 "Photometry complete: %d sources measured, %d calibrated",
@@ -631,6 +779,14 @@ async def analyze_frame(fits_path: str) -> dict | None:
         try:
             zero_point = next((s.get("zero_point") for s in sources if s.get("zero_point") is not None), None)
             zero_point_err = next((s.get("zero_point_err") for s in sources if s.get("zero_point_err") is not None), None)
+            # The colour part of the same solution, read off the same way —
+            # so a forced measurement is transformed to Gaia's G system on
+            # exactly the terms an ordinary measured source was (audit
+            # 2026-08-18, finding H5). All three stay at their "no colour term
+            # fitted" defaults when photometry never fitted one.
+            color_term = next((s.get("_color_term") for s in sources if s.get("_color_term")), 0.0) or 0.0
+            color_ref = next((s.get("_color_ref") for s in sources if s.get("_color_ref") is not None), None)
+            color_scatter = next((s.get("_color_scatter") for s in sources if s.get("_color_scatter")), 0.0) or 0.0
             gaia_stars = catalog_matcher.get_gaia_stars(
                 astro_result.get("ra_center") or header.get("ra") or 0.0,
                 astro_result.get("dec_center") or header.get("dec") or 0.0,
@@ -639,7 +795,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
             mpc_objects = catalog_matcher.get_mpc_objects(
                 astro_result.get("ra_center") or header.get("ra") or 0.0,
                 astro_result.get("dec_center") or header.get("dec") or 0.0,
-                header.get("obs_time") or "",
+                # Must be the exact epoch step 8's match() queried with — it
+                # is part of the SkyBot cache key, so anything else turns this
+                # accessor's intended cache hit into a second network round
+                # trip against a different epoch.
+                header.get("obs_time_mid") or header.get("obs_time") or "",
                 astro_result.get("fov_deg") or 1.0,
             )
             forced_sources = await forced_photometry.run(
@@ -652,8 +812,11 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 naxis2=astro_result.get("naxis2"),
                 zero_point=zero_point,
                 zero_point_err=zero_point_err,
-                obs_time=header.get("obs_time"),
+                obs_time=header.get("obs_time_mid") or header.get("obs_time"),
                 psf_fwhm_arcsec=psf_fwhm_arcsec,
+                color_term=color_term,
+                color_ref=color_ref,
+                color_scatter=color_scatter,
             )
             if forced_sources:
                 _tag_mag_and_filter(forced_sources)
@@ -718,8 +881,15 @@ async def analyze_frame(fits_path: str) -> dict | None:
     # `anomalies[].source_id` — otherwise the API has no way to know which
     # catalog source an anomaly refers to.
     # ------------------------------------------------------------------
+    # Whether this run's source list actually reached the API. A None return
+    # means the 3-attempt retry was exhausted (or the API refused the batch),
+    # and unlike the frame record — already registered, and the file already
+    # archived — that payload is simply gone unless the work is re-queued.
+    sources_posted = True
     try:
         source_ids = await api_client.post_sources(frame_id, basename, sources)
+        if source_ids is None:
+            sources_posted = False
         logger.debug(
             "Sources posted: frame_id=%s count=%d",
             frame_id,
@@ -738,6 +908,7 @@ async def analyze_frame(fits_path: str) -> dict | None:
                 extra=extra,
             )
     except Exception as exc:
+        sources_posted = False
         logger.error(
             "Failed to post sources: frame_id=%s error=%s — continuing",
             frame_id,
@@ -762,6 +933,15 @@ async def analyze_frame(fits_path: str) -> dict | None:
         if solved_wcs is not None:
             _write_solved_wcs(fits_path, solved_wcs)
 
+        # Stamp this frame's own QC verdict into the header too, so that a
+        # LATER frame's subtraction can tell what it is about to stack
+        # without an API round-trip — see _write_qc_headers()'s docstring.
+        # The FWHM stamped is the solved-scale anchor, not qc_result's own
+        # header-scale figure: subtraction screens a reference's QCFWHM
+        # against the new frame's psf_fwhm_arcsec, which is this same
+        # quantity, so the two have to be measured the same way.
+        _write_qc_headers(fits_path, qc_result, fwhm_arcsec=psf_fwhm_arcsec)
+
         # Use object name for directory structure (normalized if normalization enabled)
         dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
         os.makedirs(dest_dir, exist_ok=True)
@@ -784,8 +964,25 @@ async def analyze_frame(fits_path: str) -> dict | None:
         # processing incoming/m31/frame.fits the now-empty m31/ is removed).
         _cleanup_empty_incoming_parents(fits_path)
 
+        archive_path = dest_path
     except Exception as exc:
+        archive_path = None
         logger.error("Failed to archive file: %s", exc, extra=extra)
+
+    # Re-queue this frame when its source list never reached the API. Queued
+    # only after the archive move, and against the ARCHIVE path, because that
+    # is where the file will be by the time the worker picks the task up. If
+    # the move itself failed, the file is still where it arrived — queue
+    # against that path rather than dropping the recovery altogether.
+    recovery_path = archive_path or (fits_path if os.path.exists(fits_path) else None)
+    if not sources_posted and recovery_path:
+        await _queue_recovery_task(
+            "ANALYZE",
+            {"filename": recovery_path},
+            recovery_attempt,
+            f"frame_id={frame_id}: {len(sources)} source(s) could not be posted",
+            extra,
+        )
 
     return {
         "frame_id": frame_id,
@@ -794,9 +991,30 @@ async def analyze_frame(fits_path: str) -> dict | None:
         "sources": sources,
         "object_name": object_name,
         "obs_time": header.get("obs_time"),
+        "obs_time_mid": header.get("obs_time_mid"),
         "subtraction_performed": subtraction_info.get("performed", False),
         "quality_flag": quality_flag,
     }
+
+
+def _frame_exptime(frame: dict) -> float | None:
+    """
+    Read a frame record's exposure time from GET /frames/{id}, tolerating
+    both the flattened and the nested ("observation") shapes.
+    """
+    candidates = [frame.get("exptime")]
+    observation = frame.get("observation")
+    if isinstance(observation, dict):
+        candidates.append(observation.get("exptime"))
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +1028,7 @@ async def detect_anomalies_for_frame_data(
     frame_meta: dict,
     *,
     post_filename: str,
+    recovery_attempt: int = 0,
 ) -> list[dict]:
     """
     Classify anomalies for an already-in-memory `sources` list and post the
@@ -841,17 +1060,29 @@ async def detect_anomalies_for_frame_data(
     -------
     list[dict]
         The anomaly dicts (whatever anomaly_detector.detect() returned, or
-        [] if the module is unavailable or classification failed). Posted
-        to the API regardless (an empty list is a valid, meaningful
-        payload — see docs/API.md's replace semantics for
-        POST /frames/{id}/anomalies).
+        [] if the module is unavailable or classification failed). Posted to
+        the API only when classification actually ran to completion: an empty
+        list IS a valid, meaningful payload when detection genuinely found
+        nothing, but POST /frames/{id}/anomalies REPLACES the frame's whole
+        anomaly set (docs/API.md), so posting one because detection FAILED
+        would erase anomalies a previous successful run had already stored
+        (audit 2026-08-18, finding C8).
     """
     extra = {"fits_filename": frame_meta.get("filename", post_filename)}
 
     anomalies: list = []
+    # Whether classification actually ran to completion. POST
+    # /frames/{id}/anomalies REPLACES the frame's whole anomaly set, so an
+    # empty list is only a meaningful payload when detection genuinely found
+    # nothing. Posting [] because detection FAILED would erase every anomaly
+    # already stored for this frame — including ones a previous, successful
+    # run found — turning one transient failure (a Horizons outage, a network
+    # blip mid-batch) into permanent data loss (audit 2026-08-18, finding C8).
+    detection_ok = False
     if anomaly_detector is not None:
         try:
             anomalies = await anomaly_detector.detect(frame_id, sources, sources, frame_meta)
+            detection_ok = True
             logger.debug(
                 "Anomaly detection complete: %d anomalies",
                 len(anomalies),
@@ -859,16 +1090,18 @@ async def detect_anomalies_for_frame_data(
             )
         except Exception as exc:
             logger.error(
-                "Anomaly detection failed: %s — continuing",
+                "Anomaly detection failed: %s — leaving this frame's stored "
+                "anomalies untouched rather than replacing them with an empty set",
                 exc,
                 extra=extra,
             )
     else:
         logger.debug("Anomaly detector not available — skipping", extra=extra)
 
-    if api_client is not None:
+    if api_client is not None and detection_ok:
+        posted = False
         try:
-            await api_client.post_anomalies(frame_id, post_filename, anomalies)
+            posted = bool(await api_client.post_anomalies(frame_id, post_filename, anomalies))
             logger.debug(
                 "Anomalies posted: frame_id=%s count=%d",
                 frame_id,
@@ -881,6 +1114,20 @@ async def detect_anomalies_for_frame_data(
                 frame_id,
                 exc,
                 extra=extra,
+            )
+
+        # Same reasoning as the source list above (audit 2026-08-18, finding
+        # H19): detection ran to completion, so these anomalies are real
+        # results, and losing them to an exhausted retry leaves the frame
+        # silently missing them. DETECT_ANOMALIES reruns from stored data
+        # alone — no local FITS access — so it is cheap to redo.
+        if not posted:
+            await _queue_recovery_task(
+                "DETECT_ANOMALIES",
+                {"frame_id": frame_id},
+                recovery_attempt,
+                f"frame_id={frame_id}: {len(anomalies)} anomaly/anomalies could not be posted",
+                extra,
             )
 
     return anomalies
@@ -911,6 +1158,16 @@ def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict
         "catalog_id": api_source.get("catalog_id"),
         "object_type": api_source.get("object_type"),
         "elongation": api_source.get("elongation") or 0.0,
+        # Photometric quality, carried so that a standalone DETECT_ANOMALIES
+        # re-run judges a source on the same terms an in-process run does:
+        # mag_err feeds the Δmag significance test (audit 2026-08-18, finding
+        # M3) and snr the edge-zone test for a subtraction candidate (H11).
+        # Both are persisted on source_observations — they carry no leading
+        # underscore, so api_client._to_wire_source() sends them — and both
+        # stay None when an older row predates them, which each consumer
+        # already treats as "no evidence".
+        "mag_err": api_source.get("mag_err"),
+        "snr": api_source.get("snr"),
         "saturated": bool(api_source.get("saturated")),
         # No leading underscore on the wire, same as "saturated" — see
         # astrometry/_extraction.py's near_edge comment for why it must survive here.
@@ -921,7 +1178,7 @@ def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict
     }
 
 
-async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
+async def detect_anomalies_for_frame_id(frame_id: str, recovery_attempt: int = 0) -> list[dict]:
     """
     Standalone DETECT_ANOMALIES worker entry point.
 
@@ -972,6 +1229,14 @@ async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
     frame_meta = {
         "filename": frame.get("filename"),
         "obs_time": frame.get("obs_time"),
+        # Recomputed from stored data rather than carried over: this path has
+        # no local FITS access at all. The exposure time is flattened onto the
+        # frame record by some API versions and nested under "observation" by
+        # others — try both before giving up and using the start time.
+        "obs_time_mid": fits_header.midpoint_time(
+            frame.get("obs_time"),
+            _frame_exptime(frame),
+        ),
     }
 
     anomalies = await detect_anomalies_for_frame_data(
@@ -979,6 +1244,7 @@ async def detect_anomalies_for_frame_id(frame_id: str) -> list[dict]:
         sources,
         frame_meta,
         post_filename=frame.get("filename") or "<unknown>",
+        recovery_attempt=recovery_attempt,
     )
 
     # Same "prefer mpc_designation, fall back to catalog_id via source_id"
@@ -1165,6 +1431,7 @@ async def run(fits_path: str) -> None:
     anomaly_frame_meta = {
         "filename": result["basename"],
         "obs_time": result["obs_time"],
+        "obs_time_mid": result.get("obs_time_mid"),
         "subtraction_performed": result["subtraction_performed"],
     }
 
@@ -1498,6 +1765,26 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
     Only suppresses the UNMATCHED duplicate — a matched source is never
     removed, and two unmatched sources near each other are left alone (they
     might genuinely be two faint uncatalogued objects in a crowded field).
+
+    An uncatalogued source carrying `_from_subtraction=True` is exempt. The
+    artifact this step guards against is a *deblending* one: sep splitting a
+    single distorted PSF into two components in THIS frame's own pixels. A
+    subtraction candidate has already been confirmed as a genuine
+    pixel-level change against a median stack of the object's own archived
+    history by a method that consults no catalog at all — evidence of a
+    different and stronger kind than "nothing within 5 arcsec claims it".
+    Without the exemption, a supernova or nova flaring in projection within
+    MATCH_CONE_ARCSEC of any catalogued star (routine in a dense field, and
+    the expected geometry near a known host galaxy) was dropped here —
+    before anomaly_detector.py and before POST /frames/{id}/sources, so the
+    event was never stored in any form (audit 2026-08-18, finding C6).
+
+    Registration residuals around bright stars, the obvious worry with this
+    exemption, are already handled upstream in modules/subtraction.py rather
+    than here: it masks everything within SATURATION_MASK_RADIUS_ARCSEC
+    (10 arcsec, wider than MATCH_CONE_ARCSEC's 5) of any saturated pixel in
+    the new frame or any aligned reference, and rejects near_edge candidates
+    outright, so such a residual cannot reach this function to begin with.
     """
     from astropy.coordinates import SkyCoord
     import astropy.units as u
@@ -1514,6 +1801,7 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
     threshold = config.MATCH_CONE_ARCSEC * u.arcsec
     kept: list = []
     n_suppressed = 0
+    n_exempt_subtraction = 0
 
     for src in sources:
         if src.get("catalog_name") is not None:
@@ -1524,6 +1812,12 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
         src_coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg)
         sep = src_coord.separation(matched_coords).min()
         if sep < threshold:
+            # Pixel-level confirmation outweighs the deblending-artifact
+            # risk this step exists to guard against — see the docstring.
+            if src.get("_from_subtraction"):
+                n_exempt_subtraction += 1
+                kept.append(src)
+                continue
             n_suppressed += 1
             continue
 
@@ -1537,14 +1831,69 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
             extra=extra,
         )
 
+    if n_exempt_subtraction:
+        logger.info(
+            "Kept %d uncatalogued subtraction candidate(s) within %.1f\" of a "
+            "matched source — confirmed as a pixel-level change against the "
+            "reference stack, so not treated as a deblending artifact",
+            n_exempt_subtraction, config.MATCH_CONE_ARCSEC,
+            extra=extra,
+        )
+
     return kept
 
 
+def _separation_arcsec(a: dict, b: dict) -> float | None:
+    """
+    Great-circle separation between two source dicts, in arcsec, or None when
+    either lacks a usable position. Haversine, to stay well-behaved near the
+    poles — the same formula modules/anomaly_detector/_geometry.py uses, kept
+    local here rather than imported across the package boundary.
+    """
+    try:
+        ra1, dec1 = math.radians(float(a["ra"])), math.radians(float(a["dec"]))
+        ra2, dec2 = math.radians(float(b["ra"])), math.radians(float(b["dec"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    h = (
+        math.sin((dec2 - dec1) / 2.0) ** 2
+        + math.cos(dec1) * math.cos(dec2) * math.sin((ra2 - ra1) / 2.0) ** 2
+    )
+    return math.degrees(2.0 * math.asin(min(1.0, math.sqrt(h)))) * 3600.0
+
+
 def _prefer_candidate(candidate: dict, existing: dict) -> bool:
-    """Return True if `candidate` should replace `existing` as the kept detection."""
+    """
+    Return True if `candidate` should replace `existing` as the kept detection.
+
+    The ordinary rule prefers the blind detection over a subtraction
+    candidate: for a stationary object both describe the same thing, and the
+    blind one is measured on the frame's own pixels rather than on a
+    difference image.
+
+    That rule inverts when the two are further apart than
+    `MATCH_CONE_ARCSEC`. Only the MPC stage matches within the wide
+    `MOVING_CONE_ARCSEC` (120"), so at that separation the pair is a moving
+    object and an unrelated star that happened to fall in the same cone —
+    and preferring the "ordinary" one substituted the star's position for the
+    mover's, in the very record the ephemeris and the track chart are built
+    from (audit 2026-08-18, finding M14). Between the two, the subtraction
+    candidate is the one that must be the mover: a static star cancels in the
+    difference image and never becomes a candidate there at all.
+    """
     existing_is_sub = bool(existing.get("_from_subtraction"))
     candidate_is_sub = bool(candidate.get("_from_subtraction"))
     if candidate_is_sub != existing_is_sub:
+        separation = _separation_arcsec(candidate, existing)
+        if separation is not None and separation > config.MATCH_CONE_ARCSEC:
+            logger.info(
+                "Dedup: the two detections sharing this identity are %.1f\" apart "
+                "— keeping the subtraction candidate, which is the one that can "
+                "be the moving object",
+                separation,
+            )
+            return candidate_is_sub  # prefer the subtraction detection
         return existing_is_sub  # prefer the non-subtraction detection
     return (candidate.get("flux") or 0.0) > (existing.get("flux") or 0.0)
 
@@ -1692,10 +2041,123 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
         from astropy.io import fits as astropy_fits  # noqa: PLC0415
 
         with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
-            hdul[0].header.update(wcs.to_header())
+            header = hdul[0].header
+            _strip_wcs_representation(header)
+            header.update(wcs.to_header())
         return True
     except Exception as exc:
         logger.warning("Could not write solved WCS into %s: %s", fits_path, exc)
+        return False
+
+
+# The two interchangeable ways FITS can express a pixel-to-world linear
+# transform, plus the rotation keyword that predates both. A header is only
+# well-defined if it carries one of them.
+#
+# Matched as INDEXED cards (`CD1_1`, `PC2_1`, `CDELT1`, `CROTA2`, plus an
+# optional alternate-WCS suffix letter), never as a bare prefix: `PC` alone
+# also matches `PCOUNT`, the structural keyword an extension/random-groups HDU
+# carries, which is not a WCS term at all — stripping it corrupts the very
+# header this function exists to leave well-defined.
+_WCS_LINEAR_CARD_RE = re.compile(
+    r"^(?:CD|PC)\d+_\d+[A-Z]?$|^(?:CDELT|CROTA)\d+[A-Z]?$"
+)
+
+
+def _strip_wcs_representation(header) -> None:
+    """
+    Remove any existing CD / PC / CDELT / CROTA cards before a fresh WCS is
+    written over them.
+
+    `WCS.to_header()` emits a PC+CDELT representation even when the WCS it was
+    built from came from a CD matrix, and `header.update()` only sets the keys
+    it is given — it does not remove the ones it isn't. An archived file could
+    therefore end up carrying the old CD matrix (a capture program's
+    mount-pointing estimate) and the new PC+CDELT (astap's real solve) at the
+    same time, describing two different transforms at once (audit 2026-08-18,
+    finding H17).
+
+    What a reader then does with that is not guaranteed: `modules/astrometry/
+    _wcs.py`'s own `_read_wcs()` had to be taught explicitly to strip PC/CDELT
+    when CD is present, after astropy multiplied the two together and turned
+    0.78"/px into 0.0002"/px (real incident, 2026-08-06). This is the
+    symmetric protection on the write side — a file this pipeline archives
+    should not need that defence from whoever reads it next.
+
+    CROTA1/2 goes too: it is the pre-CD rotation convention, and a stale copy
+    of it alongside a fresh CD matrix is the same ambiguity in older clothes.
+    """
+    for key in list(header.keys()):
+        if not key:
+            continue
+        if _WCS_LINEAR_CARD_RE.match(key.upper()):
+            try:
+                del header[key]
+            except KeyError:
+                pass
+
+
+def _write_qc_headers(
+    fits_path: str,
+    qc_result: dict,
+    fwhm_arcsec: float | None = None,
+) -> bool:
+    """
+    Stamp this frame's own QC verdict into its header, right before it is
+    archived.
+
+    Since QC-failed frames are archived rather than dropped (see "Why QC-failed
+    frames are registered, not dropped"), the per-object archive directory now
+    mixes `BLUR`/`TRAIL` frames in with good ones — and
+    modules/subtraction.py picks its reference stack out of exactly that
+    directory, by recency, with no notion of quality at all. Differencing a
+    sharp new frame against a blurred reference leaves the classic ring-shaped
+    residual at every star in the field (audit 2026-08-18, finding H10).
+
+    The pipeline has no database access, and the API cannot see the
+    observatory's filesystem, so the frame's own header is the only place the
+    two can meet: this writes `QCFLAG` and, when it is in arcsec rather than
+    raw pixels, `QCFWHM`. Reading them back costs subtraction one header read
+    per candidate — no pixel data, no network.
+
+    `fwhm_arcsec` overrides `qc_result`'s own `fwhm_median` and is what
+    analyze_frame() passes: the PSF anchor re-converted with the *solved*
+    plate scale rather than the one the headers implied (audit 2026-08-18,
+    finding M16). Subtraction compares a reference's stamped `QCFWHM`
+    against the new frame's own anchor, so stamping the header-scale figure
+    would put the two sides of that ratio on different footings. Omitting
+    it falls back to `qc_result`'s value, for an ad hoc caller with no
+    solve of its own.
+
+    Best-effort, like _write_solved_wcs() above: any failure is logged and
+    returns False, never blocking the archive move. A frame archived before
+    this existed simply carries neither key, and subtraction treats that as
+    "unknown, keep it" rather than excluding it.
+    """
+    try:
+        from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+        flag = qc_result.get("quality_flag")
+        fwhm = fwhm_arcsec
+        if fwhm is None:
+            fwhm = (
+                qc_result.get("fwhm_median")
+                if qc_result.get("fwhm_unit") == "arcsec"
+                else None
+            )
+
+        if flag is None and fwhm is None:
+            return False
+
+        with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
+            header = hdul[0].header
+            if flag is not None:
+                header["QCFLAG"] = (str(flag), "observatory-pipeline QC verdict")
+            if fwhm is not None:
+                header["QCFWHM"] = (float(fwhm), "observatory-pipeline median FWHM [arcsec]")
+        return True
+    except Exception as exc:
+        logger.warning("Could not write QC headers into %s: %s", fits_path, exc)
         return False
 
 

@@ -175,8 +175,21 @@ async def render(fits_path: str) -> dict:
     # out, success or failure, rather than anywhere inside the repo/archive.
     with tempfile.TemporaryDirectory(prefix="catalog_preview_") as scratch_dir:
         output_base = os.path.join(scratch_dir, os.path.splitext(filename)[0])
+        # The pixel figure is what travels: solve() converts it with the
+        # scale it actually solves for, rather than the one qc.analyze()
+        # inferred from the headers (audit 2026-08-18, finding M16). The
+        # arcsec figure is only a fallback, and only when qc.analyze()
+        # really did report arcsec — passing a raw pixel count through as
+        # if it were arcsec is exactly the corruption M16 is about.
         astro = await astrometry.solve(
-            fits_path, psf_fwhm_arcsec=qc_result.get("fwhm_median"), output_base=output_base,
+            fits_path,
+            psf_fwhm_arcsec=(
+                qc_result.get("fwhm_median")
+                if qc_result.get("fwhm_unit") == "arcsec"
+                else None
+            ),
+            psf_fwhm_px=qc_result.get("fwhm_median_px"),
+            output_base=output_base,
         )
         if not astro:
             raise RuntimeError(f"Astrometry failed for {filename} — no WCS solution to render against")

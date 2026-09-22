@@ -35,7 +35,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     """
     Enrich each source in-place with catalog identification fields.
 
-    Queries catalogs in order: Simbad → Gaia DR3 → 2MASS → MPC.
+    Queries catalogs in order: Simbad → Gaia DR3 → 2MASS → Pan-STARRS DR1 → MPC.
     Each catalog stage is isolated; a failure in one does not prevent the
     others from running. Query results are cached for 1 hour to avoid
     redundant network calls when multiple frames cover the same sky area.
@@ -47,7 +47,12 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
            performs WCS offset correction using all sources.
         3. 2MASS — fallback for red/cool stars faint or absent in Gaia
            (late M/K dwarfs, reddened stars near Galactic plane); J-band mag.
-        4. MPC/SkyBot — solar system objects (asteroids, comets); wider cone.
+        4. Pan-STARRS DR1 — deeper optical fallback (~23 mag, dec > -30°)
+           for faint sources Gaia misses; r-band mag.
+        5. MPC/SkyBot — solar system objects (asteroids, comets); wider cone.
+           Runs against all sources rather than the unclaimed remainder, and
+           takes over a source already claimed by a stellar catalog only on a
+           tight (MATCH_CONE_ARCSEC) positional coincidence.
 
     Parameters
     ----------
@@ -82,6 +87,12 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     dec_center = float(frame_meta.get("dec_center", 0.0))
     fov_deg    = float(frame_meta.get("fov_deg",    1.0))
     obs_time   = str(frame_meta.get("obs_time",    ""))
+    # The MPC/SkyBot stage alone runs at the exposure MIDPOINT: DATE-OBS is
+    # shutter-open, and a moving object is already tens of arcsec away by
+    # mid-exposure on a long one (see fits_header.midpoint_time()). Every
+    # other catalog here is stationary on this timescale. Falls back to the
+    # start time when the caller didn't compute a midpoint.
+    obs_time_mid = str(frame_meta.get("obs_time_mid") or obs_time)
 
     # ------------------------------------------------------------------
     # Phase 1: Query Gaia to compute WCS offset, then apply it to ALL
@@ -98,6 +109,14 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     gaia_stars: list[dict] = []
     try:
         gaia_stars = _gaia._query_gaia(ra_center, dec_center, fov_deg)
+        # Propagate every star from Gaia's own J2016.0 epoch to this frame's
+        # epoch before it is used for anything. Both consumers below — the
+        # WCS-offset vote accumulator and _match_gaia() itself — compare
+        # catalog positions against measured ones within a few arcsec, and a
+        # high-proper-motion star has drifted that far since DR3 (audit
+        # 2026-08-18, finding H1). Returns the query result unchanged when
+        # obs_time is missing or the stars carry no proper motion.
+        gaia_stars = _gaia._propagate_to_epoch(gaia_stars, obs_time)
         logger.info(
             "Gaia query: ra=%.4f dec=%.4f fov=%.4f° radius=%.4f° → %d catalog stars  fits_filename=%s",
             ra_center, dec_center, fov_deg, fov_deg * math.sqrt(2) / 2.0, len(gaia_stars), fits_filename,
@@ -169,6 +188,9 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     # --- 2. Gaia DR3 (dense stellar catalog, WCS offset already applied) ---
     try:
         _gaia._match_gaia(sources, gaia_stars)
+        # A Simbad-claimed star still gets its Gaia colour, so photometry
+        # calibrates it the same way as on a night when Gaia claimed it.
+        _gaia._attach_gaia_color(sources, gaia_stars)
     except Exception as exc:
         logger.warning("Gaia matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
@@ -199,9 +221,15 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         logger.warning("Pan-STARRS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 5. MPC / SkyBot (solar system objects; wider cone) ---
+    #        Unlike the four stellar stages above, this one considers EVERY
+    #        source, not just the ones nothing has claimed yet: an asteroid
+    #        projecting onto a background star would otherwise lose its
+    #        ASTEROID/COMET classification to whichever catalog got there
+    #        first (audit 2026-08-18, C3). _match_mpc() resolves the conflict
+    #        positionally — see its docstring.
     mpc_objects: list[dict] = []
     try:
-        mpc_objects = _mpc._query_mpc(ra_center, dec_center, obs_time, fov_deg)
+        mpc_objects = _mpc._query_mpc(ra_center, dec_center, obs_time_mid, fov_deg)
         _mpc._match_mpc(sources, mpc_objects)
     except Exception as exc:
         logger.warning("MPC/SkyBot matching stage failed for fits_filename=%s: %s", fits_filename, exc)

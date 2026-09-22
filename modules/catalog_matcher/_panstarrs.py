@@ -17,7 +17,13 @@ from astroquery.vizier import Vizier
 
 import config
 
-from ._cache import _cache_get, _cache_set
+from ._cache import (
+    _cache_fov_deg,
+    _cache_get,
+    _cache_position,
+    _cache_radius_margin_deg,
+    _cache_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +46,27 @@ def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> lis
         )
         return []
 
-    cache_key = f"panstarrs:{ra_center:.1f}:{dec_center:.1f}:{fov_deg:.1f}"
+    # Query around the TILE the cache key rounds to, with the tile's own
+    # half-diagonal added to the radius — not around this frame's exact
+    # centre. A key covers a 0.1 deg tile, so a later frame sharing it can sit
+    # up to a tile diagonal away, and a circle drawn around THIS frame need
+    # not contain that one's edge region at all (audit 2026-08-18, finding
+    # M5). See _cache._cache_position().
+    key_ra, key_dec = _cache_position(ra_center, dec_center)
+    # The FOV is bucketed UPWARD to the same 0.1 deg resolution, and the query
+    # below uses the bucket rather than this frame's exact FOV — otherwise the
+    # cached cone is not a function of the key it is stored under, and a
+    # narrower frame filling the bucket first leaves a wider one's edge
+    # unqueried. See _cache._cache_fov_deg().
+    key_fov = _cache_fov_deg(fov_deg)
+    cache_key = f"panstarrs:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached  # type: ignore[return-value]
 
     try:
-        coord  = SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg)
-        radius = (fov_deg * math.sqrt(2) / 2.0) * u.deg
+        coord  = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
+        radius = ((key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()) * u.deg
 
         viz = Vizier(
             columns=["RAJ2000", "DEJ2000", "objID", "rmag"],

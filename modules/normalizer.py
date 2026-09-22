@@ -31,6 +31,21 @@ MESSIER_PATTERN = re.compile(r"^M[_\s\-]*(\d+)$", re.IGNORECASE)
 CALDWELL_PATTERN = re.compile(r"^C[_\s\-]*(\d+)$", re.IGNORECASE)
 SH2_PATTERN = re.compile(r"^SH2?[_\s\-]*(\d+)$", re.IGNORECASE)
 ABELL_PATTERN = re.compile(r"^ABELL[_\s\-]*(\d+)$", re.IGNORECASE)
+# The bare "A39" shorthand for Abell 39, which observers and planetarium
+# software use interchangeably with the long form. Left unrecognized, the same
+# physical object arrived under two different object_names across sessions and
+# its frames split across two archive directories — the same failure mode as
+# H4, with the same consequence for subtraction's history (audit 2026-08-18,
+# finding M10).
+#
+# The number must stand alone, with nothing after it. That is what keeps an
+# old-style minor planet designation out: "A807 FA" is the 1807 discovery
+# A807 FA, not Abell 807, and the trailing letter group is exactly what
+# distinguishes them (the repo's own Vesta test data is filed under
+# "Vesta_A807_FA"). The range bound is the second guard — the Abell cluster
+# catalog ends at 2712.
+ABELL_SHORTHAND_PATTERN = re.compile(r"^A[_\s\-]*(\d{1,4})$", re.IGNORECASE)
+_ABELL_MAX_NUMBER = 2712
 
 # General catalog pattern: PREFIX[_\s-]*NUMBER → PREFIX_UPPER + NUMBER
 # Abell is excluded here and handled by ABELL_PATTERN above (mixed-case output).
@@ -56,6 +71,7 @@ def normalize_object_name(raw_name: Any) -> tuple[str, str]:
         "Mrk_501" → ("MRK501", "Mrk_501")
         "Arp_220" → ("ARP220", "Arp_220")
         "Abell_1" → ("Abell1", "Abell_1")
+        "A39" → ("Abell39", "A39")
         "Andromeda Galaxy" → ("Andromeda_Galaxy", "Andromeda Galaxy")
     """
     if raw_name is None:
@@ -80,6 +96,10 @@ def normalize_object_name(raw_name: Any) -> tuple[str, str]:
     match = ABELL_PATTERN.match(raw_str)
     if match:
         return (f"Abell{match.group(1)}", raw_str)
+
+    match = ABELL_SHORTHAND_PATTERN.match(raw_str)
+    if match and int(match.group(1)) <= _ABELL_MAX_NUMBER:
+        return (f"Abell{int(match.group(1))}", raw_str)
 
     match = _CATALOG_PATTERN.match(raw_str)
     if match:
@@ -106,6 +126,16 @@ def extract_object_from_filename(filename: str) -> str:
     Splits on underscores and collects parts until a frame-type keyword or
     a pure-digit segment (exposure time) is encountered.
 
+    The pure-digit rule deliberately does not apply to the FIRST segment: a
+    numbered minor planet ("4_Vesta", "433_Eros") or star ("61_Cygni") starts
+    with its own number, and treating that as an exposure time collected
+    nothing at all and archived the frame under "_UNKNOWN" instead of its real
+    object directory — which in turn breaks history continuity for
+    modules/subtraction.py, since that object never accumulates
+    SUBTRACTION_MIN_FRAMES in one place (audit 2026-08-18, finding H4). An
+    exposure time is never the leading token of a filename in any convention
+    this pipeline has seen, so nothing is lost by exempting it.
+
     Returns:
         Normalized object name, or "_UNKNOWN" if nothing usable is found.
 
@@ -114,6 +144,8 @@ def extract_object_from_filename(filename: str) -> str:
         "M51_L_L_60_2024-...fits" → "M51"
         "Andromeda_Galaxy_Light_L_300_2024-...fits" → "Andromeda_Galaxy"
         "NGC1234_Dark_300_2024-...fits" → "NGC1234"
+        "4_Vesta_Light_L_120_2024-...fits" → "4_Vesta"
+        "61_Cygni_Light_V_60_2024-...fits" → "61_Cygni"
     """
     _FRAME_TYPE_KEYWORDS: frozenset[str] = frozenset({
         "light", "dark", "flat", "bias",
@@ -126,11 +158,25 @@ def extract_object_from_filename(filename: str) -> str:
     parts = stem.split("_")
 
     collected: list[str] = []
-    for part in parts:
+    for index, part in enumerate(parts):
         if part.lower() in _FRAME_TYPE_KEYWORDS:
             break
         if re.fullmatch(r"\d+", part):
-            break
+            # A number in the leading position, immediately followed by a
+            # segment that STARTS with a letter, is a numbered object's own
+            # designation ("4_Vesta", "433_Eros", "61_Cygni") rather than an
+            # exposure time — that is the whole shape of such a name. The
+            # "starts with" test matters: a timestamp segment
+            # ("2024-03-15T22-01-34") contains letters too, so a filename that
+            # really does lead with an exposure time still terminates
+            # collection here and falls back to "_UNKNOWN" exactly as before.
+            is_designation = (
+                index == 0
+                and len(parts) > 1
+                and re.match(r"[A-Za-z]", parts[1]) is not None
+            )
+            if not is_designation:
+                break
         collected.append(part)
 
     if not collected:
@@ -195,6 +241,42 @@ FILTER_MAP = {
     "n-ii": "NII",
     "nitrogen-ii": "NII",
     "[nii]": "NII",
+
+    # Multi-band filters for one-shot-colour cameras. Each passes two or
+    # three emission lines and blocks everything between them, so it is as
+    # narrow as a single-line filter where stars are concerned — the QC
+    # star-count floor and the Gaia zero-point both have to treat it that way
+    # (audit 2026-08-18, finding M9). Each keeps a token of its own rather
+    # than collapsing into one "multiband": modules/subtraction.py matches its
+    # reference stack on this field, and an L-eXtreme frame is not a
+    # substitute for an L-eNhance one.
+    "l-enhance": "LeNhance",
+    "lenhance": "LeNhance",
+    "l enhance": "LeNhance",
+    "l-extreme": "LeXtreme",
+    "lextreme": "LeXtreme",
+    "l extreme": "LeXtreme",
+    "l-ultimate": "LuLtimate",
+    "lultimate": "LuLtimate",
+    "l-ultimate 3nm": "LuLtimate",
+    "nbz": "NBZ",
+    "idas nbz": "NBZ",
+    "nbz uhs": "NBZ",
+    "quad band": "QuadBand",
+    "quad-band": "QuadBand",
+    "quadband": "QuadBand",
+    "alp-t": "QuadBand",
+    "alpt": "QuadBand",
+    "tri band": "TriBand",
+    "tri-band": "TriBand",
+    "triband": "TriBand",
+    "triad": "TriBand",
+    "duo band": "DuoBand",
+    "duo-band": "DuoBand",
+    "duoband": "DuoBand",
+    "dual band": "DuoBand",
+    "dual-band": "DuoBand",
+    "dualband": "DuoBand",
 
     # Standard photometric filters (Johnson-Cousins)
     "u": "U",
@@ -338,15 +420,20 @@ def generate_normalized_filename(
 
     Format:
         Light: {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
+        Flat:  {Object}_Flat_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
         Dark:  {Object}_Dark_{Exptime}_{DateTime}[_{Seq}].fits
-        Flat:  {Object}_Flat_{Exptime}_{DateTime}[_{Seq}].fits
         Bias:  {Object}_Bias_{Exptime}_{DateTime}[_{Seq}].fits
+
+    A flat is taken through a filter and is valid only for that one, so it
+    carries the filter field too; darks and biases are genuinely
+    filter-independent and keep the shorter name.
 
     Examples:
         M45_Light_B_60_2020-10-15T01-24-51.fits
         M51_Light_Ha_300_2024-03-15T22-01-34.fits
         NGC1234_Light_L_120_2024-03-15T22-01-34_001.fits
         M42_Dark_300_2024-03-15T22-01-34.fits
+        M42_Flat_Ha_3_2024-03-15T18-02-10.fits
 
     Returns:
         Normalized filename string
@@ -358,7 +445,15 @@ def generate_normalized_filename(
     if frame_type:
         parts.append(frame_type)
 
-    if filter_name and frame_type == "Light":
+    # Flats carry the filter as well as Lights. A flat is taken THROUGH a
+    # filter and is only valid for that one, so a multi-filter flat sequence
+    # of the same target, exposure and second produced identical filenames
+    # and the later file overwrote the earlier one (audit 2026-08-18, finding
+    # M11). Darks and biases are genuinely filter-independent and keep the
+    # shorter name. modules/subtraction.py's positional parser already reads
+    # a {FrameType}_{Filter}_{Exptime}_{DateTime} name for any frame type, so
+    # nothing there needed changing.
+    if filter_name and frame_type in ("Light", "Flat"):
         parts.append(filter_name)
 
     if exptime is not None:

@@ -213,13 +213,19 @@ class TestPostSources:
         _, call_kwargs = mock_client.post.call_args
         assert call_kwargs["json"]["sources"] == []
 
-    async def test_post_sources_returns_none(self):
-        """post_sources always returns None."""
+    async def test_post_sources_returns_empty_list_when_the_api_sends_no_ids(self):
+        """
+        Audit 2026-08-18, finding H19: a successful POST whose response
+        carried no usable source_ids used to be indistinguishable from a lost
+        one — both returned None. It returns [] now, so None means exactly
+        "these sources did not reach the API" and the caller can re-queue the
+        frame on that alone.
+        """
         resp = _mock_response(status_code=200, json_data={})
         with _patch_client(post_response=resp):
             result = await post_sources("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result == []
 
     async def test_post_sources_silent_on_http_error(self):
         """
@@ -284,15 +290,21 @@ class TestPostAnomalies:
         _, call_kwargs = mock_client.post.call_args
         assert call_kwargs["json"]["anomalies"] == []
 
-    async def test_post_anomalies_returns_none(self):
+    async def test_post_anomalies_reports_success(self):
+        """
+        Audit 2026-08-18, finding H19: this used to return None
+        unconditionally, so a caller could not tell an accepted batch from a
+        lost one — and pipeline.py needs to, in order to re-queue the work
+        rather than let the anomaly set vanish silently.
+        """
         resp = _mock_response(status_code=200, json_data={})
         with _patch_client(post_response=resp):
             result = await post_anomalies("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result is True
 
     async def test_post_anomalies_silent_on_http_error(self):
-        """Exhausted retries (5xx) must not propagate out of post_anomalies."""
+        """Exhausted retries (5xx) must not propagate — but must be reported."""
         exc = _make_5xx_status_error()
         with patch.object(
             _anomalies_module,
@@ -301,15 +313,15 @@ class TestPostAnomalies:
         ):
             result = await post_anomalies("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result is False
 
     async def test_post_anomalies_silent_on_4xx(self):
-        """HTTP 4xx must be handled silently."""
+        """A 4xx is not retried, and loses the anomaly set just as surely."""
         resp = _mock_response(status_code=404, json_data={"error": "not found"})
         with _patch_client(post_response=resp):
             result = await post_anomalies("frame-1", "f.fits", [])
 
-        assert result is None
+        assert result is False
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +588,33 @@ class TestGetSourceTracksBatch:
 
         assert result == {}
 
-    async def test_returns_empty_dict_when_results_not_a_dict(self):
-        resp = _mock_response(status_code=200, json_data={"results": ["not", "a", "dict"]})
+    async def test_list_shaped_results_are_keyed_by_requested_source_id(self):
+        """
+        docs/API.md documents "results" as an object keyed by source_id, but
+        PHP's json_encode() serializes any array with sequential integer keys
+        as a plain JSON array instead — which is exactly what a foreach-built
+        results array normally has. _normalize_batch_results() accepts both
+        shapes; coercing the list form to {} (as it once did) discarded every
+        batch result on every call. See its docstring.
+
+        This endpoint is addressed by source_id, not by request position:
+        modules/finder_chart reads each track back as `tracks.get(source_id)`,
+        so the array form must be re-keyed by the ids that were asked for.
+        Positional "0"/"1" keys would leave every source with no epochs and
+        no chart.
+        """
+        resp = _mock_response(
+            status_code=200,
+            json_data={"results": [[{"ra": 1.0}], []]},
+        )
+        with _patch_client(post_response=resp):
+            result = await get_source_tracks_batch(["src1", "src2"])
+
+        assert result == {"src1": [{"ra": 1.0}], "src2": []}
+
+    async def test_returns_empty_dict_when_results_is_neither_dict_nor_list(self):
+        """A "results" that is neither shape carries nothing usable."""
+        resp = _mock_response(status_code=200, json_data={"results": "not a batch"})
         with _patch_client(post_response=resp):
             result = await get_source_tracks_batch(["a"])
 
@@ -677,7 +714,11 @@ class TestApplyRemoteSettings:
             config.CHART_ENABLED = original
 
     @pytest.mark.parametrize(
-        "name", ["CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED", "FORCED_PHOTOMETRY_ENABLED"]
+        "name",
+        [
+            "CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED",
+            "FORCED_PHOTOMETRY_ENABLED", "PHOTOMETRY_COLOR_TERM_ENABLED",
+        ],
     )
     def test_applies_every_bool_setting(self, name):
         # Regression test: every key documented in _OVERRIDABLE as "special:
@@ -693,6 +734,34 @@ class TestApplyRemoteSettings:
             assert getattr(config, name) is False
         finally:
             setattr(config, name, original)
+
+    def test_no_setting_is_cast_with_bare_bool(self):
+        # bool("false") is True — a boolean setting must go through
+        # _BOOL_KEYS, never be registered with the plain `bool` type
+        # (PHOTOMETRY_COLOR_TERM_ENABLED was, and could not be disabled).
+        import config
+        assert [k for k, t in config._OVERRIDABLE.items() if t is bool] == []
+        special = {k for k, t in config._OVERRIDABLE.items() if t is None}
+        assert config._BOOL_KEYS <= special
+
+    def test_applies_color_terms(self):
+        import config
+        original = config.PHOTOMETRY_COLOR_TERMS
+        try:
+            assert config.apply_remote_settings({"PHOTOMETRY_COLOR_TERMS": "B:-1.0, G:-0.45"}) == 1
+            assert config.PHOTOMETRY_COLOR_TERMS == {"B": -1.0, "G": -0.45}
+        finally:
+            config.PHOTOMETRY_COLOR_TERMS = original
+
+    @pytest.mark.parametrize("raw, expected", [("1.8", 1.8), ("", None), ("  ", None)])
+    def test_applies_photometry_gain(self, raw, expected):
+        import config
+        original = config.PHOTOMETRY_GAIN_E_PER_ADU
+        try:
+            assert config.apply_remote_settings({"PHOTOMETRY_GAIN_E_PER_ADU": raw}) == 1
+            assert config.PHOTOMETRY_GAIN_E_PER_ADU == expected
+        finally:
+            config.PHOTOMETRY_GAIN_E_PER_ADU = original
 
     def test_applies_log_level(self):
         import config
@@ -743,3 +812,35 @@ class TestApplyRemoteSettings:
             assert config.QC_STARS_MIN == 15
         finally:
             config.QC_FWHM_MAX_ARCSEC, config.DELTA_MAG_ALERT, config.QC_STARS_MIN = originals
+
+
+class TestNonFiniteWireValues:
+    """
+    JSON has no NaN/Infinity: one such value made the whole POST /sources
+    batch fail to serialize, and the recovery re-run failed identically.
+    """
+
+    def test_nan_and_inf_are_sent_as_null(self):
+        import numpy as np
+        from api_client.sources import _to_wire_source
+
+        wire = _to_wire_source({
+            "ra": 1.0, "dec": 2.0,
+            "snr": float("inf"), "mag_err": float("nan"),
+            "flux_err": np.float32("nan"), "flux": np.float64(5.0),
+            "saturated": False, "_internal": float("nan"),
+        })
+
+        assert wire["snr"] is None
+        assert wire["mag_err"] is None
+        assert wire["flux_err"] is None
+        assert wire["flux"] == 5.0
+        assert wire["saturated"] is False
+        assert "_internal" not in wire
+
+    def test_the_whole_batch_serializes(self):
+        import json
+        from api_client.sources import _to_wire_source
+
+        json.dumps([_to_wire_source({"ra": 1.0, "dec": 2.0, "snr": float("-inf")})], allow_nan=False)
+

@@ -17,7 +17,9 @@ All tests are async because qc.analyze() is declared async.
 
 from __future__ import annotations
 
+import math
 import os
+import pathlib
 import shutil
 from contextlib import contextmanager
 from typing import Any
@@ -30,6 +32,7 @@ import pytest_asyncio
 # ---------------------------------------------------------------------------
 # Module under test
 # ---------------------------------------------------------------------------
+import config
 from modules import qc
 
 
@@ -196,6 +199,7 @@ def _patch_qc(
     header: dict[str, Any] | None = None,
     header_info: dict[str, Any] | None = None,
     cr_raises: bool = False,
+    sky_back: float | None = None,
 ):
     """
     Patch every external dependency of qc.py in one shot.
@@ -225,7 +229,7 @@ def _patch_qc(
         }
 
     hdul_mock = _make_hdu_mock(image, header)
-    bkg_mock  = _make_bkg_mock()
+    bkg_mock  = _FakeBackground(back=sky_back) if sky_back is not None else _make_bkg_mock()
     n = len(sources)
 
     def _detect_cosmics(data):
@@ -358,6 +362,47 @@ class TestLowStarsFlag:
             result = await qc.analyze(_FITS_PATH)
 
         assert result["quality_flag"] != "LOW_STARS"
+
+
+# ---------------------------------------------------------------------------
+# Test 4b — the degenerate-frame path reports the background too
+#
+# Audit 2026-08-18, finding M12: with fewer than 3 raw detections the function
+# returned LOW_STARS regardless of the background — telling the operator the
+# symptom and hiding the cause, which is backwards for the one subsystem whose
+# job is to say why a frame was rejected. Cloud, twilight, moonlight or stray
+# light drowning the stars is usually exactly the cause.
+# ---------------------------------------------------------------------------
+
+class TestDegenerateFrameBackground:
+    @pytest.mark.asyncio
+    async def test_two_sources_on_a_dark_sky_is_low_stars(self):
+        sources = _make_sources(2, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["quality_flag"] == "LOW_STARS"
+
+    @pytest.mark.asyncio
+    async def test_two_sources_under_a_bright_sky_is_bad(self):
+        """Two problems at once is BAD by this module's own flag table."""
+        import config
+
+        sources = _make_sources(2, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources, sky_back=config.QC_SKY_BACKGROUND_MAX * 2.0):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["quality_flag"] == "BAD"
+        assert result["sky_background"] > config.QC_SKY_BACKGROUND_MAX
+
+    @pytest.mark.asyncio
+    async def test_the_background_is_reported_either_way(self):
+        sources = _make_sources(2, _A_NORMAL, _B_NORMAL)
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["sky_background"] is not None
+        assert result["star_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +600,69 @@ class TestRejectedFileMoved:
         assert os.path.basename(rejected_path) == f"TRAIL_{src_file.name}"
         assert not src_file.exists(), "Source file should have been moved"
 
+    @pytest.mark.asyncio
+    async def test_existing_rejected_file_is_not_overwritten(self, tmp_path):
+        """
+        Audit 2026-08-18, finding C12: shutil.move() overwrites silently on
+        POSIX, so re-rejecting the same original filename destroyed the
+        earlier file outright — in the one subsystem whose whole purpose is to
+        keep a rejected frame around for manual review.
+        """
+        import config
+
+        src_file = tmp_path / "frame_test.fits"
+        src_file.write_bytes(b"SECOND REJECTION")
+
+        rejected_root = tmp_path / "rejected"
+        object_dir = rejected_root / "NGC_1234"
+        object_dir.mkdir(parents=True)
+        existing = object_dir / "TRAIL_frame_test.fits"
+        existing.write_bytes(b"FIRST REJECTION")
+
+        sources = _make_sources(_N_SOURCES, _A_TRAIL, _B_TRAIL)
+        header_info = {"object_name": "NGC_1234", "instrument": {"focal_length_mm": None}}
+
+        with (
+            patch("modules.qc.fits.open", return_value=_make_hdu_mock(_make_image(), {})),
+            patch("modules.qc.sep.Background", return_value=_make_bkg_mock()),
+            patch("modules.qc.sep.extract",    side_effect=_make_sep_extract_side_effect(sources)),
+            patch("modules.qc.sep.sum_circle",
+                  return_value=_sum_circle_return(len(sources))),
+            patch("modules.qc.astroscrappy.detect_cosmics",
+                  return_value=(np.zeros(_IMAGE_SHAPE, bool), _make_image().astype(np.float32))),
+            patch("modules.qc.extract_headers", return_value=header_info),
+            patch.object(config, "FITS_REJECTED", str(rejected_root)),
+        ):
+            result = await qc.analyze(str(src_file))
+
+        assert existing.read_bytes() == b"FIRST REJECTION"
+        assert os.path.basename(result["rejected_path"]) == "TRAIL_frame_test_1.fits"
+        assert pathlib.Path(result["rejected_path"]).read_bytes() == b"SECOND REJECTION"
+
+
+class TestUniqueDestination:
+
+    def test_free_path_is_returned_unchanged(self, tmp_path):
+        target = str(tmp_path / "BLUR_frame.fits")
+
+        assert qc._unique_destination(target) == target
+
+    def test_suffixes_count_up_past_every_existing_file(self, tmp_path):
+        (tmp_path / "BLUR_frame.fits").write_bytes(b"a")
+        (tmp_path / "BLUR_frame_1.fits").write_bytes(b"b")
+        (tmp_path / "BLUR_frame_2.fits").write_bytes(b"c")
+
+        result = qc._unique_destination(str(tmp_path / "BLUR_frame.fits"))
+
+        assert os.path.basename(result) == "BLUR_frame_3.fits"
+
+    def test_suffix_goes_before_the_extension(self, tmp_path):
+        (tmp_path / "BLUR_frame.fits").write_bytes(b"a")
+
+        result = qc._unique_destination(str(tmp_path / "BLUR_frame.fits"))
+
+        assert result.endswith(".fits")
+
 
 # ---------------------------------------------------------------------------
 # Test 7 — Destination directory is created automatically
@@ -695,6 +803,7 @@ class TestResultHasAllKeys:
         "star_count",
         "cr_fraction",
         "rejected_path",
+        "fwhm_median_px",
     })
 
     @pytest.mark.asyncio
@@ -878,3 +987,150 @@ class TestStreakMasking:
         coarse_data, _ = calls[0]
         final_data, _ = calls[1]
         assert np.array_equal(coarse_data, final_data)
+
+
+# ---------------------------------------------------------------------------
+# Star-population medians (audit 2026-08-18, C11)
+# ---------------------------------------------------------------------------
+
+_NARROWBAND_HEADER_INFO = {
+    "object_name": _OBJECT_NAME,
+    "instrument":  {"focal_length_mm": 997.0},
+    "observation": {"filter": "Ha"},
+}
+
+
+def _mixed_sources(
+    n_stars: int, n_other: int,
+    other_a: float, other_b: float,
+) -> np.ndarray:
+    """Normal stars plus *n_other* sources of a different morphology."""
+    stars = _make_sources(n_stars, _A_NORMAL, _B_NORMAL)
+    other = _make_sources(n_other, other_a, other_b)
+    return np.concatenate([stars, other])
+
+
+class TestMediansUseTheStarPopulation:
+    """
+    fwhm_median/elongation_median gate BLUR/TRAIL, so they must describe the
+    frame's stars — taken over every raw detection they also carried whatever
+    extended, non-stellar morphology the field happened to contain, and a
+    well-focused narrowband frame of a nebula could be rejected for what it
+    was pointed at.
+    """
+
+    @pytest.mark.asyncio
+    async def test_elongated_filaments_do_not_force_a_false_trail(self):
+        """
+        The narrowband nebula case from the finding: the frame is allowed a
+        smaller sample (QC_STARS_MIN_NARROWBAND=5), so the clumps can be the
+        majority of detections and carry the median outright.
+        """
+        # 6 round stars + 7 filament-like clumps at elongation 6
+        sources = _mixed_sources(6, 7, other_a=6.0, other_b=1.0)
+
+        with _patch_qc(sources, header_info=_NARROWBAND_HEADER_INFO):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["elongation_median"] < 2.0
+        assert result["quality_flag"] == "OK"
+
+    @pytest.mark.asyncio
+    async def test_round_extended_clumps_do_not_force_a_false_blur(self):
+        # 6 round stars + 7 round-but-extended knots (FWHM ~ 13 px = 13").
+        # These pass a roundness cut, so only the relative broad-outlier clip
+        # removes them.
+        sources = _mixed_sources(6, 7, other_a=6.0, other_b=5.0)
+
+        with _patch_qc(sources, header_info=_NARROWBAND_HEADER_INFO):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["fwhm_median"] < 8.0
+        assert result["quality_flag"] == "OK"
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_blurred_frame_is_still_blur(self):
+        """
+        The cut that removes extended objects must not cap the very quantity
+        BLUR tests: every source here is broad, so nothing is an outlier
+        relative to the rest.
+        """
+        sources = _make_sources(_N_SOURCES, _A_BLUR, _B_BLUR)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["fwhm_median"] > 8.0
+        assert result["quality_flag"] in ("BLUR", "BAD")
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_trailed_frame_is_still_trail(self):
+        sources = _make_sources(_N_SOURCES, _A_TRAIL, _B_TRAIL)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["elongation_median"] > 2.0
+        assert result["quality_flag"] in ("TRAIL", "BAD")
+
+    @pytest.mark.asyncio
+    async def test_hot_pixels_do_not_drag_the_fwhm_median_down(self):
+        """
+        The one absolute cut both subsets keep is STAR_FWHM_MIN_ARCSEC. It can
+        only bias the estimate upward, so it cannot hide blur.
+        """
+        # 8 normal stars + 7 detections far sharper than any real star here
+        sources = _mixed_sources(8, 7, other_a=0.4, other_b=0.4)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        # Median over the 8 stars alone (~3.4"), not dragged toward ~0.9".
+        assert result["fwhm_median"] > 3.0
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_all_detections_when_the_subset_empties(self):
+        """
+        A frame trailed badly enough that its own stars fall outside the
+        opposite axis' bound leaves no subset to take a median over — the raw
+        median is used, which is what keeps TRAIL reachable there.
+        """
+        # Elongation 10, FWHM ~ 16.7 px: outside BOTH the roundness cut and
+        # the compactness cut, so both subsets are empty.
+        sources = _make_sources(_N_SOURCES, 10.0, 1.0)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["elongation_median"] == pytest.approx(10.0)
+        assert result["quality_flag"] in ("TRAIL", "BAD")
+
+
+class TestDegenerateMinorAxisIsClamped:
+    """
+    `sep` reports a zero (or near-zero) semi-minor axis for a degenerate fit —
+    a detection lying along a single pixel row, a cosmic-ray track, a bad
+    column. QC substituted an elongation of exactly 1.0 for those, which reads
+    as PERFECTLY ROUND: the artifact was admitted into the round population
+    fwhm_median is taken over, and TRAIL was structurally unable to fire on
+    the very shape it exists to catch. The three other extraction paths clamp
+    the minor axis at the narrowest width a pixel grid can express; QC now
+    does the same.
+    """
+
+    def test_the_clamp_matches_the_other_extraction_paths(self):
+        assert qc._MIN_SEMI_MINOR_PX == pytest.approx(1.0 / math.sqrt(12.0))
+
+    @pytest.mark.asyncio
+    async def test_a_zero_minor_axis_reads_as_elongated_not_round(self):
+        """A line-like artifact must not be reported as a round star."""
+        sources = _make_sources(_N_SOURCES, a=5.0, b=0.0)
+
+        with _patch_qc(sources):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        # a / (1/sqrt(12)) — how elongated the feature would be if it were
+        # exactly one pixel wide, which is the most it can honestly claim.
+        assert result["elongation_median"] == pytest.approx(5.0 / qc._MIN_SEMI_MINOR_PX)
+        assert result["elongation_median"] > config.QC_ELONGATION_MAX
+        assert result["quality_flag"] in ("TRAIL", "BAD")

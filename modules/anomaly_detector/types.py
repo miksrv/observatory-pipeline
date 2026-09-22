@@ -31,10 +31,16 @@ class AnomalyType(str, Enum):
     SPACE_DEBRIS = "SPACE_DEBRIS"
 
 
-# Alert-worthy types (used for log-level selection)
+# Alert-worthy types (used for log-level selection). SPACE_DEBRIS is
+# deliberately not one: a satellite/aircraft trail is recorded so that a
+# genuine fast mover's track is never erased (finding H16) and so that it
+# does not pollute UNKNOWN, but it is nothing an operator needs to act on
+# (decided 2026-09-22 after the IC3322A test run: 38 trails on 7 frames, all
+# ordinary satellite passes). observatory-api decides the persisted
+# `is_alert` flag itself from its own AnomalyModel::ALERT_TYPES — see
+# docs/API-TASKS.md #2 for the matching change there.
 _ALERT_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.SUPERNOVA_CANDIDATE,
     AnomalyType.MOVING_UNKNOWN,
-    AnomalyType.SPACE_DEBRIS,
     AnomalyType.UNKNOWN,
 })

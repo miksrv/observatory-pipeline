@@ -5,9 +5,20 @@ The single public entry point is:
 
     await astrometry.solve(fits_path: str) -> dict
 
-It calls the astap binary for plate solving (writing WCS keywords back into
-the FITS file), then reads the WCS, computes the frame centre and FOV, and
-runs sep (SourceExtractor) to build a source list with (RA, Dec) coordinates.
+It calls the astap binary for plate solving, then reads the WCS it produced,
+computes the frame centre and FOV, and runs sep (SourceExtractor) to build a
+source list with (RA, Dec) coordinates.
+
+astap is invoked **without** `-update`, so it never writes into `fits_path`
+itself — the solved WCS lands in a `.wcs` side file next to the frame (plus
+`.ini`/`.log`), or under `output_base` when one is given, and `_wcs.py` reads
+it back from there. This docstring used to say the opposite ("writing WCS
+keywords back into the FITS file"), which matters because it is exactly the
+question `_wcs.py` has to answer — whether the WCS it reads is astap's fresh
+solve or the capture software's mount-pointing estimate that was already in
+the header (the 2026-08-06 UGC_6930 incident; audit 2026-08-18, finding L3).
+The frame's header does get a WCS written into it eventually, but by
+`pipeline.py`'s `_write_solved_wcs()` at archive time, not by astap.
 
 Returns an empty dict on any failure so the pipeline can detect and handle
 the error without crashing.
@@ -65,6 +76,7 @@ logger = logging.getLogger(__name__)
 async def solve(
     fits_path: str,
     psf_fwhm_arcsec: float | None = None,
+    psf_fwhm_px: float | None = None,
     output_base: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -88,6 +100,27 @@ async def solve(
         ``psf_fwhm_arcsec / 1.5`` (floored at ``STAR_FWHM_MIN_ARCSEC``) to
         reject hot/warm pixel clusters and other artifacts that are far
         sharper than any real star in this frame.
+
+        Prefer ``psf_fwhm_px`` below when the caller has it: this value is
+        only as good as the plate scale it was converted with, and QC's own
+        conversion uses the frame's *headers*.
+    psf_fwhm_px:
+        The same median PSF FWHM, in raw pixels — ``qc.analyze()``'s
+        ``fwhm_median_px``. When given, it wins over ``psf_fwhm_arcsec``:
+        this function converts it with the plate scale it has just solved
+        for, which is the same scale every extracted source's own
+        ``fwhm`` is measured against a few lines later.
+
+        The distinction matters whenever the header's optical setup is
+        wrong — an unaccounted focal reducer or Barlow, a camera swapped
+        without updating ``XPIXSZ``, a wrong ``FOCALLEN`` — which the solve
+        detects and the header does not. The anchor was then skewed by the
+        ratio between the two scales while the FWHMs it gates were not,
+        so the bounds either rejected every real star in the frame or
+        stopped rejecting anything (audit 2026-08-18, finding M16). It also
+        lets a frame whose headers carry no plate scale at all (an all-sky
+        lens with no ``XPIXSZ``/``FOCALLEN``) have an anchor for the first
+        time, where before it had none.
     output_base:
         Base path (no extension) astap should write its own output files
         under — ``-o`` on the astap command line. astap only ever opens
@@ -105,7 +138,11 @@ async def solve(
     On success, a dict with keys:
         ra_center   float   – frame centre RA in decimal degrees
         dec_center  float   – frame centre Dec in decimal degrees
-        fov_deg     float   – field of view (larger image dimension) in degrees
+        fov_deg     float   – field of view in degrees: the larger of the
+                              two axes' own angular extents (each axis'
+                              pixel count times that axis' own plate
+                              scale — they differ under anisotropic
+                              binning; see _frame_geometry.py)
         position_angle_deg  float | None – this frame's own orientation on the
                               sky (0 = North up, increasing clockwise toward
                               +X — see _frame_geometry._position_angle_deg()'s
@@ -119,6 +156,11 @@ async def solve(
                               operator diagnostics without re-opening FITS
                               files. Not a reason to exclude any frame from
                               anything on its own.
+        pixel_scale_arcsec  float – the solved plate scale (geometric mean
+                              of both axes; see _frame_geometry.py). Returned
+                              so a caller can re-anchor a header-derived
+                              measurement — e.g. QC's FWHM — onto the scale
+                              this solve actually found.
         naxis1      int     – image width in pixels
         naxis2      int     – image height in pixels
         sources     list    – list of source dicts; each has:
@@ -146,7 +188,7 @@ async def solve(
     # ------------------------------------------------------------------
     # Step 1 — Run astap plate solver
     # ------------------------------------------------------------------
-    if not _run_astap(fits_path, output_base):
+    if not await _run_astap(fits_path, output_base):
         return {}
 
     # ------------------------------------------------------------------
@@ -164,6 +206,28 @@ async def solve(
             _frame_center_and_scale(wcs, naxis1, naxis2, fits_filename)
         )
 
+        # Re-anchor the PSF estimate onto the scale we have just solved
+        # for. QC measured it in pixels and converted with whatever the
+        # headers claimed; the FWHM bounds it gates are compared against
+        # source FWHMs computed with *this* scale, so the two have to come
+        # from the same place (audit 2026-08-18, finding M16).
+        if psf_fwhm_px is not None and psf_fwhm_px > 0 and pixel_scale_arcsec > 0:
+            solved_psf_fwhm_arcsec = psf_fwhm_px * pixel_scale_arcsec
+            if (
+                psf_fwhm_arcsec is not None
+                and psf_fwhm_arcsec > 0
+                and abs(solved_psf_fwhm_arcsec - psf_fwhm_arcsec) > 0.05 * psf_fwhm_arcsec
+            ):
+                logger.warning(
+                    "PSF anchor re-scaled for %s: %.3f\"/px solved vs the headers' own "
+                    "scale puts the QC FWHM at %.3f\" rather than %.3f\". Using the solved "
+                    "value — the header's optical setup disagrees with the plate solve "
+                    "(an unaccounted reducer/Barlow, a swapped camera, a wrong FOCALLEN).",
+                    fits_filename, pixel_scale_arcsec,
+                    solved_psf_fwhm_arcsec, psf_fwhm_arcsec,
+                )
+            psf_fwhm_arcsec = solved_psf_fwhm_arcsec
+
         # Step 4 — Source extraction with sep
         sources, sources_all = _extract_sources(
             fits_path, wcs, pixel_scale_arcsec, naxis1, naxis2,
@@ -174,6 +238,7 @@ async def solve(
             "ra_center":         ra_center,
             "dec_center":        dec_center,
             "fov_deg":           fov_deg,
+            "pixel_scale_arcsec": pixel_scale_arcsec,
             "position_angle_deg": position_angle_deg,
             "naxis1":            naxis1,
             "naxis2":            naxis2,

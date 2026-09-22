@@ -7,6 +7,7 @@ Internal helper only — not part of this package's public surface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import subprocess
@@ -16,7 +17,7 @@ import config
 logger = logging.getLogger(__name__)
 
 
-def _run_astap(fits_path: str, output_base: str | None) -> bool:
+async def _run_astap(fits_path: str, output_base: str | None) -> bool:
     """
     Run astap plate solver against fits_path via xvfb-run.
 
@@ -39,6 +40,9 @@ def _run_astap(fits_path: str, output_base: str | None) -> bool:
     (timeout, missing binary, permission error, non-solution-related
     subprocess error) is NOT retried — a wider radius wouldn't fix those.
 
+    Async because the astap subprocess runs off the event loop — see
+    ``_run_astap_attempt()``.
+
     Returns
     -------
     bool
@@ -47,7 +51,7 @@ def _run_astap(fits_path: str, output_base: str | None) -> bool:
         attempts fail — every case already logged at the point of failure,
         so the caller only needs the boolean.
     """
-    outcome = _run_astap_attempt(fits_path, output_base, wide_radius_deg=None)
+    outcome = await _run_astap_attempt(fits_path, output_base, wide_radius_deg=None)
     if outcome == "solved":
         return True
 
@@ -58,7 +62,7 @@ def _run_astap(fits_path: str, output_base: str | None) -> bool:
             "own RA/Dec estimate, e.g. mount pointing, may be significantly off)",
             fits_path, config.ASTAP_WIDE_SEARCH_RADIUS_DEG,
         )
-        outcome = _run_astap_attempt(
+        outcome = await _run_astap_attempt(
             fits_path, output_base,
             wide_radius_deg=config.ASTAP_WIDE_SEARCH_RADIUS_DEG,
         )
@@ -67,7 +71,7 @@ def _run_astap(fits_path: str, output_base: str | None) -> bool:
     return False
 
 
-def _run_astap_attempt(
+async def _run_astap_attempt(
     fits_path: str, output_base: str | None, wide_radius_deg: float | None,
 ) -> str:
     """
@@ -89,6 +93,21 @@ def _run_astap_attempt(
     meant the wide retry was killed by the timeout, not by genuinely
     exhausting the search, on almost every mis-pointed frame it was meant to
     rescue.
+
+    The subprocess itself is launched on a worker thread
+    (``asyncio.to_thread``), not inline, so the seconds-to-minutes astap
+    spends solving do not block the event loop the rest of ``solve()`` runs
+    on (audit 2026-08-18, finding L6). Nothing depends on that today — the
+    worker drains one task item at a time — but a blocking call inside an
+    ``async def`` is a trap for whoever first tries to solve a batch of
+    frames concurrently: the tasks would run strictly one after another
+    while looking like they don't. ``modules/ephemeris.py`` already does
+    exactly this for its own blocking call, for the same reason.
+
+    ``subprocess.run``'s own ``timeout=`` is kept rather than wrapping the
+    thread in ``asyncio.wait_for``: it is what actually kills and reaps the
+    astap child process when the budget runs out. An ``asyncio`` timeout
+    around a thread can only abandon the thread, leaving astap running.
 
     Returns
     -------
@@ -133,7 +152,8 @@ def _run_astap_attempt(
     )
 
     try:
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             cmd,
             capture_output=True,
             text=True,

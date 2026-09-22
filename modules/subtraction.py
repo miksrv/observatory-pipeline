@@ -5,6 +5,10 @@ Algorithm:
   1. Find N >= SUBTRACTION_MIN_FRAMES archived FITS of same object/filter.
   2. Load new frame data + WCS.
   3. Align each reference frame to the new frame using astroalign triangle matching.
+  3.5. Normalize each aligned reference onto the new frame's own photometric
+     scale (exposure time and sensor gain) — an archive routinely mixes
+     exposure times, and stacking those in raw ADU leaves a residual at the
+     position of every star in the frame (see _flux_scale_factor()).
   4. Median-stack aligned frames -> clean reference (removes cosmic rays and hot
      pixels FROM THE REFERENCE STACK — each reference's own detector-fixed
      defects get scattered to different pixels by the sky-based astroalign
@@ -38,6 +42,7 @@ import glob
 import logging
 import math
 import os
+import re
 from typing import Optional
 
 import astropy.units as u
@@ -51,14 +56,117 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# The narrowest second-moment semi-minor axis a pixel grid can express:
+# 1/sqrt(12) px, the standard deviation of a uniform distribution across one
+# pixel. `sep` can report a smaller — even exactly zero — `b` for a
+# degenerate fit (a detection lying along a single pixel row, a cosmic-ray
+# track, a bad column), and `a / b` then depends entirely on whatever
+# epsilon is substituted to avoid dividing by zero. The old sentinels (1e-6
+# here, 0.001 in _detect_diff_sources) turned such a fit into an elongation
+# of 10^3-10^6, a number that is not a measurement of anything but clears
+# every elongation threshold in the pipeline on the way to being persisted
+# as the source's shape (audit 2026-08-18, finding L4).
+#
+# Clamping at the pixel limit instead caps the ratio at `a / 0.2887` — how
+# elongated the feature would be if it were exactly one pixel wide, which is
+# the most elongated it can honestly be claimed to be. A feature now has to
+# be genuinely long in `a` to read as a trail, which is what the thresholds
+# were written to mean.
+#
+# Hand-duplicated across modules/qc.py, modules/subtraction.py,
+# modules/astrometry/_streak.py and modules/astrometry/_extraction.py, the
+# same convention those four already follow for the streak-mask helper
+# itself. Keep them in sync.
+_MIN_SEMI_MINOR_PX: float = 1.0 / math.sqrt(12.0)   # ~= 0.2887
+
 _MAX_FRAMES = 10
-# How many of the most-recent same-filter (or, failing that, any-filter)
-# candidates _find_archive_frames() is willing to open just to read their
-# WCS for PA-based ranking (see _sort_by_pa_closeness()) — bounds the extra
-# header-only I/O to a small, fixed cost regardless of how large the whole
-# archive directory is, rather than opening every archived frame ever taken
-# of this object.
-_PA_CANDIDATE_POOL = _MAX_FRAMES * 3
+
+
+# ---------------------------------------------------------------------------
+# Normalized-filename parsing
+#
+# modules/normalizer.py writes archived frames as
+#     Light:          {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
+#     Dark/Flat/Bias: {Object}_{FrameType}_{Exptime}_{DateTime}[_{Seq}].fits
+#
+# Reference selection used to look for the filter as a bare substring
+# (``"_HA_" in basename``), which cannot tell a field apart from the object
+# name that precedes it and knows nothing about the frame type at all (audit
+# 2026-08-18, finding C5). Two consequences, one of them live today: the
+# pipeline archives Dark/Flat/Bias frames into the SAME per-object directory
+# as the science frames, so a starless calibration frame was a perfectly
+# eligible reference — and being recent, it would crowd real science frames
+# out of the newest-first _MAX_FRAMES selection. The other is the token
+# collision the finding is named for: under the earlier filename revision the
+# FrameType codes were L/D/F/B, so ``_L_`` matched every Light frame whatever
+# its actual filter, and ``_B_`` matched Bias frames when looking for Blue.
+#
+# Parsing positionally instead removes both, and is anchored from the RIGHT
+# because the object name itself may contain underscores ("Andromeda_Galaxy",
+# "4_Vesta"). The anchor is the DateTime field, the one token with a
+# distinctive shape; the exposure, filter and frame-type fields then sit at
+# fixed offsets before it. That also disambiguates the legacy single-letter
+# codes for free — "L" in the FrameType position is Light, "L" in the filter
+# position is Luminance — so an archive written by the older revision parses
+# correctly too.
+# ---------------------------------------------------------------------------
+
+_FRAME_TYPE_TOKENS: dict[str, str] = {
+    "LIGHT": "Light", "DARK": "Dark", "FLAT": "Flat", "BIAS": "Bias",
+    # Legacy one-letter codes (pre-full-word filename revision)
+    "L": "Light", "D": "Dark", "F": "Flat", "B": "Bias",
+}
+
+_CALIBRATION_FRAME_TYPES = frozenset({"Dark", "Flat", "Bias"})
+
+# The DateTime field as build_filename() writes it: an ISO timestamp with
+# ":" replaced by "-". Matched as a prefix so a trailing zone marker ("Z",
+# "+00-00") or a seconds-less timestamp still anchors.
+_DATETIME_TOKEN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}")
+
+
+def _parse_normalized_filename(basename: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return ``(frame_type, filter_name)`` parsed out of a normalized filename,
+    or ``(None, None)`` when the name doesn't follow the convention at all
+    (NORMALIZE_ENABLED=false, or a file placed in the archive by hand).
+
+    ``filter_name`` is None for a calibration frame, and also for a Light
+    frame written without a filter field.
+    """
+    tokens = os.path.splitext(basename)[0].split("_")
+
+    # Anchor on the rightmost DateTime-shaped token: everything to its left
+    # is at a fixed offset, everything to its right is the optional sequence
+    # number.
+    idx = -1
+    for i, token in enumerate(tokens):
+        if _DATETIME_TOKEN_RE.match(token):
+            idx = i
+    if idx < 2:
+        return None, None
+
+    # The field immediately before it must be the exposure time.
+    try:
+        float(tokens[idx - 1])
+    except ValueError:
+        return None, None
+
+    # {FrameType}_{Filter}_{Exptime}_{DateTime} — preferred over the
+    # filter-less reading below, so that the legacy "M51_L_L_120_<dt>"
+    # (Light frame, Luminance filter) resolves the way it was written.
+    if idx >= 3:
+        frame_type = _FRAME_TYPE_TOKENS.get(tokens[idx - 3].upper())
+        if frame_type is not None:
+            return frame_type, tokens[idx - 2]
+
+    # {FrameType}_{Exptime}_{DateTime} — a calibration frame, or a Light
+    # frame whose filter was unknown at normalization time.
+    frame_type = _FRAME_TYPE_TOKENS.get(tokens[idx - 2].upper())
+    if frame_type is not None:
+        return frame_type, None
+
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +177,19 @@ def _find_archive_frames(
     archive_dir: str,
     filter_name: Optional[str],
     new_position_angle_deg: Optional[float] = None,
+    psf_fwhm_arcsec: Optional[float] = None,
 ) -> list[str]:
     """
     Return up to _MAX_FRAMES FITS paths from archive_dir, sorted newest-first.
 
-    When filter_name is provided and there are at least SUBTRACTION_MIN_FRAMES
-    frames whose normalized filename contains the filter token (e.g. ``_Ha_``),
-    only those same-filter frames are returned.  Otherwise all frames are
-    returned, allowing cross-filter subtraction as a fallback.
+    Calibration frames (Dark/Flat/Bias, which pipeline.py archives into this
+    same per-object directory) are never eligible — see
+    _parse_normalized_filename().
+
+    When filter_name is provided and at least SUBTRACTION_MIN_FRAMES of the
+    remaining science frames carry that filter in their filename's own filter
+    FIELD, only those same-filter frames are returned.  Otherwise all science
+    frames are returned, allowing cross-filter subtraction as a fallback.
 
     Parameters
     ----------
@@ -84,6 +197,13 @@ def _find_archive_frames(
         Absolute path to the per-object archive directory.
     filter_name:
         Normalized filter string (e.g. "Ha", "R", "L") or None.
+    psf_fwhm_arcsec:
+        The new frame's own measured stellar FWHM in arcsec (qc.analyze()'s
+        fwhm_median, as forwarded by pipeline.py). When given, a candidate
+        whose own archived QCFWHM is worse than
+        SUBTRACTION_REF_MAX_FWHM_RATIO times it is excluded — see
+        _passes_quality_screen(). None leaves only the QCFLAG half of the
+        screen in force.
     new_position_angle_deg:
         The new frame's own WCS-derived position angle (run()'s own
         _position_angle_deg(wcs) — see that helper's docstring). When given,
@@ -91,7 +211,10 @@ def _find_archive_frames(
         _MAX_FRAMES, the final _MAX_FRAMES selection prefers frames whose
         own orientation is CLOSEST to this one over merely-most-recent
         ones — a reference needing less geometric correction is a mildly
-        better bet for alignment quality. This is a soft, non-exclusionary
+        better bet for alignment quality. The whole candidate list is
+        ranked, however far back in the archive it reaches; see
+        _sort_by_pa_closeness() for why it used to be only the 30 newest
+        and why that bounded nothing. This is a soft, non-exclusionary
         preference, not a hard filter: run()'s _prerotate_reference() step
         already coarse-corrects for whatever orientation difference remains
         in whichever frames end up selected here, including a ~180deg
@@ -115,21 +238,154 @@ def _find_archive_frames(
 
     all_files.sort(key=os.path.getmtime, reverse=True)
 
-    candidates = all_files
+    # Drop calibration frames before anything else. pipeline.py archives
+    # Dark/Flat/Bias into this same per-object directory, and a starless
+    # calibration frame is not a reference for anything — being recent, it
+    # would also crowd genuine science frames out of the newest-first
+    # _MAX_FRAMES selection below (audit 2026-08-18, finding C5). A file
+    # whose name doesn't follow the convention is kept: it can't be
+    # identified as calibration, and an archive normalized by hand or with
+    # NORMALIZE_ENABLED=false must not lose subtraction over it.
+    parsed = {f: _parse_normalized_filename(os.path.basename(f)) for f in all_files}
+    science_files = [f for f in all_files if parsed[f][0] not in _CALIBRATION_FRAME_TYPES]
+    n_calibration = len(all_files) - len(science_files)
+    if n_calibration:
+        logger.info(
+            "Subtraction: ignoring %d calibration frame(s) in %s as reference candidates",
+            n_calibration, archive_dir,
+        )
+
+    science_files = _screen_by_quality(science_files, psf_fwhm_arcsec)
+
+    candidates = science_files
     if filter_name:
         token = f"_{filter_name.upper()}_"
-        # Compare case-insensitively: normalized filter tokens are not all
-        # uppercase (e.g. "Ha"), so a literal uppercased token would never
-        # match a mixed-case filename token and this branch would silently
-        # always fall through to the cross-filter fallback below.
-        matching = [f for f in all_files if token in os.path.basename(f).upper()]
+
+        def _same_filter(path: str) -> bool:
+            parsed_filter = parsed[path][1]
+            if parsed[path][0] is not None:
+                # Positional match against the filename's own filter FIELD.
+                # A substring test can't tell that field apart from the object
+                # name before it, nor from the frame-type code that used to
+                # share its alphabet (see _parse_normalized_filename()).
+                return parsed_filter is not None and parsed_filter.upper() == filter_name.upper()
+            # Unparseable name — fall back to the old substring test rather
+            # than excluding it outright, so a non-normalized archive keeps
+            # whatever same-filter matching it had before.
+            return token in os.path.basename(path).upper()
+
+        matching = [f for f in science_files if _same_filter(f)]
         if len(matching) >= config.SUBTRACTION_MIN_FRAMES:
             candidates = matching
+        elif matching:
+            logger.info(
+                "Subtraction: only %d frame(s) match filter %s (need %d) — "
+                "falling back to all %d science frame(s)",
+                len(matching), filter_name, config.SUBTRACTION_MIN_FRAMES,
+                len(science_files),
+            )
 
     if new_position_angle_deg is not None and len(candidates) > _MAX_FRAMES:
         candidates = _sort_by_pa_closeness(candidates, new_position_angle_deg)
 
     return candidates[:_MAX_FRAMES]
+
+
+def _read_qc_headers(path: str) -> tuple[Optional[str], Optional[float]]:
+    """
+    Read the QCFLAG/QCFWHM pair pipeline.py stamps into a frame's header at
+    archive time. Either or both are None for a frame archived before those
+    existed, or one placed in the directory by hand.
+
+    A header-only read: no pixel data is touched, so screening the whole
+    candidate list costs a handful of small reads.
+    """
+    try:
+        header = fits.getheader(path)
+    except Exception as exc:
+        logger.debug("Subtraction: could not read QC headers from %s: %s", path, exc)
+        return None, None
+
+    flag = header.get("QCFLAG")
+    flag_str = str(flag).strip().upper() if flag is not None else None
+
+    fwhm: Optional[float] = None
+    raw = header.get("QCFWHM")
+    if raw is not None:
+        try:
+            value = float(raw)
+            if math.isfinite(value) and value > 0:
+                fwhm = value
+        except (TypeError, ValueError):
+            pass
+
+    return flag_str, fwhm
+
+
+def _screen_by_quality(
+    paths: list[str],
+    psf_fwhm_arcsec: Optional[float],
+) -> list[str]:
+    """
+    Drop reference candidates that would damage the difference image: frames
+    their own QC marked as failed, and frames whose seeing is far worse than
+    the new frame's.
+
+    Reference selection used to be recency (plus PA-closeness) alone and never
+    looked at quality at all. That was harmless while QC-failed frames were
+    moved to /fits/rejected, but they are archived now — into the very
+    directory the reference stack is drawn from (audit 2026-08-18, finding
+    H10). Differencing a sharp new frame against a blurred reference leaves
+    the classic ring-shaped residual at every star in the field: a PSF
+    mismatch, reported as a crowd of transients, on top of a noise floor
+    raised enough to bury the faint real ones.
+
+    A candidate with no QC headers at all is kept — it cannot be judged, and
+    an archive written before those headers existed must not lose subtraction
+    over it. Screening never costs the frame its subtraction either: if it
+    would leave fewer than SUBTRACTION_MIN_FRAMES, the unscreened list is
+    returned with a warning, on the same reasoning as photometry.py's
+    zero-point reference screen — an imperfect reference stack beats none.
+    """
+    if not paths:
+        return paths
+
+    limit = None
+    if psf_fwhm_arcsec is not None and psf_fwhm_arcsec > 0:
+        limit = psf_fwhm_arcsec * config.SUBTRACTION_REF_MAX_FWHM_RATIO
+
+    kept: list[str] = []
+    n_failed_qc = 0
+    n_blurred = 0
+
+    for path in paths:
+        flag, fwhm = _read_qc_headers(path)
+        if flag is not None and flag != "OK":
+            n_failed_qc += 1
+            continue
+        if limit is not None and fwhm is not None and fwhm > limit:
+            n_blurred += 1
+            continue
+        kept.append(path)
+
+    if not (n_failed_qc or n_blurred):
+        return paths
+
+    if len(kept) < config.SUBTRACTION_MIN_FRAMES:
+        logger.warning(
+            "Subtraction: only %d of %d reference candidate(s) pass the quality "
+            "screen (%d failed QC, %d blurred beyond %.2f\") — stacking the "
+            "unscreened set instead, so expect PSF-mismatch residuals",
+            len(kept), len(paths), n_failed_qc, n_blurred, limit or 0.0,
+        )
+        return paths
+
+    logger.info(
+        "Subtraction: excluded %d QC-failed and %d blurred reference "
+        "candidate(s) of %d",
+        n_failed_qc, n_blurred, len(paths),
+    )
+    return kept
 
 
 def _sort_by_pa_closeness(paths: list[str], new_position_angle_deg: float) -> list[str]:
@@ -139,16 +395,30 @@ def _sort_by_pa_closeness(paths: list[str], new_position_angle_deg: float) -> li
     the existing recency order as the tiebreaker (Python's sort is stable),
     not replacing it outright.
 
-    Only opens the first _PA_CANDIDATE_POOL entries' WCS (cheap, header-only
-    reads) to bound the I/O cost regardless of archive size — a candidate
-    outside that recency-based shortlist is left in place after it, never
-    pulled forward purely for having a better-matching angle. A candidate
-    whose own WCS/PA can't be determined sorts last (treated as the worst
-    case, same as an unknown new_position_angle_deg would be for it).
-    """
-    pool = paths[:_PA_CANDIDATE_POOL]
-    rest = paths[_PA_CANDIDATE_POOL:]
+    Every candidate is ranked, not just a shortlist of the most recent ones.
+    This used to open only the 30 newest candidates' WCS, to bound the extra
+    I/O, which quietly defeated the ranking in exactly the case it exists
+    for (audit 2026-08-18, finding L5): an archive that splits into two
+    orientation clusters — the ordinary result of a German equatorial
+    mount's meridian flip — can easily have its 30 newest frames all on one
+    side of the flip, so a new frame taken on the other side saw no
+    well-oriented reference at all and every frame it stacked needed the
+    full ~180deg pre-rotation. The better-matched frames were sitting in the
+    same directory, never opened.
 
+    The I/O that cap was protecting is already being spent: _screen_by_quality()
+    above reads every science candidate's header on every run to check its
+    QCFLAG/QCFWHM (finding H10, added after this cap). So the cap was
+    bounding a second, marginal read of files the same call had just read —
+    at the cost of the frames the ranking is meant to find. Reading the rest
+    costs one more header-level open per candidate, the same order of
+    magnitude as the screen itself and nothing beside astap and astroalign.
+
+    A candidate whose own WCS/PA can't be determined sorts last (treated as
+    the worst case, same as an unknown new_position_angle_deg would be for
+    it), which for an archive with no WCS headers at all leaves the recency
+    order exactly as it was.
+    """
     def _pa_distance(path: str) -> float:
         wcs = _open_wcs(path)
         pa = _position_angle_deg(wcs) if wcs is not None else None
@@ -158,12 +428,16 @@ def _sort_by_pa_closeness(paths: list[str], new_position_angle_deg: float) -> li
         return min(d, 360.0 - d)
 
     try:
-        pool_sorted = sorted(pool, key=_pa_distance)
+        ranked = sorted(paths, key=_pa_distance)
     except Exception as exc:
         logger.debug("Subtraction: PA-based reference ranking failed (%s) — falling back to recency order", exc)
         return paths
 
-    return pool_sorted + rest
+    logger.debug(
+        "Subtraction: ranked %d reference candidate(s) by orientation against PA=%.1f°",
+        len(paths), new_position_angle_deg,
+    )
+    return ranked
 
 
 # ---------------------------------------------------------------------------
@@ -188,23 +462,293 @@ def _load_frame_data(fits_path: str) -> Optional[np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
+# Photometric normalization of reference frames
+#
+# A frame's recorded signal in ADU scales as exposure_time / gain, where gain
+# is the sensor's true conversion factor in electrons per ADU. An object's
+# archive routinely mixes exposure times (auto-exposure, a different session,
+# a different camera profile), and median-stacking those in raw ADU leaves a
+# residual of roughly (K-1) x flux at the position of EVERY star in the frame
+# once the stack is subtracted, where K is the scale mismatch — hundreds of
+# false candidates across a single frame, plus an elevated noise floor that
+# hides the genuine faint transients subtraction exists to find (audit
+# 2026-08-18, finding C4).
+#
+# The gain plausibility range and the EGAIN-before-GAIN preference are the
+# same as modules/photometry.py's _resolve_gain(), duplicated here by hand
+# rather than imported — the convention this module already follows for the
+# streak-mask and FWHM-floor logic it shares with modules/astrometry/.
+# ---------------------------------------------------------------------------
+
+_GAIN_MIN_E_PER_ADU: float = 0.05
+_GAIN_MAX_E_PER_ADU: float = 20.0
+
+# A reference needing more correction than this (in either direction) is
+# reported to the operator: it still gets normalized and used, but such an
+# archive is heterogeneous enough that the scaled-up reference noise measurably
+# raises the detection threshold for the whole frame.
+_FLUX_SCALE_WARN_FACTOR: float = 2.0
+
+
+def _read_flux_scale_keys(fits_path: str) -> tuple[Optional[float], Optional[float]]:
+    """
+    Read (exposure_time_sec, gain_e_per_adu) from a frame's headers.
+
+    Either element is None when the file carries nothing usable for it.
+    Both the primary header and the first 2-D image HDU's own header are
+    consulted, since capture software differs on where it writes these.
+
+    `gain` prefers EGAIN over GAIN for the reason spelled out in
+    modules/photometry.py's _resolve_gain(): on most CMOS cameras EGAIN is
+    the true e-/ADU conversion while GAIN holds the camera's gain *setting*
+    in arbitrary vendor units (0-500 on a ZWO ASI). A value outside the
+    plausible e-/ADU range is rejected rather than used. config's
+    PHOTOMETRY_GAIN_E_PER_ADU deliberately does NOT override anything here:
+    a single deployment-wide value is by definition identical for the new
+    frame and every reference, so it cancels in the ratio and would only
+    mask a genuine per-frame difference.
+    """
+    exptime: Optional[float] = None
+    gain: Optional[float] = None
+    try:
+        with fits.open(fits_path) as hdul:
+            headers = [hdul[0].header]
+            for hdu in hdul:
+                if hdu.data is not None and hdu.data.ndim == 2:
+                    headers.append(hdu.header)
+                    break
+
+            for key in ("EXPTIME", "EXPOSURE"):
+                for hdr in headers:
+                    value = hdr.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        candidate = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(candidate) and candidate > 0:
+                        exptime = candidate
+                        break
+                if exptime is not None:
+                    break
+
+            for key in ("EGAIN", "GAIN"):
+                for hdr in headers:
+                    value = hdr.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        candidate = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(candidate) and _GAIN_MIN_E_PER_ADU <= candidate <= _GAIN_MAX_E_PER_ADU:
+                        gain = candidate
+                        break
+                if gain is not None:
+                    break
+    except Exception as exc:
+        logger.debug("Subtraction: cannot read flux-scale keys from %s: %s", fits_path, exc)
+
+    return exptime, gain
+
+
+def _flux_scale_factor(
+    ref_path: str,
+    new_exptime: Optional[float],
+    new_gain: Optional[float],
+) -> float:
+    """
+    Multiplier bringing *ref_path*'s pixel values onto the new frame's own
+    photometric scale: ``(t_new / t_ref) * (g_ref / g_new)``.
+
+    Each of the two factors independently falls back to 1.0 when the
+    corresponding keyword is missing on either side — an archive with no
+    EXPTIME at all therefore behaves exactly as it did before normalization
+    existed, rather than losing subtraction entirely.
+
+    Scaling the reference (not the new frame) is deliberate: the new frame's
+    own pixel values are what candidate fluxes and the SATURATION_ADU checks
+    are measured against, and must stay in their native ADU.
+
+    The scaled reference's bias/sky pedestal comes out of the subtraction as
+    a smooth ``(K-1) x pedestal`` term, which _detect_diff_sources()'s own
+    `sep.Background()` pass removes before extraction — unlike the per-star
+    residual this function exists to cancel, which is not smooth and is
+    exactly what SEP would otherwise report.
+    """
+    ref_exptime, ref_gain = _read_flux_scale_keys(ref_path)
+
+    scale = 1.0
+    if new_exptime and ref_exptime:
+        scale *= new_exptime / ref_exptime
+    if new_gain and ref_gain:
+        scale *= ref_gain / new_gain
+
+    if not math.isfinite(scale) or scale <= 0:
+        logger.warning(
+            "Subtraction: implausible flux scale %r for reference %s — using 1.0",
+            scale, os.path.basename(ref_path),
+        )
+        return 1.0
+
+    return scale
+
+
+# ---------------------------------------------------------------------------
 # Image alignment
 # ---------------------------------------------------------------------------
 
-def _align_frame(source: np.ndarray, target: np.ndarray) -> Optional[np.ndarray]:
+def _align_frame(
+    source: np.ndarray,
+    target: np.ndarray,
+) -> Optional[tuple[np.ndarray, Optional[np.ndarray]]]:
     """
     Align *source* onto *target* pixel grid using astroalign triangle matching.
 
-    Returns the aligned array as float32, or None if alignment fails (e.g.
-    too few stars detected — common for sparse or heavily trailed fields).
+    Returns ``(aligned, footprint)`` — the aligned array as float32, plus
+    astroalign's own boolean footprint marking the pixels it could NOT fill
+    from the source frame (True = no information there) — or None if alignment
+    fails (e.g. too few stars detected, common for sparse or heavily trailed
+    fields).
+
+    The footprint used to be discarded (audit 2026-08-18, finding H8). It
+    matters because the geometric transform almost never maps the reference
+    exactly onto the new frame's grid: a shift, a rotation, or a different
+    sensor size all leave a band of target pixels with no source data behind
+    them. Whatever astroalign puts there is not a measurement, and letting it
+    into the median stack produces a residual in the difference image that no
+    downstream filter is looking for — the saturation, streak and near_edge
+    filters all address something else.
+
+    `footprint` is None when astroalign returned something that isn't a usable
+    boolean mask of the right shape; the caller then treats every pixel of
+    that reference as valid, i.e. exactly the previous behaviour.
     """
     try:
         import astroalign
-        aligned, _ = astroalign.register(source, target)
-        return np.asarray(aligned, dtype=np.float32)
+        # propagate_mask=True carries a masked source's own mask into the
+        # returned footprint — which is how _prerotate_reference()'s padding
+        # (the corners a same-canvas rotation would have cropped away) stays
+        # marked as "no data here" through astroalign's own resampling.
+        aligned, footprint = astroalign.register(source, target, propagate_mask=True)
+        aligned_arr = np.asarray(aligned, dtype=np.float32)
+
+        mask: Optional[np.ndarray] = None
+        if footprint is not None:
+            candidate = np.asarray(footprint)
+            if candidate.shape == aligned_arr.shape:
+                mask = candidate.astype(bool)
+
+        return aligned_arr, mask
     except Exception as exc:
         logger.debug("astroalign failed: %s", exc)
         return None
+
+
+def _median_reference(
+    stack: np.ndarray,
+    footprints: list[Optional[np.ndarray]],
+    new_data: np.ndarray,
+) -> np.ndarray:
+    """
+    Per-pixel median of the aligned reference stack, ignoring pixels each
+    reference had no data for.
+
+    astroalign's footprint marks the target pixels it could not fill from the
+    source frame — the band a shift or rotation leaves empty, or the region
+    outside a smaller sensor's field. Those values are not measurements, and
+    averaging them into the reference puts a step into the difference image
+    that reads as a bright residual (audit 2026-08-18, finding H8).
+
+    A pixel no reference covered at all has no reference value to speak of, so
+    it takes the new frame's own value: the difference there is then exactly
+    zero and nothing can be detected in it. The alternative — leaving it at
+    whatever the stack happened to hold — is precisely the false residual this
+    is avoiding.
+
+    A non-finite value in a reference is excluded the same way, and for the
+    same reason: `np.median()` does not ignore NaN, it propagates it, so one
+    NaN pixel in one archived file — not rare, masked pixels from a previous
+    calibration pass leave them — nulled the reference at that position and
+    the difference image with it (audit 2026-08-18, finding H9). Silently, and
+    for every frame that archive is ever a reference for.
+
+    Falls back to a plain median when nothing needs excluding at all, i.e. the
+    behaviour before footprints were kept.
+
+    The excluded values are set to NaN **in `stack` itself** and the stack is
+    then sorted in place, so the caller must not reuse it. That is what keeps
+    this affordable: `np.ma.median()` — the obvious tool — builds sorted copies
+    of the data and the mask plus several index arrays, about five times the
+    stack's own size on top of it (2.3 GB extra for seven 4656x3520 frames),
+    which on a real archive doubled the subtraction step's peak memory and got
+    the worker OOM-killed mid-task (2026-09-22 test run). NaN sorts to the end,
+    so after the sort the k valid values of each pixel occupy its first k
+    slots and the median is read straight off them — the same value
+    `np.ma.median()` returns, including the mean of the two middle values
+    when k is even.
+    """
+    nonfinite = ~np.isfinite(stack)
+    has_footprints = any(fp is not None for fp in footprints)
+
+    if not has_footprints and not nonfinite.any():
+        return np.median(stack, axis=0).astype(np.float32)
+
+    n_nonfinite = int(np.count_nonzero(nonfinite))
+    if n_nonfinite:
+        logger.warning(
+            "Subtraction: %d non-finite pixel value(s) across %d reference "
+            "frame(s) excluded from the median stack — one such pixel would "
+            "otherwise null the reference at that position",
+            n_nonfinite, stack.shape[0],
+        )
+    # +/-inf would sort as a value; only NaN sorts past every valid one.
+    stack[nonfinite] = np.nan
+    del nonfinite
+
+    for i, fp in enumerate(footprints):
+        if fp is not None and fp.shape == stack.shape[1:]:
+            stack[i][fp] = np.nan
+
+    stack.sort(axis=0)
+    valid = np.count_nonzero(~np.isnan(stack), axis=0)
+
+    n_invalid = int(stack.shape[0] * stack[0].size - valid.sum())
+    if n_invalid:
+        logger.info(
+            "Subtraction: excluding %d uncovered or non-finite pixel value(s) "
+            "across %d reference frame(s) from the median stack",
+            n_invalid, stack.shape[0],
+        )
+
+    # The median of k sorted values is the mean of indices (k-1)//2 and k//2
+    # — one and the same index when k is odd. k == 0 reads slot 0 (a NaN) and
+    # is overwritten below as uncovered.
+    lo = np.maximum((valid - 1) // 2, 0)[np.newaxis]
+    hi = (valid // 2)[np.newaxis]
+    reference = (
+        np.take_along_axis(stack, lo, axis=0)[0]
+        + np.take_along_axis(stack, hi, axis=0)[0]
+    ) * np.float32(0.5)
+    reference = reference.astype(np.float32, copy=False)
+    del lo, hi
+
+    uncovered = valid == 0
+    if uncovered.any():
+        logger.info(
+            "Subtraction: %d pixel(s) have no valid reference at all — the "
+            "difference image is held at zero there",
+            int(uncovered.sum()),
+        )
+        reference[uncovered] = new_data[uncovered]
+    # A pixel the new frame itself has no value for leaves the difference
+    # non-finite whatever the reference says; run() masks those out of
+    # detection, and zeroing the reference here keeps the arithmetic itself
+    # well-defined.
+    reference[~np.isfinite(reference)] = 0.0
+
+    return reference
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +827,7 @@ def _build_streak_mask(
     if len(objs) == 0:
         return None
 
-    safe_b = np.where(objs["b"] > 0, objs["b"], 1e-6)
+    safe_b = np.where(objs["b"] > _MIN_SEMI_MINOR_PX, objs["b"], _MIN_SEMI_MINOR_PX)
     elongation = objs["a"] / safe_b
     bbox_diag_px = np.sqrt(
         (objs["xmax"] - objs["xmin"]).astype(np.float64) ** 2
@@ -326,6 +870,69 @@ def _build_streak_mask(
 # ---------------------------------------------------------------------------
 # Difference-image source detection
 # ---------------------------------------------------------------------------
+
+_NOISE_CORR_BOX: int = 4
+
+
+def _noise_correlation_factor(
+    sub: np.ndarray,
+    mask: Optional[np.ndarray],
+    rms: float,
+) -> float:
+    """
+    How much the difference image's noise is correlated between neighbouring
+    pixels, as the factor by which ``rms * sqrt(npix)`` understates the noise
+    in an aperture.
+
+    Independent per-pixel noise averaged over a box of side `k` falls as
+    `1/k`. Interpolation does not average independent samples: astroalign
+    resamples every reference onto this frame's grid (and `_prerotate_reference()`
+    may interpolate once more before it), which spreads each input pixel's
+    noise across several output pixels. The box-averaged scatter then falls
+    short of `1/k`, and the ratio of what it actually is to what it would be
+    is exactly the correction an aperture's noise needs (audit 2026-08-18,
+    finding H13).
+
+    Measured from this frame's own difference image rather than assumed,
+    because it depends on the interpolation each individual stack went
+    through. Both scatters are MAD-derived so that the real sources in the
+    image — which are not noise — don't set the answer.
+
+    Returns 1.0 (the previous, uncorrected behaviour) when the measurement
+    can't be made, comes out below 1, or SUBTRACTION_NOISE_CORR_MAX is at or
+    below 1; and never returns more than that cap.
+    """
+    cap = config.SUBTRACTION_NOISE_CORR_MAX
+    if cap <= 1.0 or rms <= 0:
+        return 1.0
+
+    try:
+        from scipy.ndimage import uniform_filter  # noqa: PLC0415
+
+        sample = sub if mask is None else sub[~mask]
+        if sample.size < _NOISE_CORR_BOX ** 2 * 16:
+            return 1.0
+
+        smoothed = uniform_filter(sub, size=_NOISE_CORR_BOX)
+        smoothed_sample = smoothed if mask is None else smoothed[~mask]
+
+        median = float(np.median(smoothed_sample))
+        mad = float(np.median(np.abs(smoothed_sample - median)))
+        sigma_box = 1.4826 * mad
+        if sigma_box <= 0:
+            return 1.0
+
+        # Expected box-averaged scatter if every pixel were independent.
+        expected = rms / _NOISE_CORR_BOX
+        factor = sigma_box / expected
+    except Exception as exc:
+        logger.debug("Subtraction: correlated-noise measurement failed (%s)", exc)
+        return 1.0
+
+    if not math.isfinite(factor) or factor <= 1.0:
+        return 1.0
+    return min(factor, cap)
+
 
 def _detect_diff_sources(
     diff: np.ndarray,
@@ -389,9 +996,42 @@ def _detect_diff_sources(
         if rms <= 0:
             return []
 
+        # The streak mask has to be found on a background-subtracted image,
+        # so the pass above is unavoidable — but its background and RMS were
+        # measured with the trail still in the frame. A bright satellite
+        # track below the saturation threshold contributes to globalrms, and
+        # since the detection threshold is SUBTRACTION_DETECT_SIGMA x rms,
+        # one trail raises the bar for every faint real transient elsewhere
+        # in the same frame (audit 2026-08-18, finding H12). Re-measure both
+        # with the trail excluded before setting that threshold.
         streak_mask = _build_streak_mask(sub, rms, pixel_scale_arcsec)
-        if streak_mask is not None:
-            sub[streak_mask] = 0.0
+        if streak_mask is not None and streak_mask.any():
+            combined = streak_mask if use_mask is None else (use_mask | streak_mask)
+            bkg = sep.Background(arr, mask=combined)
+            sub = arr - bkg.back()
+            sub[combined] = 0.0
+            rms_masked = float(bkg.globalrms)
+            if rms_masked <= 0:
+                return []
+            logger.info(
+                "Subtraction: re-measured background with %d streak pixel(s) "
+                "excluded — RMS %.3f -> %.3f",
+                int(streak_mask.sum()), rms, rms_masked,
+            )
+            rms = rms_masked
+            use_mask = combined
+
+        # How far the aperture noise exceeds rms * sqrt(npix) because
+        # neighbouring pixels' noise is not independent after resampling —
+        # see _noise_correlation_factor(). Measured once per frame.
+        noise_corr = _noise_correlation_factor(sub, use_mask, rms)
+        if noise_corr > 1.0:
+            logger.info(
+                "Subtraction: difference-image noise is correlated by a factor "
+                "of %.2f (resampling) — candidate SNRs divided by it",
+                noise_corr,
+            )
+
         thresh = config.SUBTRACTION_DETECT_SIGMA * rms
         try:
             objs = sep.extract(sub, thresh=thresh, minarea=5)
@@ -426,9 +1066,13 @@ def _detect_diff_sources(
             # Gaussian approximation used in modules/astrometry/_extraction.py.
             flux = float(obj["flux"])
             npix = int(obj["npix"])
-            snr = flux / (rms * math.sqrt(npix)) if npix > 0 else 0.0
+            # rms * sqrt(npix) is the aperture noise only if each pixel's
+            # noise is independent of its neighbours'. Resampling makes it
+            # otherwise, so the aperture holds fewer independent measurements
+            # than pixels and the uncorrected figure overstates significance.
+            snr = flux / (rms * math.sqrt(npix) * noise_corr) if npix > 0 else 0.0
             a_axis = float(obj["a"])
-            b_axis = max(float(obj["b"]), 0.001)
+            b_axis = max(float(obj["b"]), _MIN_SEMI_MINOR_PX)
             fwhm = 2.0 * math.sqrt(2.0 * math.log(2.0) * (a_axis ** 2 + b_axis ** 2) / 2.0)
 
             # Reject candidates far sharper than the frame's own stellar PSF —
@@ -451,16 +1095,30 @@ def _detect_diff_sources(
                 or obj_y < margin_y or obj_y > height - margin_y
             )
 
-            # Skip candidates in the edge zone — coma and other off-axis
-            # aberrations change the PSF shape between frames (rotation,
-            # guiding drift, focus shift), so the median reference stack
-            # never perfectly cancels an edge star's coma wing.  The
-            # resulting non-zero residual is picked up by sep as a
-            # "new source", but it is a purely optical artifact, not a real
-            # transient.  Real incident, 2026-08-10 analysis: 53 of 80
-            # UNKNOWN alerts were from_subtraction + near_edge — every one
-            # of them a coma residual of an ordinary catalogued star.
-            if near_edge:
+            elongation = a_axis / b_axis
+
+            # Candidates in the edge zone are held to a much higher bar.
+            # Coma and the other off-axis aberrations change the PSF shape
+            # between frames (rotation, guiding drift, focus shift), so the
+            # median reference stack never perfectly cancels an edge star's
+            # coma wing, and sep picks the leftover up as a "new source" —
+            # a purely optical artifact. Real incident, 2026-08-10 analysis:
+            # 53 of 80 UNKNOWN alerts were from_subtraction + near_edge,
+            # every one a coma residual of an ordinary catalogued star.
+            #
+            # Rejecting the whole zone outright — the previous behaviour —
+            # also meant a genuine transient landing near the edge, which a
+            # dithering pattern makes routine, could never be found by
+            # subtraction at all (audit 2026-08-18, finding H11). What
+            # separates the two is shape and strength, not position: an
+            # aberration stretches a PSF into an arc, and it is the mismatch
+            # between two such arcs that fails to cancel, so a coma residual
+            # is elongated and usually weak. A round, strong residual is not
+            # that shape.
+            if near_edge and not (
+                elongation <= config.SUBTRACTION_EDGE_ELONGATION_MAX
+                and snr >= config.SUBTRACTION_EDGE_SNR_MIN
+            ):
                 n_rejected_edge += 1
                 continue
 
@@ -470,16 +1128,19 @@ def _detect_diff_sources(
                 "flux":       flux,
                 "snr":        snr,
                 "fwhm":       fwhm,
-                "elongation": a_axis / b_axis,
+                "elongation": elongation,
                 "near_edge":  near_edge,
             })
 
         if n_rejected_edge:
             logger.info(
                 "Subtraction: rejected %d candidate(s) in the edge zone "
-                "(EDGE_MARGIN_FRAC=%.2f) — likely coma/aberration residuals, "
+                "(EDGE_MARGIN_FRAC=%.2f) for being elongated beyond %.2f or "
+                "weaker than SNR %.1f — likely coma/aberration residuals, "
                 "not real transients",
                 n_rejected_edge, config.EDGE_MARGIN_FRAC,
+                config.SUBTRACTION_EDGE_ELONGATION_MAX,
+                config.SUBTRACTION_EDGE_SNR_MIN,
             )
 
         if n_rejected_sharp:
@@ -644,12 +1305,40 @@ def _prerotate_reference(
 
     try:
         from scipy.ndimage import rotate as _ndi_rotate
-        rotated = _ndi_rotate(ref_data, angle=delta, reshape=False, order=1, mode="constant", cval=0.0)
+
+        # reshape=True, not False. Rotating onto the same canvas is a crop for
+        # any angle that isn't a multiple of 90 degrees — the corners rotate
+        # off the edge and are simply lost. The gate is 2 degrees, so this
+        # fires on modest field rotation (an alt-az mount without a
+        # de-rotator), not only on meridian flips, and the stars it discards
+        # are the ones astroalign needs to find a transform at all: the
+        # failure rate rose exactly for the large-angle cases pre-rotation
+        # exists to help (audit 2026-08-18, finding H14). Letting the canvas
+        # grow keeps every star; astroalign resamples onto the new frame's
+        # grid regardless of the source's shape.
+        rotated = _ndi_rotate(ref_data, angle=delta, reshape=True, order=1, mode="constant", cval=0.0)
+
+        # The other half of that finding: the constant fill leaves a hard
+        # zero/data boundary running diagonally across the frame, which the
+        # median stack cannot cancel and sep reads as a bright edge-on
+        # residual. Rotating a validity map by the same angle (order=0, so it
+        # stays binary) marks exactly those pixels, and handing astroalign a
+        # masked array with propagate_mask=True carries the marking through
+        # its own resampling into the footprint _median_reference() already
+        # excludes from the stack.
+        valid = _ndi_rotate(
+            np.ones(ref_data.shape, dtype=np.uint8),
+            angle=delta, reshape=True, order=0, mode="constant", cval=0,
+        )
+
         logger.info(
             "Subtraction: pre-rotated reference %s by %.1f deg (ref_pa=%.1f, new_pa=%.1f) before alignment",
             os.path.basename(ref_path), delta, ref_pa, new_position_angle_deg,
         )
-        return np.asarray(rotated, dtype=ref_data.dtype)
+        return np.ma.masked_array(
+            np.asarray(rotated, dtype=ref_data.dtype),
+            mask=(valid < 1),
+        )
     except Exception as exc:
         logger.debug("Subtraction: pre-rotation of %s failed (%s) — using un-rotated reference", ref_path, exc)
         return ref_data
@@ -878,7 +1567,9 @@ async def run(
     # only selection and no pre-rotation, exactly like before this feature.
     new_position_angle_deg = _position_angle_deg(wcs) if wcs is not None else None
 
-    archive_files = _find_archive_frames(archive_dir, filter_name, new_position_angle_deg)
+    archive_files = _find_archive_frames(
+        archive_dir, filter_name, new_position_angle_deg, psf_fwhm_arcsec,
+    )
     # Exclude the new frame's own file from its candidate reference stack —
     # re-analyzing an already-archived frame (see pipeline.py's
     # _resolve_bare_filename()) passes a fits_path that may already be
@@ -905,7 +1596,21 @@ async def run(
     # ------------------------------------------------------------------
     # Align each reference frame to the new frame's pixel grid
     # ------------------------------------------------------------------
+    # This frame's own photometric scale, against which every reference is
+    # normalized below — see _flux_scale_factor(). Read once here rather than
+    # per reference.
+    new_exptime, new_gain = _read_flux_scale_keys(fits_path)
+    if new_exptime is None:
+        logger.warning(
+            "Subtraction: no usable EXPTIME on %s — reference frames cannot be "
+            "normalized to its exposure, so a mixed-exposure archive will leave a "
+            "residual at every star in the diff image",
+            os.path.basename(fits_path),
+        )
+
     aligned: list[np.ndarray] = []
+    footprints: list[Optional[np.ndarray]] = []
+    scales: list[float] = []
     for ref_path in archive_files:
         ref_data = _load_frame_data(ref_path)
         if ref_data is None:
@@ -927,9 +1632,16 @@ async def run(
         # the case it exists to handle. _align_frame()'s own try/except below
         # still catches genuine alignment failures (too few common stars,
         # no overlapping field, etc.).
-        result_frame = _align_frame(ref_data, new_data)
-        if result_frame is not None:
+        result = _align_frame(ref_data, new_data)
+        if result is not None:
+            result_frame, footprint = result
             aligned.append(result_frame)
+            footprints.append(footprint)
+            # Kept alongside rather than applied to `result_frame` itself:
+            # _build_saturation_mask() below compares the aligned references
+            # against SATURATION_ADU, and a scaled-down reference's saturated
+            # core would drop below that threshold and escape masking.
+            scales.append(_flux_scale_factor(ref_path, new_exptime, new_gain))
         else:
             logger.debug(
                 "Subtraction: skipping %s (alignment failed)",
@@ -947,7 +1659,26 @@ async def run(
     # ------------------------------------------------------------------
     # Build median reference and compute difference image
     # ------------------------------------------------------------------
-    reference = np.median(np.stack(aligned, axis=0), axis=0).astype(np.float32)
+    stack = np.stack(aligned, axis=0)
+    if any(abs(scale - 1.0) > 1e-3 for scale in scales):
+        stack *= np.asarray(scales, dtype=np.float32).reshape(-1, 1, 1)
+        logger.info(
+            "Subtraction: normalized %d reference frame(s) to this frame's "
+            "photometric scale (factors %.3f-%.3f)",
+            len(scales), min(scales), max(scales),
+        )
+        extreme = [s for s in scales
+                   if s > _FLUX_SCALE_WARN_FACTOR or s < 1.0 / _FLUX_SCALE_WARN_FACTOR]
+        if extreme:
+            logger.warning(
+                "Subtraction: %d of %d reference frame(s) needed a flux scale "
+                "beyond %.1fx (worst %.3f) — this archive mixes exposure times or "
+                "gains widely enough that the scaled reference noise raises the "
+                "detection threshold for the whole frame",
+                len(extreme), len(scales), _FLUX_SCALE_WARN_FACTOR,
+                max(extreme, key=lambda s: abs(math.log(s))),
+            )
+    reference = _median_reference(stack, footprints, new_data)
     diff = new_data - reference
 
     # ------------------------------------------------------------------
@@ -967,6 +1698,22 @@ async def run(
             int(sat_mask.sum()),
             radius_px,
         )
+
+    # A non-finite pixel in the NEW frame survives everything above — the
+    # reference stack can't repair it — and would otherwise reach sep, whose
+    # background/RMS estimate it corrupts for the whole frame. Fold it into
+    # the same detection mask the saturation vicinity uses and zero it in the
+    # difference, so it is simply a place nothing can be found (audit
+    # 2026-08-18, finding H9).
+    nonfinite_diff = ~np.isfinite(diff)
+    if nonfinite_diff.any():
+        logger.warning(
+            "Subtraction: %d non-finite pixel(s) in the difference image "
+            "(the new frame carries no value there) — excluded from detection",
+            int(nonfinite_diff.sum()),
+        )
+        diff = np.where(nonfinite_diff, 0.0, diff).astype(np.float32)
+        sat_mask = nonfinite_diff if sat_mask is None else (sat_mask | nonfinite_diff)
 
     # ------------------------------------------------------------------
     # Minimum-FWHM floor for candidate shape — see psf_fwhm_arcsec's

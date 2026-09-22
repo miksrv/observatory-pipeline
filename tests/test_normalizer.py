@@ -200,7 +200,15 @@ class TestNormalizeFrameType:
 
 
 class TestGenerateNormalizedFilename:
-    """Tests for generate_normalized_filename function."""
+    """
+    Tests for generate_normalized_filename function.
+
+    The frame-type token is the full normalized word (Light/Dark/Flat/Bias),
+    not a one-letter code — changed deliberately in 3b4e369 ("updates
+    normalized filename generation to use full frame type names and
+    Light-only filter tokens"), which left these tests and CLAUDE.md/README
+    still describing the old L/D/F/B codes.
+    """
 
     def test_full_light_frame(self):
         """Test filename generation for light frame with all fields."""
@@ -211,7 +219,7 @@ class TestGenerateNormalizedFilename:
             exptime=300.0,
             obs_time="2024-03-15T22:01:34",
         )
-        assert filename == "M51_L_Ha_300_2024-03-15T22-01-34.fits"
+        assert filename == "M51_Light_Ha_300_2024-03-15T22-01-34.fits"
 
     def test_dark_frame_no_filter(self):
         """Test that dark frames exclude filter from filename."""
@@ -222,7 +230,7 @@ class TestGenerateNormalizedFilename:
             exptime=300.0,
             obs_time="2024-03-15T22:01:34",
         )
-        assert filename == "M51_D_300_2024-03-15T22-01-34.fits"
+        assert filename == "M51_Dark_300_2024-03-15T22-01-34.fits"
 
     def test_bias_frame_no_filter(self):
         """Test that bias frames exclude filter from filename."""
@@ -233,7 +241,7 @@ class TestGenerateNormalizedFilename:
             exptime=0.0,
             obs_time="2024-03-15T22:01:34",
         )
-        assert filename == "_UNKNOWN_B_0_2024-03-15T22-01-34.fits"
+        assert filename == "_UNKNOWN_Bias_0_2024-03-15T22-01-34.fits"
 
     def test_fractional_exptime(self):
         """Test fractional exposure time formatting."""
@@ -245,7 +253,7 @@ class TestGenerateNormalizedFilename:
             obs_time="2024-03-15T22:01:34",
         )
         assert "0.5" in filename
-        assert filename == "M51_L_L_0.5_2024-03-15T22-01-34.fits"
+        assert filename == "M51_Light_L_0.5_2024-03-15T22-01-34.fits"
 
     def test_sequence_number(self):
         """Test sequence number formatting."""
@@ -324,3 +332,168 @@ class TestNormalizeHeaders:
         assert result["dec"] == 45.678
         assert result["observation"]["exptime"] == 120.0
         assert result["observation"]["airmass"] == 1.2
+
+
+class TestExtractObjectFromFilename:
+    """
+    Fallback used by pipeline.py when the OBJECT header is missing or empty.
+    Audit 2026-08-18, finding H4: the loop terminated at the first pure-digit
+    segment, taking it for an exposure time — but a numbered minor planet or
+    star carries its number first, so those frames collected nothing and
+    archived under "_UNKNOWN" instead of their real object directory,
+    breaking history continuity for modules/subtraction.py.
+    """
+
+    @pytest.mark.parametrize("filename,expected", [
+        ("UGC6930_Light_Luminance_300_secs_2021-01-01.fits", "UGC6930"),
+        ("M51_L_L_60_2024-03-15T22-01-34.fits",              "M51"),
+        ("Andromeda_Galaxy_Light_L_300_2024-03-15.fits",     "Andromeda_Galaxy"),
+        ("NGC1234_Dark_300_2024-03-15.fits",                 "NGC1234"),
+        ("M51_300_2024-03-15T22-01-34.fits",                 "M51"),
+    ])
+    def test_ordinary_names_are_unchanged(self, filename, expected):
+        assert normalizer.extract_object_from_filename(filename) == expected
+
+    @pytest.mark.parametrize("filename,expected", [
+        ("4_Vesta_Light_L_120_2024-03-15T22-01-34.fits", "4_Vesta"),
+        ("433_Eros_Light_L_300_2024-03-15.fits",         "433_Eros"),
+        ("61_Cygni_Light_V_60_2024-03-15.fits",          "61_Cygni"),
+    ])
+    def test_numbered_designations_keep_their_number(self, filename, expected):
+        assert normalizer.extract_object_from_filename(filename) == expected
+
+    def test_a_leading_exposure_time_still_yields_unknown(self):
+        """
+        The guardrail: a timestamp segment contains letters ("...T22-01-34"),
+        so the designation test checks that the next segment STARTS with one.
+        A filename that really does lead with an exposure time must keep
+        falling back to "_UNKNOWN" rather than swallowing the timestamp.
+        """
+        assert normalizer.extract_object_from_filename("300_2024-03-15T22-01-34.fits") == "_UNKNOWN"
+
+    def test_no_usable_segment_yields_unknown(self):
+        assert normalizer.extract_object_from_filename("Light_L_300_2024-03-15.fits") == "_UNKNOWN"
+
+
+class TestMultiBandFilters:
+    """
+    Audit 2026-08-18, finding M9: L-eNhance, L-eXtreme, NBZ and the
+    dual/tri/quad-band families each pass two or three emission lines and
+    block everything between them, so where stars are concerned they are as
+    narrow as a single-line filter. They were absent from FILTER_MAP and from
+    NARROWBAND_FILTERS, so such a frame was held to the broadband
+    QC_STARS_MIN and had a Gaia zero-point computed for it that no bandpass
+    supports.
+    """
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("L-eNhance", "LeNhance"),
+        ("l enhance", "LeNhance"),
+        ("L-eXtreme", "LeXtreme"),
+        ("L-Ultimate", "LuLtimate"),
+        ("NBZ", "NBZ"),
+        ("Quad Band", "QuadBand"),
+        ("ALP-T", "QuadBand"),
+        ("Tri-Band", "TriBand"),
+        ("Triad", "TriBand"),
+        ("Dual Band", "DuoBand"),
+        ("Duo-Band", "DuoBand"),
+    ])
+    def test_normalization(self, raw, expected):
+        assert normalizer.normalize_filter_name(raw)[0] == expected
+
+    @pytest.mark.parametrize("raw", [
+        "L-eNhance", "L-eXtreme", "L-Ultimate", "NBZ",
+        "Quad Band", "Tri-Band", "Dual Band",
+    ])
+    def test_they_count_as_narrowband(self, raw):
+        assert normalizer.is_narrowband(raw) is True
+
+    def test_each_keeps_a_token_of_its_own(self):
+        """
+        modules/subtraction.py matches its reference stack on this field, and
+        an L-eXtreme frame is not a substitute for an L-eNhance one.
+        """
+        tokens = {
+            normalizer.normalize_filter_name(raw)[0]
+            for raw in ("L-eNhance", "L-eXtreme", "L-Ultimate", "NBZ", "Quad Band", "Tri-Band", "Dual Band")
+        }
+        assert len(tokens) == 7
+
+    @pytest.mark.parametrize("raw", ["L", "R", "G", "B", "V"])
+    def test_broadband_filters_are_unaffected(self, raw):
+        assert normalizer.is_narrowband(raw) is False
+
+
+class TestAbellShorthand:
+    """
+    Audit 2026-08-18, finding M10: observers and planetarium software use
+    "A39" and "Abell 39" interchangeably. Unrecognized, the same physical
+    object arrived under two different object_names across sessions and its
+    frames split across two archive directories — the same failure mode as
+    H4, with the same consequence for subtraction's history.
+    """
+
+    @pytest.mark.parametrize("raw", ["A39", "A 39", "A_39", "a39", "Abell 39", "Abell_39"])
+    def test_every_spelling_lands_in_one_directory(self, raw):
+        assert normalizer.normalize_object_name(raw)[0] == "Abell39"
+
+    def test_a_cluster_number_is_recognized(self):
+        assert normalizer.normalize_object_name("A2151")[0] == "Abell2151"
+
+    @pytest.mark.parametrize("raw", ["A807 FA", "A807_FA"])
+    def test_an_old_style_minor_planet_designation_is_not_swallowed(self, raw):
+        """
+        "A807 FA" is the 1807 discovery, not Abell 807. The trailing letter
+        group is what distinguishes them — the repo's own Vesta test data is
+        filed under "Vesta_A807_FA".
+        """
+        assert normalizer.normalize_object_name(raw)[0] != "Abell807"
+
+    def test_a_number_past_the_catalog_is_left_alone(self):
+        """The Abell cluster catalog ends at 2712."""
+        assert normalizer.normalize_object_name("A3000")[0] == "A3000"
+
+    def test_a_bare_letter_is_left_alone(self):
+        assert normalizer.normalize_object_name("A")[0] == "A"
+
+
+class TestFlatFilenamesCarryTheFilter:
+    """
+    Audit 2026-08-18, finding M11: a flat is taken THROUGH a filter and is
+    valid only for that one, but the filter field was added for Light frames
+    alone. A multi-filter flat sequence of the same target, exposure and
+    second therefore produced identical filenames, and the later file
+    overwrote the earlier one.
+    """
+
+    def test_two_flats_of_different_filters_do_not_collide(self):
+        ha = normalizer.generate_normalized_filename("M42", "Flat", "Ha", 3.0, "2024-03-15T18:02:10")
+        oiii = normalizer.generate_normalized_filename("M42", "Flat", "OIII", 3.0, "2024-03-15T18:02:10")
+
+        assert ha != oiii
+        assert "_Ha_" in ha
+        assert "_OIII_" in oiii
+
+    @pytest.mark.parametrize("frame_type", ["Dark", "Bias"])
+    def test_filter_independent_frames_keep_the_shorter_name(self, frame_type):
+        name = normalizer.generate_normalized_filename("M42", frame_type, "Ha", 300.0, "2024-03-15T18:02:10")
+
+        assert name == f"M42_{frame_type}_300_2024-03-15T18-02-10.fits"
+
+    def test_light_frames_are_unchanged(self):
+        name = normalizer.generate_normalized_filename("M42", "Light", "L", 120.0, "2024-03-15T18:02:10")
+
+        assert name == "M42_Light_L_120_2024-03-15T18-02-10.fits"
+
+    def test_subtractions_parser_reads_the_new_flat_name(self):
+        """
+        The positional parser already handled {FrameType}_{Filter}_{Exptime}_
+        {DateTime} for any frame type, so a flat must still be recognized as
+        calibration and kept out of the reference stack.
+        """
+        from modules.subtraction import _parse_normalized_filename
+
+        name = normalizer.generate_normalized_filename("M42", "Flat", "Ha", 3.0, "2024-03-15T18:02:10")
+
+        assert _parse_normalized_filename(name) == ("Flat", "Ha")

@@ -116,8 +116,18 @@ QC_STARS_MIN_NARROWBAND: int = int(_get("QC_STARS_MIN_NARROWBAND", "5"))
 # modules/normalizer.normalize_filter_name()/is_narrowband()), so this must
 # use those canonical codes ("Ha", "OIII", "SII", "NII"), not raw header
 # spellings like "H-Alpha" or "[OIII]".
+# Multi-band filters for one-shot-colour cameras (L-eNhance, L-eXtreme,
+# L-uLtimate, NBZ, and the dual/tri/quad-band families) belong here too: each
+# passes two or three emission lines and blocks everything between them, so
+# where stars are concerned it is as narrow as a single-line filter. They were
+# missing, so such a frame was held to the broadband QC_STARS_MIN and had a
+# Gaia zero-point computed for it that no bandpass supports (audit 2026-08-18,
+# finding M9).
 NARROWBAND_FILTERS: frozenset[str] = frozenset(
-    f.strip() for f in _get("NARROWBAND_FILTERS", "Ha,OIII,SII,NII").split(",") if f.strip()
+    f.strip() for f in _get(
+        "NARROWBAND_FILTERS",
+        "Ha,OIII,SII,NII,LeNhance,LeXtreme,LuLtimate,NBZ,QuadBand,TriBand,DuoBand",
+    ).split(",") if f.strip()
 )
 
 # ---------------------------------------------------------------------------
@@ -128,6 +138,28 @@ NARROWBAND_FILTERS: frozenset[str] = frozenset(
 STAR_FWHM_MIN_ARCSEC: float = float(_get("STAR_FWHM_MIN_ARCSEC", "2.5"))
 STAR_FWHM_MAX_ARCSEC: float = float(_get("STAR_FWHM_MAX_ARCSEC", "8.0"))
 STAR_ELONGATION_MAX: float = float(_get("STAR_ELONGATION_MAX", "1.5"))
+# Upper elongation bound for the LOOSE `sources_all` list that
+# modules/astrometry/_extraction.py feeds to catalog matching and anomaly
+# detection — deliberately far above STAR_ELONGATION_MAX, since a trailed
+# detection is exactly what modules/anomaly_detector/ needs to see in order
+# to classify SPACE_DEBRIS at all.
+#
+# It must stay comfortably ABOVE SPACE_DEBRIS_EDGE_ELONGATION_MIN (see that
+# setting below). As a hardcoded 5.0 it sat below the 6.0 edge threshold, so
+# a trailed source near the frame edge was cut at extraction time and the
+# edge branch of the SPACE_DEBRIS classification could never fire on
+# anything — the exact case that threshold was raised to handle (audit
+# 2026-08-18, finding C2). modules/astrometry/_extraction.py logs a warning
+# when a deployment configures the two into that dead state again.
+#
+# The default leaves room for a genuinely short trail: the streak pre-pass
+# (STREAK_* below) already masks out anything both highly elongated AND
+# longer than STREAK_MIN_LENGTH_ARCSEC, so what reaches this bound is a
+# sub-30" trail — a fast NEO or a short debris streak — whose a/b ratio
+# scales with how narrow this frame's PSF is. The bound still rejects the
+# degenerate ratios a near-zero minor axis produces (_extraction.py clamps
+# `b` to 1e-6 rather than dividing by zero).
+SOURCES_ALL_ELONGATION_MAX: float = float(_get("SOURCES_ALL_ELONGATION_MAX", "15.0"))
 STAR_SNR_MIN: float = float(_get("STAR_SNR_MIN", "50.0"))
 
 # SEP source extraction parameters
@@ -191,13 +223,110 @@ SATURATION_ADU: float = float(_get("SATURATION_ADU", "60000"))
 SATURATION_MASK_RADIUS_ARCSEC: float = float(_get("SATURATION_MASK_RADIUS_ARCSEC", "10.0"))
 
 # ---------------------------------------------------------------------------
+# Plate-solve plausibility
+#
+# A solved WCS is treated as authoritative by construction: every source
+# position, every catalog match and every anomaly's coordinates come from it,
+# and no downstream module has anything to compare it against. Nothing checked
+# it beyond "astap said Solution found" and "the axes are celestial" — and a
+# blind wide-radius retry (ASTAP_RETRY_WIDE_SEARCH) is statistically the most
+# likely place for a false star-pattern match to be accepted (audit
+# 2026-08-18, finding H15).
+#
+# These bracket the plate scale a real optical setup can produce. A solution
+# whose scale falls outside them is not a marginal one, it is a wrong one:
+# below the floor no amateur telescope resolves, above the ceiling the frame
+# would not be an image of a star field at all. Widen them for an unusual
+# instrument rather than switching the check off.
+ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC", "0.05"))
+ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC", "60.0"))
+
+# ---------------------------------------------------------------------------
+# Recovering a lost science payload
+#
+# The frame record itself survives an API outage: POST /frames has already
+# succeeded by then and the file is archived. What is lost when the 3-attempt
+# retry on POST /sources or POST /anomalies is exhausted is that run's entire
+# source or anomaly list — no re-post, no "needs re-analysis" flag, and no way
+# to tell afterwards that anything is missing (audit 2026-08-18, finding H19).
+#
+# pipeline.py answers that by queueing the work back onto the task queue the
+# worker already drains. This bounds how many times a single frame may be
+# re-queued that way: a transient outage clears within one, while a permanent
+# failure (a 4xx the retry decorator deliberately doesn't retry) would
+# otherwise re-queue itself forever. 0 disables recovery entirely.
+API_RECOVERY_MAX_ATTEMPTS: int = int(_get("API_RECOVERY_MAX_ATTEMPTS", "2"))
+
+# ---------------------------------------------------------------------------
 # Cross-matching
 # ---------------------------------------------------------------------------
 MATCH_CONE_ARCSEC: float = float(_get("MATCH_CONE_ARCSEC", "5.0"))
 # Default widened from 30" to 120": fast-moving objects like Vesta travel ~60"/hr,
 # so 30" was too tight to detect cross-frame position shifts reliably.
 MOVING_CONE_ARCSEC: float = float(_get("MOVING_CONE_ARCSEC", "120.0"))
+
+# --- Fast movers: the time-scaled extension of MOVING_CONE_ARCSEC ----------
+# MOVING_CONE_ARCSEC alone is a FIXED radius around the source's current
+# position, so an object that moved further than it between two frames has
+# its own previous position outside the search entirely — "shifted" can never
+# be confirmed and the object falls through to a generic UNKNOWN (no track
+# chart, no ephemeris) or is dropped as FIRST_OBSERVATION (audit 2026-08-18,
+# finding H3). How far an object can legitimately have moved is not a
+# constant at all: it is a rate times the gap between the two frames.
+#
+# The plausible upper rate for something this pipeline should still be
+# calling a "moving object" — a fast NEO trailing within a single exposure
+# runs 20–30"/min (see CLAUDE.md's exposure-midpoint discussion). Anything
+# faster is a satellite, which the SPACE_DEBRIS branch catches on elongation
+# alone without needing a previous position at all.
+MOVING_RATE_ARCSEC_PER_MIN: float = float(_get("MOVING_RATE_ARCSEC_PER_MIN", "30.0"))
+# Hard ceiling on the extended radius, whatever the elapsed time works out
+# to. The cone's false-positive risk grows with its area — every extra
+# historical detection swept in is another candidate for the "its old
+# position has vacated" test — and this also bounds how wide
+# _prefetch.py has to make its batch query.
+MOVING_CONE_MAX_ARCSEC: float = float(_get("MOVING_CONE_MAX_ARCSEC", "600.0"))
+# Only frames this recent extend the cone at all. Past this gap, rate × time
+# exceeds the ceiling for any rate worth considering, so the extension would
+# degenerate into "the whole ceiling, always" — i.e. a permanently wide cone
+# in which some unrelated historical detection is nearly always present, the
+# exact false-positive mode the two-condition "shifted" test exists to stop.
+# A gap this long is also a different observing session, where the pairing of
+# "something left A" with "something appeared at B" carries little weight.
+MOVING_EXTEND_MAX_GAP_MIN: float = float(_get("MOVING_EXTEND_MAX_GAP_MIN", "30.0"))
+
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
+
+# --- Statistical variability detection (modules/anomaly_detector/) ---------
+# The Δmag branches of the classifier used to fire ONLY for a source whose
+# Simbad OTYPE already said "variable"/"binary"/"galaxy" — but Simbad is the
+# only catalog that writes a real OTYPE at all (_gaia.py/_2mass.py/
+# _panstarrs.py all hardcode the generic "STAR"), so a star known only
+# through Gaia DR3 — the overwhelming majority of any field — could change
+# brightness by several magnitudes and be silently dropped. The variability
+# detector could therefore only ever confirm variability the catalog already
+# knew about, never discover any (audit 2026-08-18, finding C1).
+#
+# These two settings drive the catalog-independent fallback: a source whose
+# OWN same-filter history is long enough and tight enough to establish a
+# quiescent baseline, and whose current magnitude departs from that baseline
+# by more than VARIABILITY_SIGMA times its own historical scatter, is
+# reported as a VARIABLE_STAR candidate regardless of what (if anything) the
+# catalogs call it.
+#
+# Minimum number of same-filter historical detections required before that
+# scatter is considered meaningful at all. Below this the source simply falls
+# through to "no anomaly", exactly as before — three epochs is the smallest
+# sample from which a median plus a deviation from it carries any weight.
+VARIABILITY_MIN_EPOCHS: int = int(_get("VARIABILITY_MIN_EPOCHS", "3"))
+# How many times its own historical scatter the current magnitude must depart
+# from the historical median. This is what keeps an intrinsically noisy source
+# (poor SNR, blended neighbour, variable seeing) from alerting every night:
+# such a source has a large scatter, so a large Δmag is unremarkable for it.
+# DELTA_MAG_ALERT still applies on top as an absolute floor, so a source with
+# an implausibly tight history can't alert on a photometrically meaningless
+# change.
+VARIABILITY_SIGMA: float = float(_get("VARIABILITY_SIGMA", "3.0"))
 
 # Faintest predicted visual magnitude (V) for an MPC/SkyBot object to be
 # eligible for source matching. Objects fainter than this are almost certainly
@@ -260,6 +389,226 @@ SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 # absorbs a small residual angle, and rotating (interpolating) the reference
 # array for a fraction of a degree only adds blur for no real benefit.
 SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG", "2.0"))
+# Worst reference seeing worth stacking, as a multiple of the NEW frame's own
+# measured FWHM. Differencing a sharp frame against a blurred reference leaves
+# the classic ring-shaped residual at every star in the field — a mismatched
+# PSF, not a transient — and also raises the noise floor that the real faint
+# transients have to clear. Since QC-failed frames are archived rather than
+# dropped, the per-object directory the reference stack is drawn from now
+# mixes BLUR/TRAIL frames in with good ones (audit 2026-08-18, finding H10).
+#
+# The comparison uses the QCFWHM header pipeline.py stamps at archive time; a
+# frame carrying no such key (archived before that existed, or placed there by
+# hand) is kept, since it cannot be judged either way. Screening never costs
+# the frame its subtraction: if it would leave fewer than
+# SUBTRACTION_MIN_FRAMES, the unscreened set is used instead.
+SUBTRACTION_REF_MAX_FWHM_RATIO: float = float(_get("SUBTRACTION_REF_MAX_FWHM_RATIO", "1.5"))
+
+# --- Edge-zone diff candidates ---------------------------------------------
+# Every candidate in the EDGE_MARGIN_FRAC zone used to be dropped outright, on
+# the strength of a real incident (2026-08-10: 53 of 80 UNKNOWN alerts were
+# from_subtraction + near_edge, every one a coma residual of an ordinary
+# catalogued star). But that also means a genuine transient landing near the
+# edge — which a dithered sequence makes routine — can never be found by
+# subtraction at all (audit 2026-08-18, finding H11).
+#
+# These two settings replace the blanket rejection with the property that
+# actually separates the two. Coma and the other off-axis aberrations stretch
+# a PSF into an arc, and it is the *mismatch* between two such arcs that the
+# median stack fails to cancel, so a coma residual is elongated and usually
+# weak. A round, strong residual at the edge is not that shape at all.
+#
+# Both bars are deliberately stricter than their whole-frame equivalents:
+# STAR_ELONGATION_MAX allows 1.5 anywhere in the frame, and detection itself
+# only asks for SUBTRACTION_DETECT_SIGMA. In the edge zone, where the false
+# positives concentrate, a candidate has to be clearly better than merely
+# acceptable to be worth reporting.
+SUBTRACTION_EDGE_ELONGATION_MAX: float = float(_get("SUBTRACTION_EDGE_ELONGATION_MAX", "1.3"))
+SUBTRACTION_EDGE_SNR_MIN: float = float(_get("SUBTRACTION_EDGE_SNR_MIN", "10.0"))
+
+# --- Subtraction residuals of catalogued stars -----------------------------
+# An uncatalogued subtraction candidate lying within this many of its own
+# FWHM of a catalogued star of about the same measured brightness is that
+# star's own residual — a coma-shifted or imperfectly cancelled PSF whose
+# centroid landed just outside MATCH_CONE_ARCSEC — not a transient. Its
+# aperture photometry, taken on the new frame at that position, is dominated
+# by the star itself, which is why the magnitudes agree. The 2026-09-22
+# IC3322A test run had 10 such UNKNOWN alerts, all 5-7" (1.5-2 FWHM) from a
+# same-magnitude star, recurring at the same positions across sessions.
+# Expressed in FWHM rather than arcseconds because the pipeline serves
+# several telescopes and cameras: how far a PSF's residual can land from the
+# star scales with the PSF, not with a fixed angle. The radius never drops
+# below MATCH_CONE_ARCSEC (inside it the source would have been matched), and
+# a candidate with no FWHM uses twice that cone. Trade-off: a genuine
+# transient much fainter than a neighbour this close is suppressed too (its
+# measured magnitude is the star's). 0 disables the check.
+SUBTRACTION_RESIDUAL_RADIUS_FWHM: float = float(_get("SUBTRACTION_RESIDUAL_RADIUS_FWHM", "2.5"))
+SUBTRACTION_RESIDUAL_MAX_DMAG: float = float(_get("SUBTRACTION_RESIDUAL_MAX_DMAG", "1.0"))
+
+# --- Correlated noise in the difference image ------------------------------
+# A candidate's significance was computed as flux / (rms * sqrt(npix)), which
+# assumes each pixel's noise is independent of its neighbours'. It is not: a
+# reference frame goes through one or two interpolation passes (the optional
+# pre-rotation, then astroalign's own resampling), and interpolation spreads
+# each input pixel's noise across several output pixels. The aperture then
+# holds fewer independent measurements than it holds pixels, so the real
+# significance is lower than the formula says — systematically, and worst
+# after a large pre-rotation (audit 2026-08-18, finding H13).
+#
+# The factor is measured from the frame's own difference image rather than
+# assumed, by comparing its per-pixel scatter against the scatter of a
+# box-averaged copy: for independent noise the second falls as 1/box, and
+# whatever it falls short of that is the correlation. This caps how large a
+# correction that measurement is allowed to produce; 1.0 disables it and
+# restores the previous formula exactly.
+SUBTRACTION_NOISE_CORR_MAX: float = float(_get("SUBTRACTION_NOISE_CORR_MAX", "4.0"))
+
+# ---------------------------------------------------------------------------
+# Photometry — sensor gain
+# ---------------------------------------------------------------------------
+# Sensor gain in electrons per ADU, used for the Poisson term of the aperture
+# flux error in modules/photometry.py and modules/forced_photometry.py. The
+# raw aperture sum is in ADU, but photon shot noise is Poissonian in
+# ELECTRONS: with N_e = flux_adu * gain electrons, the variance back in ADU is
+# N_e / gain**2 = flux_adu / gain. Treating flux_adu itself as the variance —
+# which the formula did before — is only correct at exactly 1 e-/ADU, and real
+# cameras almost never are (CCD ~0.5-2; CMOS anywhere from well under 1 to
+# several). Above 1 the error came out overstated, so the SNR was understated
+# and forced photometry systematically failed real faint objects against
+# FORCED_PHOTOMETRY_MIN_SNR; below 1 the reverse, and noise was reported as a
+# significant detection (audit 2026-08-18, finding C7).
+#
+# Blank (the default) means "read it from each frame's own header". The
+# EGAIN keyword is preferred over GAIN there, and this is the one place in
+# the pipeline where that order matters: on most CMOS cameras EGAIN is the
+# true e-/ADU conversion while GAIN is the camera's own gain SETTING in
+# arbitrary vendor units (0-500 on a ZWO ASI, say). Feeding such a setting
+# into the formula above would be far more wrong than assuming 1.0, so a
+# header value outside the plausible e-/ADU range is rejected with a warning
+# and 1.0 is used instead — see modules/photometry.py's _resolve_gain().
+#
+# Set this explicitly when your capture software writes no usable EGAIN and
+# you know your sensor's real conversion factor.
+_photometry_gain_raw: str = _get("PHOTOMETRY_GAIN_E_PER_ADU", "").strip()
+PHOTOMETRY_GAIN_E_PER_ADU: float | None = (
+    float(_photometry_gain_raw) if _photometry_gain_raw else None
+)
+
+# --- Colour term in the Gaia zero-point ------------------------------------
+# A star's instrumental magnitude in R (or B, V, I, ...) differs from its
+# Gaia broadband G magnitude by an amount that depends on the star's own
+# colour, not by a constant. Fitting a single median offset — all this
+# pipeline did before — therefore leaves a systematic bias in every
+# mag_calibrated, and that bias drifts night to night with whatever mix of
+# red and blue reference stars the field happened to provide. It can shift
+# many stars in one epoch together by more than DELTA_MAG_ALERT, i.e. produce
+# a frame-wide false variability signal (audit 2026-08-18, finding H5).
+#
+# modules/photometry.py calibrates with
+#   catalog_mag - mag_instrumental = zero_point + k * (BP-RP - reference colour)
+# where k is a FIXED per-filter value from PHOTOMETRY_COLOR_TERMS below and
+# only the zero point is fitted per frame. k is a property of the telescope +
+# camera + filter, not of the night: fitting it frame by frame (the first
+# version of this) made the decision to apply it at all flip between
+# neighbouring frames whenever the field's colour span sat near
+# PHOTOMETRY_COLOR_TERM_MIN_SPAN, and every star then "changed" by
+# k * (its colour - reference) between epochs — 146 false VARIABLE_STARs on
+# the 2026-09-22 IC3322A test run, 32 of them on the one B frame whose fit
+# happened to pass.
+#
+# The per-frame fit still runs, but only to LOG the k this frame measured next
+# to the configured one — that log is how PHOTOMETRY_COLOR_TERMS is calibrated
+# for a new instrument. A filter with no configured k gets no colour term,
+# i.e. the plain median offset used before H5.
+PHOTOMETRY_COLOR_TERM_ENABLED: bool = _get("PHOTOMETRY_COLOR_TERM_ENABLED", "true").lower() in ("true", "1", "yes")
+
+
+def _parse_color_terms(raw: str) -> dict[str, float]:
+    """'B:-1.0,G:-0.45' -> {'B': -1.0, 'G': -0.45}; malformed entries are skipped."""
+    terms: dict[str, float] = {}
+    for item in raw.split(","):
+        name, sep, value = item.partition(":")
+        if not sep or not name.strip():
+            continue
+        try:
+            terms[name.strip()] = float(value)
+        except ValueError:
+            continue
+    return terms
+
+
+# Fixed colour term k (mag/mag against Gaia BP-RP) per NORMALIZED filter name
+# (the same tokens modules/normalizer.py produces — L, R, G, B, V, ...), as
+# "FILTER:k" pairs. Empty by default: the right values depend on the optics
+# and camera. Measure them from the "colour term measured" log lines over a
+# few nights and take each filter's median.
+PHOTOMETRY_COLOR_TERMS: dict[str, float] = _parse_color_terms(_get("PHOTOMETRY_COLOR_TERMS", ""))
+# The three below gate the per-frame DIAGNOSTIC fit only (see above).
+# Minimum number of reference stars carrying a usable BP-RP colour before a
+# slope is fitted at all. A slope from a handful of stars is noise.
+PHOTOMETRY_COLOR_TERM_MIN_REFS: int = int(_get("PHOTOMETRY_COLOR_TERM_MIN_REFS", "10"))
+# Minimum spread in BP-RP (mag) across those references. A slope fitted over a
+# field whose stars all share one colour is unconstrained — extrapolating it to
+# a source of a different colour is worse than not correcting at all.
+PHOTOMETRY_COLOR_TERM_MIN_SPAN: float = float(_get("PHOTOMETRY_COLOR_TERM_MIN_SPAN", "0.5"))
+# Largest |k| considered physically plausible for a broadband filter against
+# Gaia G. A fit beyond this is a degenerate one (outliers, a bad reference
+# set), and is discarded in favour of the plain constant offset.
+PHOTOMETRY_COLOR_TERM_MAX: float = float(_get("PHOTOMETRY_COLOR_TERM_MAX", "1.5"))
+
+# --- Screening the zero-point reference stars ------------------------------
+# Gaia publishes its own opinion of each source's reliability, and a star it
+# calls variable, flags as a duplicated_source, or gives a high RUWE
+# (astrometric goodness of fit — an unresolved binary or a blend) is exactly
+# what must not anchor a photometric calibration (audit 2026-08-18, finding
+# H6). 1.4 is the community-standard RUWE cut for "well-behaved single star".
+#
+# Screening only ever narrows the reference set; if it would leave fewer than
+# the 3 references a zero point needs, modules/photometry.py logs that and
+# calibrates off the unscreened set instead — a slightly worse zero point
+# beats none at all.
+PHOTOMETRY_REF_MAX_RUWE: float = float(_get("PHOTOMETRY_REF_MAX_RUWE", "1.4"))
+
+# --- Sky annulus statistics ------------------------------------------------
+# Sigma-clipping threshold for the per-source sky annulus. Without it the
+# annulus median takes in whatever else happens to fall in the ring — a
+# neighbouring star, a cosmic ray, or (worst) the host galaxy's own light
+# under a SUPERNOVA_CANDIDATE — and that contamination is subtracted straight
+# out of the source's flux. The bias is systematic and worst exactly where
+# photometry matters most: dense fields and the neighbourhoods of galaxies
+# (audit 2026-08-18, finding H7). 3 sigma is the conventional cut.
+PHOTOMETRY_SKY_SIGMA_CLIP: float = float(_get("PHOTOMETRY_SKY_SIGMA_CLIP", "3.0"))
+
+# --- Minimum significance for a calibrated magnitude -----------------------
+# Aperture photometry ran for any source whose net flux came out positive,
+# however marginally, and the resulting magnitude then travelled onward with
+# nothing to say how little it meant. A source at the detection limit produces
+# a number that can wander past DELTA_MAG_ALERT on noise alone (audit
+# 2026-08-18, finding M6).
+#
+# Below this significance the aperture measurement is still reported —
+# flux_aperture, flux_err, snr and mag_instrumental are real measurements and
+# an operator may want them — but mag_calibrated stays None and `calibrated`
+# stays False, so `mag` is None and no Δmag branch can fire on it. 3 sigma
+# matches FORCED_PHOTOMETRY_MIN_SNR, which draws the same line for the same
+# reason on the other detection path.
+PHOTOMETRY_MIN_SNR: float = float(_get("PHOTOMETRY_MIN_SNR", "3.0"))
+
+# --- Blending in forced photometry -----------------------------------------
+# Forced photometry measures a fixed aperture at a catalog position without
+# ever asking what else is in it. Two stars closer than a couple of FWHM share
+# most of their light, so each measurement is really the pair's combined flux,
+# reported as one star's magnitude with nothing on the wire to say otherwise
+# (audit 2026-08-18, finding M8).
+#
+# This is the separation, in units of the frame's own measured FWHM, within
+# which a neighbouring catalog entry makes a forced measurement untrustworthy.
+# Such a position is skipped rather than reported: the wire schema has no
+# field for "blended", and a contaminated magnitude presented as a clean one
+# is worse than a missing recovery — the same reasoning that drops a
+# below-threshold measurement instead of reporting it as an upper limit.
+# 0 disables the check.
+FORCED_PHOTOMETRY_BLEND_FWHM: float = float(_get("FORCED_PHOTOMETRY_BLEND_FWHM", "2.0"))
 
 # ---------------------------------------------------------------------------
 # Forced photometry (modules/forced_photometry.py) — reverse matching
@@ -304,6 +653,20 @@ FORCED_PHOTOMETRY_MAG_LIMIT: float = float(_get("FORCED_PHOTOMETRY_MAG_LIMIT", "
 # number of sources, so the "look-elsewhere effect" that forces blind
 # extraction's threshold up doesn't apply here.
 FORCED_PHOTOMETRY_MIN_SNR: float = float(_get("FORCED_PHOTOMETRY_MIN_SNR", "3.0"))
+# A forced measurement asserts "this flux is that catalog star's". When the
+# calibrated magnitude (on Gaia's G scale once the colour term is applied)
+# disagrees with the star's own G by more than this, the aperture measured
+# something else — a galaxy's light, a neighbour's wing, background structure
+# — and the recovery is dropped rather than reported. On the 2026-09-22
+# IC3322A test run 691 of 760 forced recoveries of G~20 stars (and 317 of
+# 776 at G~19) were off by more than 2 mag, and 41 of 93 VARIABLE_STAR alerts
+# were built on such measurements. Well-measured stars scatter ~0.25-0.35 mag
+# about G, so 1.5 is a ~4-5 sigma cut. A genuinely variable star that moved
+# further than this is lost from forced recovery only — blind detection still
+# sees it. 0 disables the check.
+FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG: float = float(
+    _get("FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", "1.5")
+)
 
 # ---------------------------------------------------------------------------
 # Observatory site coordinates (used for topocentric Horizons queries)
@@ -311,6 +674,18 @@ FORCED_PHOTOMETRY_MIN_SNR: float = float(_get("FORCED_PHOTOMETRY_MIN_SNR", "3.0"
 SITE_LAT: float = float(_get("SITE_LAT", "0.0"))   # degrees, positive = North
 SITE_LON: float = float(_get("SITE_LON", "0.0"))   # degrees, positive = East
 SITE_ELEV: int  = int(_get("SITE_ELEV", "0"))      # metres above sea level
+
+# Budget for a single JPL Horizons ephemeris lookup (modules/ephemeris.py).
+# astroquery's Horizons client is fully synchronous and carries no timeout by
+# default, so an unresponsive Horizons would otherwise stall the worker
+# indefinitely. Applied in two places: as astroquery's own HTTP timeout, so a
+# hung request ends the worker thread rather than leaving it occupying a slot
+# on asyncio's small shared executor where it would eventually starve every
+# other to_thread() caller, and as the outer asyncio.wait_for() ceiling that
+# bounds the total call. An ephemeris is supplementary detail on an anomaly
+# that has already been classified without it, so giving up is always
+# preferable to blocking the frame.
+EPHEMERIS_TIMEOUT_SEC: float = float(_get("EPHEMERIS_TIMEOUT_SEC", "30"))
 
 # ---------------------------------------------------------------------------
 # Finder charts (modules/finder_chart.py)
@@ -464,6 +839,7 @@ _OVERRIDABLE: dict[str, type] = {
     "STAR_FWHM_MIN_ARCSEC": float,
     "STAR_FWHM_MAX_ARCSEC": float,
     "STAR_ELONGATION_MAX": float,
+    "SOURCES_ALL_ELONGATION_MAX": float,
     "STAR_SNR_MIN": float,
     # SEP extraction
     "SEP_DETECT_THRESH": float,
@@ -477,9 +853,27 @@ _OVERRIDABLE: dict[str, type] = {
     "SATURATION_ADU": float,
     "SATURATION_MASK_RADIUS_ARCSEC": float,
     # Cross-matching
+    "PHOTOMETRY_COLOR_TERM_ENABLED": None,  # special: bool from string
+    "PHOTOMETRY_COLOR_TERMS": None,  # special: "FILTER:k" pairs
+    "PHOTOMETRY_COLOR_TERM_MIN_REFS": int,
+    "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
+    "PHOTOMETRY_COLOR_TERM_MAX": float,
+    "PHOTOMETRY_REF_MAX_RUWE": float,
+    "PHOTOMETRY_SKY_SIGMA_CLIP": float,
+    "PHOTOMETRY_MIN_SNR": float,
+    "PHOTOMETRY_GAIN_E_PER_ADU": None,  # special: float, blank → None
+    "FORCED_PHOTOMETRY_BLEND_FWHM": float,
+    "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
+    "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
+    "API_RECOVERY_MAX_ATTEMPTS": int,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
+    "MOVING_RATE_ARCSEC_PER_MIN": float,
+    "MOVING_CONE_MAX_ARCSEC": float,
+    "MOVING_EXTEND_MAX_GAP_MIN": float,
     "DELTA_MAG_ALERT": float,
+    "VARIABILITY_MIN_EPOCHS": int,
+    "VARIABILITY_SIGMA": float,
     "MPC_MAG_LIMIT": float,
     # Edge geometry
     "EDGE_MARGIN_FRAC": float,
@@ -489,10 +883,17 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_MIN_FRAMES": int,
     "SUBTRACTION_DETECT_SIGMA": float,
     "SUBTRACTION_PREROTATE_MIN_DEG": float,
+    "SUBTRACTION_REF_MAX_FWHM_RATIO": float,
+    "SUBTRACTION_EDGE_ELONGATION_MAX": float,
+    "SUBTRACTION_EDGE_SNR_MIN": float,
+    "SUBTRACTION_RESIDUAL_RADIUS_FWHM": float,
+    "SUBTRACTION_RESIDUAL_MAX_DMAG": float,
+    "SUBTRACTION_NOISE_CORR_MAX": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
     "FORCED_PHOTOMETRY_MAG_LIMIT": float,
     "FORCED_PHOTOMETRY_MIN_SNR": float,
+    "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG": float,
     # Observatory site
     "SITE_LAT": float,
     "SITE_LON": float,
@@ -522,6 +923,8 @@ _OVERRIDABLE: dict[str, type] = {
     "ASTAP_WIDE_SEARCH_RADIUS_DEG": float,
     "ASTAP_TIMEOUT_SEC": float,
     "ASTAP_WIDE_SEARCH_TIMEOUT_SEC": float,
+    # Ephemeris
+    "EPHEMERIS_TIMEOUT_SEC": float,
     # Narrowband filters
     "NARROWBAND_FILTERS": None,  # special: frozenset from CSV
 }
@@ -529,6 +932,7 @@ _OVERRIDABLE: dict[str, type] = {
 _BOOL_KEYS = {
     "CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED",
     "FORCED_PHOTOMETRY_ENABLED", "ASTAP_RETRY_WIDE_SEARCH",
+    "PHOTOMETRY_COLOR_TERM_ENABLED",
 }
 
 
@@ -540,6 +944,12 @@ def _cast_value(name: str, raw: str) -> object:
         return raw.strip().upper()
     if name == "NARROWBAND_FILTERS":
         return frozenset(f.strip() for f in raw.split(",") if f.strip())
+    if name == "PHOTOMETRY_COLOR_TERMS":
+        return _parse_color_terms(raw)
+    if name == "PHOTOMETRY_GAIN_E_PER_ADU":
+        # Blank means "not configured — use the frame's own EGAIN/GAIN",
+        # exactly as the definition-time parse above treats it.
+        return float(raw) if raw.strip() else None
     typ = _OVERRIDABLE[name]
     return typ(raw)
 

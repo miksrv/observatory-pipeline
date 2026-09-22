@@ -45,7 +45,7 @@ _retry = tenacity.retry(
 _RETRYABLE = (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError)
 
 
-def _normalize_batch_results(resp_json: object) -> dict:
+def _normalize_batch_results(resp_json: object, keys: list[str] | None = None) -> dict:
     """
     Normalize the "results" field of a batch-endpoint response to a
     dict mapping position index (as string) -> list of result dicts.
@@ -61,6 +61,17 @@ def _normalize_batch_results(resp_json: object) -> dict:
     blind to history/coverage regardless of how much data the API
     actually holds. Accept both shapes here so a fix on either side of
     the API contract keeps working.
+
+    `keys` is what the array form is re-keyed by. The batch endpoints do not
+    agree on what a result is addressed by: /sources/near/batch and
+    /frames/covering/batch are documented as keyed by the request position
+    (modules/anomaly_detector/_prefetch.py reads them back as `str(i)`), while
+    /sources/tracks/batch is keyed by `source_id` (modules/finder_chart reads
+    it back as `tracks.get(source_id)`). Indexing the array form positionally
+    is right for the first two and silently wrong for the third — every track
+    would land under "0"/"1" and every chart would be built from no epochs at
+    all. A caller whose endpoint is keyed by id passes the request's own id
+    list here; one whose endpoint is keyed by position passes nothing.
     """
     if not isinstance(resp_json, dict):
         return {}
@@ -70,6 +81,12 @@ def _normalize_batch_results(resp_json: object) -> dict:
     if isinstance(data, dict):
         return data
     if isinstance(data, list):
+        if keys is not None:
+            # A short/long response is the API disagreeing with its own
+            # contract; keep whatever pairs up rather than guessing at the
+            # rest, so a caller sees missing entries and not misattributed
+            # ones.
+            return {key: value for key, value in zip(keys, data)}
         return {str(i): v for i, v in enumerate(data)}
     return {}
 

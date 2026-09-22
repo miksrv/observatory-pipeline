@@ -76,10 +76,21 @@ async def _prefetch_history_data(
         extra=extra,
     )
 
-    # Build position lists for batch API calls
-    # Use wider radius for the batch query to ensure we capture all needed sources
-    # The tile size is 0.1 deg = 360 arcsec, plus we need MOVING_CONE_ARCSEC margin
-    batch_radius = max(config.MOVING_CONE_ARCSEC, config.MATCH_CONE_ARCSEC) + 400  # arcsec
+    # Build position lists for batch API calls.
+    #
+    # The query is centred on the TILE, not on each source, so it must cover
+    # the tile's own half-diagonal (0.1 deg tiles → up to ~255") on top of the
+    # widest cone any source in it will later be filtered with client-side.
+    # That widest cone is MOVING_CONE_MAX_ARCSEC, not MOVING_CONE_ARCSEC:
+    # _movement._find_wide_history() extends the moving-object cone by how far
+    # a fast mover could have travelled since a recent previous frame (audit
+    # 2026-08-18, finding H3), and a candidate the API never returned cannot
+    # be filtered back in afterwards.
+    batch_radius = max(
+        config.MOVING_CONE_ARCSEC,
+        config.MOVING_CONE_MAX_ARCSEC,
+        config.MATCH_CONE_ARCSEC,
+    ) + 400  # arcsec
 
     source_positions = [{"ra": t[0], "dec": t[1]} for t in tiles_needing_sources]
     coverage_positions = [{"ra": t[0], "dec": t[1]} for t in tiles_needing_coverage]

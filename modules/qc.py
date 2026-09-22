@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import shutil
+from datetime import datetime
 from typing import Any
 
 import astropy.io.fits as fits
@@ -29,64 +30,61 @@ import numpy as np
 import sep
 
 import config
+from modules import fits_header
 from modules.fits_header import extract_headers, sanitize_object_name
 from modules.normalizer import is_narrowband
 
 logger = logging.getLogger(__name__)
 
+# The narrowest second-moment semi-minor axis a pixel grid can express:
+# 1/sqrt(12) px, the standard deviation of a uniform distribution across one
+# pixel. `sep` can report a smaller — even exactly zero — `b` for a
+# degenerate fit (a detection lying along a single pixel row, a cosmic-ray
+# track, a bad column), and `a / b` then depends entirely on whatever
+# epsilon is substituted to avoid dividing by zero. The old sentinels (1e-6
+# here, 0.001 in _detect_diff_sources) turned such a fit into an elongation
+# of 10^3-10^6, a number that is not a measurement of anything but clears
+# every elongation threshold in the pipeline on the way to being persisted
+# as the source's shape (audit 2026-08-18, finding L4).
+#
+# Clamping at the pixel limit instead caps the ratio at `a / 0.2887` — how
+# elongated the feature would be if it were exactly one pixel wide, which is
+# the most elongated it can honestly be claimed to be. A feature now has to
+# be genuinely long in `a` to read as a trail, which is what the thresholds
+# were written to mean.
+#
+# Hand-duplicated across modules/qc.py, modules/subtraction.py,
+# modules/astrometry/_streak.py and modules/astrometry/_extraction.py, the
+# same convention those four already follow for the streak-mask helper
+# itself. Keep them in sync.
+_MIN_SEMI_MINOR_PX: float = 1.0 / math.sqrt(12.0)   # ~= 0.2887
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-_PLATE_SCALE_PIXEL_KEYWORDS: tuple[str, ...] = ("XPIXSZ", "PIXSIZE", "PIXSCALE")
-
 
 def _read_pixel_scale(hdr: fits.Header) -> float | None:
     """
     Derive the plate scale in arcsec/pixel from FITS headers.
 
-    Requires both a pixel size (XPIXSZ, PIXSIZE, or PIXSCALE in microns) and a
-    focal length (FOCALLEN in mm).  Some cameras write PIXSCALE directly as
-    arcsec/px — detected when the value is small (< 20) and no pixel size +
-    focal length pair is available.
+    Delegates to `modules.fits_header.resolve_pixel_scale_arcsec()` rather
+    than reading the keywords itself. This module and that one used to
+    interpret the same ambiguous keywords differently, and both unsafely: this
+    one took `PIXSCALE` as arcsec/px whenever it fell in a wide range, while
+    that one took `PIXSCALE1` as microns unconditionally. The two ranges
+    overlap — a 3.76 micron pixel and a 3.76"/px plate scale are the same
+    number — so no range check can tell them apart, and the two modules could
+    reach opposite conclusions about the same frame (audit 2026-08-18,
+    finding M2).
 
-    Returns None when the necessary headers are absent.
+    This is one of the few places this codebase shares a helper rather than
+    hand-duplicating it, precisely because the finding is that the two copies
+    disagreed.
+
+    Returns None when the headers don't carry enough, which the caller
+    already handles.
     """
-    # Direct arcsec/px keyword (written by some capture software)
-    pixscale_direct = hdr.get("PIXSCALE")
-    if pixscale_direct is not None:
-        try:
-            val = float(pixscale_direct)
-            # Sanity-check: a valid plate scale is between 0.01 and 200 arcsec/px
-            if 0.01 <= val <= 200.0:
-                return val
-        except (TypeError, ValueError):
-            pass
-
-    # Derive from pixel size + focal length
-    xpixsz: float | None = None
-    for kw in ("XPIXSZ", "PIXSIZE"):
-        raw = hdr.get(kw)
-        if raw is not None:
-            try:
-                xpixsz = float(raw)
-                break
-            except (TypeError, ValueError):
-                continue
-
-    focal_length: float | None = None
-    raw_fl = hdr.get("FOCALLEN")
-    if raw_fl is not None:
-        try:
-            focal_length = float(raw_fl)
-        except (TypeError, ValueError):
-            pass
-
-    if xpixsz is not None and focal_length is not None and focal_length > 0.0:
-        # plate_scale = 206265 * (pixel_size_um / 1000) / focal_length_mm
-        return 206265.0 * (xpixsz / 1000.0) / focal_length
-
-    return None
+    return fits_header.resolve_pixel_scale_arcsec(hdr)
 
 
 def _build_streak_mask(
@@ -131,7 +129,7 @@ def _build_streak_mask(
     if len(objs) == 0:
         return None
 
-    safe_b = np.where(objs["b"] > 0, objs["b"], 1e-6)
+    safe_b = np.where(objs["b"] > _MIN_SEMI_MINOR_PX, objs["b"], _MIN_SEMI_MINOR_PX)
     elongation = objs["a"] / safe_b
     bbox_diag_px = np.sqrt(
         (objs["xmax"] - objs["xmin"]).astype(np.float64) ** 2
@@ -179,6 +177,91 @@ def _compute_fwhm_pixels(a: float, b: float) -> float:
     return 2.0 * math.sqrt(2.0 * math.log(2.0)) * math.sqrt((a ** 2 + b ** 2) / 2.0)
 
 
+# Below this many members a subset is not a population — the raw
+# all-detections median is used instead. Matches the hard floor of 3 raw
+# detections analyze() already refuses to compute any statistics below.
+_MEDIAN_MIN_SOURCES = 3
+
+
+# How much broader than the frame's own compact population a source may be
+# before it is treated as extended rather than as a blurred star — the same
+# stellar-PSF tolerance modules/astrometry/_extraction.py applies around its
+# own psf_fwhm_arcsec estimate.
+_EXTENDED_FWHM_FACTOR = 1.5
+
+
+def _clip_broad_outliers(
+    fwhm_values: np.ndarray,
+    subset: np.ndarray,
+    fits_filename: str,
+) -> np.ndarray:
+    """
+    Narrow *subset* by dropping sources far broader than the compact
+    population it already contains.
+
+    A roundness cut removes filaments and edge-on galaxies, but not a
+    face-on galaxy or a round nebula knot — extended and round at once. Those
+    still inflate fwhm_median, and no ABSOLUTE upper bound can remove them
+    without also capping the very quantity BLUR tests (see analyze()'s
+    step 4).
+
+    So the bound is relative: the lower quartile of the subset's own FWHM
+    distribution — star-dominated in any field where stars outnumber extended
+    objects by more than 1:3 — times _EXTENDED_FWHM_FACTOR. A uniformly
+    blurred frame shifts that quartile up with everything else and nothing is
+    clipped, so BLUR remains reachable at any blur level; only a source
+    broader than the compact population *of this same frame* is dropped.
+
+    Returns *subset* unchanged whenever it is too small to estimate a
+    quartile from, or when clipping would leave too few sources to take a
+    median over.
+    """
+    selected = fwhm_values[subset]
+    if selected.size < _MEDIAN_MIN_SOURCES:
+        return subset
+
+    ceiling = float(np.percentile(selected, 25)) * _EXTENDED_FWHM_FACTOR
+    clipped = subset & (fwhm_values <= ceiling)
+
+    n_dropped = int(subset.sum()) - int(clipped.sum())
+    if int(clipped.sum()) < _MEDIAN_MIN_SOURCES:
+        return subset
+    if n_dropped:
+        logger.debug(
+            "QC: dropped %d extended source(s) broader than %.2f px "
+            "(%.1fx the compact population) from the FWHM median  file=%s",
+            n_dropped, ceiling, _EXTENDED_FWHM_FACTOR, fits_filename,
+        )
+    return clipped
+
+
+def _subset_median(
+    values: np.ndarray,
+    subset: np.ndarray,
+    metric: str,
+    fits_filename: str,
+) -> float:
+    """
+    Median of *values* over *subset*, falling back to the median of all of
+    *values* when the subset is too small to be meaningful.
+
+    The fallback is not just defensive: it is what keeps BLUR and TRAIL
+    reachable on a frame so badly blurred or trailed that its own stars fall
+    outside the opposite axis' bound and empty the subset out — see the long
+    note in analyze()'s step 4.
+    """
+    n = int(subset.sum())
+    if n >= _MEDIAN_MIN_SOURCES:
+        return float(np.median(values[subset]))
+
+    logger.debug(
+        "QC: %s subset holds only %d source(s) — using the median over all "
+        "%d detections instead  file=%s",
+        metric, n, values.size, fits_filename,
+    )
+    return float(np.median(values))
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -210,6 +293,8 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         quality_flag        "OK" | "BLUR" | "TRAIL" | "LOW_STARS" | "HIGH_BACKGROUND" | "BAD"
         fwhm_median         float | None
         fwhm_unit           "arcsec" | "pixels"
+        fwhm_median_px      float | None   (the same measurement in raw
+                            pixels, always — see below)
         elongation_median   float | None
         snr_median          float | None
         sky_background      float | None   (median sky ADU)
@@ -217,6 +302,18 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         star_count          int | None
         cr_fraction         float | None   ([0.0, 1.0])
         rejected_path       str | None     (set when the file was moved)
+
+    `fwhm_median` is this module's own verdict metric: it is what the BLUR
+    threshold is compared against, and it is in arcsec only when the frame's
+    *headers* carried enough to derive a plate scale (`_read_pixel_scale()`).
+    `fwhm_median_px` is the same measurement before that conversion, and is
+    therefore free of any assumption about the optical setup. A caller that
+    will go on to plate-solve the frame should carry the pixel value and
+    convert it with the *solved* scale instead, which is what pipeline.py
+    does for the PSF anchor it hands to astrometry/subtraction/forced
+    photometry (audit 2026-08-18, finding M16). This module cannot do that
+    itself — it runs before the solve, deliberately, since its whole point
+    is to decide whether the frame is worth solving at all.
     """
     logger.info("QC analysis starting: %s", fits_path)
 
@@ -330,29 +427,136 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     raw_detection_count: int = len(objects)
     logger.debug("QC: detected %d raw sources in %s", raw_detection_count, os.path.basename(fits_path))
 
-    # Degenerate frame — too few sources to compute reliable statistics
+    # Degenerate frame — too few sources to compute reliable statistics.
+    #
+    # The background is still worth reporting on, and it is usually the
+    # explanation: cloud, twilight, moonlight or stray light drown the stars
+    # that should have been detected. Returning LOW_STARS regardless — as this
+    # did before — told the operator the symptom and hid the cause, which is
+    # exactly backwards for the one subsystem whose job is to say why a frame
+    # was rejected (audit 2026-08-18, finding M12). Two problems at once is
+    # BAD by this module's own flag table, and the log line names both.
     if raw_detection_count < 3:
-        logger.warning(
-            "QC: only %d sources detected (< 3), flagging LOW_STARS: %s",
-            raw_detection_count,
-            fits_path,
+        high_background = (
+            sky_background is not None
+            and sky_background > config.QC_SKY_BACKGROUND_MAX
         )
+        flag = "BAD" if high_background else "LOW_STARS"
+        if high_background:
+            logger.warning(
+                "QC: only %d sources detected (< 3) AND sky_background=%.1f "
+                "exceeds QC_SKY_BACKGROUND_MAX=%.1f — flagging BAD; the "
+                "background is the likely cause of the missing stars: %s",
+                raw_detection_count, sky_background,
+                config.QC_SKY_BACKGROUND_MAX, fits_path,
+            )
+        else:
+            logger.warning(
+                "QC: only %d sources detected (< 3), flagging LOW_STARS: %s",
+                raw_detection_count,
+                fits_path,
+            )
         return _result(
-            quality_flag="LOW_STARS",
+            quality_flag=flag,
             sky_background=sky_background,
             sky_sigma=sky_sigma,
             star_count=raw_detection_count,
-            rejected_path=_move_rejected(fits_path, "LOW_STARS", object_name) if move_on_reject else None,
+            rejected_path=_move_rejected(fits_path, flag, object_name) if move_on_reject else None,
         )
 
     # ------------------------------------------------------------------
-    # 4. FWHM (pixels → arcsec when plate scale is available)
+    # 4. Per-source shape, and the subsets the two medians are taken over
     # ------------------------------------------------------------------
+    # fwhm_median/elongation_median gate BLUR/TRAIL, so they must describe
+    # the frame's STARS. Taken over every raw detection — as they were until
+    # audit 2026-08-18, finding C11 — they also carry whatever extended,
+    # non-stellar morphology the field contains (nebula filaments, galaxies,
+    # compact clumps), which is broader and less round than any point source.
+    # A well-focused, well-tracked narrowband frame of a nebula could be
+    # rejected BLUR/TRAIL purely for what it was pointed at, and the same
+    # skewed FWHM then travelled downstream as psf_fwhm_arcsec to
+    # astrometry.solve()/subtraction.run().
+    #
+    # The obvious fix — reuse the star_mask computed below for star_count —
+    # does NOT work: that mask cuts at STAR_FWHM_MAX_ARCSEC and
+    # STAR_ELONGATION_MAX, whose defaults (8.0", 1.5) sit at or below
+    # QC_FWHM_MAX_ARCSEC (8.0") and QC_ELONGATION_MAX (2.0). A median taken
+    # over survivors of those cuts can never exceed either QC threshold, so
+    # BLUR and TRAIL would both become dead branches — the same
+    # cut-below-the-threshold-being-tested failure as finding C2.
+    #
+    # Each median is therefore taken over sources filtered on the OTHER axis,
+    # never on the one being measured:
+    #
+    #   fwhm_median       — over ROUND sources (elongation < STAR_ELONGATION_MAX),
+    #                       then with sources far broader than that subset's own
+    #                       compact population dropped relative to it (see
+    #                       _clip_broad_outliers(), which is what catches the
+    #                       round-AND-extended case a roundness cut cannot).
+    #                       Filaments, edge-on galaxies, streak remnants and
+    #                       face-on blobs go; every blurred star stays, however
+    #                       blurred it is.
+    #   elongation_median — over COMPACT sources (fwhm <= STAR_FWHM_MAX_ARCSEC).
+    #                       Nebula clumps and galaxies go; a trailed star's FWHM
+    #                       only grows as sqrt((e^2+1)/2), so it stays well
+    #                       inside that bound across the elongation range TRAIL
+    #                       actually discriminates.
+    #
+    # Both also require positive flux and reject anything sharper than
+    # STAR_FWHM_MIN_ARCSEC (hot/warm pixel clusters — a floor can only bias
+    # the estimate UPWARD, so it cannot hide blur). A subset with fewer than
+    # _MEDIAN_MIN_SOURCES members is not a population at all: the raw
+    # all-detections median is used instead, which is also what restores
+    # BLUR/TRAIL on a frame so badly blurred or trailed that its own stars
+    # fall outside the opposite axis' bound.
     fwhm_pixels_arr: np.ndarray = np.array(
         [_compute_fwhm_pixels(float(o["a"]), float(o["b"])) for o in objects],
         dtype=np.float64,
     )
-    fwhm_px_median: float = float(np.median(fwhm_pixels_arr))
+    # Minor axis clamped at the pixel limit, never replaced by a sentinel:
+    # substituting 1.0 for a degenerate `b == 0` fit reported a line-like
+    # artifact (a cosmic-ray track, a bad column) as perfectly ROUND, which
+    # both admitted it into the FWHM population this very block is filtering
+    # and made TRAIL structurally unable to fire on it. The three other
+    # extraction paths already clamp the same way — see _MIN_SEMI_MINOR_PX.
+    b_clamped: np.ndarray = np.maximum(
+        objects["b"].astype(np.float64), _MIN_SEMI_MINOR_PX
+    )
+    elongation_arr: np.ndarray = objects["a"].astype(np.float64) / b_clamped
+
+    mask_flux: np.ndarray = objects["flux"] > 0
+    mask_round: np.ndarray = elongation_arr < config.STAR_ELONGATION_MAX
+
+    fwhm_per_source: np.ndarray | None = None
+    if plate_scale is not None:
+        fwhm_per_source = fwhm_pixels_arr * plate_scale
+        mask_fwhm_min: np.ndarray = fwhm_per_source >= config.STAR_FWHM_MIN_ARCSEC
+        mask_fwhm_max: np.ndarray = fwhm_per_source <= config.STAR_FWHM_MAX_ARCSEC
+    else:
+        # Without a plate scale the arcsec bounds are meaningless; only the
+        # scale-free roundness and flux cuts can be applied.
+        mask_fwhm_min = np.ones(raw_detection_count, dtype=bool)
+        mask_fwhm_max = np.ones(raw_detection_count, dtype=bool)
+
+    fwhm_subset: np.ndarray = mask_flux & mask_fwhm_min & mask_round
+    # A round source can still be extended (face-on galaxy, round nebula
+    # knot) — one more, purely relative pass removes those; see
+    # _clip_broad_outliers().
+    fwhm_subset = _clip_broad_outliers(
+        fwhm_pixels_arr, fwhm_subset, os.path.basename(fits_path)
+    )
+    # The elongation subset needs no counterpart: what contaminates it is
+    # extended morphology, which the compactness cut above already removes,
+    # and a relative clip on elongation itself would start eating into the
+    # uniformly-trailed case TRAIL exists to catch.
+    elongation_subset: np.ndarray = mask_flux & mask_fwhm_min & mask_fwhm_max
+
+    # ------------------------------------------------------------------
+    # 4b. FWHM (pixels → arcsec when plate scale is available)
+    # ------------------------------------------------------------------
+    fwhm_px_median: float = _subset_median(
+        fwhm_pixels_arr, fwhm_subset, "fwhm", os.path.basename(fits_path)
+    )
 
     if plate_scale is not None:
         fwhm_median: float | None = fwhm_px_median * plate_scale
@@ -362,24 +566,26 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         fwhm_unit = "pixels"
 
     logger.debug(
-        "QC: fwhm_median=%.3f %s (%.3f px)  file=%s",
+        "QC: fwhm_median=%.3f %s (%.3f px, over %d/%d round sources)  file=%s",
         fwhm_median,
         fwhm_unit,
         fwhm_px_median,
+        int(fwhm_subset.sum()),
+        raw_detection_count,
         os.path.basename(fits_path),
     )
 
     # ------------------------------------------------------------------
     # 5. Elongation
     # ------------------------------------------------------------------
-    elongation_arr: np.ndarray = np.array(
-        [float(o["a"]) / float(o["b"]) if float(o["b"]) > 0.0 else 1.0 for o in objects],
-        dtype=np.float64,
+    elongation_median: float | None = _subset_median(
+        elongation_arr, elongation_subset, "elongation", os.path.basename(fits_path)
     )
-    elongation_median: float | None = float(np.median(elongation_arr))
     logger.debug(
-        "QC: elongation_median=%.3f  file=%s",
+        "QC: elongation_median=%.3f (over %d/%d compact sources)  file=%s",
         elongation_median,
+        int(elongation_subset.sum()),
+        raw_detection_count,
         os.path.basename(fits_path),
     )
 
@@ -394,22 +600,13 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     # Note: We use QC thresholds (QC_ELONGATION_MAX, QC_FWHM_MAX_ARCSEC) for
     # the BLUR/TRAIL quality flags, but use the stricter STAR_* thresholds
     # here to count only genuine point sources, matching what astrometry
-    # will actually extract as stars.
-    
-    # Compute per-source FWHM in arcsec (or pixels if no plate scale)
-    fwhm_per_source: np.ndarray
+    # will actually extract as stars. This is the one place those stricter
+    # bounds are applied on BOTH axes at once — see the long note in step 4
+    # for why the two medians above deliberately cannot be.
+    star_mask: np.ndarray = mask_flux & mask_round & mask_fwhm_min & mask_fwhm_max
+    star_count: int = int(np.sum(star_mask))
+
     if plate_scale is not None:
-        fwhm_per_source = fwhm_pixels_arr * plate_scale
-        
-        # Apply star filters
-        mask_elongation = elongation_arr < config.STAR_ELONGATION_MAX
-        mask_fwhm_min = fwhm_per_source >= config.STAR_FWHM_MIN_ARCSEC
-        mask_fwhm_max = fwhm_per_source <= config.STAR_FWHM_MAX_ARCSEC
-        mask_flux = objects["flux"] > 0
-        
-        star_mask = mask_elongation & mask_fwhm_min & mask_fwhm_max & mask_flux
-        star_count: int = int(np.sum(star_mask))
-        
         logger.debug(
             "QC: star filter: %d raw → %d stars (elong<%0.1f, fwhm=[%.1f-%.1f]\")  file=%s",
             raw_detection_count,
@@ -420,12 +617,6 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
             os.path.basename(fits_path),
         )
     else:
-        # Without plate scale, use only elongation and flux filters
-        mask_elongation = elongation_arr < config.STAR_ELONGATION_MAX
-        mask_flux = objects["flux"] > 0
-        star_mask = mask_elongation & mask_flux
-        star_count = int(np.sum(star_mask))
-        
         logger.debug(
             "QC: star filter (no plate scale): %d raw → %d stars  file=%s",
             raw_detection_count,
@@ -563,6 +754,7 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
         quality_flag=quality_flag,
         fwhm_median=fwhm_median,
         fwhm_unit=fwhm_unit,
+        fwhm_median_px=fwhm_px_median,
         elongation_median=elongation_median,
         snr_median=snr_median,
         sky_background=sky_background,
@@ -581,6 +773,7 @@ def _result(
     quality_flag: str = "OK",
     fwhm_median: float | None = None,
     fwhm_unit: str = "pixels",
+    fwhm_median_px: float | None = None,
     elongation_median: float | None = None,
     snr_median: float | None = None,
     sky_background: float | None = None,
@@ -594,6 +787,7 @@ def _result(
         "quality_flag":      quality_flag,
         "fwhm_median":       fwhm_median,
         "fwhm_unit":         fwhm_unit,
+        "fwhm_median_px":    fwhm_median_px,
         "elongation_median": elongation_median,
         "snr_median":        snr_median,
         "sky_background":    sky_background,
@@ -620,11 +814,46 @@ def _cleanup_empty_incoming_parents(moved_path: str) -> None:
         parent = os.path.dirname(parent)
 
 
+# Upper bound on the numeric suffixes _unique_destination() will try before
+# falling back to a timestamp. Reaching it means something is looping; a
+# bounded probe keeps that from becoming an unbounded one.
+_MAX_REJECTED_SUFFIX = 1000
+
+
+def _unique_destination(dest_path: str) -> str:
+    """
+    Return *dest_path*, or a non-colliding variant of it when a file is
+    already there: ``BLUR_frame.fits`` → ``BLUR_frame_1.fits`` → ``_2`` …
+
+    `shutil.move()` overwrites silently on POSIX, which destroyed the earlier
+    file outright — in the one subsystem whose entire purpose is to keep a
+    rejected frame around for manual review (audit 2026-08-18, finding C12).
+    A collision is not exotic: a re-run against the same original filename, a
+    test retry, or two frames that normalize to the same name all produce one.
+
+    The probe is not atomic, but the pipeline has a single writer per file and
+    the fallback below terminates regardless.
+    """
+    if not os.path.exists(dest_path):
+        return dest_path
+
+    stem, ext = os.path.splitext(dest_path)
+    for n in range(1, _MAX_REJECTED_SUFFIX):
+        candidate = f"{stem}_{n}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+
+    # Practically unreachable; guarantees a terminating, still-unique answer.
+    return f"{stem}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}{ext}"
+
+
 def _move_rejected(fits_path: str, flag: str, object_name: str) -> str | None:
     """
     Move a rejected FITS file to the configured rejected directory.
 
-    Destination: {FITS_REJECTED}/{object_name}/{flag}_{original_filename}
+    Destination: {FITS_REJECTED}/{object_name}/{flag}_{original_filename},
+    with a numeric suffix appended on collision rather than overwriting
+    whatever is already there — see _unique_destination().
 
     Returns the destination path, or None if the move fails (logged as error).
     """
@@ -641,6 +870,15 @@ def _move_rejected(fits_path: str, flag: str, object_name: str) -> str | None:
     original_filename = os.path.basename(fits_path)
     dest_filename = f"{flag}_{original_filename}"
     dest_path = os.path.join(dest_dir, dest_filename)
+
+    unique_path = _unique_destination(dest_path)
+    if unique_path != dest_path:
+        logger.warning(
+            "QC: %s already exists — storing this rejection as %s instead of "
+            "overwriting it",
+            dest_path, os.path.basename(unique_path),
+        )
+        dest_path = unique_path
 
     try:
         shutil.move(fits_path, dest_path)

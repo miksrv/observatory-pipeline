@@ -12,10 +12,17 @@ observatory's topocentric coordinates from config.py.
 Returns None on any error (network timeout, unknown designation, rate limit).
 Errors are logged but never raised — the pipeline continues with partial results.
 No tenacity retries: JPL Horizons enforces strict rate limits.
+
+astroquery's Horizons client is fully synchronous and carries no timeout of
+its own. The blocking call therefore runs in a worker thread under an
+explicit config.EPHEMERIS_TIMEOUT_SEC budget, so that an unresponsive
+Horizons can neither stall the worker's whole event loop nor hold up the
+frame indefinitely (audit 2026-08-18, finding C8).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 
@@ -64,7 +71,26 @@ async def query(designation: str, obs_time: str) -> dict | None:
         }
 
         horizons = Horizons(id=designation, location=location, epochs=jd)
-        eph = horizons.ephemerides()
+
+        # The budget is enforced at the HTTP layer first: astroquery passes
+        # this straight to requests as its own socket timeout, so an
+        # unresponsive Horizons ends the *thread* too, not just our wait on
+        # it. That distinction matters because asyncio.to_thread() runs on the
+        # loop's shared default executor, whose pool is small and bounded — a
+        # thread abandoned by asyncio.wait_for() keeps occupying a slot for as
+        # long as its socket blocks, and enough of them starve every other
+        # to_thread() user (astap's subprocess call among them) of workers.
+        horizons.TIMEOUT = config.EPHEMERIS_TIMEOUT_SEC
+
+        # asyncio.wait_for() stays as the outer bound: the HTTP timeout covers
+        # each socket operation, not the total call (redirects, retries and
+        # astropy's own table parsing all sit outside it), so this is what
+        # guarantees a wall-clock ceiling. It is now a backstop for a call
+        # that is already killable rather than the only line of defence.
+        eph = await asyncio.wait_for(
+            asyncio.to_thread(horizons.ephemerides),
+            timeout=config.EPHEMERIS_TIMEOUT_SEC,
+        )
 
         row = eph[0]
 
@@ -117,6 +143,13 @@ async def query(designation: str, obs_time: str) -> dict | None:
             "angular_velocity_arcsec_per_hour": angular_velocity,
         }
 
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Horizons query for %s at %s exceeded EPHEMERIS_TIMEOUT_SEC=%.0fs "
+            "— giving up on the ephemeris",
+            designation, obs_time, config.EPHEMERIS_TIMEOUT_SEC,
+        )
+        return None
     except Exception as e:
         logger.warning(
             "Horizons query failed for %s at %s: %s",

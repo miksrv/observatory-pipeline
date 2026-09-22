@@ -64,7 +64,7 @@ import os
 
 import astropy.io.fits as fits
 import numpy as np
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import SigmaClip, sigma_clipped_stats
 from astropy.time import Time
 from astropy.wcs import WCS
 from photutils.aperture import ApertureStats, CircularAnnulus, CircularAperture, aperture_photometry
@@ -112,6 +112,157 @@ def _propagate_gaia_position(star: dict, obs_jyear: float | None) -> tuple[float
     return ra + d_ra_deg, dec + d_dec_deg
 
 
+# Plausible range for a real sensor's electrons-per-ADU conversion factor —
+# duplicated from modules/photometry.py, same convention as the aperture /
+# net-flux formulas below. See config.PHOTOMETRY_GAIN_E_PER_ADU.
+_GAIN_MIN_E_PER_ADU: float = 0.05
+_GAIN_MAX_E_PER_ADU: float = 20.0
+
+
+def _resolve_gain(hdr, fits_filename: str, override: float | None = None) -> float:
+    """
+    Resolve this frame's sensor gain in electrons per ADU — a hand-duplicated
+    copy of modules/photometry.py's _resolve_gain(), kept in sync by hand the
+    same way this module's aperture/net-flux formulas already are. See that
+    function's docstring for the EGAIN-before-GAIN preference and why a value
+    outside the plausible range is rejected rather than trusted.
+    """
+    candidates: list[tuple[str, object]] = []
+    if override is not None:
+        candidates.append(("caller", override))
+    if config.PHOTOMETRY_GAIN_E_PER_ADU is not None:
+        candidates.append(("PHOTOMETRY_GAIN_E_PER_ADU", config.PHOTOMETRY_GAIN_E_PER_ADU))
+    if hdr is not None:
+        for key in ("EGAIN", "GAIN"):
+            try:
+                value = hdr.get(key)
+            except Exception:
+                value = None
+            if value is not None:
+                candidates.append((key, value))
+
+    for origin, value in candidates:
+        try:
+            gain = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(gain):
+            continue
+        if _GAIN_MIN_E_PER_ADU <= gain <= _GAIN_MAX_E_PER_ADU:
+            return gain
+        logger.warning(
+            "forced_photometry: %s=%s is outside the plausible %.2f-%.1f "
+            "e-/ADU range — ignoring it  file=%s",
+            origin, value, _GAIN_MIN_E_PER_ADU, _GAIN_MAX_E_PER_ADU,
+            fits_filename,
+        )
+
+    return 1.0
+
+
+def _sky_sigma_clip() -> SigmaClip | None:
+    """
+    The sigma-clipper applied to the sky annulus — a hand-duplicated copy of
+    modules/photometry.py's helper of the same name, kept in sync by hand the
+    same way this module's aperture/net-flux formulas already are.
+    """
+    sigma = config.PHOTOMETRY_SKY_SIGMA_CLIP
+    if sigma is None or sigma <= 0:
+        return None
+    return SigmaClip(sigma=float(sigma), maxiters=5)
+
+
+def _blend_radius_arcsec(psf_fwhm_arcsec: float | None) -> float:
+    """
+    How close another catalog entry may be before a forced measurement is
+    considered blended, in arcsec. 0 when the check is disabled or the frame's
+    FWHM is unknown — without a PSF width there is no scale to judge
+    "close" against.
+    """
+    factor = config.FORCED_PHOTOMETRY_BLEND_FWHM
+    if factor <= 0 or not psf_fwhm_arcsec or psf_fwhm_arcsec <= 0:
+        return 0.0
+    return factor * float(psf_fwhm_arcsec)
+
+
+def _blend_lookup(
+    positions: list[tuple[float, float]],
+    radius_arcsec: float,
+):
+    """
+    Return a callable answering "is there another of these positions within
+    `radius_arcsec` of (ra, dec)?".
+
+    Forced photometry measures a fixed aperture at a catalog position without
+    asking what else is in it. Two stars closer than a couple of FWHM share
+    most of their light, so the measurement is really the pair's combined
+    flux, reported as one star's magnitude with nothing on the wire to say
+    otherwise (audit 2026-08-18, finding M8). Such a position is skipped
+    rather than reported: the schema has no field for "blended", and a
+    contaminated magnitude presented as a clean one is worse than a missing
+    recovery — the same reasoning that drops a below-threshold measurement
+    instead of calling it an upper limit.
+
+    Built once over every catalog entry in the field, so the cost is one
+    tree build rather than a scan per position. Returns a callable that always
+    says False when the check is disabled or there is nothing to compare
+    against.
+    """
+    if radius_arcsec <= 0 or len(positions) < 2:
+        return lambda ra, dec: False
+
+    try:
+        import astropy.units as u
+        from astropy.coordinates import SkyCoord
+
+        catalog = SkyCoord(
+            ra=[p[0] for p in positions] * u.deg,
+            dec=[p[1] for p in positions] * u.deg,
+        )
+    except Exception as exc:
+        logger.debug("forced_photometry: blend lookup unavailable (%s)", exc)
+        return lambda ra, dec: False
+
+    def _is_blended(ra: float, dec: float) -> bool:
+        try:
+            target = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+            separations = target.separation(catalog).arcsec
+            # The position itself is in the catalog, so its own zero
+            # separation has to be discounted — anything else inside the
+            # radius is a neighbour.
+            return bool(np.sum(separations <= radius_arcsec) > 1)
+        except Exception:
+            return False
+
+    return _is_blended
+
+
+def _aperture_max(data: np.ndarray, x_px: float, y_px: float, radius: float) -> float:
+    """
+    The largest raw value inside the circular photometric aperture at
+    (x_px, y_px) — the pixels that actually contribute flux.
+
+    Falls back to the bounding square's maximum if the circular mask can't be
+    built, which is the previous, stricter behaviour: erring toward rejecting
+    a measurement is the safe direction here.
+    """
+    r = int(math.ceil(radius))
+    x0, x1 = int(x_px) - r, int(x_px) + r + 1
+    y0, y1 = int(y_px) - r, int(y_px) + r + 1
+    patch = data[y0:y1, x0:x1]
+    if patch.size == 0:
+        return float("inf")
+
+    try:
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        inside = (xx - x_px) ** 2 + (yy - y_px) ** 2 <= radius ** 2
+        if not inside.any():
+            return float(np.max(patch))
+        return float(np.max(patch[inside]))
+    except Exception:
+        return float(np.max(patch))
+
+
 def _measure_at_pixel(
     data_sub: np.ndarray,
     raw_data: np.ndarray,
@@ -121,6 +272,7 @@ def _measure_at_pixel(
     annulus_inner: float,
     annulus_outer: float,
     sky_sigma: float,
+    gain_e_per_adu: float = 1.0,
 ) -> tuple[float, float] | None:
     """
     Aperture-photometer a single fixed position. Mirrors modules/photometry.py's
@@ -142,14 +294,27 @@ def _measure_at_pixel(
     if x0 < 0 or y0 < 0 or x1 > naxis1 or y1 > naxis2:
         return None  # too close to the edge for the full annulus to fit
 
-    if float(np.max(raw_data[y0:y1, x0:x1])) >= config.SATURATION_ADU:
+    # Saturation is checked inside the PHOTOMETRIC APERTURE, not across the
+    # square that bounds the annulus. The square is nearly twice the area of
+    # the circle it contains, and most of that surplus sits in the corners —
+    # the part of the neighbourhood that contributes nothing to the flux. A
+    # bright star there discarded a perfectly good recovery for a pixel the
+    # measurement never touches (audit 2026-08-18, finding M7). The annulus
+    # is deliberately not included either: a saturated pixel in the sky ring
+    # biases the background estimate but does not clip the source's own core,
+    # and the sigma clip on the annulus stats (H7) already handles it.
+    if _aperture_max(raw_data, x_px, y_px, ap_radius) >= config.SATURATION_ADU:
         return None
 
     position = (x_px, y_px)
     aperture = CircularAperture(position, r=ap_radius)
     annulus = CircularAnnulus(position, r_in=annulus_inner, r_out=annulus_outer)
 
-    ann_stats = ApertureStats(data_sub, annulus)
+    # Sigma-clipped for the same reason photometry.py's identical annulus is
+    # (audit 2026-08-18, finding H7): an unclipped median takes in whatever
+    # neighbour, cosmic ray or galaxy light falls in the ring, and subtracts
+    # it straight out of the source's flux.
+    ann_stats = ApertureStats(data_sub, annulus, sigma_clip=_sky_sigma_clip())
     sky_per_px = float(ann_stats.median)
 
     phot_table = aperture_photometry(data_sub, aperture)
@@ -157,8 +322,32 @@ def _measure_at_pixel(
     ap_area = float(aperture.area)
 
     net_flux = ap_sum - sky_per_px * ap_area
-    flux_err = math.sqrt(abs(net_flux) + ap_area * sky_sigma ** 2)
+    # Poisson term divided by the gain: the aperture sum is in ADU, but shot
+    # noise is Poissonian in electrons — see photometry.py's own comment on
+    # the identical formula, and audit 2026-08-18 finding C7 for what the
+    # implicit gain=1 assumption cost this module specifically (an
+    # overstated flux_err understates the significance, so real faint
+    # recoveries were dropped against FORCED_PHOTOMETRY_MIN_SNR — defeating
+    # the entire point of precovery).
+    flux_err = math.sqrt(abs(net_flux) / gain_e_per_adu + ap_area * sky_sigma ** 2)
     return net_flux, flux_err
+
+
+def _inconsistent_with_catalog(mag_calibrated: float | None, catalog_mag: float | None) -> bool:
+    """
+    Whether a forced recovery's calibrated magnitude is too far from the
+    catalog star's own to be a measurement of that star — see
+    FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG. Undecidable (no calibration,
+    no catalog magnitude, check disabled) means "not inconsistent".
+    """
+    limit = config.FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG
+    if limit <= 0 or mag_calibrated is None or catalog_mag is None:
+        return False
+    try:
+        deviation = abs(float(mag_calibrated) - float(catalog_mag))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(deviation) and deviation > limit
 
 
 def _build_result(
@@ -176,9 +365,33 @@ def _build_result(
     zero_point_err: float | None,
     fwhm_arcsec: float | None,
     near_edge: bool,
+    color: float | None = None,
+    color_term: float = 0.0,
+    color_ref: float | None = None,
+    color_scatter: float = 0.0,
 ) -> dict:
-    """Assemble one forced-photometry result in the same shape as an ordinary source dict."""
+    """
+    Assemble one forced-photometry result in the same shape as an ordinary source dict.
+
+    The colour handling mirrors modules/photometry.py's exactly (audit
+    2026-08-18, finding H5): a source whose own Gaia BP-RP colour is known
+    gets the frame's fitted colour term applied to it, and one whose colour is
+    unknown — every MPC object, and any Gaia star with no BP/RP photometry —
+    uses the zero point as it stands, which is defined at the reference set's
+    median colour, with `mag_err` widened by what the colour term can move
+    across that set's own colour spread.
+    """
     calibrated = zero_point is not None
+
+    mag_calibrated: float | None = None
+    if calibrated:
+        mag_calibrated = mag_instrumental + zero_point
+        if color_term and color_ref is not None and color is not None and math.isfinite(color):
+            mag_calibrated += color_term * (color - color_ref)
+        elif color_term:
+            color_unc = abs(color_term) * color_scatter
+            mag_err = math.sqrt(mag_err ** 2 + color_unc ** 2)
+
     return {
         "ra": ra,
         "dec": dec,
@@ -194,7 +407,7 @@ def _build_result(
         "flux_aperture": net_flux,
         "flux_err": flux_err,
         "mag_instrumental": mag_instrumental,
-        "mag_calibrated": mag_instrumental + zero_point if calibrated else None,
+        "mag_calibrated": mag_calibrated,
         "mag_err": mag_err,
         "calibrated": calibrated,
         "edge_flag": near_edge,
@@ -224,6 +437,10 @@ async def run(
     zero_point_err: float | None,
     obs_time: str | None,
     psf_fwhm_arcsec: float | None = None,
+    gain: float | None = None,
+    color_term: float = 0.0,
+    color_ref: float | None = None,
+    color_scatter: float = 0.0,
 ) -> list[dict]:
     """
     Force-measure every catalog star/MPC object not already present in
@@ -270,6 +487,17 @@ async def run(
         Sets the fixed aperture/annulus radii, same formula as
         photometry.py. Falls back to a fixed 3-pixel FWHM assumption when
         unavailable (mirrors photometry.py's own fallback).
+    gain:
+        Sensor gain in electrons per ADU for the Poisson term of the flux
+        error. None (the default) resolves it from
+        config.PHOTOMETRY_GAIN_E_PER_ADU, then from the frame's own
+        EGAIN/GAIN header — see _resolve_gain().
+    color_term, color_ref, color_scatter:
+        The colour part of the same photometric solution, read off an
+        already-measured source's "_color_term"/"_color_ref"/"_color_scatter"
+        the way zero_point is (see photometry._compute_zero_point()). The
+        defaults (0.0 / None / 0.0) mean "no colour term was fitted for this
+        frame" and reproduce the plain zero-point behaviour exactly.
 
     Returns
     -------
@@ -318,9 +546,12 @@ async def run(
     try:
         with fits.open(fits_path, mode="readonly", ignore_missing_simple=True) as hdul:
             raw_data = hdul[0].data
+            hdr = hdul[0].header
     except Exception as exc:
         logger.warning("forced_photometry: failed to open %s: %s", fits_path, exc)
         return []
+
+    gain_e_per_adu = _resolve_gain(hdr, fits_filename, override=gain)
 
     if raw_data is None:
         return []
@@ -364,9 +595,37 @@ async def run(
         except Exception as exc:
             logger.debug("forced_photometry: could not parse obs_time=%r: %s", obs_time, exc)
 
+    # Every catalog entry in this field, for the blend check below — the
+    # neighbour that contaminates an aperture need not be one this pass is
+    # forcing; an already-detected star is just as bright.
+    #
+    # Gaia neighbours are propagated to the observation epoch exactly as the
+    # forced targets themselves are, a few lines down. At their catalog epoch
+    # a high-proper-motion star's own entry can sit further from where it is
+    # being measured than the blend radius, so the lookup stops recognising
+    # the self-match — and then rejects the measurement as "blended" against
+    # the star's own stale position. Both sides of the comparison have to be
+    # at the same epoch for it to mean anything.
+    blend_radius = _blend_radius_arcsec(psf_fwhm_arcsec)
+    neighbour_positions: list[tuple[float, float]] = []
+    if blend_radius > 0:
+        for star in gaia_stars:
+            try:
+                neighbour_positions.append(_propagate_gaia_position(star, obs_jyear))
+            except (KeyError, TypeError, ValueError):
+                continue
+        for obj in mpc_objects:
+            try:
+                neighbour_positions.append((float(obj["ra"]), float(obj["dec"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    is_blended = _blend_lookup(neighbour_positions, blend_radius)
+
     results: list[dict] = []
     n_below_snr = 0
     n_unmeasurable = 0
+    n_blended = 0
+    n_inconsistent = 0
 
     def _try_measure(ra: float, dec: float) -> tuple[float, float, float, float] | None:
         """Project (ra, dec) to a pixel and measure it, or None if out of bounds/unmeasurable."""
@@ -378,6 +637,7 @@ async def run(
             return None
         measured = _measure_at_pixel(
             data_sub, data, x_px, y_px, ap_radius, annulus_inner, annulus_outer, sky_sigma,
+            gain_e_per_adu,
         )
         if measured is None:
             return None
@@ -389,6 +649,9 @@ async def run(
     # ------------------------------------------------------------------
     for star in eligible_gaia:
         ra, dec = _propagate_gaia_position(star, obs_jyear)
+        if is_blended(ra, dec):
+            n_blended += 1
+            continue
         measured = _try_measure(ra, dec)
         if measured is None:
             n_unmeasurable += 1
@@ -403,18 +666,30 @@ async def run(
             x_px < margin_x or x_px > naxis1 - margin_x
             or y_px < margin_y or y_px > naxis2 - margin_y
         )
-        results.append(_build_result(
+        result = _build_result(
             ra, dec, "Gaia DR3", star["source_id"], star["phot_g_mean_mag"], "STAR",
             net_flux, flux_err,
             -2.5 * math.log10(net_flux), 1.0857 * flux_err / net_flux,
             zero_point, zero_point_err, psf_fwhm_arcsec, near_edge,
-        ))
+            color=star.get("bp_rp"),
+            color_term=color_term, color_ref=color_ref, color_scatter=color_scatter,
+        )
+        # The recovery claims "this flux is that star's". A calibrated
+        # magnitude far from the star's own G says the aperture measured
+        # something else — see FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG.
+        if _inconsistent_with_catalog(result["mag_calibrated"], star.get("phot_g_mean_mag")):
+            n_inconsistent += 1
+            continue
+        results.append(result)
 
     # ------------------------------------------------------------------
     # MPC / SkyBot — position already at obs_time, no PM correction needed
     # ------------------------------------------------------------------
     for obj in eligible_mpc:
         ra, dec = float(obj["ra"]), float(obj["dec"])
+        if is_blended(ra, dec):
+            n_blended += 1
+            continue
         measured = _try_measure(ra, dec)
         if measured is None:
             n_unmeasurable += 1
@@ -434,15 +709,23 @@ async def run(
             net_flux, flux_err,
             -2.5 * math.log10(net_flux), 1.0857 * flux_err / net_flux,
             zero_point, zero_point_err, psf_fwhm_arcsec, near_edge,
+            # A solar system object has no catalogued colour — the zero point
+            # at the reference colour is the best available, with the colour
+            # term's own reach folded into mag_err.
+            color=None,
+            color_term=color_term, color_ref=color_ref, color_scatter=color_scatter,
         ))
 
-    if results or n_below_snr or n_unmeasurable:
+    if results or n_below_snr or n_unmeasurable or n_blended or n_inconsistent:
         logger.info(
             "Forced photometry: %d eligible Gaia + %d eligible MPC position(s) -> "
             "%d recovered, %d below FORCED_PHOTOMETRY_MIN_SNR=%.1f, %d unmeasurable "
-            "(saturated/edge/out-of-bounds)  file=%s",
+            "(saturated/edge/out-of-bounds), %d off the catalog magnitude by more "
+            "than %.1f mag, %d blended within %.2f\"  file=%s",
             len(eligible_gaia), len(eligible_mpc), len(results),
             n_below_snr, config.FORCED_PHOTOMETRY_MIN_SNR, n_unmeasurable,
+            n_inconsistent, config.FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG,
+            n_blended, blend_radius,
             fits_filename,
         )
 

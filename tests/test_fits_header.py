@@ -12,7 +12,8 @@ import numpy as np
 import astropy.io.fits as fits
 import pytest
 
-from modules.fits_header import extract_headers, sanitize_object_name
+from modules import fits_header
+from modules.fits_header import extract_headers, midpoint_time, sanitize_object_name
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +343,241 @@ class TestCoordinateConversion:
 
 
 # ---------------------------------------------------------------------------
+# Plate scale resolution — audit 2026-08-18, finding M2
+#
+# modules/qc.py and this module used to read the same ambiguous keywords
+# differently, and both unsafely: one took PIXSCALE as arcsec/px whenever it
+# fell in a wide range, the other took PIXSCALE1 as microns unconditionally.
+# The ranges overlap — a 3.76 micron pixel and a 3.76"/px scale are the same
+# number — so no range check can separate them, and the two modules could
+# reach opposite conclusions about the same frame.
+# ---------------------------------------------------------------------------
+
+class TestPlateScaleResolution:
+    def _hdr(self, cards: dict) -> fits.Header:
+        header = fits.Header()
+        for key, value in cards.items():
+            header[key] = value
+        return header
+
+    def test_pixel_size_and_focal_length_win_outright(self):
+        header = self._hdr({"XPIXSZ": 3.76, "FOCALLEN": 1000.0, "PIXSCALE": 99.0})
+
+        scale = fits_header.resolve_pixel_scale_arcsec(header)
+
+        assert scale == pytest.approx(206265.0 * 0.00376 / 1000.0, rel=1e-6)
+
+    def test_a_comment_naming_arcsec_is_honoured(self):
+        header = fits.Header()
+        header["PIXSCALE"] = (3.76, "plate scale [arcsec/pixel]")
+
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(3.76)
+
+    def test_a_comment_naming_microns_is_honoured(self):
+        header = fits.Header()
+        header["PIXSCALE"] = (3.76, "pixel size in microns")
+        header["FOCALLEN"] = 1000.0
+
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(
+            206265.0 * 0.00376 / 1000.0, rel=1e-6
+        )
+
+    def test_an_unlabelled_value_is_read_as_arcsec(self):
+        """The assumption is made explicitly and logged, not hidden in a range check."""
+        assert fits_header.resolve_pixel_scale_arcsec(self._hdr({"PIXSCALE": 1.23})) == pytest.approx(1.23)
+
+    def test_pixscale1_is_no_longer_taken_for_a_pixel_size(self):
+        """
+        The plain bug half of the finding: PIXSCALE1 was read as microns
+        unconditionally, and fed to the sensor record as one.
+        """
+        header = self._hdr({"PIXSCALE1": 1.23})
+
+        assert fits_header.pixel_size_um(header) is None
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(1.23)
+
+    def test_nothing_usable_returns_none(self):
+        assert fits_header.resolve_pixel_scale_arcsec(self._hdr({"FOCALLEN": 1000.0})) is None
+
+    def test_an_implausible_labelled_value_falls_through_to_the_next_keyword(self):
+        """An arcsec-labelled garbage PIXSCALE must not hide a usable PIXSCALE1."""
+        header = fits.Header()
+        header["PIXSCALE"] = (500.0, "plate scale [arcsec/pixel]")
+        header["PIXSCALE1"] = 1.23
+
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(1.23)
+
+    def test_qc_and_fits_header_agree(self):
+        """
+        The finding itself: two modules, one frame, two different answers.
+        """
+        from modules import qc
+
+        header = self._hdr({"PIXSCALE1": 1.23, "FOCALLEN": 1000.0})
+
+        assert qc._read_pixel_scale(header) == fits_header.resolve_pixel_scale_arcsec(header)
+
+
+# ---------------------------------------------------------------------------
+# Equinox handling — audit 2026-08-18, finding M1
+#
+# A mount reporting apparent coordinates of date ("JNow", the default in many
+# planetarium programs and ASCOM drivers) writes EQUINOX as the current year.
+# Read as J2000, the accumulated precession — roughly 50"/yr, about half a
+# degree by now — lands whole in pointing_error_arcsec, masking a real mount
+# problem or inventing one, and it grows every year.
+# ---------------------------------------------------------------------------
+
+class TestEquinox:
+    _RA = 202.469
+    _DEC = 47.195
+
+    def _ra_dec(self, extra_headers: dict) -> tuple[float, float]:
+        path = _write_fits({"RA": self._RA, "DEC": self._DEC, **extra_headers})
+        try:
+            h = extract_headers(path)
+            return h["ra"], h["dec"]
+        finally:
+            _cleanup(path)
+
+    def test_no_equinox_leaves_coordinates_alone(self):
+        assert self._ra_dec({}) == (pytest.approx(self._RA), pytest.approx(self._DEC))
+
+    def test_j2000_is_already_the_working_frame(self):
+        assert self._ra_dec({"EQUINOX": 2000.0}) == (
+            pytest.approx(self._RA), pytest.approx(self._DEC)
+        )
+
+    def test_jnow_is_precessed_to_icrs(self):
+        ra, dec = self._ra_dec({"EQUINOX": 2026.5})
+
+        # Roughly 50"/yr over ~26 years — tens of arcmin, far past anything
+        # this pipeline would otherwise call a pointing error.
+        sep_arcmin = math.hypot(
+            (ra - self._RA) * math.cos(math.radians(self._DEC)), dec - self._DEC
+        ) * 60.0
+        assert 10.0 < sep_arcmin < 40.0
+
+    def test_the_older_epoch_keyword_is_honoured(self):
+        from_epoch = self._ra_dec({"EPOCH": 2026.5})
+        from_equinox = self._ra_dec({"EQUINOX": 2026.5})
+
+        assert from_epoch == (pytest.approx(from_equinox[0]), pytest.approx(from_equinox[1]))
+
+    def test_an_explicit_icrs_radesys_wins_over_a_stale_equinox(self):
+        assert self._ra_dec({"EQUINOX": 2026.5, "RADESYS": "ICRS"}) == (
+            pytest.approx(self._RA), pytest.approx(self._DEC)
+        )
+
+    def test_an_implausible_equinox_is_ignored(self):
+        assert self._ra_dec({"EQUINOX": 12.0}) == (
+            pytest.approx(self._RA), pytest.approx(self._DEC)
+        )
+
+    def test_missing_coordinates_stay_missing(self):
+        path = _write_fits({"EQUINOX": 2026.5})
+        try:
+            h = extract_headers(path)
+            assert h["ra"] is None
+            assert h["dec"] is None
+        finally:
+            _cleanup(path)
+
+
+# ---------------------------------------------------------------------------
+# Numeric RA units — audit 2026-08-18, finding H18
+#
+# A bare numeric RA was always read as decimal degrees. Some ASCOM-driven
+# capture software writes decimal HOURS into the same keyword — a factor of
+# 15. The cost is not only a wrong pointing_error_arcsec: that RA also seeds
+# astap's narrow search centre, so with the wrong unit the narrow search
+# reliably misses and every such frame pays for a blind wide search.
+# ---------------------------------------------------------------------------
+
+class TestNumericRaUnits:
+    def test_a_value_past_24_is_unambiguously_degrees(self):
+        path = _write_fits({"RA": 202.469})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(202.469)
+        finally:
+            _cleanup(path)
+
+    def test_the_card_comment_can_say_hours(self):
+        data = np.zeros((10, 10), dtype=np.float32)
+        hdu = fits.PrimaryHDU(data=data)
+        hdu.header["RA"] = (13.498, "RA of target [hours]")
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        hdu.writeto(tmp.name, overwrite=True)
+        tmp.close()
+        try:
+            assert extract_headers(tmp.name)["ra"] == pytest.approx(202.47, abs=0.01)
+        finally:
+            _cleanup(tmp.name)
+
+    def test_a_blank_ra_card_does_not_shadow_objctra_comment(self):
+        """
+        The value comes from OBJCTRA when RA is blank; its unit comment has
+        to come from the same card, not from the empty RA placeholder.
+        """
+        data = np.zeros((10, 10), dtype=np.float32)
+        hdu = fits.PrimaryHDU(data=data)
+        hdu.header["RA"] = ("", "unset")
+        hdu.header["OBJCTRA"] = (13.498, "RA of target [hours]")
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        hdu.writeto(tmp.name, overwrite=True)
+        tmp.close()
+        try:
+            assert extract_headers(tmp.name)["ra"] == pytest.approx(202.47, abs=0.01)
+        finally:
+            _cleanup(tmp.name)
+
+    def test_the_card_comment_can_say_degrees(self):
+        data = np.zeros((10, 10), dtype=np.float32)
+        hdu = fits.PrimaryHDU(data=data)
+        hdu.header["RA"] = (13.498, "RA of target [degrees]")
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        hdu.writeto(tmp.name, overwrite=True)
+        tmp.close()
+        try:
+            assert extract_headers(tmp.name)["ra"] == pytest.approx(13.498)
+        finally:
+            _cleanup(tmp.name)
+
+    def test_crval1_decides_in_favour_of_hours(self):
+        """
+        Whichever interpretation lands closer to the header's own idea of
+        where the frame points is the right one — a 15x error is never the
+        closer of the two, even against a badly mis-pointed mount.
+        """
+        path = _write_fits({"RA": 13.498, "CRVAL1": 202.4})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(202.47, abs=0.01)
+        finally:
+            _cleanup(path)
+
+    def test_crval1_decides_in_favour_of_degrees(self):
+        path = _write_fits({"RA": 13.498, "CRVAL1": 13.6})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(13.498)
+        finally:
+            _cleanup(path)
+
+    def test_no_evidence_falls_back_to_the_fits_convention(self):
+        path = _write_fits({"RA": 13.498})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(13.498)
+        finally:
+            _cleanup(path)
+
+    def test_a_sexagesimal_ra_is_unaffected(self):
+        path = _write_fits({"OBJCTRA": "13 29 52.7", "CRVAL1": 13.6})
+        try:
+            assert extract_headers(path)["ra"] == pytest.approx(202.469, abs=0.01)
+        finally:
+            _cleanup(path)
+
+
+# ---------------------------------------------------------------------------
 # Missing / empty headers
 # ---------------------------------------------------------------------------
 
@@ -415,7 +651,7 @@ class TestMissingHeaders:
 
 class TestOutputStructure:
     EXPECTED_KEYS = {
-        "obs_time", "ra", "dec", "object_name",
+        "obs_time", "obs_time_mid", "ra", "dec", "object_name",
         "observation", "instrument", "sensor", "observer", "software",
     }
     EXPECTED_OBSERVATION_KEYS = {"object", "exptime", "filter", "frame_type", "airmass"}
@@ -469,3 +705,146 @@ class TestOutputStructure:
             assert self.EXPECTED_SOFTWARE_KEYS == set(extract_headers(path)["software"].keys())
         finally:
             _cleanup(path)
+
+
+# ---------------------------------------------------------------------------
+# Exposure midpoint (audit 2026-08-18, C9)
+# ---------------------------------------------------------------------------
+
+class TestMidpointTime:
+    """
+    DATE-OBS is the shutter-OPEN time per the FITS convention, but a moving
+    object's position is only meaningful at the middle of the exposure —
+    every query that computes one (SkyBot, JPL Horizons, Gaia proper-motion
+    propagation) used the start time as-is.
+    """
+
+    def test_adds_half_the_exposure(self):
+        assert midpoint_time("2024-03-15T22:01:34", 120.0).startswith(
+            "2024-03-15T22:02:34"
+        )
+
+    def test_trailing_zone_marker_is_accepted(self):
+        assert midpoint_time("2024-03-15T22:01:34Z", 60.0).startswith(
+            "2024-03-15T22:02:04"
+        )
+
+    def test_crosses_a_day_boundary(self):
+        assert midpoint_time("2024-03-15T23:59:34", 120.0).startswith(
+            "2024-03-16T00:00:34"
+        )
+
+    def test_missing_exptime_returns_the_start_time(self):
+        assert midpoint_time("2024-03-15T22:01:34", None) == "2024-03-15T22:01:34"
+
+    def test_zero_exposure_returns_the_start_time(self):
+        assert midpoint_time("2024-03-15T22:01:34", 0.0) == "2024-03-15T22:01:34"
+
+    def test_missing_obs_time_returns_none(self):
+        assert midpoint_time(None, 120.0) is None
+
+    def test_unparseable_obs_time_falls_back_to_the_start_time(self):
+        assert midpoint_time("not-a-timestamp", 120.0) == "not-a-timestamp"
+
+    def test_extract_headers_exposes_the_midpoint(self):
+        path = _write_fits({"DATE-OBS": "2024-03-15T22:01:34", "EXPTIME": 300.0})
+        try:
+            result = extract_headers(path)
+        finally:
+            _cleanup(path)
+
+        # obs_time itself must keep meaning exactly what the header says —
+        # it is what the frame is registered and archived under.
+        assert result["obs_time"] == "2024-03-15T22:01:34"
+        assert result["obs_time_mid"].startswith("2024-03-15T22:04:04")
+
+    def test_extract_headers_midpoint_is_none_without_a_timestamp(self):
+        path = _write_fits({"EXPTIME": 300.0})
+        try:
+            result = extract_headers(path)
+        finally:
+            _cleanup(path)
+
+        assert result["obs_time"] is None
+        assert result["obs_time_mid"] is None
+
+
+# ---------------------------------------------------------------------------
+# Observation timestamp resolution (audit 2026-08-18, C10)
+# ---------------------------------------------------------------------------
+
+class TestObsTimeResolution:
+    """
+    The older FITS convention puts only the calendar date in DATE-OBS and the
+    time of day in a separate TIME-OBS. Taking the first non-empty key on an
+    either/or basis dropped the time entirely, placing every frame of the
+    night at midnight.
+    """
+
+    def _obs_time(self, headers: dict):
+        path = _write_fits(headers)
+        try:
+            return extract_headers(path)["obs_time"]
+        finally:
+            _cleanup(path)
+
+    def test_date_only_is_combined_with_time_obs(self):
+        assert self._obs_time({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "22:01:34",
+        }) == "2024-03-15T22:01:34"
+
+    def test_combined_value_is_parseable_downstream(self):
+        from astropy.time import Time
+
+        obs_time = self._obs_time({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "22:01:34.500",
+        })
+
+        assert Time(obs_time, scale="utc").isot.startswith("2024-03-15T22:01:34")
+
+    def test_full_date_obs_ignores_time_obs(self):
+        """The modern convention: DATE-OBS already carries the time of day."""
+        assert self._obs_time({
+            "DATE-OBS": "2024-03-15T22:01:34",
+            "TIME-OBS": "03:00:00",
+        }) == "2024-03-15T22:01:34"
+
+    def test_time_obs_carrying_a_full_timestamp_wins_over_splicing(self):
+        """Some capture software writes a complete timestamp into TIME-OBS."""
+        assert self._obs_time({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "2024-03-15T22:01:34",
+        }) == "2024-03-15T22:01:34"
+
+    def test_date_only_without_time_obs_stays_date_only(self):
+        assert self._obs_time({"DATE-OBS": "2024-03-15"}) == "2024-03-15"
+
+    def test_bare_time_obs_alone_is_not_returned(self):
+        """
+        A time of day with no date anywhere can't be parsed by anything
+        downstream — returning it turns a missing timestamp into a corrupt
+        one.
+        """
+        assert self._obs_time({"TIME-OBS": "22:01:34"}) is None
+
+    def test_bare_time_obs_falls_through_to_mjd(self):
+        obs_time = self._obs_time({"TIME-OBS": "22:01:34", "MJD-OBS": 60384.0})
+
+        assert obs_time is not None
+        assert "2024-03-15" in obs_time
+
+    def test_combined_timestamp_feeds_the_exposure_midpoint(self):
+        """C9 and C10 compose: the midpoint is computed off the combined value."""
+        path = _write_fits({
+            "DATE-OBS": "2024-03-15",
+            "TIME-OBS": "22:01:34",
+            "EXPTIME":  120.0,
+        })
+        try:
+            result = extract_headers(path)
+        finally:
+            _cleanup(path)
+
+        assert result["obs_time_mid"].startswith("2024-03-15T22:02:34")

@@ -10,12 +10,15 @@ asyncio_mode = auto in pytest.ini — no @pytest.mark.asyncio decorators needed.
 from __future__ import annotations
 
 import math
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import numpy.ma as npma
 import pytest
 
+import config
 import modules.ephemeris as ephemeris
 
 
@@ -205,3 +208,58 @@ class TestEphemerisQuery:
             result = await ephemeris.query(_DESIGNATION, _OBS_TIME)
 
         assert result is None
+
+    async def test_query_gives_up_after_the_configured_timeout(self, monkeypatch):
+        """
+        Audit 2026-08-18, finding C8: astroquery's Horizons client is
+        synchronous and carries no timeout of its own, so an unresponsive
+        Horizons could hold up the frame indefinitely.
+        """
+        monkeypatch.setattr(config, "EPHEMERIS_TIMEOUT_SEC", 0.05)
+
+        instance = MagicMock()
+        instance.ephemerides.side_effect = lambda: time.sleep(0.6)
+
+        with patch("modules.ephemeris.Horizons", MagicMock(return_value=instance)):
+            result = await ephemeris.query(_DESIGNATION, _OBS_TIME)
+
+        assert result is None
+
+    async def test_the_budget_reaches_astroquery_as_an_http_timeout(self):
+        """
+        asyncio.wait_for() only stops *awaiting* the call — it cannot cancel
+        the thread, which keeps a slot on asyncio's small shared default
+        executor for as long as its socket blocks. Enough hung Horizons
+        requests starve every other to_thread() caller, astap's subprocess
+        among them. The budget therefore has to reach the HTTP layer too,
+        where it actually ends the request.
+        """
+        instance = MagicMock()
+        instance.ephemerides.side_effect = lambda: [_make_eph_row()]
+
+        with patch("modules.ephemeris.Horizons", MagicMock(return_value=instance)):
+            await ephemeris.query(_DESIGNATION, _OBS_TIME)
+
+        assert instance.TIMEOUT == config.EPHEMERIS_TIMEOUT_SEC
+
+    async def test_query_runs_the_blocking_call_off_the_event_loop(self):
+        """
+        The same finding's other half: run inline, the blocking HTTP round
+        trip stalls the worker's whole event loop and makes
+        _resolve_ephemerides()' asyncio.gather() concurrent in name only.
+        """
+        loop_thread = threading.get_ident()
+        seen: dict = {}
+
+        def record():
+            seen["thread"] = threading.get_ident()
+            return [_make_eph_row()]
+
+        instance = MagicMock()
+        instance.ephemerides.side_effect = record
+
+        with patch("modules.ephemeris.Horizons", MagicMock(return_value=instance)):
+            result = await ephemeris.query(_DESIGNATION, _OBS_TIME)
+
+        assert result is not None
+        assert seen["thread"] != loop_thread

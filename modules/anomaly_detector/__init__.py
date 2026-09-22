@@ -47,8 +47,18 @@ from modules import ephemeris  # noqa: F401 — same reason, for ephemeris.query
 
 from ._detect import detect
 from ._geometry import _haversine_arcsec
-from ._history import _history_median_mag, _same_filter_history
-from ._movement import _is_position_shifted, _is_still_occupied
+from ._history import (
+    _history_mag_scatter,
+    _history_median_mag,
+    _same_filter_history,
+)
+from ._movement import (
+    _find_wide_history,
+    _is_position_shifted,
+    _is_still_occupied,
+    _wide_cone_radius_arcsec,
+)
+from ._classify import _is_significant_delta, _survives_edge_zone
 from ._otypes import _is_binary_star, _is_galaxy, _is_variable_star
 from .types import AnomalyType
 
