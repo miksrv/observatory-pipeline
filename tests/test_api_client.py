@@ -744,6 +744,15 @@ class TestApplyRemoteSettings:
         special = {k for k, t in config._OVERRIDABLE.items() if t is None}
         assert config._BOOL_KEYS <= special
 
+    def test_applies_color_terms(self):
+        import config
+        original = config.PHOTOMETRY_COLOR_TERMS
+        try:
+            assert config.apply_remote_settings({"PHOTOMETRY_COLOR_TERMS": "B:-1.0, G:-0.45"}) == 1
+            assert config.PHOTOMETRY_COLOR_TERMS == {"B": -1.0, "G": -0.45}
+        finally:
+            config.PHOTOMETRY_COLOR_TERMS = original
+
     @pytest.mark.parametrize("raw, expected", [("1.8", 1.8), ("", None), ("  ", None)])
     def test_applies_photometry_gain(self, raw, expected):
         import config

@@ -104,6 +104,18 @@ async def detect(
         except (TypeError, ValueError):
             continue
 
+    # Catalogued sources with a measured magnitude, for telling a subtraction
+    # candidate that is merely a star's own residual from a transient — see
+    # _classify._is_residual_of_catalogued_star().
+    catalogued_frame_sources: list[tuple[float, float, float]] = []
+    for s in sources:
+        if s.get("catalog_name") is None:
+            continue
+        try:
+            catalogued_frame_sources.append((float(s["ra"]), float(s["dec"]), float(s["mag"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+
     anomalies: list[dict] = []
 
     for source in sources:
@@ -116,6 +128,7 @@ async def detect(
                 coverage_by_tile=coverage_by_tile,
                 current_frame_positions=current_frame_positions,
                 obs_time=obs_time,
+                catalogued_frame_sources=catalogued_frame_sources,
             )
             if result is not None:
                 anomalies.append(result)

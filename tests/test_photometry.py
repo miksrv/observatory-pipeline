@@ -14,6 +14,7 @@ asyncio_mode = auto is set in pytest.ini, so no @pytest.mark.asyncio required.
 
 from __future__ import annotations
 
+import logging
 import math
 from contextlib import contextmanager
 from typing import Any
@@ -785,10 +786,12 @@ def _ref(delta: float, color: float | None, inst: float = -10.0) -> dict:
 class TestColorTerm:
     """
     A star's instrumental magnitude in R/B/V differs from its Gaia broadband
-    G magnitude by an amount that depends on the star's own colour, not by a
-    constant. Fitting one median offset leaves a systematic bias in every
-    mag_calibrated that drifts with the reference set's colour mix — enough
-    to shift many stars in one epoch together past DELTA_MAG_ALERT.
+    G magnitude by an amount that depends on the star's own colour. The slope
+    k is a property of the instrument and filter, so it is configured per
+    filter (PHOTOMETRY_COLOR_TERMS) and applied identically on every frame;
+    only the intercept is fitted per frame. A per-frame fitted slope, whose
+    acceptance flipped between neighbouring frames, made every star "vary" by
+    k x (colour - reference) between epochs (2026-09-22 IC3322A test run).
     """
 
     def _colored_refs(self, k: float = 0.4, zp: float = 24.0, n: int = 20) -> list[dict]:
@@ -796,88 +799,100 @@ class TestColorTerm:
         colors = [0.2 + 0.1 * i for i in range(n)]
         return [_ref(zp + k * (c - 1.0), c) for c in colors]
 
-    def test_slope_is_recovered(self):
-        sol = photometry._compute_zero_point(self._colored_refs(k=0.4, zp=24.0))
+    def test_the_configured_slope_is_applied_and_the_intercept_fitted(self):
+        sol = photometry._compute_zero_point(self._colored_refs(k=0.4, zp=24.0), fixed_color_term=0.4)
 
-        assert sol.color_term == pytest.approx(0.4, abs=0.02)
+        assert sol.color_term == pytest.approx(0.4)
         assert sol.color_ref == pytest.approx(1.15, abs=0.1)
-        # The zero point is reported AT the reference colour, so it equals the
-        # line's value there rather than the mean of a tilted set.
-        assert sol.zero_point == pytest.approx(24.0 + 0.4 * (sol.color_ref - 1.0), abs=0.02)
+        # Reported AT the reference colour: the line's value there.
+        assert sol.zero_point == pytest.approx(24.0 + 0.4 * (sol.color_ref - 1.0), abs=1e-9)
+        # The configured slope matches the data, so nothing is left over.
+        assert sol.zero_point_err == pytest.approx(0.0, abs=1e-9)
 
-    def test_an_outlier_does_not_tilt_the_slope(self):
+    def test_a_frame_that_would_fit_a_different_slope_still_gets_the_configured_one(self):
+        """The whole point: the slope must not change from frame to frame."""
+        sol = photometry._compute_zero_point(self._colored_refs(k=1.0, zp=24.0), fixed_color_term=0.4)
+
+        assert sol.color_term == pytest.approx(0.4)
+
+    def test_no_configured_slope_means_the_plain_median(self):
+        """
+        However well this frame's own references would constrain a slope, it
+        is never applied — only logged.
+        """
         refs = self._colored_refs(k=0.4, zp=24.0)
-        refs.append(_ref(24.0 + 5.0, 2.2))  # one blended/variable reference
         sol = photometry._compute_zero_point(refs)
 
-        assert sol.color_term == pytest.approx(0.4, abs=0.05)
+        assert sol.color_term == 0.0
+        assert sol.zero_point == pytest.approx(
+            float(np.median([r["catalog_mag"] - r["mag_instrumental"] for r in refs]))
+        )
 
-    def test_references_without_colors_behave_exactly_as_before(self):
-        """The pre-existing path: no colour anywhere, plain median offset."""
+    def test_references_without_colors_use_the_plain_median(self):
         refs = [_ref(24.0, None) for _ in range(20)]
-        sol = photometry._compute_zero_point(refs)
+        sol = photometry._compute_zero_point(refs, fixed_color_term=0.4)
 
         assert sol.color_term == 0.0
         assert sol.color_ref is None
         assert sol.zero_point == pytest.approx(24.0)
 
-    def test_a_narrow_color_span_is_not_fitted(self):
-        """
-        A slope fitted over a field whose stars all share one colour is
-        unconstrained — extrapolating it is worse than not correcting.
-        """
-        refs = [_ref(24.0, 1.0 + 0.001 * i) for i in range(20)]
-        sol = photometry._compute_zero_point(refs)
-
-        assert sol.color_term == 0.0
-
-    def test_too_few_colored_references_are_not_fitted(self):
-        refs = self._colored_refs(n=4) + [_ref(24.0, None) for _ in range(10)]
-        sol = photometry._compute_zero_point(refs)
-
-        assert sol.color_term == 0.0
-
-    def test_an_implausible_slope_is_discarded(self):
-        sol = photometry._compute_zero_point(self._colored_refs(k=5.0, zp=24.0))
+    def test_too_few_colored_references_use_the_plain_median(self):
+        refs = [_ref(24.0, 1.0), _ref(24.0, 1.5)] + [_ref(24.0, None) for _ in range(10)]
+        sol = photometry._compute_zero_point(refs, fixed_color_term=0.4)
 
         assert sol.color_term == 0.0
 
     def test_disabled_by_config(self, monkeypatch):
         monkeypatch.setattr(config, "PHOTOMETRY_COLOR_TERM_ENABLED", False)
-        sol = photometry._compute_zero_point(self._colored_refs(k=0.4))
+        sol = photometry._compute_zero_point(self._colored_refs(k=0.4), fixed_color_term=0.4)
 
         assert sol.color_term == 0.0
 
-    async def test_a_colored_source_gets_the_term_applied(self):
+    def test_the_measured_slope_is_logged_for_calibration(self, caplog):
+        with caplog.at_level(logging.INFO, logger="modules.photometry"):
+            photometry._compute_zero_point(self._colored_refs(k=0.4, zp=24.0), fixed_color_term=0.3)
+
+        assert "colour term measured on this frame k=0.400" in caplog.text
+        assert "configured k=0.300" in caplog.text
+
+    def test_the_filter_lookup_is_case_insensitive(self, monkeypatch):
+        monkeypatch.setattr(config, "PHOTOMETRY_COLOR_TERMS", {"B": -1.0})
+
+        assert photometry._color_term_for("B") == -1.0
+        assert photometry._color_term_for("b") == -1.0
+        assert photometry._color_term_for("R") is None
+        assert photometry._color_term_for(None) is None
+
+    async def test_a_colored_source_gets_the_term_applied(self, monkeypatch):
         """
-        End to end through measure(): two Gaia stars of different colours, on
-        a reference set whose fitted slope is non-zero, must end up with
-        different mag_calibrated offsets from their (identical) instrumental
-        magnitudes.
+        End to end through measure(): two Gaia stars of different colours must
+        end up with different mag_calibrated offsets from their (identical)
+        instrumental magnitudes once the frame's filter has a configured k.
         """
+        monkeypatch.setattr(config, "PHOTOMETRY_COLOR_TERMS", {"R": 0.4})
         srcs = _make_gaia_sources(n=20, catalog_mag=14.0)
-        # Give the set a real colour-magnitude relation: delta grows with colour.
         for i, src in enumerate(srcs):
             color = 0.2 + 0.1 * i
             src["_catalog_color"] = color
             src["catalog_mag"] = 14.0 + 0.4 * color
 
         with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
-            result = await photometry.measure(_FITS_PATH, srcs)
+            result = await photometry.measure(_FITS_PATH, srcs, filter_name="R")
+            unconfigured = await photometry.measure(_FITS_PATH, srcs, filter_name="V")
 
         assert result[0]["calibrated"] is True
-        offsets = {
-            round(src["mag_calibrated"] - src["mag_instrumental"], 6)
-            for src in result
-        }
+        offsets = {round(s["mag_calibrated"] - s["mag_instrumental"], 6) for s in result}
         assert len(offsets) > 1, "colour term was not applied per source"
+        flat = {round(s["mag_calibrated"] - s["mag_instrumental"], 6) for s in unconfigured}
+        assert len(flat) == 1, "a filter with no configured k must get no colour term"
 
-    async def test_a_colorless_source_keeps_the_bare_zero_point_and_a_wider_error(self):
+    async def test_a_colorless_source_keeps_the_bare_zero_point_and_a_wider_error(self, monkeypatch):
         """
         An uncatalogued transient — the case that matters — has no colour to
         transform with, so it uses the zero point at the reference colour and
         carries the colour term's own reach in its mag_err instead.
         """
+        monkeypatch.setattr(config, "PHOTOMETRY_COLOR_TERMS", {"R": 0.4})
         srcs = _make_gaia_sources(n=20, catalog_mag=14.0)
         for i, src in enumerate(srcs):
             color = 0.2 + 0.1 * i
@@ -888,12 +903,8 @@ class TestColorTerm:
         plain[0]["dec"] = srcs[0]["dec"]
 
         with _patch_photometry(aperture_sum=80000.0, annulus_sky_per_px=10.0):
-            with_term = await photometry.measure(_FITS_PATH, srcs + plain)
-            monochrome = [dict(s) for s in srcs]
-            for s in monochrome:
-                s["_catalog_color"] = None
-                s["catalog_mag"] = 14.0
-            without_term = await photometry.measure(_FITS_PATH, monochrome + [dict(plain[0])])
+            with_term = await photometry.measure(_FITS_PATH, srcs + plain, filter_name="R")
+            without_term = await photometry.measure(_FITS_PATH, srcs + [dict(plain[0])], filter_name="V")
 
         target_with = with_term[-1]
         target_without = without_term[-1]

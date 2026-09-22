@@ -13,7 +13,7 @@ import math
 
 import config
 
-from ._geometry import _find_sources_within_radius, _tile_key
+from ._geometry import _find_sources_within_radius, _haversine_arcsec, _tile_key
 from ._history import (
     _history_mag_epochs,
     _history_mag_scatter,
@@ -190,6 +190,54 @@ def _survives_edge_zone(source: dict) -> bool:
         return False
 
 
+def _is_residual_of_catalogued_star(
+    source: dict,
+    catalogued_frame_sources: list[tuple[float, float, float]],
+) -> bool:
+    """
+    Whether an uncatalogued subtraction candidate is a catalogued star's own
+    residual rather than a transient: a catalogued source of about the same
+    measured brightness (within SUBTRACTION_RESIDUAL_MAX_DMAG) lies within
+    SUBTRACTION_RESIDUAL_RADIUS_ARCSEC of it in this same frame.
+
+    A coma-shifted or imperfectly cancelled stellar PSF leaves a difference
+    residual whose centroid can land just outside MATCH_CONE_ARCSEC, so it
+    reaches here uncatalogued; photometered on the new frame at that
+    position, its aperture holds mostly the star itself, which is why the two
+    magnitudes agree. Seen on the 2026-09-22 IC3322A test run: 10 of 11
+    UNKNOWN alerts were 5-7" from a star of the same magnitude, recurring at
+    the same positions across sessions.
+
+    The magnitude condition is what keeps the finding-C6 case alive — a
+    transient flaring beside a star of clearly different brightness. A
+    transient much FAINTER than a neighbour this close is lost, since its
+    measured magnitude is then essentially the star's; that is the accepted
+    cost. No magnitude on the candidate, or the check disabled, decides
+    nothing.
+    """
+    radius = config.SUBTRACTION_RESIDUAL_RADIUS_ARCSEC
+    if radius <= 0 or not catalogued_frame_sources:
+        return False
+    if not source.get("_from_subtraction") or source.get("catalog_name") is not None:
+        return False
+    try:
+        ra, dec, mag = float(source["ra"]), float(source["dec"]), float(source["mag"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (math.isfinite(ra) and math.isfinite(dec) and math.isfinite(mag)):
+        return False
+
+    for c_ra, c_dec, c_mag in catalogued_frame_sources:
+        if abs(c_dec - dec) * 3600.0 > radius:
+            continue
+        if (
+            abs(c_mag - mag) <= config.SUBTRACTION_RESIDUAL_MAX_DMAG
+            and _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius
+        ):
+            return True
+    return False
+
+
 def _classify_source_sync(
     source: dict,
     frame_id: str,
@@ -198,6 +246,7 @@ def _classify_source_sync(
     coverage_by_tile: dict[tuple, list],
     current_frame_positions: list[tuple[float, float]],
     obs_time: str = "",
+    catalogued_frame_sources: list[tuple[float, float, float]] | None = None,
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).
@@ -506,6 +555,15 @@ def _classify_source_sync(
                 extra=extra,
             )
             return None
+        if _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
+            logger.debug(
+                "Suppressed UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f "
+                "mag=%s sits beside a catalogued star of the same brightness — "
+                "its residual, not a transient",
+                ra, dec, mag,
+                extra=extra,
+            )
+            return None
         logger.info(
             "UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f mag=%s",
             ra, dec, mag,
@@ -580,6 +638,16 @@ def _classify_source_sync(
                 "Suppressed UNKNOWN: near_edge uncatalogued source ra=%.4f "
                 "dec=%.4f mag=%s — likely coma-shifted centroid, not a real "
                 "transient",
+                ra, dec, mag,
+                extra=extra,
+            )
+            return None
+
+        if _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
+            logger.debug(
+                "Suppressed UNKNOWN: subtraction candidate ra=%.4f dec=%.4f "
+                "mag=%s sits beside a catalogued star of the same brightness — "
+                "its residual, not a transient",
                 ra, dec, mag,
                 extra=extra,
             )

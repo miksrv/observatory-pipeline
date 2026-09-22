@@ -1466,6 +1466,9 @@ async def test_photometry_gets_the_solved_wcs(mock_modules):
     await pipeline.run(str(mock_modules))
 
     assert pipeline.photometry.measure.call_args.kwargs["wcs"] is solved_wcs
+    # ... and the frame's filter, which selects its fixed colour term.
+    assert pipeline.photometry.measure.call_args.kwargs["filter_name"] == \
+        _GOOD_HEADER["observation"]["filter"]
 
 
 @pytest.mark.asyncio

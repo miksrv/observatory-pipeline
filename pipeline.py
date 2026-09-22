@@ -692,6 +692,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 sources,
                 skip_calibration=skip_calibration,
                 wcs=(astro_result or {}).get("wcs"),
+                filter_name=header.get("observation", {}).get("filter"),
             )
             calibrated_count = sum(1 for s in sources if s.get("calibrated"))
             logger.info(

@@ -727,7 +727,8 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   independently reimplement) so its `fwhm_median`/`elongation_median`/`star_count` stay consistent
   with what this module will end up extracting from the same frame.
 
-  Each masked streak is then **re-emitted as one detection of its own**, at its own centroid,
+  Each masked streak is then **re-emitted as one detection of its own** (marked `_streak=True`,
+  internal, so `modules/photometry.py` never sizes a PSF aperture from its length), at its own centroid,
   appended to `sources_all` (never to `sources` — a trail is not a star and must not reach the
   photometric reference set) and bypassing that list's elongation ceiling, which exists to reject
   a near-zero minor axis's degenerate `a/b` rather than a feature deliberately selected for being
@@ -851,21 +852,34 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   previous behaviour as n grows.
 - The zero-point carries a **colour term**, not a single constant offset: a star's instrumental
   magnitude in R/B/V/I differs from its Gaia broadband G magnitude by an amount that depends on
-  the star's own colour, so one median offset leaves a systematic bias that drifts night to night
-  with whatever mix of red and blue reference stars the field supplied — enough to move many stars
-  in one epoch together past `DELTA_MAG_ALERT` and read as a frame-wide variability signal (audit
-  2026-08-18, finding H5). `_compute_zero_point()` fits `catalog_mag − mag_instrumental = zp + k ×
-  (BP−RP − color_ref)` with 3σ-clipped passes (`PHOTOMETRY_COLOR_TERM_*`), reporting `zp` **at**
-  `color_ref` (the reference set's own median BP−RP). A source whose Gaia BP−RP is known — carried
-  on `_catalog_color`, set by `modules/catalog_matcher/_gaia.py` — gets `k` applied to it; one
-  whose colour is unknown (every uncatalogued transient, every MPC object) uses `zp` bare, which
-  amounts to assuming a typical colour for the field, and has `mag_err` widened by
-  `|k| × color_scatter` rather than that assumption being left silent. The fit is skipped — falling
-  back to the plain median, i.e. the previous behaviour exactly — when too few references carry a
-  colour, when their colour span is too narrow to constrain a slope, or when the fitted `k` exceeds
-  `PHOTOMETRY_COLOR_TERM_MAX`. `modules/forced_photometry.py` receives the same solution from
-  `pipeline.py` (`_color_term`/`_color_ref`/`_color_scatter`, read off a measured source the way
-  `zero_point` already is) and applies it identically.
+  the star's own colour, so one median offset leaves a systematic, colour-dependent bias (audit
+  2026-08-18, finding H5). The model is `catalog_mag − mag_instrumental = zp + k × (BP−RP −
+  color_ref)`, with `zp` reported **at** `color_ref` (the reference set's own median BP−RP). The
+  slope `k` is **fixed per filter** (`PHOTOMETRY_COLOR_TERMS`, e.g. `B:-1.0,G:-0.50,L:-0.37`) and
+  only `zp` is fitted per frame, because `k` belongs to the telescope + camera + filter, and
+  because every Δmag comparison downstream needs each epoch transformed identically. The first
+  version fitted `k` frame by frame and applied it whenever the fit passed its gates; in a field
+  whose colour span sat near `PHOTOMETRY_COLOR_TERM_MIN_SPAN` the fit passed on some frames and
+  not on their neighbours, so every star moved by `k × (colour − color_ref)` from one epoch to the
+  next — 146 false `VARIABLE_STAR`s on the 2026-09-22 IC3322A test run, 32 of them on the single
+  B frame whose fit passed (`k = −1.02`). The per-frame fit still runs, gated by
+  `PHOTOMETRY_COLOR_TERM_MIN_REFS`/`_MIN_SPAN`/`_MAX`, but is only **logged** ("colour term
+  measured on this frame k=…; configured k=…") as the measurement `PHOTOMETRY_COLOR_TERMS` is
+  calibrated from. A filter with no configured `k` gets the plain median — the pre-H5 behaviour,
+  consistent between epochs. A source whose Gaia BP−RP is known — carried on `_catalog_color`, set
+  by `modules/catalog_matcher/_gaia.py` — gets `k` applied to it; one whose colour is unknown
+  (every uncatalogued transient, every MPC object) uses `zp` bare, which amounts to assuming a
+  typical colour for the field, and has `mag_err` widened by `|k| × color_scatter`.
+  `pipeline.py` passes the frame's normalized filter as `measure(filter_name=…)`.
+  `modules/forced_photometry.py` receives the same solution from `pipeline.py`
+  (`_color_term`/`_color_ref`/`_color_scatter`, read off a measured source the way `zero_point`
+  already is) and applies it identically.
+- A re-emitted streak (`_streak=True`, see `modules/astrometry/`) is never photometered, and
+  neither is any source whose sky annulus (`6 × FWHM`) would exceed a quarter of the frame: a
+  streak's `fwhm` is its trail length, and on the 2026-09-22 test run the resulting
+  thousands-of-pixels annulus got the worker OOM-killed, while a ring lying off the frame gave a
+  NaN sky that failed the whole `POST /sources` as non-JSON. A non-finite net flux likewise
+  leaves the source unmeasured.
 - Adds the following fields to each source: `flux_aperture`, `flux_err`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `snr`, `calibrated` (bool), `edge_flag`, `zero_point`, `zero_point_err`
 - `edge_flag` is the **same** definition as `near_edge` (`EDGE_MARGIN_FRAC`, a fraction of the
   frame's own size), and is copied straight from it when the source already carries one — which
@@ -1335,6 +1349,7 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction applies the same test at extraction time), **unless** it is round and strong per `_survives_edge_zone()` |
 | No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is not None` | Suppressed — `return None` (a known catalog object — most likely an ordinary astroalign registration residual near it, not a real transient; see "camera rotation" below. Real incident, 2026-08-14, source_id `6a7cfbae64e706.89320404`, a Gaia DR3 star — this branch used to ignore `catalog_name` entirely) |
 | No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is None` | `UNKNOWN` → **ALERT** (subtraction already confirms it's absent from the reference stack, so missing API coverage doesn't downgrade it) |
+| Uncatalogued subtraction candidate (either coverage branch) within `SUBTRACTION_RESIDUAL_RADIUS_ARCSEC` of a catalogued star of about the same magnitude (`SUBTRACTION_RESIDUAL_MAX_DMAG`) | Suppressed — `return None`: that star's own residual (coma-shifted or imperfectly cancelled PSF, centroid just outside `MATCH_CONE_ARCSEC`), photometered mostly on the star itself — `_is_residual_of_catalogued_star()`. 2026-09-22 test run: 10 of 11 `UNKNOWN` alerts, all 5–7″ from a same-magnitude star, in frame corners the API's `fov_deg/2` coverage circle misses (docs/API-TASKS.md #1). A transient beside a star of clearly different brightness still passes (finding C6); one much fainter than a neighbour this close is lost |
 | Area covered, source not in history at all, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (new point source, no baseline to compare against) |
 | Area covered, source not in history, found in catalog (not a galaxy) | `KNOWN_CATALOG_NEW` — was below detection threshold |
 | Area covered, source not in history, not in any catalog, `near_edge=True` | Suppressed — `return None` (same coma-shifted-centroid rationale as above) |

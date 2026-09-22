@@ -426,6 +426,20 @@ SUBTRACTION_REF_MAX_FWHM_RATIO: float = float(_get("SUBTRACTION_REF_MAX_FWHM_RAT
 SUBTRACTION_EDGE_ELONGATION_MAX: float = float(_get("SUBTRACTION_EDGE_ELONGATION_MAX", "1.3"))
 SUBTRACTION_EDGE_SNR_MIN: float = float(_get("SUBTRACTION_EDGE_SNR_MIN", "10.0"))
 
+# --- Subtraction residuals of catalogued stars -----------------------------
+# An uncatalogued subtraction candidate lying within this radius of a
+# catalogued star of about the same measured brightness is that star's own
+# residual — a coma-shifted or imperfectly cancelled PSF whose centroid landed
+# just outside MATCH_CONE_ARCSEC — not a transient. Its aperture photometry,
+# taken on the new frame at that position, is dominated by the star itself,
+# which is why the magnitudes agree. The 2026-09-22 IC3322A test run had 10
+# such UNKNOWN alerts, all 5-7" from a same-magnitude star, recurring at the
+# same positions across sessions. Trade-off: a genuine transient much fainter
+# than a neighbour within this radius is suppressed too (its measured
+# magnitude is the star's). 0 disables the check.
+SUBTRACTION_RESIDUAL_RADIUS_ARCSEC: float = float(_get("SUBTRACTION_RESIDUAL_RADIUS_ARCSEC", "10.0"))
+SUBTRACTION_RESIDUAL_MAX_DMAG: float = float(_get("SUBTRACTION_RESIDUAL_MAX_DMAG", "1.0"))
+
 # --- Correlated noise in the difference image ------------------------------
 # A candidate's significance was computed as flux / (rms * sqrt(npix)), which
 # assumes each pixel's noise is independent of its neighbours'. It is not: a
@@ -485,12 +499,46 @@ PHOTOMETRY_GAIN_E_PER_ADU: float | None = (
 # many stars in one epoch together by more than DELTA_MAG_ALERT, i.e. produce
 # a frame-wide false variability signal (audit 2026-08-18, finding H5).
 #
-# With this enabled, modules/photometry.py fits
+# modules/photometry.py calibrates with
 #   catalog_mag - mag_instrumental = zero_point + k * (BP-RP - reference colour)
-# robustly against the frame's own Gaia references, reports the zero point at
-# the reference colour, and applies the k term per source for any source whose
-# own Gaia BP-RP colour is known.
+# where k is a FIXED per-filter value from PHOTOMETRY_COLOR_TERMS below and
+# only the zero point is fitted per frame. k is a property of the telescope +
+# camera + filter, not of the night: fitting it frame by frame (the first
+# version of this) made the decision to apply it at all flip between
+# neighbouring frames whenever the field's colour span sat near
+# PHOTOMETRY_COLOR_TERM_MIN_SPAN, and every star then "changed" by
+# k * (its colour - reference) between epochs — 146 false VARIABLE_STARs on
+# the 2026-09-22 IC3322A test run, 32 of them on the one B frame whose fit
+# happened to pass.
+#
+# The per-frame fit still runs, but only to LOG the k this frame measured next
+# to the configured one — that log is how PHOTOMETRY_COLOR_TERMS is calibrated
+# for a new instrument. A filter with no configured k gets no colour term,
+# i.e. the plain median offset used before H5.
 PHOTOMETRY_COLOR_TERM_ENABLED: bool = _get("PHOTOMETRY_COLOR_TERM_ENABLED", "true").lower() in ("true", "1", "yes")
+
+
+def _parse_color_terms(raw: str) -> dict[str, float]:
+    """'B:-1.0,G:-0.45' -> {'B': -1.0, 'G': -0.45}; malformed entries are skipped."""
+    terms: dict[str, float] = {}
+    for item in raw.split(","):
+        name, sep, value = item.partition(":")
+        if not sep or not name.strip():
+            continue
+        try:
+            terms[name.strip()] = float(value)
+        except ValueError:
+            continue
+    return terms
+
+
+# Fixed colour term k (mag/mag against Gaia BP-RP) per NORMALIZED filter name
+# (the same tokens modules/normalizer.py produces — L, R, G, B, V, ...), as
+# "FILTER:k" pairs. Empty by default: the right values depend on the optics
+# and camera. Measure them from the "colour term measured" log lines over a
+# few nights and take each filter's median.
+PHOTOMETRY_COLOR_TERMS: dict[str, float] = _parse_color_terms(_get("PHOTOMETRY_COLOR_TERMS", ""))
+# The three below gate the per-frame DIAGNOSTIC fit only (see above).
 # Minimum number of reference stars carrying a usable BP-RP colour before a
 # slope is fitted at all. A slope from a handful of stars is noise.
 PHOTOMETRY_COLOR_TERM_MIN_REFS: int = int(_get("PHOTOMETRY_COLOR_TERM_MIN_REFS", "10"))
@@ -787,6 +835,7 @@ _OVERRIDABLE: dict[str, type] = {
     "SATURATION_MASK_RADIUS_ARCSEC": float,
     # Cross-matching
     "PHOTOMETRY_COLOR_TERM_ENABLED": None,  # special: bool from string
+    "PHOTOMETRY_COLOR_TERMS": None,  # special: "FILTER:k" pairs
     "PHOTOMETRY_COLOR_TERM_MIN_REFS": int,
     "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
     "PHOTOMETRY_COLOR_TERM_MAX": float,
@@ -818,6 +867,8 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_REF_MAX_FWHM_RATIO": float,
     "SUBTRACTION_EDGE_ELONGATION_MAX": float,
     "SUBTRACTION_EDGE_SNR_MIN": float,
+    "SUBTRACTION_RESIDUAL_RADIUS_ARCSEC": float,
+    "SUBTRACTION_RESIDUAL_MAX_DMAG": float,
     "SUBTRACTION_NOISE_CORR_MAX": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
@@ -873,6 +924,8 @@ def _cast_value(name: str, raw: str) -> object:
         return raw.strip().upper()
     if name == "NARROWBAND_FILTERS":
         return frozenset(f.strip() for f in raw.split(",") if f.strip())
+    if name == "PHOTOMETRY_COLOR_TERMS":
+        return _parse_color_terms(raw)
     if name == "PHOTOMETRY_GAIN_E_PER_ADU":
         # Blank means "not configured — use the frame's own EGAIN/GAIN",
         # exactly as the definition-time parse above treats it.

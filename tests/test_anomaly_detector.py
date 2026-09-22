@@ -1402,6 +1402,77 @@ class TestEdgeZoneSubtractionCandidates:
         assert result == []
 
 
+class TestSubtractionResidualOfCatalogedStar:
+    """
+    2026-09-22 IC3322A test run: 10 of 11 UNKNOWN alerts were subtraction
+    residuals 5-7" from a catalogued star of the same magnitude — outside
+    MATCH_CONE_ARCSEC, so uncatalogued, and (in a frame corner the API's
+    fov/2 coverage circle misses) not even deemed "covered".
+    """
+
+    def _candidate(self, dec_offset_arcsec: float = 0.0, mag: float = 15.5) -> dict:
+        return _make_source(
+            dec=_DEC + dec_offset_arcsec / 3600.0, mag=mag, catalog_name=None,
+            from_subtraction=True, source_id="src-resid-001",
+        )
+
+    def _star(self, mag: float = 15.5) -> dict:
+        # 6" from the candidate: beyond MATCH_CONE_ARCSEC, inside the residual radius.
+        return _make_source(
+            dec=_DEC + 6.0 / 3600.0, mag=mag, catalog_name="Gaia DR3",
+            catalog_id="GAIA-1", source_id="src-star-001",
+        )
+
+    async def _detect(self, sources: list[dict]) -> list[dict]:
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {}
+            mock_cov.return_value = {}  # the uncovered-corner case
+            return await ad.detect(_FRAME_ID, sources, sources, _FRAME_META)
+
+    async def test_a_residual_beside_a_same_magnitude_star_is_suppressed(self):
+        result = await self._detect([self._candidate(), self._star()])
+
+        assert [a for a in result if a["source_id"] == "src-resid-001"] == []
+
+    async def test_a_transient_beside_a_star_of_different_brightness_survives(self):
+        """Finding C6's case: a transient flaring near a clearly brighter star."""
+        result = await self._detect([self._candidate(mag=15.5), self._star(mag=12.0)])
+
+        assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
+
+    async def test_a_candidate_far_from_any_star_survives(self):
+        far = _make_source(
+            dec=_DEC + 60.0 / 3600.0, mag=15.5, catalog_name="Gaia DR3",
+            catalog_id="GAIA-2", source_id="src-star-002",
+        )
+        result = await self._detect([self._candidate(), far])
+
+        assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
+
+    async def test_disabled_by_a_zero_radius(self, monkeypatch):
+        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_ARCSEC", 0.0)
+        result = await self._detect([self._candidate(), self._star()])
+
+        assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
+
+    def test_an_ordinary_detection_is_never_judged_this_way(self):
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        ordinary = self._candidate()
+        ordinary["_from_subtraction"] = False
+        assert _is_residual_of_catalogued_star(ordinary, [(_RA, _DEC + 6.0 / 3600.0, 15.5)]) is False
+
+    def test_a_candidate_without_a_magnitude_is_not_judged(self):
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        unmeasured = self._candidate()
+        unmeasured["mag"] = None
+        assert _is_residual_of_catalogued_star(unmeasured, [(_RA, _DEC + 6.0 / 3600.0, 15.5)]) is False
+
+
 class TestFastMoverWideCone:
     """
     Audit 2026-08-18, finding H3: the wide "did this used to be somewhere

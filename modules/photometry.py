@@ -356,7 +356,24 @@ def _robust_color_fit(
     return fit
 
 
-def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
+def _color_term_for(filter_name: str | None) -> float | None:
+    """This filter's fixed colour term from config, matched case-insensitively."""
+    if not filter_name:
+        return None
+    terms = config.PHOTOMETRY_COLOR_TERMS
+    if filter_name in terms:
+        return terms[filter_name]
+    wanted = filter_name.strip().lower()
+    for name, k in terms.items():
+        if name.strip().lower() == wanted:
+            return k
+    return None
+
+
+def _compute_zero_point(
+    sources: list[dict],
+    fixed_color_term: float | None = None,
+) -> _ZeroPoint:
     """
     Compute the differential photometry zero-point from Gaia DR3 reference stars.
 
@@ -366,15 +383,25 @@ def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
     variable/duplicated/RUWE flags — with a documented fallback to the
     unscreened set when screening would leave too few.
 
-    When enough of those references also carry a Gaia BP-RP colour spanning a
-    wide enough range, the offset is fitted as a line in colour rather than
-    taken as a single median. A star's instrumental magnitude in R (or B, V,
+    With a ``fixed_color_term`` k (the frame's filter's entry in
+    `config.PHOTOMETRY_COLOR_TERMS`) the offset is modelled as a line in
+    colour of that FIXED slope, and only its intercept is fitted here. A star's instrumental magnitude in R (or B, V,
     I) differs from its Gaia broadband G magnitude by an amount that depends
     on the star's own colour; collapsing that into one constant leaves a
     systematic bias in every `mag_calibrated`, and the bias moves night to
     night with whatever mix of red and blue stars the field supplied — enough
     to shift many stars in one epoch together past `DELTA_MAG_ALERT` and read
     as a frame-wide variability signal (audit 2026-08-18, finding H5).
+
+    The slope is fixed rather than fitted per frame because it is a property
+    of the instrument and filter, and because consistency between epochs is
+    what every Δmag comparison downstream depends on: a per-frame fit whose
+    acceptance flipped between neighbouring frames (colour span hovering
+    around PHOTOMETRY_COLOR_TERM_MIN_SPAN) moved every star by
+    k × (colour − reference) from one epoch to the next, which the
+    light-curve detector duly reported as 146 variable stars on the
+    2026-09-22 IC3322A test run. The per-frame fit still runs — its result is
+    only logged, as the measurement PHOTOMETRY_COLOR_TERMS is calibrated from.
 
     The zero point is reported **at the reference colour** (the reference
     set's own median BP-RP), so it keeps meaning "the offset for a typical
@@ -386,9 +413,9 @@ def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
     -------
     _ZeroPoint
         ``zero_point``/``zero_point_err`` are None when fewer than 3 valid
-        references are available. ``color_term`` is 0.0 (and ``color_ref``
-        None) whenever no colour fit was made, in which case the result is
-        identical to the plain median this function returned before.
+        references are available. ``color_term`` is 0.0 whenever no colour
+        term is configured for the filter (or too few references carry a
+        colour), in which case the result is the plain median.
     """
     candidates = [src for src in sources if src.get("catalog_name") == "Gaia DR3"]
     screened = [src for src in candidates if _is_usable_reference(src)]
@@ -471,36 +498,36 @@ def _compute_zero_point(sources: list[dict]) -> _ZeroPoint:
             np.median(np.abs(col[has_color] - color_ref))
         )
 
-    if config.PHOTOMETRY_COLOR_TERM_ENABLED and n_color >= config.PHOTOMETRY_COLOR_TERM_MIN_REFS:
+    # Diagnostic only: what slope does THIS frame's own reference set imply?
+    # Logged next to the configured value so an operator can calibrate
+    # PHOTOMETRY_COLOR_TERMS; never applied (see the docstring for why).
+    if n_color >= config.PHOTOMETRY_COLOR_TERM_MIN_REFS:
         span = float(
             np.percentile(col[has_color], 90) - np.percentile(col[has_color], 10)
         )
-        if span < config.PHOTOMETRY_COLOR_TERM_MIN_SPAN:
-            logger.info(
-                "photometry: colour span of the reference set is only %.2f mag "
-                "(need >= %.2f) — a slope fitted over it would be "
-                "unconstrained; using a constant zero-point",
-                span, config.PHOTOMETRY_COLOR_TERM_MIN_SPAN,
-            )
-        else:
+        if span >= config.PHOTOMETRY_COLOR_TERM_MIN_SPAN:
             fit = _robust_color_fit(col[has_color], arr[has_color], color_ref)
-            if fit is None:
-                logger.info("photometry: colour-term fit did not converge — using a constant zero-point")
-            elif abs(fit[1]) > config.PHOTOMETRY_COLOR_TERM_MAX:
-                logger.warning(
-                    "photometry: fitted colour term k=%.3f mag/mag exceeds the "
-                    "plausible %.2f — discarding it as a degenerate fit and "
-                    "using a constant zero-point",
-                    fit[1], config.PHOTOMETRY_COLOR_TERM_MAX,
-                )
-            else:
-                zp, color_term, resid_sigma = fit
-                mad = resid_sigma
+            if fit is not None and abs(fit[1]) <= config.PHOTOMETRY_COLOR_TERM_MAX:
                 logger.info(
-                    "photometry: colour term k=%.3f mag/mag at BP-RP=%.3f "
-                    "(n_color=%d/%d, span=%.2f mag)",
-                    color_term, color_ref, n_color, len(deltas), span,
+                    "photometry: colour term measured on this frame k=%.3f mag/mag "
+                    "at BP-RP=%.3f (n_color=%d, span=%.2f mag); configured k=%s",
+                    fit[1], color_ref, n_color, span,
+                    "none" if fixed_color_term is None else f"{fixed_color_term:.3f}",
                 )
+
+    # Applied: the configured, fixed slope — the intercept alone is fitted.
+    if (
+        config.PHOTOMETRY_COLOR_TERM_ENABLED
+        and fixed_color_term is not None
+        and math.isfinite(fixed_color_term)
+        and fixed_color_term != 0.0
+        and color_ref is not None
+        and n_color >= 3
+    ):
+        adjusted = arr[has_color] - fixed_color_term * (col[has_color] - color_ref)
+        zp = float(np.median(adjusted))
+        mad = _robust_scatter(adjusted)
+        color_term = float(fixed_color_term)
 
     logger.info(
         "photometry: zero_point=%.4f  zero_point_err=%.4f  "
@@ -523,6 +550,7 @@ async def measure(
     skip_calibration: bool = False,
     gain: float | None = None,
     wcs=None,
+    filter_name: str | None = None,
 ) -> list[dict]:
     """
     Perform aperture photometry and differential magnitude calibration.
@@ -559,6 +587,11 @@ async def measure(
         error. None (the default) resolves it from
         config.PHOTOMETRY_GAIN_E_PER_ADU, then from the frame's own
         EGAIN/GAIN header — see _resolve_gain().
+    filter_name:
+        The frame's normalized filter (L, R, G, B, ...), used to look up its
+        fixed colour term in ``config.PHOTOMETRY_COLOR_TERMS`` — see
+        ``_color_term_for()``. None, or a filter with no entry, calibrates
+        without a colour term.
     wcs:
         The frame's already-solved ``astropy.wcs.WCS`` (``astrometry.solve()``'s
         own). Preferred over any WCS in the file's header: at this point in
@@ -959,7 +992,7 @@ async def measure(
         )
         solution = _ZeroPoint(None, None, 0.0, None, 0.0)
     else:
-        solution = _compute_zero_point(output)
+        solution = _compute_zero_point(output, _color_term_for(filter_name))
 
     zero_point     = solution.zero_point
     zero_point_err = solution.zero_point_err
