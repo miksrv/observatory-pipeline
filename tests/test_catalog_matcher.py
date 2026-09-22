@@ -377,6 +377,48 @@ class TestGaiaMatching:
 
         assert source["catalog_name"] is None
 
+    def test_a_simbad_claimed_star_still_gets_its_gaia_colour(self):
+        """
+        The catalog that names a source must not decide how its magnitude is
+        calibrated: the same star, Simbad-claimed one night and recovered
+        under its Gaia identity another, was 0.9 mag apart between epochs
+        purely from the colour term being applied only the second time.
+        """
+        star = _make_source(ra=_RA, dec=_DEC)
+        star["catalog_name"] = "Simbad"
+        star["catalog_id"]   = "2MASS J12241242+0704552"
+        star["object_type"]  = "PM*"
+        gaia_stars = [{
+            "ra": _RA, "dec": _DEC, "source_id": "3901036404599908224",
+            "phot_g_mean_mag": 13.65, "bp_rp": 2.4, "ruwe": 1.0,
+        }]
+
+        cm._match_gaia([star], gaia_stars)      # leaves a claimed source alone
+        n = cm._attach_gaia_color([star], gaia_stars)
+
+        assert n == 1
+        assert star["catalog_name"] == "Simbad"  # identity untouched
+        assert star["_catalog_color"] == pytest.approx(2.4)
+        assert star["_catalog_flags"]["ruwe"] == pytest.approx(1.0)
+
+    def test_colour_attachment_respects_the_match_cone_and_existing_colours(self):
+        far_ra, far_dec = _offset_ra_exact(_RA, _DEC, 3 * config.MATCH_CONE_ARCSEC)
+        distant = _make_source(ra=_RA, dec=_DEC)
+        distant["catalog_name"] = "Simbad"
+        already = _make_source(ra=far_ra, dec=far_dec)
+        already["catalog_name"] = "2MASS"
+        already["_catalog_color"] = 0.7
+        mpc = _make_source(ra=far_ra, dec=far_dec)
+        mpc["catalog_name"] = "MPC"
+        gaia_stars = [{"ra": far_ra, "dec": far_dec, "source_id": "1", "phot_g_mean_mag": 15.0, "bp_rp": 1.9}]
+
+        n = cm._attach_gaia_color([distant, already, mpc], gaia_stars)
+
+        assert n == 0
+        assert "_catalog_color" not in distant
+        assert already["_catalog_color"] == pytest.approx(0.7)
+        assert "_catalog_color" not in mpc
+
     def test_gaia_error_returns_empty_list(self):
         """If the Gaia query raises, _query_gaia returns []."""
         with patch("modules.catalog_matcher._gaia.Gaia") as mock_gaia:

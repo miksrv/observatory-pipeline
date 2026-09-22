@@ -78,7 +78,7 @@ from ._cache import (
     _cache_radius_margin_deg,
     _cache_set,
 )
-from ._gaia import _match_gaia, _propagate_to_epoch, _query_gaia, get_gaia_stars
+from ._gaia import _attach_gaia_color, _match_gaia, _propagate_to_epoch, _query_gaia, get_gaia_stars
 from ._match import match
 from ._mpc import _match_mpc, _query_mpc, get_mpc_objects
 from ._panstarrs import _match_panstarrs, _query_panstarrs

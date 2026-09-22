@@ -198,7 +198,11 @@ def _is_residual_of_catalogued_star(
     Whether an uncatalogued subtraction candidate is a catalogued star's own
     residual rather than a transient: a catalogued source of about the same
     measured brightness (within SUBTRACTION_RESIDUAL_MAX_DMAG) lies within
-    SUBTRACTION_RESIDUAL_RADIUS_ARCSEC of it in this same frame.
+    SUBTRACTION_RESIDUAL_RADIUS_FWHM times the candidate's own FWHM of it in
+    this same frame — in FWHM rather than arcseconds because the pipeline
+    serves several telescopes, and how far a residual lands from its star
+    scales with the PSF. Never less than MATCH_CONE_ARCSEC (inside it the
+    source would have been matched); twice that cone when the FWHM is unknown.
 
     A coma-shifted or imperfectly cancelled stellar PSF leaves a difference
     residual whose centroid can land just outside MATCH_CONE_ARCSEC, so it
@@ -215,8 +219,8 @@ def _is_residual_of_catalogued_star(
     cost. No magnitude on the candidate, or the check disabled, decides
     nothing.
     """
-    radius = config.SUBTRACTION_RESIDUAL_RADIUS_ARCSEC
-    if radius <= 0 or not catalogued_frame_sources:
+    factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
+    if factor <= 0 or not catalogued_frame_sources:
         return False
     if not source.get("_from_subtraction") or source.get("catalog_name") is not None:
         return False
@@ -226,6 +230,13 @@ def _is_residual_of_catalogued_star(
         return False
     if not (math.isfinite(ra) and math.isfinite(dec) and math.isfinite(mag)):
         return False
+
+    try:
+        fwhm = float(source.get("fwhm") or 0.0)
+    except (TypeError, ValueError):
+        fwhm = 0.0
+    radius = factor * fwhm if fwhm > 0 else 2.0 * config.MATCH_CONE_ARCSEC
+    radius = max(radius, config.MATCH_CONE_ARCSEC)
 
     for c_ra, c_dec, c_mag in catalogued_frame_sources:
         if abs(c_dec - dec) * 3600.0 > radius:
@@ -425,8 +436,8 @@ def _classify_source_sync(
         if not history and elongation > trail_elongation_min:
             anomaly_type = AnomalyType.SPACE_DEBRIS
 
-            logger.warning(
-                "ALERT — %s: unmatched trail-like source, elongation alone is "
+            logger.info(
+                "%s: unmatched trail-like source, elongation alone is "
                 "sufficient (no position-shift evidence needed) ra=%.4f dec=%.4f "
                 "elongation=%.2f near_edge=%s threshold=%.2f",
                 anomaly_type, ra, dec, elongation, near_edge, trail_elongation_min,
@@ -819,6 +830,21 @@ def _classify_source_sync(
         # counting it here would let VARIABILITY_MIN_EPOCHS be satisfied by a
         # baseline shorter than the one the scatter was measured over.
         n_same_filter = _history_mag_epochs(same_filter_history)
+
+        # An extended object is not a candidate here: a galaxy's or cluster's
+        # aperture magnitude moves with seeing, focus and the aperture radius
+        # (sized from the detection's own FWHM), not with the object. Its
+        # brightening is the SUPERNOVA_CANDIDATE branch above; its "fading"
+        # is measurement, and was reported as VARIABLE_STAR for NGC 4370 and
+        # NGC 4341 on the 2026-09-22 IC3322A test run.
+        if _is_galaxy(object_type):
+            logger.debug(
+                "No light-curve variability check for extended object_type=%s "
+                "at ra=%.4f dec=%.4f",
+                object_type, ra, dec,
+                extra=extra,
+            )
+            return None
 
         if (
             scatter is not None

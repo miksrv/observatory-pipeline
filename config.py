@@ -427,17 +427,22 @@ SUBTRACTION_EDGE_ELONGATION_MAX: float = float(_get("SUBTRACTION_EDGE_ELONGATION
 SUBTRACTION_EDGE_SNR_MIN: float = float(_get("SUBTRACTION_EDGE_SNR_MIN", "10.0"))
 
 # --- Subtraction residuals of catalogued stars -----------------------------
-# An uncatalogued subtraction candidate lying within this radius of a
-# catalogued star of about the same measured brightness is that star's own
-# residual — a coma-shifted or imperfectly cancelled PSF whose centroid landed
-# just outside MATCH_CONE_ARCSEC — not a transient. Its aperture photometry,
-# taken on the new frame at that position, is dominated by the star itself,
-# which is why the magnitudes agree. The 2026-09-22 IC3322A test run had 10
-# such UNKNOWN alerts, all 5-7" from a same-magnitude star, recurring at the
-# same positions across sessions. Trade-off: a genuine transient much fainter
-# than a neighbour within this radius is suppressed too (its measured
-# magnitude is the star's). 0 disables the check.
-SUBTRACTION_RESIDUAL_RADIUS_ARCSEC: float = float(_get("SUBTRACTION_RESIDUAL_RADIUS_ARCSEC", "10.0"))
+# An uncatalogued subtraction candidate lying within this many of its own
+# FWHM of a catalogued star of about the same measured brightness is that
+# star's own residual — a coma-shifted or imperfectly cancelled PSF whose
+# centroid landed just outside MATCH_CONE_ARCSEC — not a transient. Its
+# aperture photometry, taken on the new frame at that position, is dominated
+# by the star itself, which is why the magnitudes agree. The 2026-09-22
+# IC3322A test run had 10 such UNKNOWN alerts, all 5-7" (1.5-2 FWHM) from a
+# same-magnitude star, recurring at the same positions across sessions.
+# Expressed in FWHM rather than arcseconds because the pipeline serves
+# several telescopes and cameras: how far a PSF's residual can land from the
+# star scales with the PSF, not with a fixed angle. The radius never drops
+# below MATCH_CONE_ARCSEC (inside it the source would have been matched), and
+# a candidate with no FWHM uses twice that cone. Trade-off: a genuine
+# transient much fainter than a neighbour this close is suppressed too (its
+# measured magnitude is the star's). 0 disables the check.
+SUBTRACTION_RESIDUAL_RADIUS_FWHM: float = float(_get("SUBTRACTION_RESIDUAL_RADIUS_FWHM", "2.5"))
 SUBTRACTION_RESIDUAL_MAX_DMAG: float = float(_get("SUBTRACTION_RESIDUAL_MAX_DMAG", "1.0"))
 
 # --- Correlated noise in the difference image ------------------------------
@@ -648,6 +653,20 @@ FORCED_PHOTOMETRY_MAG_LIMIT: float = float(_get("FORCED_PHOTOMETRY_MAG_LIMIT", "
 # number of sources, so the "look-elsewhere effect" that forces blind
 # extraction's threshold up doesn't apply here.
 FORCED_PHOTOMETRY_MIN_SNR: float = float(_get("FORCED_PHOTOMETRY_MIN_SNR", "3.0"))
+# A forced measurement asserts "this flux is that catalog star's". When the
+# calibrated magnitude (on Gaia's G scale once the colour term is applied)
+# disagrees with the star's own G by more than this, the aperture measured
+# something else — a galaxy's light, a neighbour's wing, background structure
+# — and the recovery is dropped rather than reported. On the 2026-09-22
+# IC3322A test run 691 of 760 forced recoveries of G~20 stars (and 317 of
+# 776 at G~19) were off by more than 2 mag, and 41 of 93 VARIABLE_STAR alerts
+# were built on such measurements. Well-measured stars scatter ~0.25-0.35 mag
+# about G, so 1.5 is a ~4-5 sigma cut. A genuinely variable star that moved
+# further than this is lost from forced recovery only — blind detection still
+# sees it. 0 disables the check.
+FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG: float = float(
+    _get("FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", "1.5")
+)
 
 # ---------------------------------------------------------------------------
 # Observatory site coordinates (used for topocentric Horizons queries)
@@ -867,13 +886,14 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_REF_MAX_FWHM_RATIO": float,
     "SUBTRACTION_EDGE_ELONGATION_MAX": float,
     "SUBTRACTION_EDGE_SNR_MIN": float,
-    "SUBTRACTION_RESIDUAL_RADIUS_ARCSEC": float,
+    "SUBTRACTION_RESIDUAL_RADIUS_FWHM": float,
     "SUBTRACTION_RESIDUAL_MAX_DMAG": float,
     "SUBTRACTION_NOISE_CORR_MAX": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string
     "FORCED_PHOTOMETRY_MAG_LIMIT": float,
     "FORCED_PHOTOMETRY_MIN_SNR": float,
+    "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG": float,
     # Observatory site
     "SITE_LAT": float,
     "SITE_LON": float,

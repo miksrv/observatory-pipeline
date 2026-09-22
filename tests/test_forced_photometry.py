@@ -109,6 +109,10 @@ def scene(monkeypatch):
         "modules.forced_photometry.fits.open",
         lambda *a, **kw: _FakeHDUL(_FakeHDU(image)),
     )
+    # These fixtures use an arbitrary zero point and catalog magnitudes, so
+    # the catalog-consistency cut would reject every recovery; it has its own
+    # tests (TestCatalogConsistency) and is switched off everywhere else.
+    monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", 0.0)
     return image, wcs
 
 
@@ -458,6 +462,48 @@ class TestRunRecovery:
 # ---------------------------------------------------------------------------
 
 
+class TestCatalogConsistency:
+    """
+    A forced recovery asserts "this flux is that catalog star's". On the
+    2026-09-22 IC3322A test run most recoveries of G~19-20 stars came out
+    2+ mag off their own G — the aperture was measuring galaxy light or a
+    neighbour's wing — and fed false VARIABLE_STAR alerts.
+    """
+
+    async def _recover(self, scene, monkeypatch, catalog_mag: float, limit: float) -> list[dict]:
+        image, wcs = scene
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 25.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", 3.0)
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", limit)
+        gaia = [_gaia_star(wcs, 100, 100, "gaia-1", mag=catalog_mag)]
+        return await fp.run(
+            _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,
+            naxis1=320, naxis2=320, zero_point=24.0, zero_point_err=0.05, obs_time=None,
+            psf_fwhm_arcsec=None,
+        )
+
+    async def test_a_recovery_far_from_its_catalog_magnitude_is_dropped(self, scene, monkeypatch):
+        # The synthetic star measures ~11.8 mag at zero_point=24; the catalog says 17.5.
+        assert await self._recover(scene, monkeypatch, catalog_mag=17.5, limit=1.5) == []
+
+    async def test_a_consistent_recovery_is_kept(self, scene, monkeypatch):
+        probe = await self._recover(scene, monkeypatch, catalog_mag=17.5, limit=0.0)
+        measured = probe[0]["mag_calibrated"]
+
+        kept = await self._recover(scene, monkeypatch, catalog_mag=measured + 0.4, limit=1.5)
+
+        assert len(kept) == 1
+
+    async def test_zero_disables_the_check(self, scene, monkeypatch):
+        assert len(await self._recover(scene, monkeypatch, catalog_mag=17.5, limit=0.0)) == 1
+
+    def test_undecidable_cases_are_not_inconsistent(self):
+        assert fp._inconsistent_with_catalog(None, 15.0) is False
+        assert fp._inconsistent_with_catalog(15.0, None) is False
+        assert fp._inconsistent_with_catalog(float("nan"), 15.0) is False
+
+
 class TestPropagateGaiaPosition:
     def test_no_correction_without_obs_jyear(self):
         star = {"ra": 10.0, "dec": 20.0, "pmra": 100.0, "pmdec": 100.0, "ref_epoch": 2016.0}
@@ -593,6 +639,8 @@ class TestRunGain:
         monkeypatch.setattr(config, "FORCED_PHOTOMETRY_ENABLED", True)
         monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAG_LIMIT", 20.0)
         monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MIN_SNR", min_snr)
+        # Arbitrary zero point/catalog magnitude — see the `scene` fixture.
+        monkeypatch.setattr(config, "FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG", 0.0)
         gaia = [_gaia_star(wcs, 100, 100, "gaia-1", mag=17.5)]
         return await fp.run(
             _FITS_PATH, sources=[], gaia_stars=gaia, mpc_objects=[], wcs=wcs,

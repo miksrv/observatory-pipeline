@@ -798,6 +798,19 @@ class TestDetectLightCurveVariability:
         assert result[0]["delta_mag"] == pytest.approx(12.0 - 14.505, abs=0.02)
         assert "own light curve" in result[0]["notes"]
 
+    async def test_an_extended_object_is_not_a_light_curve_variable(self):
+        """
+        A galaxy's aperture magnitude moves with seeing and aperture size,
+        not with the object — NGC 4370 and NGC 4341 were reported as
+        VARIABLE_STAR on the 2026-09-22 test run. Brightening near a galaxy
+        is the SUPERNOVA_CANDIDATE branch's job; a fading galaxy is nothing.
+        """
+        source = _make_source(mag=15.5, catalog_name="Simbad",
+                              catalog_id="NGC 4370", object_type="GiG")
+        hist = [_make_hist_source(mag=m) for m in (14.50, 14.52, 14.48, 14.51)]
+
+        assert await self._run(source, hist) == []
+
     async def test_gaia_only_star_dimming_is_reported(self):
         """Variability is symmetric — a quiescent star that fades is as much
         a variability candidate as one that brightens (unlike the
@@ -1452,8 +1465,24 @@ class TestSubtractionResidualOfCatalogedStar:
 
         assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
 
+    def test_the_radius_scales_with_the_candidates_own_fwhm(self, monkeypatch):
+        """
+        Several telescopes feed this pipeline; a residual lands within a
+        couple of PSF widths of its star, however wide the PSF is. A sharp
+        1" PSF must not inherit a radius tuned to a 3" one.
+        """
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_FWHM", 2.5)
+        neighbour = [(_RA, _DEC + 6.0 / 3600.0, 15.5)]
+        wide = self._candidate(); wide["fwhm"] = 3.0      # 7.5" radius -> the 6" star is a residual
+        sharp = self._candidate(); sharp["fwhm"] = 1.0    # 2.5" -> floored at MATCH_CONE_ARCSEC
+
+        assert _is_residual_of_catalogued_star(wide, neighbour) is True
+        assert _is_residual_of_catalogued_star(sharp, neighbour) is (6.0 <= config.MATCH_CONE_ARCSEC)
+
     async def test_disabled_by_a_zero_radius(self, monkeypatch):
-        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_ARCSEC", 0.0)
+        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_FWHM", 0.0)
         result = await self._detect([self._candidate(), self._star()])
 
         assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
@@ -1576,6 +1605,14 @@ class TestFastMoverWideCone:
 
         assert len(result) == 1
         assert result[0]["anomaly_type"] == "UNKNOWN"
+
+
+class TestAlertTypes:
+    def test_space_debris_is_recorded_but_not_an_alert(self):
+        from modules.anomaly_detector.types import _ALERT_TYPES, AnomalyType
+
+        assert AnomalyType.SPACE_DEBRIS not in _ALERT_TYPES
+        assert {AnomalyType.SUPERNOVA_CANDIDATE, AnomalyType.MOVING_UNKNOWN, AnomalyType.UNKNOWN} <= _ALERT_TYPES
 
 
 class TestDetectSpaceDebrisNearEdge:

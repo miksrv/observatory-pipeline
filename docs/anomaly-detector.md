@@ -99,7 +99,7 @@ flowchart TD
     NewBright -- "yes (possible nova —\nclassified, magnitude unmeasurable)" --> NoHist
     Sat -- no --> NoHist{"catalog_name is None\nAND no history within MATCH_CONE_ARCSEC\nof the CURRENT position?"}
     NoHist -- yes --> Trail{"elongation > trail threshold?\n(SPACE_DEBRIS_ELONGATION_MIN=3.0,\nor the higher SPACE_DEBRIS_EDGE_\nELONGATION_MIN=6.0 if near_edge —\ncoma inflates elongation near the\nframe edge; see below)"}
-    Trail -- yes --> SpaceDebris["🔔 SPACE_DEBRIS"]
+    Trail -- yes --> SpaceDebris["SPACE_DEBRIS\n(recorded, not an alert)"]
     Trail -- no --> Vacated{"a wide-cone (MOVING_CONE_ARCSEC)\nhistorical position has vacated\n(no source in THIS frame near it)?"}
     Vacated -- yes --> MovingUnknown["🔔 MOVING_UNKNOWN"]
 
@@ -292,7 +292,11 @@ one condition matches, the function returns and no further checks run:
        — at least `VARIABILITY_MIN_EPOCHS` (default 3) epochs — and `abs(delta_mag)`
        exceeds `VARIABILITY_SIGMA` (default 3.0) times that baseline's own robust scatter
        (`_history_mag_scatter()`, a MAD-derived 1σ equivalent) → `VARIABLE_STAR`, with
-       notes stating the classification came from the light curve rather than a catalog;
+       notes stating the classification came from the light curve rather than a catalog.
+       Not applied to an extended object (`_is_galaxy(object_type)`): a galaxy's or
+       cluster's aperture magnitude moves with seeing and aperture size, not with the
+       object — NGC 4370/4341 were reported this way on the 2026-09-22 test run. A galaxy
+       brightening is the `SUPERNOVA_CANDIDATE` branch above; a "fading" one is nothing;
      - otherwise — no anomaly.
 
    The last of those exists because only `_simbad.py` ever writes a real OTYPE:
@@ -328,7 +332,7 @@ Table of Simbad OTYPE substrings used by the classifiers:
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |
 | `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening by a significant Δmag (as above) | **Yes** |
 | `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold | **Yes** |
-| `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | **Yes** |
+| `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | No (recorded so a fast mover's track is never erased and does not pollute `UNKNOWN`; an operator need not act on a satellite pass — decided 2026-09-22). The API mirrors this in its own `ALERT_TYPES`, see docs/API-TASKS.md #2 |
 | `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()` | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match

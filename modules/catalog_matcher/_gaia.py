@@ -357,6 +357,73 @@ def _match_gaia(sources: list[dict], gaia_stars: list[dict]) -> None:
             }
 
 
+def _attach_gaia_color(sources: list[dict], gaia_stars: list[dict]) -> int:
+    """
+    Give every source already claimed by a NON-Gaia stellar catalog the Gaia
+    BP-RP colour (and quality flags) of the Gaia star at its position, when
+    there is one within MATCH_CONE_ARCSEC. Returns how many were enriched.
+
+    The colour term in modules/photometry.py is applied per source from
+    `_catalog_color`, which only _match_gaia() set — so a star Simbad claimed
+    first (Simbad runs first, for its object types) was calibrated WITHOUT
+    the colour correction while the very same star, recovered on another
+    night under its Gaia identity by forced photometry, was calibrated WITH
+    it. For a red star that is ~0.8 mag between epochs, and the light-curve
+    detector reported it as variability (2026-09-22 IC3322A test run: a PM*
+    star, 14.79 mag under Simbad vs 13.89 under Gaia DR3 for the same flux).
+    The catalog that names a source must not decide how its magnitude is
+    calibrated.
+
+    Never touches a source that already carries a colour, an unmatched one
+    (Gaia would have claimed it), or an MPC object (a moving body has no
+    catalogued colour; this runs before the MPC stage anyway).
+    """
+    if not gaia_stars:
+        return 0
+
+    todo = [
+        i for i, s in enumerate(sources)
+        if s.get("catalog_name") not in (None, "Gaia DR3", "MPC")
+        and s.get("_catalog_color") is None
+    ]
+    if not todo:
+        return 0
+
+    source_coords = SkyCoord(
+        ra=[sources[i]["ra"] for i in todo] * u.deg,
+        dec=[sources[i]["dec"] for i in todo] * u.deg,
+    )
+    gaia_coords = SkyCoord(
+        ra=[g["ra"] for g in gaia_stars] * u.deg,
+        dec=[g["dec"] for g in gaia_stars] * u.deg,
+    )
+    idx, sep2d, _ = source_coords.match_to_catalog_sky(gaia_coords)
+    threshold = config.MATCH_CONE_ARCSEC * u.arcsec
+
+    n = 0
+    for k, i in enumerate(todo):
+        if sep2d[k] >= threshold:
+            continue
+        matched = gaia_stars[idx[k]]
+        color = matched.get("bp_rp")
+        if color is None:
+            continue
+        sources[i]["_catalog_color"] = color
+        sources[i].setdefault("_catalog_flags", {
+            "ruwe":       matched.get("ruwe"),
+            "variable":   matched.get("variable"),
+            "duplicated": matched.get("duplicated"),
+        })
+        n += 1
+    if n:
+        logger.info(
+            "Gaia colour attached to %d source(s) claimed by another catalog, so "
+            "their colour term matches the same stars' Gaia-identity epochs",
+            n,
+        )
+    return n
+
+
 # ---------------------------------------------------------------------------
 # Public accessor for the already-fetched, region-wide Gaia field list
 #

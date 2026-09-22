@@ -1183,6 +1183,16 @@ external catalogs using
 `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC`
 (`MOVING_CONE_ARCSEC` for the MPC step, since moving objects shift between frames).
 
+A source that Simbad claimed (Simbad runs first, for its object types) still receives the Gaia
+BP−RP colour and quality flags of the Gaia star at its position (`_gaia._attach_gaia_color()`,
+run right after `_match_gaia()`). `modules/photometry.py` applies the colour term per source from
+`_catalog_color`, which only a Gaia match set — so one and the same star was calibrated *without*
+the colour correction on a night Simbad named it and *with* it on a night forced photometry
+recovered it under its Gaia identity: ~0.8 mag apart for a red star, which the light-curve
+detector reported as variability (2026-09-22 IC3322A test run, a `PM*` star at 14.79 vs 13.89 for
+the same flux). The catalog that names a source must not decide how its magnitude is calibrated.
+MPC objects are excluded (no catalogued colour), as is any source already carrying a colour.
+
 Every Gaia DR3 star is **proper-motion propagated** from its own `ref_epoch` (J2016.0 for DR3)
 to the frame's `obs_time` before it is used for anything — once, in `match()`, so both the
 WCS-offset accumulator and `_match_gaia()` see the corrected positions (`_gaia`'s
@@ -1297,6 +1307,15 @@ flagged for the same reason as the non-detection below — the wire schema has n
 being forced, since an already-detected star contaminates just as much, and the check disables
 itself when the frame's FWHM is unknown, there being no scale to judge "close" against.
 
+**A recovery whose calibrated magnitude disagrees with the star's own Gaia G by more than
+`FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG` (1.5) is dropped** (`_inconsistent_with_catalog()`):
+the recovery asserts "this flux is that star's", and a magnitude that far off means the aperture
+measured something else — a galaxy's light, a neighbour's wing, background structure. On the
+2026-09-22 IC3322A test run 691 of 760 recoveries of G≈20 stars and 317 of 776 at G≈19 were off
+by more than 2 mag, and 41 of 93 `VARIABLE_STAR` alerts stood on such measurements; well-measured
+stars scatter ~0.3 mag about G, so 1.5 is a 4–5σ cut. A genuinely variable star that moved
+further than this is lost from *forced* recovery only — blind detection still sees it.
+
 **A genuine non-detection (significance below
 `FORCED_PHOTOMETRY_MIN_SNR`) is silently dropped, never reported as an "upper limit" magnitude** —
 the wire schema (`POST /frames/{id}/sources`, docs/API.md §2) has no field to distinguish a real
@@ -1349,7 +1368,7 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction applies the same test at extraction time), **unless** it is round and strong per `_survives_edge_zone()` |
 | No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is not None` | Suppressed — `return None` (a known catalog object — most likely an ordinary astroalign registration residual near it, not a real transient; see "camera rotation" below. Real incident, 2026-08-14, source_id `6a7cfbae64e706.89320404`, a Gaia DR3 star — this branch used to ignore `catalog_name` entirely) |
 | No historical coverage, source was detected via image subtraction (`_from_subtraction=True`), `near_edge=False`, and `catalog_name is None` | `UNKNOWN` → **ALERT** (subtraction already confirms it's absent from the reference stack, so missing API coverage doesn't downgrade it) |
-| Uncatalogued subtraction candidate (either coverage branch) within `SUBTRACTION_RESIDUAL_RADIUS_ARCSEC` of a catalogued star of about the same magnitude (`SUBTRACTION_RESIDUAL_MAX_DMAG`) | Suppressed — `return None`: that star's own residual (coma-shifted or imperfectly cancelled PSF, centroid just outside `MATCH_CONE_ARCSEC`), photometered mostly on the star itself — `_is_residual_of_catalogued_star()`. 2026-09-22 test run: 10 of 11 `UNKNOWN` alerts, all 5–7″ from a same-magnitude star, in frame corners the API's `fov_deg/2` coverage circle misses (docs/API-TASKS.md #1). A transient beside a star of clearly different brightness still passes (finding C6); one much fainter than a neighbour this close is lost |
+| Uncatalogued subtraction candidate (either coverage branch) within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × its own FWHM (floored at `MATCH_CONE_ARCSEC`; in FWHM so it holds across telescopes) of a catalogued star of about the same magnitude (`SUBTRACTION_RESIDUAL_MAX_DMAG`) | Suppressed — `return None`: that star's own residual (coma-shifted or imperfectly cancelled PSF, centroid just outside `MATCH_CONE_ARCSEC`), photometered mostly on the star itself — `_is_residual_of_catalogued_star()`. 2026-09-22 test run: 10 of 11 `UNKNOWN` alerts, all 5–7″ from a same-magnitude star, in frame corners the API's `fov_deg/2` coverage circle misses (docs/API-TASKS.md #1). A transient beside a star of clearly different brightness still passes (finding C6); one much fainter than a neighbour this close is lost |
 | Area covered, source not in history at all, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (new point source, no baseline to compare against) |
 | Area covered, source not in history, found in catalog (not a galaxy) | `KNOWN_CATALOG_NEW` — was below detection threshold |
 | Area covered, source not in history, not in any catalog, `near_edge=True` | Suppressed — `return None` (same coma-shifted-centroid rationale as above) |
@@ -1357,9 +1376,9 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 | Source **has** prior history, brightened by more than `DELTA_MAG_ALERT`, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → **ALERT** (already-known host got brighter) |
 | Source in history, Δmag > DELTA_MAG_ALERT, known binary (Simbad) | `BINARY_STAR` |
 | Source in history, Δmag > DELTA_MAG_ALERT, known variable (Simbad) | `VARIABLE_STAR` |
-| Source in history, Δmag > DELTA_MAG_ALERT, no catalog classification that explains it, but the change exceeds `VARIABILITY_SIGMA` × the source's own same-filter historical scatter over ≥ `VARIABILITY_MIN_EPOCHS` epochs | `VARIABLE_STAR` (light-curve based — see below) |
+| Source in history, Δmag > DELTA_MAG_ALERT, no catalog classification that explains it, but the change exceeds `VARIABILITY_SIGMA` × the source's own same-filter historical scatter over ≥ `VARIABILITY_MIN_EPOCHS` epochs — and the object is not a Simbad galaxy/cluster (`_is_galaxy`), whose aperture magnitude tracks seeing and aperture size rather than the object | `VARIABLE_STAR` (light-curve based — see below) |
 | Source present but shifted > MATCH_CONE_ARCSEC, matches MPC | `ASTEROID` or `COMET` |
-| Unmatched, no detection within `MATCH_CONE_ARCSEC` of this position, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default), or > `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) when `near_edge=True` | `SPACE_DEBRIS` → **ALERT** (elongation alone is treated as sufficient trail evidence — no "vacated old position" proof required, see below) |
+| Unmatched, no detection within `MATCH_CONE_ARCSEC` of this position, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (3.0 default), or > `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0 default) when `near_edge=True` | `SPACE_DEBRIS` — recorded, **not an alert** (elongation alone is treated as sufficient trail evidence — no "vacated old position" proof required, see below). It exists so a genuine fast mover's track is never erased (H16) and so trails do not pollute `UNKNOWN`; a satellite pass is nothing an operator must act on (decided 2026-09-22). The persisted `is_alert` is the API's decision — docs/API-TASKS.md #2 |
 | Source present but shifted, not in MPC, `near_edge=True` | Suppressed — `return None` (coma shifts centroid between frames, creating false "position shifted" evidence) |
 | Source present but shifted, not in MPC, `near_edge=False`, elongation ≤ 3.0 | `MOVING_UNKNOWN` → **ALERT** |
 

@@ -16,6 +16,25 @@ Each entry records:
 
 ---
 
+## 2. `SPACE_DEBRIS` must not be an alert
+
+**Origin** — post-remediation test run, 2026-09-22: 38 `SPACE_DEBRIS` anomalies on 7 IC3322A
+frames, every one an ordinary satellite pass, all flagged `is_alert=1` alongside the 12 genuine
+alerts.
+
+**What** — remove `'SPACE_DEBRIS'` from `AnomalyModel::ALERT_TYPES`
+(`app/Models/AnomalyModel.php`). `FramesController::saveAnomalies` derives the persisted
+`is_alert` from that list, so nothing the pipeline sends can change it.
+
+**Why** — the type exists so that a genuine fast mover's single-exposure track is never erased
+(audit finding H16) and so that trails don't land in `UNKNOWN`; it is bookkeeping, not
+something an operator has to act on. With it in the alert set, alerts on a night with a few
+passes are mostly trails.
+
+**Pipeline side** — done: `modules/anomaly_detector/types.py` no longer lists it in
+`_ALERT_TYPES`, so it is logged at INFO and not counted as an alert; the classification itself
+is unchanged.
+
 ## 1. Frame coverage misses the frame's own corners
 
 **Origin** — post-remediation test run, 2026-09-22 (63 IC3322A frames): 10 of 11 `UNKNOWN`
@@ -43,7 +62,7 @@ uncatalogued subtraction candidate without consulting history, on the premise th
 genuinely never been imaged. The corner regions break that premise on every frame.
 
 **Pipeline side** — mitigated, not fixed: an uncatalogued subtraction candidate lying within
-`SUBTRACTION_RESIDUAL_RADIUS_ARCSEC` of a catalogued star of the same brightness is now
+`SUBTRACTION_RESIDUAL_RADIUS_FWHM` × its own FWHM of a catalogued star of the same brightness is now
 suppressed as that star's residual, which removed all 10 observed cases. A genuine corner
 transient still reaches the no-coverage branch rather than the history-aware one until this is
 fixed.

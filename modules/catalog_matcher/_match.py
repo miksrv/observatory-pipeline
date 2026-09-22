@@ -188,6 +188,9 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     # --- 2. Gaia DR3 (dense stellar catalog, WCS offset already applied) ---
     try:
         _gaia._match_gaia(sources, gaia_stars)
+        # A Simbad-claimed star still gets its Gaia colour, so photometry
+        # calibrates it the same way as on a night when Gaia claimed it.
+        _gaia._attach_gaia_color(sources, gaia_stars)
     except Exception as exc:
         logger.warning("Gaia matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 

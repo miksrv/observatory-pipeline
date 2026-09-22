@@ -333,6 +333,23 @@ def _measure_at_pixel(
     return net_flux, flux_err
 
 
+def _inconsistent_with_catalog(mag_calibrated: float | None, catalog_mag: float | None) -> bool:
+    """
+    Whether a forced recovery's calibrated magnitude is too far from the
+    catalog star's own to be a measurement of that star — see
+    FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG. Undecidable (no calibration,
+    no catalog magnitude, check disabled) means "not inconsistent".
+    """
+    limit = config.FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG
+    if limit <= 0 or mag_calibrated is None or catalog_mag is None:
+        return False
+    try:
+        deviation = abs(float(mag_calibrated) - float(catalog_mag))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(deviation) and deviation > limit
+
+
 def _build_result(
     ra: float,
     dec: float,
@@ -608,6 +625,7 @@ async def run(
     n_below_snr = 0
     n_unmeasurable = 0
     n_blended = 0
+    n_inconsistent = 0
 
     def _try_measure(ra: float, dec: float) -> tuple[float, float, float, float] | None:
         """Project (ra, dec) to a pixel and measure it, or None if out of bounds/unmeasurable."""
@@ -648,14 +666,21 @@ async def run(
             x_px < margin_x or x_px > naxis1 - margin_x
             or y_px < margin_y or y_px > naxis2 - margin_y
         )
-        results.append(_build_result(
+        result = _build_result(
             ra, dec, "Gaia DR3", star["source_id"], star["phot_g_mean_mag"], "STAR",
             net_flux, flux_err,
             -2.5 * math.log10(net_flux), 1.0857 * flux_err / net_flux,
             zero_point, zero_point_err, psf_fwhm_arcsec, near_edge,
             color=star.get("bp_rp"),
             color_term=color_term, color_ref=color_ref, color_scatter=color_scatter,
-        ))
+        )
+        # The recovery claims "this flux is that star's". A calibrated
+        # magnitude far from the star's own G says the aperture measured
+        # something else — see FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG.
+        if _inconsistent_with_catalog(result["mag_calibrated"], star.get("phot_g_mean_mag")):
+            n_inconsistent += 1
+            continue
+        results.append(result)
 
     # ------------------------------------------------------------------
     # MPC / SkyBot — position already at obs_time, no PM correction needed
@@ -691,13 +716,15 @@ async def run(
             color_term=color_term, color_ref=color_ref, color_scatter=color_scatter,
         ))
 
-    if results or n_below_snr or n_unmeasurable or n_blended:
+    if results or n_below_snr or n_unmeasurable or n_blended or n_inconsistent:
         logger.info(
             "Forced photometry: %d eligible Gaia + %d eligible MPC position(s) -> "
             "%d recovered, %d below FORCED_PHOTOMETRY_MIN_SNR=%.1f, %d unmeasurable "
-            "(saturated/edge/out-of-bounds), %d blended within %.2f\"  file=%s",
+            "(saturated/edge/out-of-bounds), %d off the catalog magnitude by more "
+            "than %.1f mag, %d blended within %.2f\"  file=%s",
             len(eligible_gaia), len(eligible_mpc), len(results),
             n_below_snr, config.FORCED_PHOTOMETRY_MIN_SNR, n_unmeasurable,
+            n_inconsistent, config.FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG,
             n_blended, blend_radius,
             fits_filename,
         )
