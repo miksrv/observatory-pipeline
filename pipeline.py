@@ -684,7 +684,15 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 normalizer is not None
                 and normalizer.is_narrowband(header.get("observation", {}).get("filter"))
             )
-            sources = await photometry.measure(fits_path, sources, skip_calibration=skip_calibration)
+            # The solved WCS, not the file's own header: that is only
+            # corrected at archive time (step 12.5) and may still hold the
+            # mount-pointing estimate — see photometry.measure()'s `wcs`.
+            sources = await photometry.measure(
+                fits_path,
+                sources,
+                skip_calibration=skip_calibration,
+                wcs=(astro_result or {}).get("wcs"),
+            )
             calibrated_count = sum(1 for s in sources if s.get("calibrated"))
             logger.info(
                 "Photometry complete: %d sources measured, %d calibrated",

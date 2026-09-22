@@ -161,7 +161,7 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
 
     # photometry — returns sources with photometry fields added
     phot_mock = MagicMock()
-    async def mock_measure(fits_path, sources, skip_calibration=False):
+    async def mock_measure(fits_path, sources, skip_calibration=False, **kwargs):
         for s in sources:
             s.setdefault("flux_aperture", 1000.0)
             s.setdefault("mag_instrumental", -7.5)
@@ -1431,7 +1431,7 @@ async def test_forced_photometry_gets_midpoint_epoch_and_colour_term(mock_module
 
     original_measure = pipeline.photometry.measure.side_effect
 
-    async def measure_with_colour(fits_path, sources, skip_calibration=False):
+    async def measure_with_colour(fits_path, sources, skip_calibration=False, **kwargs):
         sources = await original_measure(fits_path, sources, skip_calibration)
         for s in sources:
             s["_color_term"] = 0.12
@@ -1450,6 +1450,22 @@ async def test_forced_photometry_gets_midpoint_epoch_and_colour_term(mock_module
     assert kwargs["color_scatter"] == pytest.approx(0.3)
     # The SkyBot accessor must hit the same epoch match() queried with.
     assert "2024-03-15T22:01:00" in pipeline.catalog_matcher.get_mpc_objects.call_args.args
+
+
+@pytest.mark.asyncio
+async def test_photometry_gets_the_solved_wcs(mock_modules):
+    """
+    photometry.measure() runs before the archive step writes astap's solve
+    into the file, so it must be handed the solved WCS explicitly.
+    """
+    solved_wcs = MagicMock(name="solved_wcs")
+    pipeline.astrometry.solve = AsyncMock(
+        return_value={**copy.deepcopy(_GOOD_ASTRO), "wcs": solved_wcs}
+    )
+
+    await pipeline.run(str(mock_modules))
+
+    assert pipeline.photometry.measure.call_args.kwargs["wcs"] is solved_wcs
 
 
 @pytest.mark.asyncio
@@ -1542,7 +1558,7 @@ async def test_mag_field_is_none_when_uncalibrated(mock_modules):
     values for entire uncalibrated frames in production.
     """
 
-    async def mock_measure_uncalibrated(fits_path, sources, skip_calibration=False):
+    async def mock_measure_uncalibrated(fits_path, sources, skip_calibration=False, **kwargs):
         for s in sources:
             s["flux_aperture"] = 100.0
             s["mag_instrumental"] = -5.0
@@ -1563,7 +1579,7 @@ async def test_mag_field_is_none_when_uncalibrated(mock_modules):
 async def test_mag_field_uses_calibrated_value_when_available(mock_modules):
     """When photometry did calibrate a source, "mag" must be mag_calibrated."""
 
-    async def mock_measure_calibrated(fits_path, sources, skip_calibration=False):
+    async def mock_measure_calibrated(fits_path, sources, skip_calibration=False, **kwargs):
         for s in sources:
             s["flux_aperture"]   = 100.0
             s["mag_instrumental"] = -5.0

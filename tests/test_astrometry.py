@@ -1410,6 +1410,8 @@ class TestStreakMasking:
         streaks = [s for s in result["sources_all"] if s["flux"] == pytest.approx(123_456.0)]
         assert len(streaks) == 1
         assert streaks[0]["elongation"] == pytest.approx(95.0)
+        # Marked so photometry never sizes a PSF aperture from its length.
+        assert streaks[0]["_streak"] is True
         # Not a star: it must never reach the photometric reference set.
         assert not any(s["flux"] == pytest.approx(123_456.0) for s in result["sources"])
 

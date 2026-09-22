@@ -803,3 +803,35 @@ class TestApplyRemoteSettings:
             assert config.QC_STARS_MIN == 15
         finally:
             config.QC_FWHM_MAX_ARCSEC, config.DELTA_MAG_ALERT, config.QC_STARS_MIN = originals
+
+
+class TestNonFiniteWireValues:
+    """
+    JSON has no NaN/Infinity: one such value made the whole POST /sources
+    batch fail to serialize, and the recovery re-run failed identically.
+    """
+
+    def test_nan_and_inf_are_sent_as_null(self):
+        import numpy as np
+        from api_client.sources import _to_wire_source
+
+        wire = _to_wire_source({
+            "ra": 1.0, "dec": 2.0,
+            "snr": float("inf"), "mag_err": float("nan"),
+            "flux_err": np.float32("nan"), "flux": np.float64(5.0),
+            "saturated": False, "_internal": float("nan"),
+        })
+
+        assert wire["snr"] is None
+        assert wire["mag_err"] is None
+        assert wire["flux_err"] is None
+        assert wire["flux"] == 5.0
+        assert wire["saturated"] is False
+        assert "_internal" not in wire
+
+    def test_the_whole_batch_serializes(self):
+        import json
+        from api_client.sources import _to_wire_source
+
+        json.dumps([_to_wire_source({"ra": 1.0, "dec": 2.0, "snr": float("-inf")})], allow_nan=False)
+

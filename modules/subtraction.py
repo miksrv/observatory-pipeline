@@ -676,6 +676,18 @@ def _median_reference(
 
     Falls back to a plain median when nothing needs excluding at all, i.e. the
     behaviour before footprints were kept.
+
+    The excluded values are set to NaN **in `stack` itself** and the stack is
+    then sorted in place, so the caller must not reuse it. That is what keeps
+    this affordable: `np.ma.median()` — the obvious tool — builds sorted copies
+    of the data and the mask plus several index arrays, about five times the
+    stack's own size on top of it (2.3 GB extra for seven 4656x3520 frames),
+    which on a real archive doubled the subtraction step's peak memory and got
+    the worker OOM-killed mid-task (2026-09-22 test run). NaN sorts to the end,
+    so after the sort the k valid values of each pixel occupy its first k
+    slots and the median is read straight off them — the same value
+    `np.ma.median()` returns, including the mean of the two middle values
+    when k is even.
     """
     nonfinite = ~np.isfinite(stack)
     has_footprints = any(fp is not None for fp in footprints)
@@ -683,15 +695,7 @@ def _median_reference(
     if not has_footprints and not nonfinite.any():
         return np.median(stack, axis=0).astype(np.float32)
 
-    # A copy, not an alias: `nonfinite` is counted separately below, and
-    # folding the footprints into it would report every uncovered border
-    # pixel as a non-finite one.
-    invalid = nonfinite.copy()
-    for i, fp in enumerate(footprints):
-        if fp is not None and fp.shape == stack.shape[1:]:
-            invalid[i] |= fp
-
-    n_nonfinite = int(nonfinite.sum())
+    n_nonfinite = int(np.count_nonzero(nonfinite))
     if n_nonfinite:
         logger.warning(
             "Subtraction: %d non-finite pixel value(s) across %d reference "
@@ -699,8 +703,18 @@ def _median_reference(
             "otherwise null the reference at that position",
             n_nonfinite, stack.shape[0],
         )
+    # +/-inf would sort as a value; only NaN sorts past every valid one.
+    stack[nonfinite] = np.nan
+    del nonfinite
 
-    n_invalid = int(invalid.sum())
+    for i, fp in enumerate(footprints):
+        if fp is not None and fp.shape == stack.shape[1:]:
+            stack[i][fp] = np.nan
+
+    stack.sort(axis=0)
+    valid = np.count_nonzero(~np.isnan(stack), axis=0)
+
+    n_invalid = int(stack.shape[0] * stack[0].size - valid.sum())
     if n_invalid:
         logger.info(
             "Subtraction: excluding %d uncovered or non-finite pixel value(s) "
@@ -708,11 +722,19 @@ def _median_reference(
             n_invalid, stack.shape[0],
         )
 
-    masked = np.ma.masked_array(stack, mask=invalid)
-    median = np.ma.median(masked, axis=0)
+    # The median of k sorted values is the mean of indices (k-1)//2 and k//2
+    # — one and the same index when k is odd. k == 0 reads slot 0 (a NaN) and
+    # is overwritten below as uncovered.
+    lo = np.maximum((valid - 1) // 2, 0)[np.newaxis]
+    hi = (valid // 2)[np.newaxis]
+    reference = (
+        np.take_along_axis(stack, lo, axis=0)[0]
+        + np.take_along_axis(stack, hi, axis=0)[0]
+    ) * np.float32(0.5)
+    reference = reference.astype(np.float32, copy=False)
+    del lo, hi
 
-    uncovered = np.ma.getmaskarray(median)
-    reference = np.ma.filled(median, 0.0).astype(np.float32)
+    uncovered = valid == 0
     if uncovered.any():
         logger.info(
             "Subtraction: %d pixel(s) have no valid reference at all — the "

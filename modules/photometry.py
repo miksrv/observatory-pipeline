@@ -522,6 +522,7 @@ async def measure(
     sources: list[dict],
     skip_calibration: bool = False,
     gain: float | None = None,
+    wcs=None,
 ) -> list[dict]:
     """
     Perform aperture photometry and differential magnitude calibration.
@@ -558,6 +559,18 @@ async def measure(
         error. None (the default) resolves it from
         config.PHOTOMETRY_GAIN_E_PER_ADU, then from the frame's own
         EGAIN/GAIN header — see _resolve_gain().
+    wcs:
+        The frame's already-solved ``astropy.wcs.WCS`` (``astrometry.solve()``'s
+        own). Preferred over any WCS in the file's header: at this point in
+        pipeline.py that header has not been corrected yet — astap's solve is
+        only written into the file at archive time — so it may still carry
+        the capture software's mount-pointing estimate, and every aperture
+        would then be placed wherever that estimate says the star is rather
+        than where it actually is (the photometry side of the 2026-08-06
+        UGC_6930 incident; on 2026-09-22 a test database showed 24 IC3322A
+        frames, every one with a ~10° mount desync, reaching the API with
+        zero calibrated sources). None falls back to the header, then to
+        astap's ``.wcs`` side file, as before.
 
     Returns
     -------
@@ -639,10 +652,15 @@ async def measure(
 
     data: np.ndarray = np.ascontiguousarray(raw_data.astype(np.float64))
 
-    # Try to get WCS from FITS header first, then fallback to .wcs file
+    # The solved WCS the caller passed wins; otherwise the FITS header, then
+    # astap's .wcs side file.
+    solved_wcs = wcs
     wcs = None
     try:
-        wcs = WCS(hdr)
+        if solved_wcs is not None and getattr(solved_wcs, "has_celestial", False):
+            wcs = solved_wcs
+        else:
+            wcs = WCS(hdr)
         if not wcs.has_celestial:
             # Try to read from .wcs file that astap creates
             wcs_file_path = os.path.splitext(fits_path)[0] + ".wcs"
@@ -791,6 +809,19 @@ async def measure(
             output.append(out)
             continue
 
+        # A re-emitted streak (modules/astrometry/_extraction.py) is not a
+        # point source: its `fwhm` is the trail's length, and an aperture
+        # scaled from it measures nothing meaningful. Worse, at 6x that
+        # "FWHM" the sky annulus of a long trail spans thousands of pixels:
+        # photutils builds float64 arrays the size of its bounding box, which
+        # got the worker OOM-killed, and a ring lying mostly off the frame
+        # yields a NaN sky that then failed the whole POST /sources as
+        # non-JSON (2026-09-22 test run). Left unmeasured, like a saturated
+        # source; its detection and classification are what matter.
+        if src.get("_streak"):
+            output.append(out)
+            continue
+
         try:
             # Aperture sizes in pixels, derived from FWHM
             fwhm_arcsec: float = float(src.get("fwhm") or 0.0)
@@ -803,6 +834,18 @@ async def measure(
             ap_radius: float    = 2.0 * fwhm_px
             annulus_inner: float = 4.0 * fwhm_px
             annulus_outer: float = 6.0 * fwhm_px
+
+            # Whatever the source, a sky ring wider than a quarter of the
+            # frame is not a local background estimate, and its bounding box
+            # is what photutils allocates — never attempt one.
+            if annulus_outer > 0.25 * min(naxis1, naxis2):
+                logger.debug(
+                    "photometry: skipping source at ra=%.5f dec=%.5f — FWHM %.1f px "
+                    "implies a %.0f px sky annulus  file=%s",
+                    src["ra"], src["dec"], fwhm_px, annulus_outer, fits_filename,
+                )
+                output.append(out)
+                continue
 
             position = (x_px, y_px)
             aperture = CircularAperture(position, r=ap_radius)
@@ -828,6 +871,11 @@ async def measure(
             # Net flux after per-pixel sky correction
             ap_area: float   = float(aperture.area)
             net_flux: float  = ap_sum - sky_per_px * ap_area
+            if not math.isfinite(net_flux):
+                # A sky ring with no valid pixels (off the frame, fully
+                # clipped) gives a NaN median — no measurement, not a NaN one.
+                output.append(out)
+                continue
 
             # Flux uncertainty: Poisson noise + sky noise.
             #

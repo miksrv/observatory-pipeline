@@ -602,6 +602,78 @@ class TestOutOfBoundsSources:
         assert result[1]["flux_aperture"] is None
 
 
+class TestNonPointSources:
+    """
+    2026-09-22 test run: a re-emitted streak's `fwhm` is its trail length, so a
+    PSF-scaled sky annulus spanned thousands of pixels — the worker was
+    OOM-killed, and a ring lying off the frame produced a NaN sky that failed
+    the whole POST /sources as non-JSON.
+    """
+
+    async def test_a_streak_is_not_photometered(self):
+        src = _make_source(ra=202.47, dec=47.20)
+        src["_streak"] = True
+        src["fwhm"] = 900.0
+
+        with _patch_photometry():
+            result = await photometry.measure(_FITS_PATH, [src])
+
+        assert result[0]["flux_aperture"] is None
+        assert result[0]["snr"] is None
+
+    async def test_an_aperture_wider_than_the_frame_allows_is_skipped(self):
+        src = _make_source(ra=202.47, dec=47.20, fwhm=200.0)  # 6x -> 1200 px ring on 1024 px
+
+        with _patch_photometry():
+            result = await photometry.measure(_FITS_PATH, [src])
+
+        assert result[0]["flux_aperture"] is None
+
+    async def test_a_nan_sky_leaves_the_source_unmeasured(self):
+        srcs = [_make_source(ra=202.47, dec=47.20)]
+
+        with _patch_photometry(annulus_sky_per_px=float("nan")):
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        for key in ("flux_aperture", "flux_err", "snr", "mag_err"):
+            value = result[0][key]
+            assert value is None or math.isfinite(value), key
+
+
+class TestSolvedWcsWins:
+    """
+    pipeline.py calls measure() before the frame is archived, i.e. before
+    astap's solve is written into the file — so the header may still carry
+    the capture software's mount-pointing WCS. The solved WCS passed in must
+    be the one the apertures are placed with.
+    """
+
+    async def test_passed_wcs_overrides_a_stale_header_wcs(self):
+        # Header WCS: the mount's estimate, 10 deg off in Dec — every real
+        # source projects far outside the frame through it.
+        stale = _make_wcs(ra=202.47, dec=37.20)
+        solved = _make_wcs(ra=202.47, dec=47.20)
+        srcs = [_make_source(ra=202.47, dec=47.20)]
+
+        with _patch_photometry(wcs=stale):
+            via_header = await photometry.measure(_FITS_PATH, srcs)
+            via_solve = await photometry.measure(_FITS_PATH, srcs, wcs=solved)
+
+        assert via_header[0]["flux_aperture"] is None
+        assert via_solve[0]["flux_aperture"] is not None
+
+    async def test_a_non_celestial_passed_wcs_falls_back_to_the_header(self):
+        header_wcs = _make_wcs(ra=202.47, dec=47.20)
+        srcs = [_make_source(ra=202.47, dec=47.20)]
+
+        with _patch_photometry(wcs=header_wcs):
+            result = await photometry.measure(
+                _FITS_PATH, srcs, wcs=_make_wcs(celestial=False)
+            )
+
+        assert result[0]["flux_aperture"] is not None
+
+
 # ---------------------------------------------------------------------------
 # Test 5 — Negative / zero flux handling
 # ---------------------------------------------------------------------------

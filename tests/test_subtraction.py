@@ -411,6 +411,19 @@ class TestNonFiniteHandling:
         assert np.isfinite(reference).all()
         assert reference[2, 2] == pytest.approx(100.0)
 
+    def test_an_even_number_of_valid_values_averages_the_middle_two(self):
+        """
+        The in-place sort median must return what np.ma.median() would: with
+        one reference masked out of five, the median of the remaining four.
+        """
+        stack = np.stack([np.full((3, 3), v, dtype=np.float32) for v in (1.0, 2.0, 3.0, 4.0, 100.0)])
+        footprint = np.ones((3, 3), dtype=bool)  # the 100.0 frame covers nothing
+        new_data = np.zeros((3, 3), dtype=np.float32)
+
+        reference = subtraction._median_reference(stack, [None, None, None, None, footprint], new_data)
+
+        assert reference == pytest.approx(np.full((3, 3), 2.5))
+
     def test_a_footprint_is_not_reported_as_non_finite(self, caplog):
         """
         An ordinary astroalign footprint, with no NaN/Inf anywhere, must not

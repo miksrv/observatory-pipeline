@@ -815,6 +815,13 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
 
 ### `modules/photometry.py`
 - Aperture photometry via `photutils.aperture`
+- Apertures are placed through the **solved** WCS `pipeline.py` passes in (`measure(..., wcs=)`,
+  `astrometry.solve()`'s own), not through the file's header: photometry runs before step 12.5
+  writes astap's solve into the file, so the header can still hold the capture software's
+  mount-pointing estimate — the photometry side of the `UGC_6930` incident. Found 2026-09-22 on a
+  test database: 24 `IC3322A` frames whose mount had desynced by ~10° reached the API with zero
+  calibrated sources, although their plate solves and catalog matches were fine. Without a
+  passed WCS it falls back to the header, then to astap's `.wcs` side file, as before.
 - Differential photometry against Gaia reference stars in the field (requires ≥3 Gaia DR3 matches to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations
 - Each source's sky annulus is **sigma-clipped** (`PHOTOMETRY_SKY_SIGMA_CLIP`, 3σ) before its
   median is taken. The ring is a background sample only in principle — in practice it routinely

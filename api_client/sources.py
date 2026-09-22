@@ -9,6 +9,8 @@ See docs/API.md sections 2, 4, 6, 8, 9, 11.
 from __future__ import annotations
 
 import logging
+import math
+import numbers
 
 import config
 from ._shared import (
@@ -67,6 +69,25 @@ def _to_wire_source(source: dict) -> dict:
     wire = {k: v for k, v in source.items() if not k.startswith("_")}
     if source.get("_from_subtraction"):
         wire["from_subtraction"] = True
+
+    # JSON has no NaN/Infinity: one such value anywhere in the batch makes
+    # the whole POST fail to serialize, the frame loses every source, and a
+    # recovery re-run fails identically because the value is deterministic
+    # (2026-09-22 test run, IC3322A). A measurement that came out non-finite
+    # is no measurement, so it travels as null — logged, so the producer can
+    # be found and fixed rather than silently papered over.
+    nonfinite = [
+        k for k, v in wire.items()
+        if isinstance(v, numbers.Real) and not isinstance(v, numbers.Integral)
+        and not math.isfinite(v)
+    ]
+    if nonfinite:
+        logger.warning(
+            "Non-finite value(s) in %s for source at ra=%s dec=%s — sent as null",
+            ", ".join(sorted(nonfinite)), source.get("ra"), source.get("dec"),
+        )
+        for k in nonfinite:
+            wire[k] = None
     return wire
 
 

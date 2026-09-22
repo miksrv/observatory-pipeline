@@ -459,6 +459,10 @@ def _streak_sources(
                 feature["x"] < margin_x or feature["x"] > naxis1 - margin_x
                 or feature["y"] < margin_y or feature["y"] > naxis2 - margin_y
             ),
+            # Internal marker (stripped before the wire): this is a trail,
+            # whose `fwhm` is really its length. modules/photometry.py must
+            # not size a PSF aperture from it — see that module's skip.
+            "_streak":    True,
         })
 
     return out
