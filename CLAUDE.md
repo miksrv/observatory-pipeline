@@ -1322,7 +1322,7 @@ returned by `POST /frames/{id}/sources`. `None` when that round-trip couldn't re
 
 | Situation | Classification |
 |---|---|
-| Unmatched (`catalog_name is None`) and `saturated=True` | Suppressed — `return None`, no anomaly record at all (bright-star/subtraction artifact, not a real transient; see docs/ISSUES.md #1, #2). **Exempt**: a source that is round (`elongation ≤ STAR_ELONGATION_MAX`), interior, and has no history at all at a position prior frames *did* cover — `_could_be_a_new_bright_object()`. A nova or fireball has no catalog match by definition and saturates if it matters at all, so an unconditional rule could never report one (audit 2026-08-18, finding M4). It falls through to the ordinary `UNKNOWN` alert, with no usable magnitude |
+| Unmatched (`catalog_name is None`) and `saturated=True` | Suppressed — `return None`, no anomaly record at all (bright-star/subtraction artifact, not a real transient; see docs/ISSUES.md #1, #2). **Exempt**: a source that is round (`elongation ≤ STAR_ELONGATION_MAX`), interior, and has no history at all at a position prior frames *did* cover — `_could_be_a_new_bright_object()`. A nova or fireball has no catalog match by definition and saturates if it matters at all, so an unconditional rule could never report one (audit 2026-08-18, finding M4). It falls through to the ordinary classification — in practice the `UNKNOWN` alert (or `MOVING_UNKNOWN`, if wide-cone evidence shows it moved), with no usable magnitude |
 | Unmatched (`catalog_name is None`) and `near_edge=True` | Suppressed — `return None` (coma shifts the measured centroid away from the star's true catalog position, making catalog matching miss it; these are overwhelmingly ordinary stars with optical distortion, not real transients — real incident, 2026-08-10: 27 of 80 UNKNOWN alerts were non-subtraction near_edge sources). **Exempt**: a subtraction candidate that is round and strong (`_survives_edge_zone()` — the same `SUBTRACTION_EDGE_ELONGATION_MAX`/`SUBTRACTION_EDGE_SNR_MIN` bar `modules/subtraction.py` applies at extraction). It is not the shape an aberration residual takes, and unlike an ordinary detection it carries pixel-level evidence that nothing was there before (audit 2026-08-18, finding H11) |
 | No historical coverage | `FIRST_OBSERVATION` — not an anomaly, just note |
 | No historical coverage, but the source was detected via image subtraction (`_from_subtraction=True`) and `near_edge=True` | Suppressed — `return None` (defense in depth for standalone `DETECT_ANOMALIES` re-runs; fresh subtraction applies the same test at extraction time), **unless** it is round and strong per `_survives_edge_zone()` |
@@ -1938,11 +1938,20 @@ containerized. A disk write failure (permission, disk full, not mounted) is logg
 degrading to in-process-only caching for the rest of that run rather than breaking catalog
 matching — see that module's `_cache_set()` docstring.
 
-### Why bad frames go to /fits/rejected instead of API
-Bad frames (blur, trailing, low star count) have no scientific value for the analysis pipeline.
-Sending them to the API would waste bandwidth/storage, pollute the database with unusable data,
-and complicate queries. Instead, they are moved locally to `/fits/rejected/` organized by target
-object, with a prefix indicating the rejection reason — this allows manual review if needed.
+### Why QC-failed frames are registered, not dropped
+An earlier revision moved a bad frame (blur, trailing, low star count) straight to
+`/fits/rejected/` and never told the API about it, on the grounds that it had no scientific
+value. That saved little — the frame record itself is small — and cost the operator the one
+thing they need to act on a rejection: seeing *which* frames failed and *why*, without SSHing
+into the observatory server. So `pipeline.analyze_frame()` now registers every Light frame
+(`POST /frames` with its QC metrics and non-`OK` `quality_flag`), posts an empty source list,
+and archives the file into `/fits/archive/{object}/` like any other, so a later re-analysis
+after tuning QC thresholds can find it again. What is still saved is the much larger
+source/photometry/catalog-matching payload, since steps 6–9.5 are skipped for such a frame.
+Two consequences are handled elsewhere: `modules/subtraction.py` screens each archived
+reference on its stamped `QCFLAG` (audit 2026-08-18, finding H10) so a QC-failed frame never
+enters a reference stack, and `qc.analyze(move_on_reject=True)` — the `/fits/rejected/`
+behaviour — remains only for direct/ad hoc callers.
 
 ### Why finder charts, and why two rendering styles
 An anomaly on its own is a single (RA, Dec, mag, anomaly_type) row — useful for the API and any

@@ -295,11 +295,13 @@ class _ZeroPoint(NamedTuple):
     The frame's photometric solution: an offset, its uncertainty, and the
     colour term that offset is defined at.
 
-    `color_term` is 0.0 and `color_ref` is None whenever no colour fit was
-    made (disabled, too few references carrying a Gaia BP-RP colour, too
-    narrow a colour span to constrain a slope, or an implausible fitted
-    slope) — in that case this behaves exactly like the plain median offset
-    this module computed before colour terms existed.
+    `color_term` is 0.0 whenever no colour fit was made (disabled, too few
+    references carrying a Gaia BP-RP colour, too narrow a colour span to
+    constrain a slope, or an implausible fitted slope) — in that case this
+    behaves exactly like the plain median offset this module computed before
+    colour terms existed. `color_ref` may still carry the references' median
+    colour then; `color_term`, not `color_ref is not None`, is the test for
+    "is a colour correction active".
     """
 
     zero_point: float | None

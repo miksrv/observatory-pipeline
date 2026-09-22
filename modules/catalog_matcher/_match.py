@@ -35,7 +35,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     """
     Enrich each source in-place with catalog identification fields.
 
-    Queries catalogs in order: Simbad → Gaia DR3 → 2MASS → MPC.
+    Queries catalogs in order: Simbad → Gaia DR3 → 2MASS → Pan-STARRS DR1 → MPC.
     Each catalog stage is isolated; a failure in one does not prevent the
     others from running. Query results are cached for 1 hour to avoid
     redundant network calls when multiple frames cover the same sky area.
@@ -47,7 +47,9 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
            performs WCS offset correction using all sources.
         3. 2MASS — fallback for red/cool stars faint or absent in Gaia
            (late M/K dwarfs, reddened stars near Galactic plane); J-band mag.
-        4. MPC/SkyBot — solar system objects (asteroids, comets); wider cone.
+        4. Pan-STARRS DR1 — deeper optical fallback (~23 mag, dec > -30°)
+           for faint sources Gaia misses; r-band mag.
+        5. MPC/SkyBot — solar system objects (asteroids, comets); wider cone.
            Runs against all sources rather than the unclaimed remainder, and
            takes over a source already claimed by a stellar catalog only on a
            tight (MATCH_CONE_ARCSEC) positional coincidence.

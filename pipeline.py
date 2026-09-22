@@ -962,11 +962,14 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
 
     # Re-queue this frame when its source list never reached the API. Queued
     # only after the archive move, and against the ARCHIVE path, because that
-    # is where the file will be by the time the worker picks the task up.
-    if not sources_posted and archive_path:
+    # is where the file will be by the time the worker picks the task up. If
+    # the move itself failed, the file is still where it arrived — queue
+    # against that path rather than dropping the recovery altogether.
+    recovery_path = archive_path or (fits_path if os.path.exists(fits_path) else None)
+    if not sources_posted and recovery_path:
         await _queue_recovery_task(
             "ANALYZE",
-            {"filename": archive_path},
+            {"filename": recovery_path},
             recovery_attempt,
             f"frame_id={frame_id}: {len(sources)} source(s) could not be posted",
             extra,

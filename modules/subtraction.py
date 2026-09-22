@@ -683,7 +683,10 @@ def _median_reference(
     if not has_footprints and not nonfinite.any():
         return np.median(stack, axis=0).astype(np.float32)
 
-    invalid = nonfinite
+    # A copy, not an alias: `nonfinite` is counted separately below, and
+    # folding the footprints into it would report every uncovered border
+    # pixel as a non-finite one.
+    invalid = nonfinite.copy()
     for i, fp in enumerate(footprints):
         if fp is not None and fp.shape == stack.shape[1:]:
             invalid[i] |= fp

@@ -25,6 +25,7 @@ asyncio_mode = auto is set in pytest.ini, so async tests need no decorator.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from unittest.mock import patch
@@ -409,6 +410,21 @@ class TestNonFiniteHandling:
 
         assert np.isfinite(reference).all()
         assert reference[2, 2] == pytest.approx(100.0)
+
+    def test_a_footprint_is_not_reported_as_non_finite(self, caplog):
+        """
+        An ordinary astroalign footprint, with no NaN/Inf anywhere, must not
+        trigger the non-finite warning — it fires on real contamination only.
+        """
+        stack = np.stack([np.full((6, 6), 100.0, dtype=np.float32)] * 3)
+        footprint = np.zeros((6, 6), dtype=bool)
+        footprint[0, :] = True
+        new_data = np.full((6, 6), 100.0, dtype=np.float32)
+
+        with caplog.at_level(logging.WARNING, logger="modules.subtraction"):
+            subtraction._median_reference(stack, [footprint, None, None], new_data)
+
+        assert "non-finite" not in caplog.text
 
     def test_an_infinite_reference_pixel_is_excluded_too(self):
         stack = np.stack([

@@ -94,7 +94,9 @@ flowchart TD
     P1 -- yes --> Asteroid["ASTEROID / COMET\n(by object_type)\n⚑ _needs_ephemeris=True"]
 
     P1 -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
-    Sat -- yes --> Suppressed(["suppressed — return None\n(bright-star/subtraction artifact,\nnot a real transient)"])
+    Sat -- yes --> NewBright{"_could_be_a_new_bright_object()?\n(round, not near_edge, area covered,\nno history at all here)"}
+    NewBright -- no --> Suppressed(["suppressed — return None\n(bright-star/subtraction artifact,\nnot a real transient)"])
+    NewBright -- "yes (possible nova —\nclassified, magnitude unmeasurable)" --> NoHist
     Sat -- no --> NoHist{"catalog_name is None\nAND no history within MATCH_CONE_ARCSEC\nof the CURRENT position?"}
     NoHist -- yes --> Trail{"elongation > trail threshold?\n(SPACE_DEBRIS_ELONGATION_MIN=3.0,\nor the higher SPACE_DEBRIS_EDGE_\nELONGATION_MIN=6.0 if near_edge —\ncoma inflates elongation near the\nframe edge; see below)"}
     Trail -- yes --> SpaceDebris["🔔 SPACE_DEBRIS"]
@@ -105,7 +107,9 @@ flowchart TD
     Vacated -- no --> Coverage
     Coverage -- yes --> FromSub{"_from_subtraction\n== True?"}
     FromSub -- no --> FirstObs["FIRST_OBSERVATION\n(not an anomaly, logged only)"]
-    FromSub -- yes --> SubCatalog{"catalog_name\nis not None?"}
+    FromSub -- yes --> SubEdge{"near_edge AND NOT\n_survives_edge_zone()?"}
+    SubEdge -- yes --> Suppressed
+    SubEdge -- no --> SubCatalog{"catalog_name\nis not None?"}
     SubCatalog -- yes --> SubKnown["known catalog match\n(not an anomaly — most likely\nan astroalign registration\nresidual near a real object;\nsee 'camera rotation' below)"]
     SubCatalog -- no --> UnkNewArea["🔔 UNKNOWN\n(subtraction already confirmed\nnovelty despite\nno coverage record)"]
 
@@ -114,11 +118,13 @@ flowchart TD
     History -- yes --> Galaxy{"near a Simbad galaxy?\n(_is_galaxy)"}
     Galaxy -- yes --> SNnew["🔔 SUPERNOVA_CANDIDATE\n(new point source,\nno baseline to compare)"]
     Galaxy -- no --> InCatalog{"catalog_name\nis not None?"}
-    InCatalog -- no --> UnkNoCat["🔔 UNKNOWN\n(not found in\nany catalog)"]
+    InCatalog -- no --> CovEdge{"near_edge AND NOT\n_survives_edge_zone()?"}
+    CovEdge -- yes --> Suppressed
+    CovEdge -- no --> UnkNoCat["🔔 UNKNOWN\n(not found in\nany catalog)"]
     InCatalog -- yes --> KnownNew["KNOWN_CATALOG_NEW\n(known object, was simply\nbelow detection threshold\nbefore; not an anomaly)"]
 
     History -- no, has\nhistory --> DeltaMag["delta_mag = mag − median(\n_same_filter_history(history).mag)\n(only same-filter epochs — see below)"]
-    DeltaMag --> Changed{"abs(delta_mag) >\nDELTA_MAG_ALERT?"}
+    DeltaMag --> Changed{"_is_significant_delta():\nabs(delta_mag) > DELTA_MAG_ALERT\nAND > VARIABILITY_SIGMA x noise\n(mag_err ⊕ same-filter scatter)?"}
     Changed -- no --> NoAnomaly(["no anomaly"])
     Changed -- yes --> Bright{"delta_mag < 0\n(got brighter)\nAND near a galaxy?"}
     Bright -- yes --> SNbright["🔔 SUPERNOVA_CANDIDATE\n(already-known host\nbrightened)"]
@@ -163,13 +169,24 @@ one condition matches, the function returns and no further checks run:
 1. **MPC match** — `catalog_name == "MPC"` → `ASTEROID`/`COMET`, regardless of history
    or coverage.
 2. **Saturated, unmatched source** — `catalog_name is None` and `saturated == True` →
-   suppressed outright (`return None`, no anomaly record). A saturated star leaves
+   suppressed (`return None`, no anomaly record) **unless**
+   `_could_be_a_new_bright_object()` holds: the source is round
+   (`0 < elongation ≤ STAR_ELONGATION_MAX`), not `near_edge`, and has no historical
+   detection at all at a position that prior frames *did* cover (`n_coverage > 0`). Such a
+   source — a candidate nova, outburst or fireball, which has no catalog match by
+   definition and saturates if it matters at all — is not suppressed but falls through to
+   bullets 3–4 below like any other uncatalogued source (in practice `UNKNOWN`, or
+   `MOVING_UNKNOWN` if wide-cone evidence also shows it moved), with no usable magnitude
+   (audit 2026-08-18, finding M4). The exemption cannot rest on `_from_subtraction`:
+   `modules/subtraction.py` masks the vicinity of every saturated pixel, so a saturated
+   transient never becomes a subtraction candidate. A saturated star leaves
    large `astroalign` residual artifacts around it even under near-perfect
    registration (see `modules/subtraction.py`'s saturation masking), and an
    uncatalogued detection sitting on top of one is overwhelmingly that artifact, not
    a real transient or mover — see docs/ISSUES.md #1, #2. This check runs *before*
-   the position-shift check below, so a saturated artifact can never become
-   `MOVING_UNKNOWN`/`SPACE_DEBRIS` either. Scoped to `catalog_name is None` only: a
+   the position-shift check below, so a suppressed saturated artifact can never become
+   `MOVING_UNKNOWN`/`SPACE_DEBRIS` either (an exempted one cannot become `SPACE_DEBRIS`:
+   it is round by construction). Scoped to `catalog_name is None` only: a
    saturated source that *is* MPC- or Simbad-matched (bullet 1, or the history-based
    branches below) is a legitimate detection and is unaffected — it just never gets a
    usable `magnitude`, since `photometry.py` never measures a saturated source.
@@ -247,13 +264,23 @@ one condition matches, the function returns and no further checks run:
      `6a7cfbae64e706.89320404`, a Gaia DR3 star — this branch used to ignore
      `catalog_name` entirely; see CLAUDE.md's "camera rotation" discussion);
    - covered, no history, near a galaxy (Simbad OTYPE) → `SUPERNOVA_CANDIDATE`;
-   - covered, no history, not in any catalog → `UNKNOWN`;
+   - covered, no history, not in any catalog → `UNKNOWN` — **suppressed** instead when
+     `near_edge` (coma shifts the centroid off the star's catalog position so matching
+     misses it), unless `_survives_edge_zone()` holds: a subtraction candidate that is
+     round (`elongation ≤ SUBTRACTION_EDGE_ELONGATION_MAX`) and strong
+     (`snr ≥ SUBTRACTION_EDGE_SNR_MIN`). The same exemption applies to the
+     no-coverage subtraction `UNKNOWN` above, which is likewise suppressed when
+     `near_edge` otherwise (audit 2026-08-18, finding H11). An ordinary (non-subtraction)
+     near-edge detection never qualifies;
    - covered, no history, in a catalog (not a galaxy) → `KNOWN_CATALOG_NEW` (not an anomaly);
    - has history → compare `delta_mag = mag − median(same_filter_history.mag)` — only
      history entries observed through the same filter as this source, via
-     `_same_filter_history()` — against `DELTA_MAG_ALERT` (default 0.5). No same-filter
-     history at all → `delta_mag` stays `None`, same as an uncalibrated source. If the
-     threshold is exceeded:
+     `_same_filter_history()` — via `_is_significant_delta()`: the change must exceed
+     `DELTA_MAG_ALERT` (default 0.5) **and** `VARIABILITY_SIGMA` × the source's own noise
+     (its `mag_err` and its same-filter historical scatter added in quadrature). With no
+     usable noise estimate the flat floor applies alone (audit 2026-08-18, finding M3). No
+     same-filter history at all → `delta_mag` stays `None`, same as an uncalibrated
+     source. If the change is significant:
      - a change near a galaxy only counts when the source **brightened**, i.e.
        `delta_mag < 0` → `SUPERNOVA_CANDIDATE` (checked first — takes priority over
        binary/variable stars);
@@ -295,14 +322,14 @@ Table of Simbad OTYPE substrings used by the classifiers:
 |---|---|---|
 | `FIRST_OBSERVATION` | Sky area never observed before | No (logged only, not returned) |
 | `KNOWN_CATALOG_NEW` | Not in history, but found in a catalog | No (logged only, not returned) |
-| `VARIABLE_STAR` | Has history, Δmag > `DELTA_MAG_ALERT`, and either Simbad classifies it as a variable **or** the change exceeds `VARIABILITY_SIGMA` × the source's own same-filter historical scatter over ≥ `VARIABILITY_MIN_EPOCHS` epochs | No (logged) |
-| `BINARY_STAR` | Has history, Δmag > `DELTA_MAG_ALERT`, Simbad binary | No (logged) |
+| `VARIABLE_STAR` | Has history, significant Δmag (> `DELTA_MAG_ALERT` and > `VARIABILITY_SIGMA` × own noise), and either Simbad classifies it as a variable **or** the change exceeds `VARIABILITY_SIGMA` × the source's own same-filter historical scatter over ≥ `VARIABILITY_MIN_EPOCHS` epochs | No (logged) |
+| `BINARY_STAR` | Has history, significant Δmag (as above), Simbad binary | No (logged) |
 | `ASTEROID` | Matched in MPC/SkyBot, type "asteroid" | No (logged + ephemeris) |
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |
-| `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening beyond Δmag | **Yes** |
+| `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening by a significant Δmag (as above) | **Yes** |
 | `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold | **Yes** |
 | `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | **Yes** |
-| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog | **Yes** |
+| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()` | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match
 `AnomalyModel::ALLOWED_TYPES`/the `ENUM` constraint on the `observatory-api` side — the

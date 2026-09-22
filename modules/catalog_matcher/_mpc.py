@@ -326,6 +326,12 @@ def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
         source["catalog_id"]   = obj["designation"]
         source["catalog_mag"]  = None
         source["object_type"]  = obj["object_type"]
+        # A takeover inherits nothing from the star it displaced: its Gaia
+        # BP-RP would otherwise be applied through the colour term to the
+        # moving object's own calibrated magnitude (photometry.py reads
+        # _catalog_color regardless of catalog_name).
+        source.pop("_catalog_color", None)
+        source.pop("_catalog_flags", None)
 
 
 # ---------------------------------------------------------------------------

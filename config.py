@@ -786,13 +786,14 @@ _OVERRIDABLE: dict[str, type] = {
     "SATURATION_ADU": float,
     "SATURATION_MASK_RADIUS_ARCSEC": float,
     # Cross-matching
-    "PHOTOMETRY_COLOR_TERM_ENABLED": bool,
+    "PHOTOMETRY_COLOR_TERM_ENABLED": None,  # special: bool from string
     "PHOTOMETRY_COLOR_TERM_MIN_REFS": int,
     "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
     "PHOTOMETRY_COLOR_TERM_MAX": float,
     "PHOTOMETRY_REF_MAX_RUWE": float,
     "PHOTOMETRY_SKY_SIGMA_CLIP": float,
     "PHOTOMETRY_MIN_SNR": float,
+    "PHOTOMETRY_GAIN_E_PER_ADU": None,  # special: float, blank → None
     "FORCED_PHOTOMETRY_BLEND_FWHM": float,
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
@@ -860,6 +861,7 @@ _OVERRIDABLE: dict[str, type] = {
 _BOOL_KEYS = {
     "CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED",
     "FORCED_PHOTOMETRY_ENABLED", "ASTAP_RETRY_WIDE_SEARCH",
+    "PHOTOMETRY_COLOR_TERM_ENABLED",
 }
 
 
@@ -871,6 +873,10 @@ def _cast_value(name: str, raw: str) -> object:
         return raw.strip().upper()
     if name == "NARROWBAND_FILTERS":
         return frozenset(f.strip() for f in raw.split(",") if f.strip())
+    if name == "PHOTOMETRY_GAIN_E_PER_ADU":
+        # Blank means "not configured — use the frame's own EGAIN/GAIN",
+        # exactly as the definition-time parse above treats it.
+        return float(raw) if raw.strip() else None
     typ = _OVERRIDABLE[name]
     return typ(raw)
 

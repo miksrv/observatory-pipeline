@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -164,6 +165,27 @@ class TestCacheLogic:
         cm._cache["stale_key"] = {"data": "old_data", "fetched_at": two_hours_ago}
         result = cm._cache_get("stale_key")
         assert result is None
+
+    def test_a_pre_versioned_disk_entry_is_not_read_back(self, tmp_path, monkeypatch):
+        """
+        A disk file written before the cache's key meaning changed (M5) must
+        not be served as a hit under a coinciding new key.
+        """
+        import importlib
+        # The package re-exports the dict `_cache` under the same name as the
+        # submodule, so fetch the module itself.
+        cache_mod = importlib.import_module("modules.catalog_matcher._cache")
+
+        monkeypatch.setattr(config, "CATALOG_CACHE_DIR", str(tmp_path))
+        key = "gaia:10.0:20.0:1.1"
+        legacy = tmp_path / (key.replace(":", "_") + ".json")
+        legacy.write_text('[{"ra": 10.0, "dec": 20.0}]')
+        cache_mod._cache.pop(key, None)
+
+        assert cache_mod._cache_get(key) is None
+        assert os.path.basename(cache_mod._cache_file_path(key)).startswith(
+            cache_mod._CACHE_FORMAT_VERSION + "_"
+        )
 
 
 # ===========================================================================
@@ -617,6 +639,30 @@ class TestMpcMatching:
         assert source["catalog_id"]   == "2024 AB1"
         assert source["object_type"]  == "ASTEROID"
         assert source["catalog_mag"]  is None
+
+    def test_a_takeover_drops_the_displaced_stars_gaia_fields(self):
+        """
+        The displaced star's BP-RP must not follow the source into MPC:
+        photometry applies _catalog_color through the colour term regardless
+        of catalog_name, which would correct the asteroid's magnitude with the
+        background star's colour.
+        """
+        star_ra, star_dec = _offset_ra_exact(_RA, _DEC, 2.0)
+        source = _make_source(ra=star_ra, dec=star_dec)
+        source["catalog_name"]   = "Gaia DR3"
+        source["catalog_id"]     = "GAIA_STAR_ID"
+        source["catalog_mag"]    = 13.0
+        source["object_type"]    = "STAR"
+        source["_catalog_color"] = 2.7
+        source["_catalog_flags"] = {"ruwe": 1.0}
+
+        mpc_objects = [{"ra": _RA, "dec": _DEC, "designation": "2024 AB1", "object_type": "ASTEROID"}]
+
+        cm._match_mpc([source], mpc_objects)
+
+        assert source["catalog_name"] == "MPC"
+        assert "_catalog_color" not in source
+        assert "_catalog_flags" not in source
 
     def test_mpc_leaves_a_distant_catalogued_source_alone(self):
         """

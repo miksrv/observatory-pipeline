@@ -316,6 +316,24 @@ def test_from_wire_source_defaults_near_edge_to_false():
     assert result["near_edge"] is False
 
 
+def test_from_wire_source_reconstructs_mag_err_and_snr():
+    """
+    A standalone DETECT_ANOMALIES re-run judges a source on the same terms as
+    the in-process one: M3's significance gate reads mag_err, and H11's
+    _survives_edge_zone() reads snr (audit 2026-08-18).
+    """
+    api_source = {"ra": 1.0, "dec": 2.0, "mag": 14.5, "mag_err": 0.05, "snr": 12.3}
+    result = pipeline._from_wire_source(api_source)
+    assert result["mag_err"] == pytest.approx(0.05)
+    assert result["snr"] == pytest.approx(12.3)
+
+
+def test_from_wire_source_defaults_mag_err_and_snr_to_none():
+    result = pipeline._from_wire_source({"ra": 1.0, "dec": 2.0, "mag": 14.5})
+    assert result["mag_err"] is None
+    assert result["snr"] is None
+
+
 @pytest.mark.asyncio
 async def test_detect_anomalies_for_frame_id_propagates_frame_filter(monkeypatch):
     """
@@ -344,6 +362,37 @@ async def test_detect_anomalies_for_frame_id_propagates_frame_filter(monkeypatch
 
     detect_call_sources = pipeline.anomaly_detector.detect.call_args.args[1]
     assert detect_call_sources[0]["_filter"] == "Ha"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frame_extra", [
+    {"exptime": 120},                    # flattened (docs/API.md shape)
+    {"observation": {"exptime": 120}},   # nested shape some API versions return
+])
+async def test_detect_anomalies_for_frame_id_recomputes_the_midpoint(monkeypatch, frame_extra):
+    """
+    Audit 2026-08-18, finding C9: the standalone path has no local FITS, so
+    it rebuilds obs_time_mid from the stored obs_time + exptime.
+    """
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(return_value={
+        "filename": "M51_Light_V_120_2024-03-15T22-00-00.fits",
+        "obs_time": "2024-03-15T22:00:00",
+        **frame_extra,
+    })
+    api_mock.get_frame_sources = AsyncMock(return_value=[])
+    api_mock.post_anomalies = AsyncMock(return_value=True)
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+
+    anom_mock = MagicMock()
+    anom_mock.detect = AsyncMock(return_value=[])
+    monkeypatch.setattr("pipeline.anomaly_detector", anom_mock)
+
+    await pipeline.detect_anomalies_for_frame_id("frame-123")
+
+    frame_meta = anom_mock.detect.call_args.args[3]
+    assert frame_meta["obs_time"] == "2024-03-15T22:00:00"
+    assert frame_meta["obs_time_mid"].startswith("2024-03-15T22:01:00")
 
 
 @pytest.mark.asyncio
@@ -590,6 +639,27 @@ async def test_failed_post_sources_queues_an_analyze_task(mock_modules):
     assert items[0]["filename"].endswith(_NORMALIZED_FILENAME)
     assert config.FITS_ARCHIVE in items[0]["filename"]
     assert items[0]["payload"]["recovery_attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_falls_back_to_the_incoming_path_when_archiving_fails(mock_modules, monkeypatch):
+    """
+    A failed archive move leaves the file where it arrived; the lost source
+    list must still be re-queued, against that path.
+    """
+    pipeline.api_client.post_sources = AsyncMock(return_value=None)
+    pipeline.api_client.create_task = AsyncMock(return_value={"id": "task-9"})
+
+    def failing_move(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pipeline.shutil, "move", failing_move)
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    pipeline.api_client.create_task.assert_awaited_once()
+    items = pipeline.api_client.create_task.call_args.kwargs["items"]
+    assert items[0]["filename"] == str(mock_modules)
 
 
 @pytest.mark.asyncio
@@ -1344,6 +1414,42 @@ async def test_forced_photometry_reuses_cached_catalog_lists(mock_modules):
     assert kwargs["gaia_stars"] == gaia_stars
     assert kwargs["mpc_objects"] == mpc_objects
     assert kwargs["zero_point"] == pytest.approx(14.5)  # from mock_measure's mag_calibrated fixture
+
+
+@pytest.mark.asyncio
+async def test_forced_photometry_gets_midpoint_epoch_and_colour_term(mock_modules, monkeypatch):
+    """
+    Forced photometry propagates Gaia proper motion to the exposure MIDPOINT
+    (finding C9), and transforms its magnitudes with the same colour-term
+    solution photometry.measure() fitted (finding H5) — both read by
+    pipeline.py and forwarded, so both are pinned here.
+    """
+    header = dict(_GOOD_HEADER)
+    header["obs_time"] = "2024-03-15T22:00:00"
+    header["obs_time_mid"] = "2024-03-15T22:01:00"
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: header)
+
+    original_measure = pipeline.photometry.measure.side_effect
+
+    async def measure_with_colour(fits_path, sources, skip_calibration=False):
+        sources = await original_measure(fits_path, sources, skip_calibration)
+        for s in sources:
+            s["_color_term"] = 0.12
+            s["_color_ref"] = 0.85
+            s["_color_scatter"] = 0.3
+        return sources
+
+    pipeline.photometry.measure.side_effect = measure_with_colour
+
+    await pipeline.run(str(mock_modules))
+
+    _, kwargs = pipeline.forced_photometry.run.call_args
+    assert kwargs["obs_time"] == "2024-03-15T22:01:00"
+    assert kwargs["color_term"] == pytest.approx(0.12)
+    assert kwargs["color_ref"] == pytest.approx(0.85)
+    assert kwargs["color_scatter"] == pytest.approx(0.3)
+    # The SkyBot accessor must hit the same epoch match() queried with.
+    assert "2024-03-15T22:01:00" in pipeline.catalog_matcher.get_mpc_objects.call_args.args
 
 
 @pytest.mark.asyncio

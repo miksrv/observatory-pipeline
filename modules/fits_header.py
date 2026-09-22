@@ -378,10 +378,13 @@ def _resolve_numeric_ra(hdr: fits.Header, ra_raw: Any) -> float | None:
     if ra is None or not (0.0 <= ra < 24.0):
         return ra
 
+    # Read the comment of the card the value actually came from — the same
+    # "present and non-empty" test `_get()` applied. A blank `RA = ''`
+    # placeholder must not shadow `OBJCTRA`'s own "[hours]" comment.
     comment = ""
     for key in ("RA", "OBJCTRA"):
         try:
-            if key in hdr:
+            if _get(hdr, key) is not None:
                 comment = str(hdr.comments[key]).lower()
                 break
         except Exception:
@@ -571,7 +574,9 @@ def resolve_pixel_scale_arcsec(hdr: fits.Header) -> float | None:
                 return from_um
             continue
         if unit == "arcsec":
-            return value if _PLATE_SCALE_MIN_ARCSEC <= value <= _PLATE_SCALE_MAX_ARCSEC else None
+            if _PLATE_SCALE_MIN_ARCSEC <= value <= _PLATE_SCALE_MAX_ARCSEC:
+                return value
+            continue
 
         if not (_PLATE_SCALE_MIN_ARCSEC <= value <= _PLATE_SCALE_MAX_ARCSEC):
             continue

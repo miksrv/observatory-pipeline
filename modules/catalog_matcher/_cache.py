@@ -98,10 +98,19 @@ _cache: dict[str, dict[str, Any]] = {}
 _CACHE_TTL = datetime.timedelta(hours=config.CACHE_TTL_HOURS)
 
 
+# Bumped whenever what a key MEANS changes, so an on-disk entry written under
+# the old meaning is never read back as a hit. v2: the tile-centred query with
+# a tile-diagonal margin (audit 2026-08-18, finding M5) — a pre-M5 file under
+# a key that happens to coincide holds a circle drawn around some other
+# frame's own centre with no margin, exactly the edge loss M5 fixes, and Gaia
+# entries from then also lack the bp_rp/ruwe/flag columns H5/H6 read.
+_CACHE_FORMAT_VERSION = "v2"
+
+
 def _cache_file_path(key: str) -> str:
     """Filesystem-safe path under CATALOG_CACHE_DIR for a given cache key."""
     safe_key = key.replace("/", "_").replace(":", "_")
-    return os.path.join(config.CATALOG_CACHE_DIR, f"{safe_key}.json")
+    return os.path.join(config.CATALOG_CACHE_DIR, f"{_CACHE_FORMAT_VERSION}_{safe_key}.json")
 
 
 def _cache_get(key: str) -> Any | None:

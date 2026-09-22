@@ -1413,6 +1413,42 @@ class TestStreakMasking:
         # Not a star: it must never reach the photometric reference set.
         assert not any(s["flux"] == pytest.approx(123_456.0) for s in result["sources"])
 
+    async def test_extraction_uses_the_background_re_measured_without_the_streak(self):
+        """
+        Audit 2026-08-18, finding H12: once the trail is masked, the RMS the
+        real extraction thresholds on must be the one measured with the trail
+        EXCLUDED, not the first pass's trail-inflated figure.
+        """
+        streak_col = 10
+        seen_err: list[float] = []
+        unmasked = _FakeBackground(globalrms=20.0)
+        masked = _FakeBackground(globalrms=7.0)
+
+        def _sep_background(data, mask=None):
+            return unmasked if mask is None else masked
+
+        def _sep_extract(data, *args, **kwargs):
+            arr = np.asarray(data)
+            if kwargs.get("segmentation_map"):
+                coarse = _make_coarse_object(
+                    a=95.0, xmin=streak_col, xmax=streak_col, ymin=10, ymax=200,
+                    x=float(streak_col), y=105.0, flux=123_456.0,
+                )
+                seg = np.zeros(arr.shape, dtype=np.int32)
+                seg[10:200, streak_col] = 1
+                return coarse, seg
+            seen_err.append(kwargs.get("err"))
+            return _make_sources(n=5)
+
+        with _patch_astrometry(sources=_make_sources(n=5)):
+            with (
+                patch("modules.astrometry.sep.extract", side_effect=_sep_extract),
+                patch("modules.astrometry.sep.Background", side_effect=_sep_background),
+            ):
+                await astrometry.solve(_FITS_PATH)
+
+        assert seen_err == [pytest.approx(7.0)]
+
     async def test_a_streak_bypasses_the_sources_all_elongation_ceiling(self):
         """
         SOURCES_ALL_ELONGATION_MAX exists to reject the degenerate a/b of a

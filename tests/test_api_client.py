@@ -714,7 +714,11 @@ class TestApplyRemoteSettings:
             config.CHART_ENABLED = original
 
     @pytest.mark.parametrize(
-        "name", ["CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED", "FORCED_PHOTOMETRY_ENABLED"]
+        "name",
+        [
+            "CHART_ENABLED", "CHART_GIF_ENABLED", "NORMALIZE_ENABLED",
+            "FORCED_PHOTOMETRY_ENABLED", "PHOTOMETRY_COLOR_TERM_ENABLED",
+        ],
     )
     def test_applies_every_bool_setting(self, name):
         # Regression test: every key documented in _OVERRIDABLE as "special:
@@ -730,6 +734,25 @@ class TestApplyRemoteSettings:
             assert getattr(config, name) is False
         finally:
             setattr(config, name, original)
+
+    def test_no_setting_is_cast_with_bare_bool(self):
+        # bool("false") is True — a boolean setting must go through
+        # _BOOL_KEYS, never be registered with the plain `bool` type
+        # (PHOTOMETRY_COLOR_TERM_ENABLED was, and could not be disabled).
+        import config
+        assert [k for k, t in config._OVERRIDABLE.items() if t is bool] == []
+        special = {k for k, t in config._OVERRIDABLE.items() if t is None}
+        assert config._BOOL_KEYS <= special
+
+    @pytest.mark.parametrize("raw, expected", [("1.8", 1.8), ("", None), ("  ", None)])
+    def test_applies_photometry_gain(self, raw, expected):
+        import config
+        original = config.PHOTOMETRY_GAIN_E_PER_ADU
+        try:
+            assert config.apply_remote_settings({"PHOTOMETRY_GAIN_E_PER_ADU": raw}) == 1
+            assert config.PHOTOMETRY_GAIN_E_PER_ADU == expected
+        finally:
+            config.PHOTOMETRY_GAIN_E_PER_ADU = original
 
     def test_applies_log_level(self):
         import config

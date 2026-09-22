@@ -77,6 +77,35 @@ def mock_stages(monkeypatch, tmp_path):
 
 
 class TestRender:
+    async def test_pixel_fwhm_travels_and_a_pixel_median_is_not_passed_as_arcsec(self, mock_stages, fits_file):
+        """
+        Audit 2026-08-18, finding M16: the pixel measurement is what solve()
+        converts with its own solved scale. A median qc.analyze() reported in
+        pixels (no header plate scale) must never be forwarded as arcsec.
+        """
+        mock_stages["qc"].return_value = {
+            "quality_flag": "OK", "fwhm_median": 3.0, "fwhm_unit": "pixels",
+            "fwhm_median_px": 3.0, "elongation_median": 1.1, "star_count": 10,
+        }
+
+        await catalog_preview.render(fits_file)
+
+        kwargs = mock_stages["astro"].call_args.kwargs
+        assert kwargs["psf_fwhm_px"] == pytest.approx(3.0)
+        assert kwargs["psf_fwhm_arcsec"] is None
+
+    async def test_an_arcsec_median_is_forwarded_as_the_fallback_anchor(self, mock_stages, fits_file):
+        mock_stages["qc"].return_value = {
+            "quality_flag": "OK", "fwhm_median": 4.2, "fwhm_unit": "arcsec",
+            "fwhm_median_px": 3.0, "elongation_median": 1.1, "star_count": 10,
+        }
+
+        await catalog_preview.render(fits_file)
+
+        kwargs = mock_stages["astro"].call_args.kwargs
+        assert kwargs["psf_fwhm_arcsec"] == pytest.approx(4.2)
+        assert kwargs["psf_fwhm_px"] == pytest.approx(3.0)
+
     async def test_returns_summary_and_png_bytes(self, mock_stages, fits_file):
         result = await catalog_preview.render(fits_file)
 

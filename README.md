@@ -46,7 +46,7 @@ fits_header.extract_headers()   ← parse metadata
      │
      ▼
 qc.analyze()                    ← check quality
-     ├─ BAD → /fits/rejected/{object}/   STOP
+     ├─ not OK → register frame (QC metrics, no sources) → archive   STOP
      └─ OK ──────────────────────────────┐
                                          ▼
                               astrometry.solve()    ← plate solve + source list
@@ -206,12 +206,17 @@ Quality flags:
 | Flag | Condition | Action |
 |---|---|---|
 | `OK` | All metrics pass | Continue processing |
-| `BLUR` | FWHM > threshold | Move to `/fits/rejected/{object}/BLUR_*.fits` |
-| `TRAIL` | Elongation > threshold | Move to `/fits/rejected/{object}/TRAIL_*.fits` |
-| `LOW_STARS` | Star count < minimum | Move to `/fits/rejected/{object}/LOW_STARS_*.fits` |
-| `BAD` | Multiple issues | Move to `/fits/rejected/{object}/BAD_*.fits` |
+| `BLUR` | FWHM > threshold | Register + archive, no source analysis |
+| `TRAIL` | Elongation > threshold | Register + archive, no source analysis |
+| `HIGH_BACKGROUND` | Sky background > threshold | Register + archive, no source analysis |
+| `LOW_STARS` | Star count < minimum | Register + archive, no source analysis |
+| `BAD` | Multiple issues, or too few stars under a bright sky | Register + archive, no source analysis |
 
-Bad frames are never sent to the API — this keeps the remote database clean.
+A QC-failed frame is registered with the API (with its QC metrics and flag, and an empty source
+list) and archived like any other, so an operator can see why it was rejected and a later
+re-analysis can find it again. Astrometry, photometry, catalog matching and anomaly detection
+are skipped for it, and image subtraction never uses it as a reference. `/fits/rejected/` is only
+used by direct callers of `qc.analyze()` with `move_on_reject=True`.
 
 ### `modules/astrometry/`
 A package split one file per step of `solve()` (`_astap.py`, `_wcs.py`, `_frame_geometry.py`, `_extraction.py`, `_streak.py` — see CLAUDE.md for the exact map), with `solve()` itself living in `__init__.py` as the orchestrator, so it's still imported and called the same way everywhere else in this codebase. Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.

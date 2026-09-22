@@ -399,6 +399,14 @@ class TestPlateScaleResolution:
     def test_nothing_usable_returns_none(self):
         assert fits_header.resolve_pixel_scale_arcsec(self._hdr({"FOCALLEN": 1000.0})) is None
 
+    def test_an_implausible_labelled_value_falls_through_to_the_next_keyword(self):
+        """An arcsec-labelled garbage PIXSCALE must not hide a usable PIXSCALE1."""
+        header = fits.Header()
+        header["PIXSCALE"] = (500.0, "plate scale [arcsec/pixel]")
+        header["PIXSCALE1"] = 1.23
+
+        assert fits_header.resolve_pixel_scale_arcsec(header) == pytest.approx(1.23)
+
     def test_qc_and_fits_header_agree(self):
         """
         The finding itself: two modules, one frame, two different answers.
@@ -498,6 +506,23 @@ class TestNumericRaUnits:
         data = np.zeros((10, 10), dtype=np.float32)
         hdu = fits.PrimaryHDU(data=data)
         hdu.header["RA"] = (13.498, "RA of target [hours]")
+        tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
+        hdu.writeto(tmp.name, overwrite=True)
+        tmp.close()
+        try:
+            assert extract_headers(tmp.name)["ra"] == pytest.approx(202.47, abs=0.01)
+        finally:
+            _cleanup(tmp.name)
+
+    def test_a_blank_ra_card_does_not_shadow_objctra_comment(self):
+        """
+        The value comes from OBJCTRA when RA is blank; its unit comment has
+        to come from the same card, not from the empty RA placeholder.
+        """
+        data = np.zeros((10, 10), dtype=np.float32)
+        hdu = fits.PrimaryHDU(data=data)
+        hdu.header["RA"] = ("", "unset")
+        hdu.header["OBJCTRA"] = (13.498, "RA of target [hours]")
         tmp = tempfile.NamedTemporaryFile(suffix=".fits", delete=False)
         hdu.writeto(tmp.name, overwrite=True)
         tmp.close()
