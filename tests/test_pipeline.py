@@ -2832,3 +2832,82 @@ async def test_cfa_conversion_runs_before_header_extraction(mock_modules, monkey
 
     assert order[0] == ("convert", str(mock_modules))
     assert order[1][0] == "headers"
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — files that are not a single exposure
+# ---------------------------------------------------------------------------
+
+def _write_frame(path, data: np.ndarray, **cards) -> None:
+    hdu = fits.PrimaryHDU(data=data)
+    hdu.header["OBJECT"] = "NGC 7331"
+    for key, value in cards.items():
+        hdu.header[key] = value
+    hdu.writeto(path)
+
+
+@pytest.fixture
+def rejected_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "FITS_REJECTED", str(tmp_path / "rejected"))
+    monkeypatch.setattr(config, "NORMALIZE_ENABLED", True)
+    return tmp_path / "rejected"
+
+
+def test_colour_cube_is_moved_to_rejected(rejected_dir, tmp_path):
+    frame = tmp_path / "cube.fit"
+    _write_frame(frame, np.zeros((3, 20, 30), dtype=np.uint16), BAYERPAT="RGGB")
+
+    assert pipeline._reject_unsupported_frame(str(frame), {}) is True
+
+    assert not frame.exists()
+    assert (rejected_dir / "NGC7331" / "UNSUPPORTED_cube.fit").exists()
+
+
+@pytest.mark.parametrize("key", ["STACKCNT", "NCOMBINE"])
+def test_stack_is_moved_to_rejected(rejected_dir, tmp_path, key):
+    frame = tmp_path / "stack.fit"
+    _write_frame(frame, np.zeros((20, 30), dtype=np.uint16), **{key: 48})
+
+    assert pipeline._reject_unsupported_frame(str(frame), {}) is True
+    assert (rejected_dir / "NGC7331" / "UNSUPPORTED_stack.fit").exists()
+
+
+@pytest.mark.parametrize("cards", [{}, {"STACKCNT": 1}, {"NCOMBINE": 1}, {"BAYERPAT": "RGGB"}])
+def test_single_exposure_is_accepted(rejected_dir, tmp_path, cards):
+    frame = tmp_path / "single.fit"
+    _write_frame(frame, np.zeros((20, 30), dtype=np.uint16), **cards)
+
+    assert pipeline._reject_unsupported_frame(str(frame), {}) is False
+    assert frame.exists()
+    assert not rejected_dir.exists()
+
+
+def test_unsupported_rejection_never_overwrites(rejected_dir, tmp_path):
+    earlier = rejected_dir / "NGC7331" / "UNSUPPORTED_stack.fit"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_bytes(b"earlier")
+    frame = tmp_path / "stack.fit"
+    _write_frame(frame, np.zeros((20, 30), dtype=np.uint16), STACKCNT=31)
+
+    pipeline._reject_unsupported_frame(str(frame), {})
+
+    assert earlier.read_bytes() == b"earlier"
+    assert (rejected_dir / "NGC7331" / "UNSUPPORTED_stack_1.fit").exists()
+
+
+def test_unreadable_file_is_not_rejected_here(rejected_dir, fits_file):
+    assert pipeline._reject_unsupported_frame(str(fits_file), {}) is False
+    assert fits_file.exists()
+
+
+async def test_unsupported_frame_stops_before_any_analysis(mock_modules, monkeypatch):
+    monkeypatch.setattr(pipeline, "_reject_unsupported_frame", lambda p, extra: True)
+    convert = Mock()
+    monkeypatch.setattr(pipeline, "_convert_cfa_frame", convert)
+
+    result = await pipeline.analyze_frame(str(mock_modules))
+
+    assert result is None
+    convert.assert_not_called()
+    pipeline.qc.analyze.assert_not_called()
+    pipeline.api_client.post_frame.assert_not_called()

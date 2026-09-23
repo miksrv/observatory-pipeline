@@ -255,8 +255,9 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     returning.
 
     Steps:
-        0. Reduce a Bayer-mosaic (one-shot-colour) frame to mono, keeping
-           the colour original in FITS_RAW_ARCHIVE
+        0. Refuse colour cubes and stacks; reduce a Bayer-mosaic
+           (one-shot-colour) frame to mono, keeping the colour original in
+           FITS_RAW_ARCHIVE
         1. Extract FITS headers
         2. Quality control — a rejection skips steps 3-5.6 (nothing to
            detect sources against) but no longer stops the frame from being
@@ -286,7 +287,9 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     Returns
     -------
     dict | None
-        `None` if processing stopped early — a Dark/Flat/Bias calibration
+        `None` if processing stopped early — a file that is not a single
+        exposure (a colour cube or a capture-software stack, moved to
+        FITS_REJECTED unanalysed), a Dark/Flat/Bias calibration
         frame (archived with no analysis), no `api_client` configured, or
         `POST /frames` itself failing. A QC rejection is **not** one of
         these cases anymore: the frame is still registered (with its QC
@@ -320,8 +323,11 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     extra = {"fits_filename": basename}
 
     # ------------------------------------------------------------------
-    # Step 0 — One-shot-colour frames become mono before anything reads them
+    # Step 0 — Refuse what isn't a single exposure; one-shot-colour frames
+    # become mono before anything reads them
     # ------------------------------------------------------------------
+    if _reject_unsupported_frame(fits_path, extra):
+        return None
     _convert_cfa_frame(fits_path, extra)
 
     # ------------------------------------------------------------------
@@ -1628,6 +1634,63 @@ def _resolve_bare_filename(fits_path: str) -> str:
     return fits_path
 
 
+def _object_dir_name(fits_path: str) -> str:
+    """The per-object directory name Step 1 will file this frame under."""
+    frame_header = fits_header.extract_headers(fits_path)
+    if config.NORMALIZE_ENABLED and normalizer is not None:
+        frame_header = normalizer.normalize_headers(frame_header)
+    return frame_header.get("object_name") or "_UNKNOWN"
+
+
+def _reject_unsupported_frame(fits_path: str, extra: dict) -> bool:
+    """
+    Move a file that is not a single 2-D exposure to
+    `FITS_REJECTED/{object}/UNSUPPORTED_{filename}` and return True.
+
+    Two kinds reach FITS_INCOMING in practice, both from capture software
+    that stacks on the fly (ZWO ASIAIR's live stacking, first seen with the
+    NGC 7331 set): a debayered colour cube (`NAXIS = 3`), which no module
+    here can read as an image, and a stack of N exposures (`STACKCNT` or
+    `NCOMBINE` above 1), which would otherwise be registered as one more
+    epoch — with N× the depth, an obs_time that is no single moment, and a
+    place in the reference archive and the light curves it has no business
+    in. Neither is registered or archived.
+
+    Moved rather than left in place, because `watcher.py`'s startup scan
+    would otherwise re-submit it on every restart. An unreadable file
+    returns False and fails later in the ordinary way.
+    """
+    from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+    try:
+        header = astropy_fits.getheader(fits_path)
+    except Exception:
+        return False
+
+    reasons = []
+    if header.get("NAXIS", 2) != 2:
+        reasons.append(f"NAXIS={header.get('NAXIS')}")
+    for key in ("STACKCNT", "NCOMBINE"):
+        count = header.get(key)
+        if isinstance(count, (int, float)) and not isinstance(count, bool) and count > 1:
+            reasons.append(f"{key}={count}")
+    if not reasons:
+        return False
+
+    dest_dir = os.path.join(config.FITS_REJECTED, _object_dir_name(fits_path))
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = qc._unique_destination(
+        os.path.join(dest_dir, f"UNSUPPORTED_{os.path.basename(fits_path)}")
+    )
+    shutil.move(fits_path, dest_path)
+    _cleanup_empty_incoming_parents(fits_path)
+    logger.warning(
+        "Not a single exposure (%s) — not analysed; moved to %s",
+        ", ".join(reasons), dest_path, extra=extra,
+    )
+    return True
+
+
 def _convert_cfa_frame(fits_path: str, extra: dict) -> None:
     """
     Replace a Bayer-mosaic frame with its mono 2×2-superpixel version
@@ -1665,12 +1728,7 @@ def _convert_cfa_frame(fits_path: str, extra: dict) -> None:
     if not cfa.is_cfa(header):
         return
 
-    frame_header = fits_header.extract_headers(fits_path)
-    if config.NORMALIZE_ENABLED and normalizer is not None:
-        frame_header = normalizer.normalize_headers(frame_header)
-    object_name = frame_header.get("object_name") or "_UNKNOWN"
-
-    raw_dir = os.path.join(config.FITS_RAW_ARCHIVE, object_name)
+    raw_dir = os.path.join(config.FITS_RAW_ARCHIVE, _object_dir_name(fits_path))
     basename = os.path.basename(fits_path)
 
     with tempfile.TemporaryDirectory() as tmp_dir:

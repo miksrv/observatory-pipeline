@@ -98,7 +98,7 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
 - Note: an OSC camera shooting through a dual-band filter (`LeNhance` etc.) keeps that
   filter's name and stays narrowband — `FILTER` wins over the `OSC` default.
 
-### T4 — refuse inputs the pipeline cannot analyse
+### T4 — refuse inputs the pipeline cannot analyse **[done]**
 - Before QC: a frame with `NAXIS != 2` (colour cubes) or `STACKCNT > 1` (capture-software
   stacks) is not an epoch. Move it to `FITS_REJECTED/{object}/UNSUPPORTED_{filename}` with a
   WARNING and stop — not registered, not archived. Leaving it in `incoming` would re-enqueue
