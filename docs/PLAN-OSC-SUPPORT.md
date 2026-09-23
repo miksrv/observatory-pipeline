@@ -132,7 +132,7 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
   per-frame `psf / 1.5` bound did, and it is unchanged.
 - Leave `QC_FWHM_MAX_ARCSEC` in arcsec: seeing *is* an angle, so that one is correct as is.
 
-### T6 — tests
+### T6 — tests **[done]**
 - `tests/test_cfa.py`: synthetic RGGB frame with distinct channel pedestals → flat
   superpixel background; a star's flux conserved (×¼ per mean); a block with one saturated
   sub-pixel stays ≥ `SATURATION_ADU`; odd dimensions; header keys (`XPIXSZ`, `EGAIN`,
@@ -143,6 +143,9 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
   input untouched.
 - QC/extraction: pixel floor behaves identically at two different plate scales.
 - Full suite under `.env` and `.env.test`.
+- Outcome: each task's tests landed with that task (T1–T5); T6 added the end-to-end check —
+  a real Bayer frame through `analyze_frame()` is QC'd as mono, archived as mono, and its
+  colour original sits byte-identical in `FITS_RAW_ARCHIVE`. 1114 passed under both env files.
 
 ### T7 — documentation
 - `CLAUDE.md`: new step 0 in the `pipeline.py` list; `modules/cfa.py` section (design

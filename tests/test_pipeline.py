@@ -2911,3 +2911,34 @@ async def test_unsupported_frame_stops_before_any_analysis(mock_modules, monkeyp
     convert.assert_not_called()
     pipeline.qc.analyze.assert_not_called()
     pipeline.api_client.post_frame.assert_not_called()
+
+
+async def test_cfa_frame_end_to_end_archives_mono_and_keeps_raw(mock_modules, raw_archive, tmp_path, monkeypatch):
+    """
+    A real Bayer frame through analyze_frame(): the archived frame is the
+    mono superpixel version, the colour original sits byte-identical in
+    FITS_RAW_ARCHIVE, and QC ran on the mono file.
+    """
+    frame = tmp_path / "incoming_osc.fit"
+    _write_cfa_frame(frame)
+    original_sha = _sha(frame)
+    seen = {}
+
+    async def fake_qc(path, move_on_reject=True):
+        with fits.open(path) as hdul:
+            seen["qc_shape"] = hdul[0].data.shape
+        return _GOOD_QC
+
+    monkeypatch.setattr("pipeline.qc.analyze", AsyncMock(side_effect=fake_qc))
+
+    await pipeline.analyze_frame(str(frame))
+
+    assert seen["qc_shape"] == (20, 30)
+    # extract_headers is mocked to report M51 — both archives follow it.
+    raw_copy = raw_archive / "M51" / frame.name
+    assert _sha(raw_copy) == original_sha
+    archived = tmp_path / "archive" / "M51" / _NORMALIZED_FILENAME
+    with fits.open(archived) as hdul:
+        assert hdul[0].header["CFACONV"] is True
+        assert hdul[0].data.shape == (20, 30)
+    assert not frame.exists()
