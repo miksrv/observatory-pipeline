@@ -444,7 +444,7 @@ Separate process (own `docker-compose.yml` service) that polls observatory-api's
 |---|---|---|
 | `ANALYZE` | `pipeline.analyze_frame(item["filename"])` | `filename` — the FULL path to the FITS file, not just a basename |
 | `DETECT_ANOMALIES` | `pipeline.detect_anomalies_for_frame_id(item["frame_id"])` | `frame_id` |
-| `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, batched across the WHOLE task | `source_id` (required) + optionally `anomaly_id` + `payload` (`{"anomaly_type", "designation"}`) |
+| `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, one call per `source_id`, progress reported after each | `source_id` (required) + optionally `anomaly_id` + `payload` (`{"anomaly_type", "designation"}`) |
 | `PREVIEW_CATALOG_MATCH` | `pipeline.preview_catalog_match(item["filename"], task_id, item["id"])` | `filename` — same "full path, not a basename" convention as `ANALYZE` |
 | `RESTART` | Clean process exit → Docker restarts container → re-fetches remote settings | (none — signal task, no items) |
 
@@ -465,12 +465,14 @@ A single task can carry **more than one item for the same `source_id`**, each wi
 `anomaly_type` — observatory-api's `Web\AnomaliesController::createTask()` submits one item per
 distinct `anomaly_type` within a selected group, rather than collapsing a source's whole anomaly
 history down to one arbitrary type (see that controller's own docstring). `worker.py`'s
-`_run_charts_task()` collects all of a source_id's items into one list before the batched
+`_run_charts_task()` collects all of a source_id's items into one list for that source's
 `generate_charts_for_source_ids()` call, and looks up each item's own outcome afterwards by
 `(source_id, anomaly_type)` — not by `source_id` alone — since `modules/finder_chart.py` renders
 one chart per distinct *style* those types imply (see that module's section below), and two items
 of the same source_id can resolve to two different styles that must both succeed or fail
-independently.
+independently. Sources are rendered one at a time and each one's items are reported the moment
+it finishes: the whole task used to be one batched call with a single progress report at the
+end, so a 96-item task showed "0/96" in the UI until it was entirely done (2026-09-23).
 
 A bare basename with no directory component at all (no full path) is not rejected outright: both
 `analyze_frame()` and `preview_catalog_match()` run it through `pipeline._resolve_bare_filename()`

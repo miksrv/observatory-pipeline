@@ -203,12 +203,19 @@ class TestRunDetectTask:
 
 
 class TestRunChartsTask:
-    async def test_batches_all_items_into_one_call(self, monkeypatch):
-        generate_mock = AsyncMock(return_value={
-            "src-a": {"UNKNOWN": True}, "src-b": {"ASTEROID": False},
-        })
+    async def test_reports_progress_after_each_source(self, monkeypatch):
+        """
+        One call and one progress report per source_id, in order — a single
+        batched call reported nothing until the whole task finished, so the
+        UI showed 0/96 while charts were being uploaded (2026-09-23).
+        """
+        generate_mock = AsyncMock(side_effect=[
+            {"src-a": {"UNKNOWN": True}},
+            {"src-b": {"ASTEROID": False}},
+        ])
+        progress_mock = AsyncMock()
         monkeypatch.setattr(worker.pipeline, "generate_charts_for_source_ids", generate_mock)
-        monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock())
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", progress_mock)
 
         items = [
             {"id": "item-1", "source_id": "src-a", "payload": {"anomaly_type": "UNKNOWN", "designation": None}},
@@ -217,15 +224,28 @@ class TestRunChartsTask:
 
         await worker._run_charts_task({"id": "chart-task-1"}, items)
 
-        # One call covering both source_ids at once — not one call per item.
-        generate_mock.assert_called_once()
-        anomaly_types_by_source_id, designation_by_source_id = generate_mock.call_args.args
-        assert anomaly_types_by_source_id == {"src-a": ["UNKNOWN"], "src-b": ["ASTEROID"]}
-        assert designation_by_source_id == {"src-b": "Vesta"}
+        assert [c.args for c in generate_mock.call_args_list] == [
+            ({"src-a": ["UNKNOWN"]}, {}),
+            ({"src-b": ["ASTEROID"]}, {"src-b": "Vesta"}),
+        ]
+        reports = [c.args[1] for c in progress_mock.call_args_list]
+        assert [[(p["item_id"], p["status"]) for p in r] for r in reports] == [
+            [("item-1", "DONE")],
+            [("item-2", "FAILED")],
+        ]
 
-        progress = worker.api_client.post_task_items_progress.call_args.args[1]
-        by_id = {p["item_id"]: p["status"] for p in progress}
-        assert by_id == {"item-1": "DONE", "item-2": "FAILED"}
+    async def test_a_failing_source_does_not_stop_the_rest(self, monkeypatch):
+        generate_mock = AsyncMock(side_effect=[RuntimeError("render failed"), {"src-b": {None: True}}])
+        progress_mock = AsyncMock()
+        monkeypatch.setattr(worker.pipeline, "generate_charts_for_source_ids", generate_mock)
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", progress_mock)
+
+        items = [{"id": "item-1", "source_id": "src-a"}, {"id": "item-2", "source_id": "src-b"}]
+
+        await worker._run_charts_task({"id": "chart-task-1"}, items)
+
+        statuses = {p["item_id"]: p["status"] for c in progress_mock.call_args_list for p in c.args[1]}
+        assert statuses == {"item-1": "FAILED", "item-2": "DONE"}
 
     async def test_two_items_same_source_different_type_both_reported_from_nested_result(self, monkeypatch):
         """Regression for the 2026-08-11 UI report: a task with two items for

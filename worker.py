@@ -180,8 +180,14 @@ async def _run_detect_task(task: dict, items: list[dict]) -> None:
 
 async def _run_charts_task(task: dict, items: list[dict]) -> None:
     """
-    Process one GENERATE_CHARTS task — a single batched call covering every
-    item's source_id at once, regardless of how many items the task has.
+    Process one GENERATE_CHARTS task, one source_id at a time, reporting each
+    source's items as soon as its charts are done.
+
+    It used to render every source in one batched call and report progress
+    once at the very end, so a 96-item task sat at "0/96" in the UI for as
+    long as the whole task took while charts were visibly being uploaded
+    (2026-09-23). Rendering dominates the cost; one extra small
+    POST /sources/tracks/batch per source is what the live progress costs.
 
     `payload.anomaly_type` is optional, not required: an item created from
     an anomaly (observatory-api's AnomaliesController::createTask) carries
@@ -196,63 +202,59 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
     no anomaly_type in the chart title.
 
     A task can carry MORE THAN ONE item for the same source_id, each with a
-    different anomaly_type — observatory-api's AnomaliesController now
-    submits one item per distinct anomaly_type within a source's group
-    rather than collapsing them to one (see that controller's createTask()
-    docstring), since a source classified more than one way over its
-    lifetime (e.g. UNKNOWN then MOVING_UNKNOWN once it moved) needs both
-    its "track" and "stamp_strip" charts, not just whichever type was
-    arbitrarily picked. All of a source_id's items are therefore collected
-    into one list before the batched call, and each item's own outcome is
-    looked up by (source_id, anomaly_type) afterwards, not by source_id
-    alone — see modules/finder_chart.py's update_charts_for_sources() for
-    why the result dict is nested that way.
+    different anomaly_type — observatory-api's AnomaliesController submits
+    one item per distinct anomaly_type within a source's group rather than
+    collapsing them to one (see that controller's createTask() docstring),
+    since a source classified more than one way over its lifetime (e.g.
+    UNKNOWN then MOVING_UNKNOWN once it moved) needs both its "track" and
+    "stamp_strip" charts. All of a source_id's items therefore go into the
+    same call, and each item's own outcome is looked up by
+    (source_id, anomaly_type) afterwards, not by source_id alone — see
+    modules/finder_chart.py's update_charts_for_sources() for why the result
+    dict is nested that way.
     """
-    anomaly_types_by_source_id: dict = {}
-    designation_by_source_id: dict = {}
-    valid_items: list[dict] = []
-
-    progress = []
+    items_by_source_id: dict[str, list[dict]] = {}
+    malformed = []
     for item in items:
         source_id = item.get("source_id")
-        payload = item.get("payload") or {}
-        anomaly_type = payload.get("anomaly_type")
-
         if not source_id:
-            progress.append({
+            malformed.append({
                 "item_id": item["id"], "status": "FAILED",
                 "error": "Item missing source_id",
             })
             continue
+        items_by_source_id.setdefault(source_id, []).append(item)
 
-        anomaly_types_by_source_id.setdefault(source_id, []).append(anomaly_type)
-        if payload.get("designation"):
-            designation_by_source_id[source_id] = payload["designation"]
-        valid_items.append(item)
+    if malformed:
+        await api_client.post_task_items_progress(task["id"], malformed)
 
-    results: dict = {}
-    if anomaly_types_by_source_id:
+    for source_id, source_items in items_by_source_id.items():
+        payloads = [item.get("payload") or {} for item in source_items]
+        designations = [p["designation"] for p in payloads if p.get("designation")]
+
+        progress = []
         try:
             results = await pipeline.generate_charts_for_source_ids(
-                anomaly_types_by_source_id, designation_by_source_id,
+                {source_id: [p.get("anomaly_type") for p in payloads]},
+                {source_id: designations[-1]} if designations else {},
             )
         except Exception as exc:
-            logger.exception("GENERATE_CHARTS task_id=%s failed", task["id"])
-            for item in valid_items:
-                progress.append({"item_id": item["id"], "status": "FAILED", "error": str(exc)})
-            valid_items = []  # already recorded above — don't record twice below
+            logger.exception("GENERATE_CHARTS task_id=%s failed for source_id=%s", task["id"], source_id)
+            progress = [
+                {"item_id": item["id"], "status": "FAILED", "error": str(exc)}
+                for item in source_items
+            ]
+        else:
+            source_results = results.get(source_id) or {}
+            for item, payload in zip(source_items, payloads):
+                ok = source_results.get(payload.get("anomaly_type"))
+                progress.append({
+                    "item_id": item["id"],
+                    "status": "DONE" if ok else "FAILED",
+                    **({} if ok else {"error": "Chart update failed or was skipped"}),
+                })
 
-    for item in valid_items:
-        payload = item.get("payload") or {}
-        source_results = results.get(item.get("source_id")) or {}
-        ok = source_results.get(payload.get("anomaly_type"))
-        progress.append({
-            "item_id": item["id"],
-            "status": "DONE" if ok else "FAILED",
-            **({} if ok else {"error": "Chart update failed or was skipped"}),
-        })
-
-    await api_client.post_task_items_progress(task["id"], progress)
+        await api_client.post_task_items_progress(task["id"], progress)
 
 
 async def _run_preview_task(task: dict, items: list[dict]) -> None:
