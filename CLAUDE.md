@@ -64,6 +64,7 @@ An automated Python service that runs on a **dedicated observatory server** and:
 │  /data/fits/incoming     │            │  │  MariaDB           │  │
 │  /data/fits/archive      │            │  └────────────────────┘  │
 │  /data/fits/rejected     │            │                           │
+│  /data/fits/raw          │            │                           │
 │  /data/astap/catalogs    │            │  Also consumed by:        │
 └─────────────────────────┘            │  - Observatory website    │
                                         └──────────────────────────┘
@@ -240,6 +241,16 @@ No hardcoded paths, thresholds, or credentials anywhere else.
 
 ### `pipeline.py`
 Orchestrates processing of a single FITS file in order:
+0. **Refuse what isn't a single exposure; reduce a colour mosaic to mono.**
+   `_reject_unsupported_frame()` moves a file with `NAXIS != 2` (a debayered colour cube) or
+   `STACKCNT`/`NCOMBINE` above 1 (a capture-software stack — ZWO ASIAIR's live stacks landed in
+   `FITS_INCOMING` beside the raw frames on the NGC 7331 set) to
+   `FITS_REJECTED/{object}/UNSUPPORTED_{filename}` and **STOPs**: not registered, not archived.
+   Moved rather than left, since `watcher.py`'s startup scan would otherwise re-submit it on every
+   restart. Then `_convert_cfa_frame()`: a Bayer-mosaic frame (`cfa.is_cfa()`) is replaced in place
+   by its mono 2×2-superpixel version, after its untouched original has been **copied** to
+   `FITS_RAW_ARCHIVE/{object}/` — see `modules/cfa.py` below. Everything from step 1 on, and every
+   later read of the archived frame, sees only the mono frame.
 1. `fits_header.extract_headers(fits_path)` → returns all FITS metadata
 2. `normalizer.normalize_headers()` → normalize object name, filter, frame type (if enabled)
 3. **Check frame type** (`IMAGETYP` header):
@@ -532,6 +543,50 @@ result (`{"matched", "total", "quality_flag", "chart_uploaded"}`) is written ont
 that endpoint's `payload` field is genuinely bidirectional: `GENERATE_CHARTS` reads it as input at
 task-creation time, this task type writes it as a result at completion time.
 
+### `modules/cfa.py`
+
+One-shot-colour (Bayer/CFA) support: `is_cfa(header)` and `to_superpixel(src, dest)`. Nothing else
+in the pipeline understands a colour mosaic — the three channels sit on sky pedestals ~1900 ADU
+apart (ZWO ASI585MC, NGC 7331), so the checkerboard reads as noise: `sep`'s background RMS was 835
+on the raw mosaic against 214 once converted, and every sampled frame failed QC as `LOW_STARS`.
+Subtraction would be worse still, since `astroalign`'s sub-pixel resampling mixes the channels.
+
+- **Why a 2×2 superpixel, not a debayer.** Any aligned 2×2 window of a 2-periodic pattern holds one
+  cell of each colour, so the result is independent of the Bayer phase (`XBAYROFF`/`YBAYROFF`
+  don't matter); it involves no interpolation, so it adds no correlated noise (compare subtraction's
+  noise-correlation factor, H13); and it gives a luminance-like band — the same situation as a mono
+  "L" frame. The cost is half the linear resolution (0.38″/px → 0.76″/px on the first dataset,
+  still adequate sampling).
+- **Mean, not sum**, so `SATURATION_ADU` keeps its meaning — except that a block holding a saturated
+  sub-pixel keeps its **maximum**: the mean of one clipped and three unclipped pixels falls below
+  the threshold and the clipped core would escape every saturation check downstream.
+- **Header:** pixel-size keywords (`XPIXSZ`, `PIXSIZE`, and the ambiguous `PIXSCALE` family, which
+  doubles correctly under either reading) ×2; `EGAIN` ×4 (one ADU of a 4-pixel mean is 4× the
+  electrons; `GAIN`, the vendor setting, untouched); `BAYERPAT` and friends, `BZERO`/`BSCALE` and the
+  capture software's native-grid WCS removed — astap re-solves every frame, while the mount's own
+  `RA`/`DEC`/`EQUINOX`/`RADESYS` stay, since they seed astap's narrow search and
+  `pointing_error_arcsec`. `CFACONV = T` marks the result (so conversion is idempotent) and
+  `CFAPAT` records the original pattern. A frame with no filter recorded gets `FILTER = 'OSC'`; a
+  recorded one (e.g. `L-eNhance` on a colour camera) wins.
+
+**Why convert at ingest, not in memory** (the design decision, `docs/PLAN-OSC-SUPPORT.md` T0).
+astap solves the file on disk. Converting in a shared loader would leave its WCS in the native grid
+while every in-memory module works in the superpixel grid — ~20 `fits.open()` sites plus the WCS
+written back at archive time, each needing a coordinate transform: the same "two descriptions of
+one frame" class of bug the 2026-08-18 audit spent several findings removing. Converting once, in
+`pipeline.py`'s step 0, means every module and every later archive read sees one consistent mono
+frame.
+
+**The colour original is the operator's.** `pipeline._convert_cfa_frame()` copies it byte for byte,
+under its own filename, to `FITS_RAW_ARCHIVE/{object}/` (numeric suffix on collision, never
+overwritten) — the source for artistic stacking in Siril/PixInsight/DSS, which the pipeline never
+renames or writes to again. The order makes every failure safe: convert into a temp file first, then
+copy and size-check the raw, and only then overwrite the original path. The mono content is written
+*over* the path rather than renamed onto it, keeping the inode, so neither inotify nor the polling
+observer reports a new file and `watcher.py` never enqueues the frame twice.
+`modules/catalog_preview.py` converts into a throwaway copy instead, since it must never touch its
+input.
+
 ### `modules/catalog_preview.py`
 
 Backs the `PREVIEW_CATALOG_MATCH` task type (single public entry point: `render(fits_path)`). Runs
@@ -575,8 +630,14 @@ Computes quality metrics from a FITS file without plate solving:
   median is therefore filtered on the *other* axis, never on the one it measures: `fwhm_median`
   over **round** sources (plus a relative pass dropping anything far broader than that subset's
   own compact population, which is what catches a round-*and*-extended blob), `elongation_median`
-  over **compact** ones. Both reject anything sharper than `STAR_FWHM_MIN_ARCSEC` (hot pixels — a
-  floor can only bias upward, so it can't hide blur). A subset of fewer than 3 sources falls back
+  over **compact** ones. Both reject anything sharper than `STAR_FWHM_MIN_PX` (hot pixels — a
+  floor can only bias upward, so it can't hide blur). That floor is in **pixels**, applied with or
+  without a plate scale: a hot pixel's footprint is set by the pixel grid, not the optics (a lit
+  pixel measures 0.68 px with this FWHM, a lit 2×2 block 1.18 px; default 1.2). As
+  `STAR_FWHM_MIN_ARCSEC=2.5` it sat above nearly every real star at 0.38″/px and failed a whole
+  dataset as `LOW_STARS` (2026-09-23, NGC 7331). `SEP_MIN_AREA` stays at 15 on purpose: at 7 the
+  detections doubled but the median FWHM pinned at 1.67 px — the width of a tiny thresholded
+  footprint, not the PSF. A subset of fewer than 3 sources falls back
   to the raw all-detections median, which is also what keeps both flags reachable on a frame so
   badly blurred or trailed that its own stars fall outside the opposite axis' bound.
 - **SNR** (signal-to-noise ratio of detected sources) — computed and reported as `snr_median`,
@@ -658,6 +719,7 @@ Normalizes FITS header values and filenames for consistency across different cap
 | Input | Normalized |
 |---|---|
 | `Luminance`, `Lum`, `L`, `Clear`, `clr` | `L` |
+| `OSC`, `CFA`, `RGB`, `Color`/`Colour`, `One-Shot Colour` | `OSC` (also written by `modules/cfa.py` on a converted frame with no filter recorded) |
 | `Red`, `RED`, `r` | `R` |
 | `Green`, `g` | `G` |
 | `Blue`, `BLUE`, `b` | `B` |
@@ -783,12 +845,12 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   `qc.analyze()`'s `fwhm_median`) when available: upper bound → `psf_fwhm_arcsec × 1.5` (rejects
   compact galaxies broader than the stellar PSF), lower bound → `psf_fwhm_arcsec / 1.5` (rejects
   hot/warm sensor pixel clusters and similar artifacts far sharper than any real star in this
-  frame — a static, site-agnostic `STAR_FWHM_MIN_ARCSEC` floor alone can sit comfortably below a
+  frame — the static `STAR_FWHM_MIN_PX` floor alone can sit comfortably below a
   hot pixel's measured FWHM even when that pixel is still far more compact than every genuine
   star here; real incident, 2026-08-06, Vesta test frames, `sources_all` fed hot pixels ~2.6–3.0″
   FWHM into anomaly detection as `UNKNOWN` alerts on a frame whose real stars measured ~4.5″).
-  Both bounds fall back to the static `STAR_FWHM_MIN_ARCSEC`/`STAR_FWHM_MAX_ARCSEC` config values
-  when no PSF estimate is available. This tightened lower bound applies to `sources_all` too, not
+  Both bounds fall back to the static `STAR_FWHM_MIN_PX` (× the solved scale)/`STAR_FWHM_MAX_ARCSEC`
+  config values when no PSF estimate is available. This tightened lower bound applies to `sources_all` too, not
   just the strict `sources` list, since both share the same underlying FWHM mask.
 - Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`
 - Returns a dict: `{ra_center, dec_center, fov_deg, position_angle_deg, naxis1, naxis2, sources, sources_all, wcs}`
@@ -1789,7 +1851,11 @@ the analysis its results can be trusted for:
 - **Broadband** — Johnson-Cousins `U`/`V`/`I` (`u'`/`g'`/`r'`/`i'`/`z'` are the SDSS analogs),
   and `L`/Luminance/Clear (panchromatic — the closest analog to Gaia's own broadband G-band).
   Used for star fields; astrometry, catalog matching, and Gaia zero-point calibration all work
-  normally.
+  normally. `OSC` — an unfiltered colour camera's frame after `modules/cfa.py` — is broadband too,
+  but a token of its own rather than `L`: its bandpass is the sensor's R+2G+B response, so
+  subtraction must not stack it with a mono camera's luminance frames, and a colour term
+  calibrated for one must not be applied to the other. No colour term is configured for it, so
+  photometry uses the plain median zero point.
 - **Narrowband** (`Ha`, `OIII`, `SII`, `NII`, plus the multi-band OSC filters `LeNhance`,
   `LeXtreme`, `LuLtimate`, `NBZ`, `QuadBand`, `TriBand`, `DuoBand` — `config.NARROWBAND_FILTERS`).
   The multi-band ones pass two or three emission lines and block everything between them, so where

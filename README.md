@@ -111,6 +111,7 @@ The pipeline communicates with the API exclusively over HTTPS using an API key. 
 │  /data/fits/incoming    │             │  │  MariaDB           │  │
 │  /data/fits/archive     │             │  └────────────────────┘  │
 │  /data/fits/rejected    │             └──────────────────────────┘
+│  /data/fits/raw         │
 │  /data/astap/catalogs   │
 └─────────────────────────┘
 ```
@@ -136,6 +137,7 @@ observatory-pipeline/
 │   └── anomaly-detector.md    ← deep-dive into modules/anomaly_detector/
 │
 ├── modules/
+│   ├── cfa.py                 ← reduce a colour (Bayer) mosaic to a mono 2×2-superpixel frame
 │   ├── fits_header.py         ← extract FITS headers into structured dict
 │   ├── normalizer.py          ← normalize object/filter/frame-type names and filenames
 │   ├── qc.py                  ← quality control: bad frame detection & rejection
@@ -216,7 +218,20 @@ A QC-failed frame is registered with the API (with its QC metrics and flag, and 
 list) and archived like any other, so an operator can see why it was rejected and a later
 re-analysis can find it again. Astrometry, photometry, catalog matching and anomaly detection
 are skipped for it, and image subtraction never uses it as a reference. `/fits/rejected/` is only
-used by direct callers of `qc.analyze()` with `move_on_reject=True`.
+used by direct callers of `qc.analyze()` with `move_on_reject=True` — and for files that are not
+a single exposure at all (see below).
+
+### One-shot-colour cameras and stacks
+A frame from a colour camera without a filter wheel (a Bayer mosaic, `BAYERPAT` in the header) is
+reduced to a mono frame by averaging each 2×2 pixel block before anything else looks at it
+(`modules/cfa.py`) — the pipeline analyses and archives that mono version. The **untouched colour
+original is copied to `/fits/raw/{object}/`** under its own filename and never modified again:
+use those files for your own colour stacking. A frame with no filter recorded is filed under the
+filter `OSC`.
+
+A debayered colour cube (`NAXIS=3`) or a stack produced by the capture software (`STACKCNT` or
+`NCOMBINE` above 1 — e.g. ZWO ASIAIR's live stacks) is not an exposure the pipeline can analyse:
+it is moved to `/fits/rejected/{object}/UNSUPPORTED_{filename}` and not registered.
 
 ### `modules/astrometry/`
 A package split one file per step of `solve()` (`_astap.py`, `_wcs.py`, `_frame_geometry.py`, `_extraction.py`, `_streak.py` — see CLAUDE.md for the exact map), with `solve()` itself living in `__init__.py` as the orchestrator, so it's still imported and called the same way everywhere else in this codebase. Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
@@ -321,6 +336,7 @@ so it works out of the box for local development without `sudo`:
 mkdir -p ~/observatory-data/fits/incoming
 mkdir -p ~/observatory-data/fits/archive
 mkdir -p ~/observatory-data/fits/rejected
+mkdir -p ~/observatory-data/fits/raw
 mkdir -p ~/observatory-data/astap/catalogs
 ```
 
@@ -332,6 +348,7 @@ side of each volume mount in `docker-compose.yml` accordingly:
 sudo mkdir -p /data/fits/incoming
 sudo mkdir -p /data/fits/archive
 sudo mkdir -p /data/fits/rejected
+sudo mkdir -p /data/fits/raw
 sudo mkdir -p /data/astap/catalogs
 
 sudo chown -R $USER:$USER /data/fits /data/astap
@@ -407,6 +424,7 @@ API_KEY=your-secret-api-key-here
 FITS_INCOMING=/fits/incoming
 FITS_ARCHIVE=/fits/archive
 FITS_REJECTED=/fits/rejected
+FITS_RAW_ARCHIVE=/fits/raw
 
 # ── ASTAP plate solver ────────────────────────────────────────────────────────
 ASTAP_BINARY=/usr/local/bin/astap
@@ -493,6 +511,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `FITS_INCOMING` | `/fits/incoming` | No | Directory to watch for new FITS files |
 | `FITS_ARCHIVE` | `/fits/archive` | No | Directory for successfully processed frames |
 | `FITS_REJECTED` | `/fits/rejected` | No | Directory for frames that fail QC |
+| `FITS_RAW_ARCHIVE` | `/fits/raw` | No | Untouched colour originals of one-shot-colour (Bayer) frames, which are analysed as mono copies |
 | **ASTAP Plate Solver** |
 | `ASTAP_BINARY` | `/usr/local/bin/astap` | No | Path to the astap executable |
 | `ASTAP_CATALOGS` | `/astap/catalogs` | No | Path to ASTAP star catalog directory |
@@ -616,7 +635,7 @@ rebuilding Docker images on the observatory server.
    still starts normally.
 
 **Security:** credentials (`API_KEY`), filesystem paths (`FITS_INCOMING`, `FITS_ARCHIVE`,
-`FITS_REJECTED`, `ASTAP_BINARY`, `ASTAP_CATALOGS`, `CATALOG_CACHE_DIR`), and `API_BASE_URL`
+`FITS_REJECTED`, `FITS_RAW_ARCHIVE`, `ASTAP_BINARY`, `ASTAP_CATALOGS`, `CATALOG_CACHE_DIR`), and `API_BASE_URL`
 cannot be overridden remotely — only the tunable thresholds, toggles, and site parameters
 listed in [docs/API.md section 16](docs/API.md#16-pipeline-configuration-remote-settings) are
 accepted.
@@ -716,6 +735,7 @@ services:
       - ~/observatory-data/fits/incoming:/fits/incoming     # watch this for new frames
       - ~/observatory-data/fits/archive:/fits/archive       # processed frames stored here
       - ~/observatory-data/fits/rejected:/fits/rejected     # bad frames moved here
+      - ~/observatory-data/fits/raw:/fits/raw               # colour originals of OSC frames
       - ~/observatory-data/astap/catalogs:/astap/catalogs   # star catalogs for plate solving
     env_file:
       - .env
@@ -727,6 +747,7 @@ services:
 | `~/observatory-data/fits/incoming` | `/data/fits/incoming` | `/fits/incoming` | Drop new `.fits` / `.fit` files here. The watcher detects them automatically. |
 | `~/observatory-data/fits/archive` | `/data/fits/archive` | `/fits/archive` | Successfully processed frames are moved here, organized by object name. |
 | `~/observatory-data/fits/rejected` | `/data/fits/rejected` | `/fits/rejected` | Frames that fail QC are moved here with a prefix indicating the reason (`BLUR_`, `TRAIL_`, `LOW_STARS_`, `BAD_`). |
+| `~/observatory-data/fits/raw` | `/data/fits/raw` | `/fits/raw` | Untouched colour originals of one-shot-colour frames, under their original filenames — for your own colour stacking. The pipeline itself works on mono copies. |
 | `~/observatory-data/astap/catalogs` | `/data/astap/catalogs` | `/astap/catalogs` | ASTAP star catalog files. Download once; survives container rebuilds. |
 
 To use different host paths, edit the **left side** of each volume entry in `docker-compose.yml` and update the corresponding variables in `.env`. `extra_hosts: host.docker.internal:host-gateway` lets the container reach services running on the host machine.

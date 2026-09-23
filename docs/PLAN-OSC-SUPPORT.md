@@ -147,7 +147,7 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
   a real Bayer frame through `analyze_frame()` is QC'd as mono, archived as mono, and its
   colour original sits byte-identical in `FITS_RAW_ARCHIVE`. 1114 passed under both env files.
 
-### T7 — documentation
+### T7 — documentation **[done]**
 - `CLAUDE.md`: new step 0 in the `pipeline.py` list; `modules/cfa.py` section (design
   decision and why superpixel); `OSC` row in the filter tables; `STAR_FWHM_MIN_PX` in the
   QC/astrometry sections; T4 in the QC "Action" paragraph.
