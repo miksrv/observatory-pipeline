@@ -35,6 +35,10 @@ API_KEY: str = _require("API_KEY")
 FITS_INCOMING: str = _get("FITS_INCOMING", "/fits/incoming")
 FITS_ARCHIVE: str = _get("FITS_ARCHIVE", "/fits/archive")
 FITS_REJECTED: str = _get("FITS_REJECTED", "/fits/rejected")
+# Untouched colour originals of one-shot-colour (Bayer) frames, kept for the
+# operator's own stacking — pipeline.py analyses a mono copy instead (see
+# modules/cfa.py) and never writes here after the initial copy.
+FITS_RAW_ARCHIVE: str = _get("FITS_RAW_ARCHIVE", "/fits/raw")
 
 # ---------------------------------------------------------------------------
 # ASTAP plate solver

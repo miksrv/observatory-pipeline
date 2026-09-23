@@ -72,9 +72,10 @@ import math
 import os
 import re
 import shutil
+import tempfile
 
 import config
-from modules import fits_header, qc
+from modules import cfa, fits_header, qc
 
 # ---------------------------------------------------------------------------
 # Optional modules — each wrapped in try/except ImportError so that the
@@ -254,6 +255,8 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     returning.
 
     Steps:
+        0. Reduce a Bayer-mosaic (one-shot-colour) frame to mono, keeping
+           the colour original in FITS_RAW_ARCHIVE
         1. Extract FITS headers
         2. Quality control — a rejection skips steps 3-5.6 (nothing to
            detect sources against) but no longer stops the frame from being
@@ -315,6 +318,11 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # source file name of the logger call). Use "fits_filename" instead so
     # that extra= does not clash with that built-in attribute.
     extra = {"fits_filename": basename}
+
+    # ------------------------------------------------------------------
+    # Step 0 — One-shot-colour frames become mono before anything reads them
+    # ------------------------------------------------------------------
+    _convert_cfa_frame(fits_path, extra)
 
     # ------------------------------------------------------------------
     # Step 1 — Header extraction and normalization
@@ -1618,6 +1626,72 @@ def _resolve_bare_filename(fits_path: str) -> str:
         return matches[0]
 
     return fits_path
+
+
+def _convert_cfa_frame(fits_path: str, extra: dict) -> None:
+    """
+    Replace a Bayer-mosaic frame with its mono 2×2-superpixel version
+    (`modules/cfa.py`), keeping the untouched colour original for the operator.
+
+    Nothing downstream understands a colour mosaic (see that module's
+    docstring), so this runs before every other step and every module —
+    including the ones that later read this frame back out of the archive as
+    a subtraction reference or a chart epoch — sees a plain mono frame.
+
+    The original is **copied**, byte for byte and under its own filename, to
+    `FITS_RAW_ARCHIVE/{object}/` — the operator's colour source for artistic
+    stacking, which this pipeline never renames or writes to afterwards. The
+    order makes every failure safe: the conversion is written to a temp file
+    first (a failure leaves nothing touched), the raw copy is made and
+    size-checked before the original is overwritten, and only then is the
+    mono content written over the original path.
+
+    Overwriting the path's content rather than renaming a new file onto it is
+    deliberate: it keeps the inode, so neither inotify nor the polling
+    observer reports a *new* file there and `watcher.py` never enqueues the
+    frame a second time. The price is a non-atomic final write, harmless
+    since the raw copy already exists by then.
+
+    A frame that isn't a mosaic — mono, already converted (`CFACONV`), or not
+    readable as FITS at all — is left alone; an unreadable one fails later in
+    the ordinary way.
+    """
+    from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+    try:
+        header = astropy_fits.getheader(fits_path)
+    except Exception:
+        return
+    if not cfa.is_cfa(header):
+        return
+
+    frame_header = fits_header.extract_headers(fits_path)
+    if config.NORMALIZE_ENABLED and normalizer is not None:
+        frame_header = normalizer.normalize_headers(frame_header)
+    object_name = frame_header.get("object_name") or "_UNKNOWN"
+
+    raw_dir = os.path.join(config.FITS_RAW_ARCHIVE, object_name)
+    basename = os.path.basename(fits_path)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        mono_path = os.path.join(tmp_dir, basename + ".mono")
+        info = cfa.to_superpixel(fits_path, mono_path)
+
+        os.makedirs(raw_dir, exist_ok=True)
+        raw_path = qc._unique_destination(os.path.join(raw_dir, basename))
+        shutil.copy2(fits_path, raw_path)
+        if os.path.getsize(raw_path) != os.path.getsize(fits_path):
+            raise OSError(f"raw copy of {fits_path} is incomplete: {raw_path}")
+
+        shutil.copyfile(mono_path, fits_path)
+
+    logger.info(
+        "CFA frame (%s) reduced to 2x2 superpixels: %dx%d → %dx%d, "
+        "%d saturated block(s); colour original kept at %s",
+        info["pattern"], info["native_shape"][1], info["native_shape"][0],
+        info["shape"][1], info["shape"][0], info["saturated_blocks"], raw_path,
+        extra=extra,
+    )
 
 
 def _dedupe_by_catalog_identity(sources: list, extra: dict) -> list:

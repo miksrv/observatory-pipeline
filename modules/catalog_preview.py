@@ -60,7 +60,7 @@ from astropy.io import fits
 from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
 
 import config
-from modules import astrometry, catalog_matcher, qc, subtraction
+from modules import astrometry, catalog_matcher, cfa, qc, subtraction
 from modules.fits_header import sanitize_object_name
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,25 @@ async def render(fits_path: str) -> dict:
         failure handling. Never raised for a QC-rejected frame, since
         astrometry is never attempted for one.
     """
+    # A Bayer mosaic is analysed the way pipeline.analyze_frame() would
+    # analyse it — as its mono superpixel version (modules/cfa.py) — but
+    # converted into a throwaway copy, since this module never touches its
+    # input. Same basename, so the rendered title is unchanged.
+    try:
+        is_mosaic = cfa.is_cfa(fits.getheader(fits_path))
+    except Exception:
+        is_mosaic = False
+    if not is_mosaic:
+        return await _render(fits_path)
+
+    with tempfile.TemporaryDirectory(prefix="catalog_preview_cfa_") as tmp_dir:
+        mono_path = os.path.join(tmp_dir, os.path.basename(fits_path))
+        cfa.to_superpixel(fits_path, mono_path)
+        return await _render(mono_path)
+
+
+async def _render(fits_path: str) -> dict:
+    """`render()`'s body, for a frame that is already mono."""
     filename = os.path.basename(fits_path)
     extra = {"fits_filename": filename}
 

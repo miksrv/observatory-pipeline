@@ -69,7 +69,7 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
 - Missing `FILTER` → `FILTER = 'OSC'` (see T3).
 - Pure function over files, no config side effects; `SATURATION_ADU` read from `config`.
 
-### T2 — pipeline integration and raw preservation
+### T2 — pipeline integration and raw preservation **[done]**
 - `pipeline.analyze_frame()` step 0, before `fits_header.extract_headers()`: if `is_cfa()`,
   convert into a temp file beside the original (a failed conversion then leaves nothing
   moved), move the original to `FITS_RAW_ARCHIVE/{object}/` — new setting, default
@@ -118,6 +118,11 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
 - Cross-repo: the observatory-api `settings` seed still has `STAR_FWHM_MIN_ARCSEC` — queue
   in `docs/API-TASKS.md` (rename the row, keep the description in pixels). Same entry: the
   seed's `NARROWBAND_FILTERS` still lacks the M9 multi-band filters.
+- `SEP_MIN_AREA=15` has the same problem (found in T2's check on a real converted frame: 3
+  detections at 10σ, against 197 at `minarea=5`). A star's footprint above the threshold
+  scales with FWHM², so a fixed pixel count admits only the brightest stars once the PSF is
+  ~2 px across. Measure on both datasets and either derive the minimum area from the frame's
+  own PSF (e.g. a fraction of π·FWHM²) or pick a default that works at both scales.
 - Leave `QC_FWHM_MAX_ARCSEC` in arcsec: seeing *is* an angle, so that one is correct as is.
 
 ### T6 — tests

@@ -2719,3 +2719,116 @@ class TestComputePointingError:
         assert payload["pointing_error_arcsec"] == pytest.approx(0.0, abs=1e-6)
         assert payload["pointing_error_ra_arcsec"] == pytest.approx(0.0, abs=1e-6)
         assert payload["pointing_error_dec_arcsec"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — one-shot-colour (Bayer) frames
+# ---------------------------------------------------------------------------
+
+def _write_cfa_frame(path, bayer: str | None = "RGGB") -> None:
+    hdu = fits.PrimaryHDU(data=np.full((40, 60), 5000, dtype=np.uint16))
+    if bayer:
+        hdu.header["BAYERPAT"] = bayer
+    hdu.header["OBJECT"] = "NGC 7331"
+    hdu.header["IMAGETYP"] = "Light"
+    hdu.header["DATE-OBS"] = "2026-09-21T16:56:14"
+    hdu.writeto(path)
+
+
+def _sha(path) -> str:
+    import hashlib
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+@pytest.fixture
+def raw_archive(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "FITS_RAW_ARCHIVE", str(tmp_path / "raw"))
+    monkeypatch.setattr(config, "NORMALIZE_ENABLED", True)
+    return tmp_path / "raw"
+
+
+def test_cfa_frame_converted_in_place_and_original_kept_byte_identical(raw_archive, tmp_path):
+    frame = tmp_path / "incoming" / "Light_NGC 7331_60.0s_0001.fit"
+    frame.parent.mkdir()
+    _write_cfa_frame(frame)
+    original_sha = _sha(frame)
+    inode = os.stat(frame).st_ino
+
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    raw_copy = raw_archive / "NGC7331" / frame.name
+    assert _sha(raw_copy) == original_sha
+    with fits.open(frame) as hdul:
+        assert hdul[0].header["CFACONV"] is True
+        assert hdul[0].data.shape == (20, 30)
+    # Same inode: the watcher sees a modification, never a new file to enqueue.
+    assert os.stat(frame).st_ino == inode
+
+
+def test_cfa_conversion_is_idempotent(raw_archive, tmp_path):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame)
+
+    pipeline._convert_cfa_frame(str(frame), {})
+    converted_sha = _sha(frame)
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    assert _sha(frame) == converted_sha
+    assert len(list((raw_archive / "NGC7331").iterdir())) == 1
+
+
+def test_cfa_raw_copy_never_overwrites_an_earlier_one(raw_archive, tmp_path):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame)
+    earlier = raw_archive / "NGC7331" / "frame.fit"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_bytes(b"an earlier original")
+
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    assert earlier.read_bytes() == b"an earlier original"
+    assert (raw_archive / "NGC7331" / "frame_1.fit").exists()
+
+
+def test_mono_frame_is_left_alone(raw_archive, tmp_path):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame, bayer=None)
+    before = _sha(frame)
+
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    assert _sha(frame) == before
+    assert not raw_archive.exists()
+
+
+def test_unreadable_file_is_left_for_the_ordinary_failure(raw_archive, fits_file):
+    before = fits_file.read_bytes()
+    pipeline._convert_cfa_frame(str(fits_file), {})
+    assert fits_file.read_bytes() == before
+
+
+def test_failed_conversion_touches_nothing(raw_archive, tmp_path, monkeypatch):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame)
+    before = _sha(frame)
+    monkeypatch.setattr(pipeline.cfa, "to_superpixel", Mock(side_effect=OSError("disk full")))
+
+    with pytest.raises(OSError):
+        pipeline._convert_cfa_frame(str(frame), {})
+
+    assert _sha(frame) == before
+    assert not raw_archive.exists()
+
+
+async def test_cfa_conversion_runs_before_header_extraction(mock_modules, monkeypatch):
+    order = []
+    monkeypatch.setattr(pipeline, "_convert_cfa_frame", lambda p, extra: order.append(("convert", p)))
+    monkeypatch.setattr(
+        "pipeline.fits_header.extract_headers",
+        lambda p: order.append(("headers", p)) or _GOOD_HEADER,
+    )
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    assert order[0] == ("convert", str(mock_modules))
+    assert order[1][0] == "headers"
