@@ -821,6 +821,7 @@ Accept: application/json
 | `positions[].dec` | float | yes | Declination in decimal degrees |
 | `radius_arcsec` | float | yes | Cone search radius in arcseconds (same for all positions) |
 | `before_time` | string (ISO 8601) | yes | Only return sources from frames observed strictly before this timestamp |
+| `uncatalogued_only` | bool | no (default `false`) | Only return observations of sources with no catalog identity, or an MPC one. The pipeline sets it on its wide-cone moving-object query (`modules/anomaly_detector/_prefetch.py`): a catalogued star's position is never evidence of motion, and on a field that has been observed many times the unfiltered wide cone is almost entirely stars. An API that predates the field ignores it. |
 
 ### Response
 

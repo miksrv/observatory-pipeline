@@ -253,7 +253,8 @@ def _classify_source_sync(
     source: dict,
     frame_id: str,
     log_filename: str,
-    history_by_tile: dict[tuple, list],
+    narrow_history: list[dict],
+    wide_pool: list[dict],
     coverage_by_tile: dict[tuple, list],
     current_frame_positions: list[tuple[float, float]],
     obs_time: str = "",
@@ -262,7 +263,11 @@ def _classify_source_sync(
     """
     Classify a single source using PREFETCHED batch data (synchronous).
 
-    No API calls are made here - all data comes from the batch prefetch.
+    No API calls are made here - all data comes from the batch prefetch
+    (`_prefetch._prefetch_history_data()`): ``narrow_history`` is this
+    source's own narrow-cone history, ``wide_pool`` its uncatalogued
+    wide-cone candidates (empty for a catalogued source, which never uses
+    them).
 
     Returns an anomaly dict, or None if no reportable anomaly is found.
     """
@@ -301,8 +306,9 @@ def _classify_source_sync(
     # check (see _is_position_shifted's docstring), and Priority 3 needs the
     # exact same query for the UNKNOWN/FIRST_OBSERVATION/KNOWN_CATALOG_NEW
     # distinction and for delta_mag, so there is no reason to run it twice.
-    tile_sources = history_by_tile.get(tile, [])
-    history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
+    # Already a MATCH_CONE_ARCSEC query around this very position; the filter
+    # is kept so the cone is defined here, whatever the API returned.
+    history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, narrow_history)
     n_history = len(history)
 
     # Coverage is read here rather than in Priority 3 where it is mainly used:
@@ -394,7 +400,7 @@ def _classify_source_sync(
         # (audit 2026-08-18, finding H3). See _wide_cone_radius_arcsec() for
         # the two bounds that keep the extension from becoming a permanently
         # wide cone.
-        wide_history, wide_radius = _find_wide_history(ra, dec, tile_sources, obs_time)
+        wide_history, wide_radius = _find_wide_history(ra, dec, wide_pool, obs_time)
 
         # A trail this elongated is, on its own, sufficient evidence of a
         # fast single-exposure mover (satellite / space debris) — unlike a

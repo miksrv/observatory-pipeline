@@ -1886,3 +1886,101 @@ class TestDetectResilienceAndMixedSources:
         # source_c is catalog-matched → KNOWN_CATALOG_NEW (suppressed)
         assert len(result) == 2
         assert all(r["anomaly_type"] == "UNKNOWN" for r in result)
+
+
+# ===========================================================================
+# History prefetch shape (docs/PLAN-OSC-SUPPORT.md, T9)
+# ===========================================================================
+
+class TestHistoryPrefetchShape:
+    """
+    One tile-wide query (MOVING_CONE_MAX_ARCSEC + 400") per 0.1° tile returned
+    the whole field's history once per tile — 870 828 rows for a database of
+    62 353 observations on the NGC 7331 run, and the worker was OOM-killed.
+    The narrow cone is now queried per source, and the wide cone only for
+    uncatalogued sources, restricted to uncatalogued history.
+    """
+
+    @staticmethod
+    def _calls(mock_sources):
+        narrow = [c for c in mock_sources.await_args_list if not c.kwargs.get("uncatalogued_only")]
+        wide = [c for c in mock_sources.await_args_list if c.kwargs.get("uncatalogued_only")]
+        return narrow, wide
+
+    async def test_narrow_per_source_wide_only_for_uncatalogued(self):
+        star = _make_source(catalog_name="Gaia DR3", catalog_id="1", object_type="STAR")
+        unknown = _make_source(ra=_RA + 0.01, catalog_name=None)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {}
+            mock_cov.return_value = {}
+            await ad.detect(_FRAME_ID, [star, unknown], [star, unknown], _FRAME_META)
+
+        narrow, wide = self._calls(mock_sources)
+        assert len(narrow) == 1 and len(wide) == 1
+        positions, radius, _ = narrow[0].args
+        assert positions == [{"ra": star["ra"], "dec": star["dec"]},
+                             {"ra": unknown["ra"], "dec": unknown["dec"]}]
+        assert radius == config.MATCH_CONE_ARCSEC
+        positions, radius, _ = wide[0].args
+        assert positions == [{"ra": unknown["ra"], "dec": unknown["dec"]}]
+        assert radius == max(config.MOVING_CONE_ARCSEC, config.MOVING_CONE_MAX_ARCSEC)
+
+    async def test_no_wide_query_when_every_source_is_catalogued(self):
+        star = _make_source(catalog_name="Gaia DR3", catalog_id="1", object_type="STAR")
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {}
+            mock_cov.return_value = {}
+            await ad.detect(_FRAME_ID, [star], [star], _FRAME_META)
+
+        narrow, wide = self._calls(mock_sources)
+        assert len(narrow) == 1 and wide == []
+
+    async def test_results_are_mapped_back_by_source_index(self):
+        """
+        Source 0 has a detection at its own position; source 1 has none. A
+        swapped mapping would give source 1 a history and source 0 none.
+        """
+        seen = _make_source(catalog_name=None, source_id="seen")
+        new = _make_source(ra=_RA + 0.01, catalog_name=None, source_id="new")
+
+        async def near(positions, radius, before, uncatalogued_only=False):
+            if uncatalogued_only:
+                return {}
+            return {"0": [_make_hist_source()], "1": []}
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            result = await ad.detect(_FRAME_ID, [seen, new], [seen, new], _FRAME_META)
+
+        by_id = {a["source_id"]: a["anomaly_type"] for a in result}
+        assert by_id == {"new": "UNKNOWN"}
+
+    async def test_vacated_uncatalogued_detection_still_gives_moving_unknown(self):
+        source = _make_source(catalog_name=None, elongation=1.1, source_id="mover")
+        # Between the narrow and the wide cone, in the wide pool only, and
+        # nothing in this frame sits there now.
+        offset = (config.MATCH_CONE_ARCSEC + config.MOVING_CONE_ARCSEC) / 2
+        previous = _make_hist_source(dec=_DEC + offset / 3600.0)
+
+        async def near(positions, radius, before, uncatalogued_only=False):
+            return {"0": [previous]} if uncatalogued_only else {}
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]

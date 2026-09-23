@@ -30,7 +30,8 @@ async def detect(
     Detect and classify anomalies for all sources in a processed frame.
 
     Uses BATCH API queries to minimize network round-trips:
-    - One POST /sources/near/batch for all source history
+    - One POST /sources/near/batch for every source's narrow-cone history
+    - One POST /sources/near/batch for the uncatalogued sources' wide cone
     - One POST /frames/covering/batch for all coverage checks
 
     This reduces API calls from O(N) to O(1) where N is the number of sources.
@@ -79,9 +80,9 @@ async def detect(
         return []
 
     # ------------------------------------------------------------------
-    # BATCH PREFETCH: Get all historical data in TWO API calls
+    # BATCH PREFETCH: Get all historical data in at most THREE API calls
     # ------------------------------------------------------------------
-    history_by_tile, coverage_by_tile = await _prefetch_history_data(
+    narrow_by_source, wide_by_source, coverage_by_tile = await _prefetch_history_data(
         sources, obs_time, frame_id, log_filename
     )
 
@@ -118,13 +119,14 @@ async def detect(
 
     anomalies: list[dict] = []
 
-    for source in sources:
+    for i, source in enumerate(sources):
         try:
             result = _classify_source_sync(
                 source,
                 frame_id=frame_id,
                 log_filename=log_filename,
-                history_by_tile=history_by_tile,
+                narrow_history=narrow_by_source[i],
+                wide_pool=wide_by_source.get(i, []),
                 coverage_by_tile=coverage_by_tile,
                 current_frame_positions=current_frame_positions,
                 obs_time=obs_time,

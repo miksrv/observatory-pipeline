@@ -47,14 +47,24 @@ are only logged (`logger.debug`), since they are not an actionable signal.
 ## Batch API prefetch
 
 A key architectural feature: instead of one HTTP request per source (`O(N)`), the
-module makes **exactly two** batch requests for the entire frame (`O(1)`):
+module makes **at most three** batch requests for the entire frame (`O(1)`), concurrently via
+`asyncio.gather`, each shaped to what its consumer reads:
 
-1. `POST /sources/near/batch` — historical sources near every position.
-2. `POST /frames/covering/batch` — which positions were already covered by earlier frames.
+1. `POST /sources/near/batch`, **narrow** — every source's own position, radius
+   `MATCH_CONE_ARCSEC`, every epoch: the existence check and the light curve.
+2. `POST /sources/near/batch`, **wide** — only the *uncatalogued* sources (the only ones that
+   reach the moving-object test), radius `max(MOVING_CONE_ARCSEC, MOVING_CONE_MAX_ARCSEC)`, with
+   `uncatalogued_only: true` so only uncatalogued/MPC history comes back. A catalogued star does
+   not move; a missing detection of one tonight is a non-detection, not a vacated position.
+   Skipped when every source is catalogued.
+3. `POST /frames/covering/batch` — which `0.1°×0.1°` tiles (`_tile_key()`) earlier frames covered.
 
-Both requests group source coordinates into `0.1°×0.1°` tiles (`_tile_key()`, ~6
-arcminutes) so nearby sources reuse the same result instead of issuing duplicate
-queries. Both requests run concurrently via `asyncio.gather`.
+Until 2026-09-23 a single history query per 0.1° tile, radius `MOVING_CONE_MAX_ARCSEC + 400″`,
+served both cones. On a field smaller than that radius every tile query returned the whole
+field's history, so each observation arrived once per tile: 870 828 rows for a database of
+62 353 observations on the 228-frame NGC 7331 run (2.3 GB RSS, 38 s per frame), and the worker
+was OOM-killed. The split query returned 82k rows (343 MB, 4 s) for the same frame even before
+the API honoured `uncatalogued_only`, with the same classification.
 
 Important: **history is fetched for every source without exception**, including
 already catalog-matched ones — it's needed not only to detect position shifts (movers)
@@ -86,7 +96,7 @@ detected in a different filter is still a real prior detection, not evidence of 
 flowchart TD
     Start(["detect(frame_id, sources,\ncatalog_matches, frame_meta)"]) --> Empty{"sources\nempty?"}
     Empty -- yes --> ReturnEmpty(["return []"])
-    Empty -- no --> Prefetch["_prefetch_history_data()\n2 batch requests in parallel:\nPOST /sources/near/batch\nPOST /frames/covering/batch\n(grouped into 0.1° tiles)"]
+    Empty -- no --> Prefetch["_prefetch_history_data()\nup to 3 batch requests in parallel:\nnear/batch narrow (every source)\nnear/batch wide (uncatalogued only)\nframes/covering/batch (0.1° tiles)"]
 
     Prefetch --> Loop["for each source:\n_classify_source_sync()"]
 

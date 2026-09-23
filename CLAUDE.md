@@ -1475,8 +1475,18 @@ and a genuine fast mover fell through to plain `UNKNOWN` (no track chart, no eph
 dropped as `FIRST_OBSERVATION` (audit 2026-08-18, finding H3). Both bounds exist because the
 cone's false-positive risk grows with its area; without them the extension degenerates into a
 permanently wide cone — exactly what the two-condition test above was added to stop. `_prefetch.py`
-sizes its batch query off `MOVING_CONE_MAX_ARCSEC` accordingly, since a candidate the API never
+sizes its wide query off `MOVING_CONE_MAX_ARCSEC` accordingly, since a candidate the API never
 returned can't be filtered back in client-side.
+
+The history prefetch is split by consumer (`_prefetch.py`): a **narrow** query
+(`MATCH_CONE_ARCSEC`) around every source for the existence check and light curve, and a **wide**
+query only around *uncatalogued* sources — the only ones that reach the moving-object test — with
+`uncatalogued_only` so only uncatalogued/MPC history returns. A catalogued star does not move, so
+its missing detection tonight is a non-detection rather than a vacated position. One query per
+0.1° tile at `MOVING_CONE_MAX_ARCSEC + 400″` used to serve both, and on a field smaller than that
+radius each tile returned the whole field's history: 870 828 rows for 62 353 stored observations
+on the 228-frame NGC 7331 run, and an OOM-killed worker (2026-09-23; 82k rows, 343 MB, 4 s per
+frame after the split, same classification).
 
 `SPACE_DEBRIS` deliberately does **not** wait for that second half of the evidence. A satellite or
 debris trail's entire visible track — both "endpoints" — exists within a single exposure; unlike a

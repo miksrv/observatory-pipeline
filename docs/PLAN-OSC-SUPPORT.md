@@ -163,6 +163,47 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
 - Regression: re-analyse a handful of IC3322A frames (mono, unaffected by T1–T4) and compare
   star counts / QC flags with T5's new floor against the previous run.
 
+### T9 — history prefetch that scales with the archive **[done]**
+Not a colour-camera issue, but found on the same NGC 7331 run: the worker was OOM-killed
+(`docker events`: `oom`, `die 137`) 94 frames into a 228-frame `DETECT_ANOMALIES` task.
+Profile of the latest frame: `POST /sources/near/batch` returned **870 828 rows** for a
+database holding **62 353** observations — RSS 2.27 GB, and 33 s of client-side filtering.
+`_prefetch.py` queries per 0.1° tile with a radius of `MOVING_CONE_MAX_ARCSEC + 400″` ≈ 17′,
+so on a 24′×14′ field every one of the ~14 tile queries returns the whole field's history, and
+it grows with every frame (`before_time`).
+
+What the classifier actually consumes:
+- **Narrow cone** (`MATCH_CONE_ARCSEC`) around every source, all epochs — existence check and
+  light curve. Bounded by the field's true history (≤ 62k rows here, not 870k).
+- **Wide cone** (up to `MOVING_CONE_MAX_ARCSEC`) only for *uncatalogued* current sources —
+  `_is_position_shifted()` is never reached for a catalogued one — and only *uncatalogued or
+  MPC* historical detections. A catalogued star does not move; its absent detection tonight
+  is a non-detection (faint, cloud, edge), not a vacated position, so counting it as motion
+  evidence was a false-positive route. On this run: 39 uncatalogued observations of 62 353.
+- **Coverage** per tile — 1.6k rows, unchanged.
+
+Tasks:
+- `api_client.get_sources_near_batch(..., uncatalogued_only=False)` — sent only when True.
+- `_prefetch.py`: narrow query on per-source positions at `MATCH_CONE_ARCSEC`; wide query on
+  uncatalogued sources only at the widest moving cone, `uncatalogued_only=True`, no tile
+  margin; coverage as before; three requests concurrently.
+- `_classify_source_sync()` takes the source's own narrow history and wide pool instead of a
+  tile map; `detect()` passes them by index.
+- Tests: the two queries' radii/positions/flag; a vacated uncatalogued detection still gives
+  `MOVING_UNKNOWN`; catalogued sources never trigger a wide query.
+- observatory-api (own branch, own commit): `uncatalogued_only` in `nearBatch()` —
+  `JOIN sources … (catalog_name IS NULL OR catalog_name = 'MPC')`; plus a per-position
+  bounding-box pre-check before the haversine (the loop is positions × candidates over one
+  union box: ~18M haversines per request here). Documented in `docs/API.md`.
+- An older API ignores the flag: the wide query then returns catalogued history too — the
+  previous semantics, just without the saving. No crash either way.
+- Then reset the stuck `DETECT_ANOMALIES` task to `PENDING` and let it finish.
+
+Outcome, latest NGC 7331 frame: 870 828 rows / 2.27 GB RSS / 38 s → 51 981 narrow + 12 wide
+rows / 284 MB / 0.8 s (observatory-api `develop`, `ae891fe`). One classification changed as
+intended: the source at ra=339.4096 dec=34.3024 went from `MOVING_UNKNOWN` to `UNKNOWN` — its
+"vacated position" evidence had been a catalogued star missing from this frame.
+
 ## Commits
 One task per commit (T1+T2 may land together if T2 is too thin alone), no co-author lines,
 pushed and merged by the user.
