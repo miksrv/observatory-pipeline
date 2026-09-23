@@ -516,7 +516,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Star Detection Filtering** |
 | `SEP_DETECT_THRESH` | `10.0` | No | Detection threshold in sigma above background for SEP source extraction. Higher = fewer, more reliable detections. |
 | `SEP_MIN_AREA` | `15` | No | Minimum connected pixels for a valid source detection. Filters out hot pixels and noise. |
-| `STAR_FWHM_MIN_ARCSEC` | `2.5` | No | Minimum FWHM in arcseconds. Sources below this are likely hot pixels or cosmic rays. |
+| `STAR_FWHM_MIN_PX` | `1.2` | No | Minimum FWHM in **pixels**. Sources below this are hot pixels or cosmic rays — a property of the pixel grid, so it holds for any optics (a lit 2×2 block measures 1.18 px). |
 | `STAR_FWHM_MAX_ARCSEC` | `8.0` | No | Maximum FWHM in arcseconds. Sources above this are extended objects (nebulae, galaxies) or badly defocused. |
 | `STAR_ELONGATION_MAX` | `1.5` | No | Maximum elongation for valid star detections. Filters out trails and extended objects. |
 | `SOURCES_ALL_ELONGATION_MAX` | `15.0` | No | Maximum elongation for the loose `sources_all` list that catalog matching and anomaly detection operate on — far above `STAR_ELONGATION_MAX` on purpose, since a trailed detection is exactly what `modules/anomaly_detector/` needs in order to classify `SPACE_DEBRIS`. Must stay comfortably above `SPACE_DEBRIS_EDGE_ELONGATION_MIN`, or a trailed near-edge source is cut before the classifier can see it; `modules/astrometry/_extraction.py` logs a warning if it isn't. |

@@ -139,7 +139,15 @@ NARROWBAND_FILTERS: frozenset[str] = frozenset(
 # These parameters filter raw SEP detections to keep only point sources (stars)
 # and reject extended objects (nebula parts, galaxies) and artifacts.
 # ---------------------------------------------------------------------------
-STAR_FWHM_MIN_ARCSEC: float = float(_get("STAR_FWHM_MIN_ARCSEC", "2.5"))
+# Hot/warm-pixel floor, in PIXELS: a hot pixel's footprint is fixed by the
+# pixel grid, whatever the optics. With the pipeline's moment-based FWHM
+# (2.3548 * sqrt((a² + b²) / 2)) a single lit pixel measures 0.68 px and a
+# fully lit 2×2 block 1.18 px; no PSF, however well sampled, is that sharp.
+# It used to be STAR_FWHM_MIN_ARCSEC=2.5, which on a 0.38"/px camera
+# (ZWO ASI585MC at 1568 mm, 2026-09-23) sat above nearly every real star.
+# The per-frame PSF bound in astrometry/_extraction.py (psf / 1.5) still
+# does the finer work of rejecting clusters that clear this floor.
+STAR_FWHM_MIN_PX: float = float(_get("STAR_FWHM_MIN_PX", "1.2"))
 STAR_FWHM_MAX_ARCSEC: float = float(_get("STAR_FWHM_MAX_ARCSEC", "8.0"))
 STAR_ELONGATION_MAX: float = float(_get("STAR_ELONGATION_MAX", "1.5"))
 # Upper elongation bound for the LOOSE `sources_all` list that
@@ -840,7 +848,7 @@ _OVERRIDABLE: dict[str, type] = {
     "QC_SKY_BACKGROUND_MAX": float,
     "QC_STARS_MIN_NARROWBAND": int,
     # Star detection filtering
-    "STAR_FWHM_MIN_ARCSEC": float,
+    "STAR_FWHM_MIN_PX": float,
     "STAR_FWHM_MAX_ARCSEC": float,
     "STAR_ELONGATION_MAX": float,
     "SOURCES_ALL_ELONGATION_MAX": float,

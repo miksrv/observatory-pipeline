@@ -16,6 +16,29 @@ Each entry records:
 
 ---
 
+## 3. Settings seed: `STAR_FWHM_MIN_PX` and the post-M9 `NARROWBAND_FILTERS`
+
+**Origin** — one-shot-colour support, `docs/PLAN-OSC-SUPPORT.md` T5 (2026-09-23), and the
+pre-run check of the local `settings` table the same day.
+
+**What** — in the settings seed migration (`2026-08-10-000001_CreateSettingsTable.php`) and in
+a new migration for existing databases:
+- rename the row `STAR_FWHM_MIN_ARCSEC` (value `2.5`) to `STAR_FWHM_MIN_PX`, value `1.2`,
+  description "Minimum star FWHM in pixels — sharper sources are hot pixels or cosmic rays";
+- set `NARROWBAND_FILTERS` to
+  `Ha,OIII,SII,NII,LeNhance,LeXtreme,LuLtimate,NBZ,QuadBand,TriBand,DuoBand`.
+Also update the settings list in the API's own docs if it names either.
+
+**Why** — a remote setting overrides the pipeline's default. `STAR_FWHM_MIN_ARCSEC` no longer
+exists in the pipeline, so the old row is silently ignored and the new parameter can't be tuned
+remotely until it has a row. The old `NARROWBAND_FILTERS` value undoes audit finding M9 on
+every deployment: a frame through an L-eNhance or other multi-band filter is held to the
+broadband star floor and calibrated against Gaia.
+
+**Pipeline side** — done: `config.py` has `STAR_FWHM_MIN_PX` (default 1.2) and accepts it from
+`GET /settings`; `STAR_FWHM_MIN_ARCSEC` is gone. The local development database's
+`NARROWBAND_FILTERS` row was corrected by hand on 2026-09-23.
+
 ## ✅ DONE — 2. `SPACE_DEBRIS` must not be an alert
 
 Done in `observatory-api` on 2026-09-22 (branch `develop`, commit `3fc4087`).

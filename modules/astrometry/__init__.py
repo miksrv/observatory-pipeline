@@ -97,7 +97,7 @@ async def solve(
         ``psf_fwhm_arcsec * 1.5`` (capped at ``STAR_FWHM_MAX_ARCSEC``) to
         better reject compact galaxies and other extended sources whose FWHM
         significantly exceeds stellar PSF, and the lower bound to
-        ``psf_fwhm_arcsec / 1.5`` (floored at ``STAR_FWHM_MIN_ARCSEC``) to
+        ``psf_fwhm_arcsec / 1.5`` (floored at ``STAR_FWHM_MIN_PX``) to
         reject hot/warm pixel clusters and other artifacts that are far
         sharper than any real star in this frame.
 

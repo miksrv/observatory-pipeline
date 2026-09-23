@@ -105,7 +105,7 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
   it on every watcher restart (`process_existing_files()`).
 - Make this check independent of CFA support: it protects mono pipelines just as much.
 
-### T5 — hot-pixel FWHM floor in pixels
+### T5 — hot-pixel FWHM floor in pixels **[done]**
 - Replace `STAR_FWHM_MIN_ARCSEC` with `STAR_FWHM_MIN_PX` in `modules/qc.py` (star-count mask
   and both median subsets) and `modules/astrometry/_extraction.py` (static floor under the
   dynamic `psf_fwhm / 1.5` bound). A hot pixel's footprint is fixed in pixels whatever the
@@ -118,11 +118,18 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
 - Cross-repo: the observatory-api `settings` seed still has `STAR_FWHM_MIN_ARCSEC` — queue
   in `docs/API-TASKS.md` (rename the row, keep the description in pixels). Same entry: the
   seed's `NARROWBAND_FILTERS` still lacks the M9 multi-band filters.
-- `SEP_MIN_AREA=15` has the same problem (found in T2's check on a real converted frame: 3
-  detections at 10σ, against 197 at `minarea=5`). A star's footprint above the threshold
-  scales with FWHM², so a fixed pixel count admits only the brightest stars once the PSF is
-  ~2 px across. Measure on both datasets and either derive the minimum area from the frame's
-  own PSF (e.g. a fraction of π·FWHM²) or pick a default that works at both scales.
+- `SEP_MIN_AREA=15` looked like the same problem (T2's check on one converted frame found 3
+  detections), but measured on 7 converted frames it is not, and it stays: with the pixel
+  floor at 1.2 px, `qc.analyze()` passes all 7 as `OK` with 15–92 stars, FWHM 2.1–2.5″
+  (≈3 px), elongation 1.1–1.2. Lowering it to 7 doubles the detections but pins the median
+  FWHM at 1.67 px — the moment-based width of a tiny thresholded footprint, not the PSF — and
+  that estimate would then set the `psf / 1.5` bounds in extraction. It also keeps the
+  `SOURCES_ALL_ELONGATION_MAX=15` argument in CLAUDE.md (finding L4) valid.
+- Result of the measurement that set the 1.2 px default: a single lit pixel reads 0.68 px, a
+  lit 2×2 block 1.18 px; real stars on the converted NGC 7331 frames have a median of
+  2.0–2.5 px and a 5th percentile of 1.2–1.4 px. The IC3322A archive was no longer on disk to
+  cross-check; the old floor (2.5″) did not do the Vesta-incident work anyway — the
+  per-frame `psf / 1.5` bound did, and it is unchanged.
 - Leave `QC_FWHM_MAX_ARCSEC` in arcsec: seeing *is* an angle, so that one is correct as is.
 
 ### T6 — tests

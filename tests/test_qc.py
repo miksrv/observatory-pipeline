@@ -1076,7 +1076,7 @@ class TestMediansUseTheStarPopulation:
     @pytest.mark.asyncio
     async def test_hot_pixels_do_not_drag_the_fwhm_median_down(self):
         """
-        The one absolute cut both subsets keep is STAR_FWHM_MIN_ARCSEC. It can
+        The one absolute cut both subsets keep is STAR_FWHM_MIN_PX. It can
         only bias the estimate upward, so it cannot hide blur.
         """
         # 8 normal stars + 7 detections far sharper than any real star here
@@ -1134,3 +1134,42 @@ class TestDegenerateMinorAxisIsClamped:
         assert result["elongation_median"] == pytest.approx(5.0 / qc._MIN_SEMI_MINOR_PX)
         assert result["elongation_median"] > config.QC_ELONGATION_MAX
         assert result["quality_flag"] in ("TRAIL", "BAD")
+
+
+# ---------------------------------------------------------------------------
+# Hot-pixel floor in pixels (docs/PLAN-OSC-SUPPORT.md, T5)
+# ---------------------------------------------------------------------------
+
+class TestHotPixelFloorIsInPixels:
+    """
+    STAR_FWHM_MIN_ARCSEC=2.5 removed nearly every real star at 0.38"/px
+    (ZWO ASI585MC, NGC 7331). A hot pixel's footprint is set by the pixel
+    grid, so the floor is STAR_FWHM_MIN_PX and must cut the same sources
+    at any plate scale.
+    """
+
+    # a = b = 0.8 → FWHM ≈ 1.88 px: a compact but real PSF.
+    # a = b = 0.4 → FWHM ≈ 0.94 px: sharper than a lit 2×2 block.
+    _STAR_AB = 0.8
+    _HOT_AB = 0.4
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("header", [
+        {"XPIXSZ": 2.9, "FOCALLEN": 1568.0, "PIXSCALE": None},   # 0.38"/px
+        {"XPIXSZ": 4.83, "FOCALLEN": 997.0, "PIXSCALE": None},   # 1.0"/px
+        {"XPIXSZ": 5.8, "FOCALLEN": 400.0, "PIXSCALE": None},    # 3.0"/px
+        {"PIXSCALE": None},                                        # no scale at all
+    ])
+    async def test_same_cut_at_every_plate_scale(self, header):
+        assert qc._compute_fwhm_pixels(self._STAR_AB, self._STAR_AB) >= config.STAR_FWHM_MIN_PX
+        assert qc._compute_fwhm_pixels(self._HOT_AB, self._HOT_AB) < config.STAR_FWHM_MIN_PX
+        n_stars, n_hot = 12, 9
+        sources = _mixed_sources(0, n_hot, self._HOT_AB, self._HOT_AB)
+        sources = np.concatenate([_make_sources(n_stars, self._STAR_AB, self._STAR_AB), sources])
+
+        with _patch_qc(sources, header=header):
+            result = await qc.analyze(_FITS_PATH, move_on_reject=False)
+
+        assert result["star_count"] == n_stars
+        assert result["fwhm_median_px"] == pytest.approx(
+            qc._compute_fwhm_pixels(self._STAR_AB, self._STAR_AB))
