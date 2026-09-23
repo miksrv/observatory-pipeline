@@ -448,6 +448,27 @@ class TestProcessOneTask:
         worker.api_client.update_task.assert_called_once_with("t1", "RUNNING")
         handler_mock.assert_called_once()
 
+    async def test_a_lost_claim_is_not_processed(self, monkeypatch):
+        """
+        The API's PATCH status=RUNNING is an atomic claim and answers 409 when
+        another worker already holds the task; update_task() returns None on
+        any 4xx. Processing anyway would redo every item (API audit
+        2026-08-20, finding C2).
+        """
+        detail = {
+            "task": {"id": "t1", "type": "ANALYZE"},
+            "items": [{"id": "item-1", "status": "PENDING", "filename": "/x.fits"}],
+        }
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(return_value=detail))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value=None))
+        handler_mock = AsyncMock()
+        monkeypatch.setattr(worker, "_HANDLERS", {**worker._HANDLERS, "ANALYZE": handler_mock})
+
+        await worker._process_one_task({"id": "t1"})
+
+        worker.api_client.update_task.assert_called_once_with("t1", "RUNNING")
+        handler_mock.assert_not_called()
+
     async def test_only_pending_items_are_passed_to_handler(self, monkeypatch):
         detail = {
             "task": {"id": "t1", "type": "ANALYZE"},
