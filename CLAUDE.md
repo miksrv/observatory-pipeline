@@ -508,9 +508,15 @@ queued task first) at `TASK_POLL_INTERVAL_SEC` when idle, backing off exponentia
 `TASK_POLL_BACKOFF_MAX_SEC` on consecutive empty polls and resetting the moment a task is found.
 A busy queue is drained back-to-back with no sleep between tasks.
 
+The claim itself (`PATCH status=RUNNING`) is atomic on the API side — it succeeds only while the
+task is still `PENDING` and answers `409` otherwise — and `worker.py` stops on a failed claim
+(`api_client.update_task()` returns `None` on any 4xx), so two workers polling the same queue
+never both process one task (API audit 2026-08-20, finding C2).
+
 **Known limitation:** no lease/heartbeat/timeout mechanism yet — a task a worker claims (`PATCH
-status=RUNNING`) and then crashes on stays stuck at `RUNNING` forever. Reset it by hand
-(`PATCH /tasks/{id} {"status": "PENDING"}`) if that happens during testing.
+status=RUNNING`) and then crashes on stays stuck at `RUNNING` forever (this happened twice on the
+2026-09-22 test run, both times an OOM kill). Reset it by hand
+(`PATCH /tasks/{id} {"status": "PENDING"}`) if that happens.
 
 **`PREVIEW_CATALOG_MATCH` is a diagnostic tool, not a fourth production module** — it never
 registers a frame or source, never archives/rejects its input file, and doesn't chain into any

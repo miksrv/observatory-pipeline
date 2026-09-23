@@ -423,7 +423,20 @@ async def _process_one_task(task_summary: dict) -> None:
         await api_client.update_task(task_id, "FAILED", error=f"Unknown task type: {task['type']}")
         return
 
-    await api_client.update_task(task_id, "RUNNING")
+    # The claim is atomic on the API side: PATCH status=RUNNING succeeds only
+    # while the task is still PENDING and answers 409 otherwise (API audit
+    # 2026-08-20, finding C2). update_task() returns None on any 4xx, so None
+    # here means another worker got there first (or the task was cancelled
+    # meanwhile) — processing it anyway would redo every item and overwrite
+    # the other worker's results.
+    if await api_client.update_task(task_id, "RUNNING") is None:
+        logger.warning(
+            "Could not claim task_id=%s (already claimed, cancelled, or the API "
+            "refused) — leaving it to whoever holds it",
+            task_id,
+        )
+        return
+
     logger.info(
         "Processing task_id=%s type=%s (%d pending item(s))",
         task_id, task["type"], len(items),

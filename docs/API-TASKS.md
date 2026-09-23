@@ -16,7 +16,9 @@ Each entry records:
 
 ---
 
-## 2. `SPACE_DEBRIS` must not be an alert
+## ✅ DONE — 2. `SPACE_DEBRIS` must not be an alert
+
+Done in `observatory-api` on 2026-09-22 (branch `develop`, commit `3fc4087`).
 
 **Origin** — post-remediation test run, 2026-09-22: 38 `SPACE_DEBRIS` anomalies on 7 IC3322A
 frames, every one an ordinary satellite pass, all flagged `is_alert=1` alongside the 12 genuine
@@ -35,7 +37,11 @@ passes are mostly trails.
 `_ALERT_TYPES`, so it is logged at INFO and not counted as an alert; the classification itself
 is unchanged.
 
-## 1. Frame coverage misses the frame's own corners
+## ✅ DONE — 1. Frame coverage misses the frame's own corners
+
+Done in `observatory-api` on 2026-09-22 (branch `develop`, commit `700c4ff`): the coverage radius
+is the frame's half-diagonal (`SkyMath::coverageRadiusArcsec()`), from `width_px`/`height_px` when
+known and the square-frame worst case otherwise.
 
 **Origin** — post-remediation test run, 2026-09-22 (63 IC3322A frames): 10 of 11 `UNKNOWN`
 alerts carried the note "no prior coverage in the API history" at positions that earlier frames
