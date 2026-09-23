@@ -199,6 +199,20 @@ FILTER_MAP = {
     "clear": "L",
     "clr": "L",
 
+    # One-shot colour: an unfiltered Bayer camera, reduced to a luminance-like
+    # mono frame by modules/cfa.py (which also writes FILTER='OSC' when the
+    # capture software recorded none). Broadband, and deliberately not "L":
+    # the bandpass is the sensor's R+2G+B response, so subtraction must not
+    # stack it with a mono camera's luminance frames, and a colour term
+    # calibrated for one must not be applied to the other.
+    "osc": "OSC",
+    "cfa": "OSC",
+    "rgb": "OSC",
+    "color": "OSC",
+    "colour": "OSC",
+    "one-shot color": "OSC",
+    "one-shot colour": "OSC",
+
     # Red
     "red": "R",
     "r": "R",

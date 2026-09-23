@@ -88,7 +88,7 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
   its existing `TemporaryDirectory()` and work on the copy.
 - Log one INFO line per conversion (pattern, old/new size, new plate scale).
 
-### T3 — `OSC` as a broadband filter
+### T3 — `OSC` as a broadband filter **[done]**
 - `modules/normalizer.py`: recognise `OSC` (and common spellings: `CFA`, `RGB`, `Color`,
   empty-on-a-CFA-frame is handled in T1) → canonical `OSC`; not narrowband.
 - Photometry: no configured colour term for `OSC` → plain median zero point (pre-H5
