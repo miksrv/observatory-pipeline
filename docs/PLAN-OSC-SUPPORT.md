@@ -49,7 +49,7 @@ the photometry already handles. Cost: half the linear resolution — at 0.38″/
 
 ## Tasks
 
-### T1 — `modules/cfa.py`: detection and superpixel conversion
+### T1 — `modules/cfa.py`: detection and superpixel conversion **[done]**
 - `is_cfa(header) -> bool`: `BAYERPAT` (or `COLORTYP`) present and `NAXIS == 2`; not already
   converted (`CFACONV` marker absent).
 - `to_superpixel(fits_path, dest_path) -> dict`: 2×2 block **mean** (keeps the ADU range, so
