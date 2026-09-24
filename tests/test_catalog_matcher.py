@@ -399,6 +399,8 @@ class TestGaiaMatching:
         assert n == 1
         assert star["catalog_name"] == "Simbad"  # identity untouched
         assert star["_catalog_color"] == pytest.approx(2.4)
+        # ...and its Gaia G magnitude, so it can anchor the zero point.
+        assert star["_gaia_mag"] == pytest.approx(13.65)
         assert star["_catalog_flags"]["ruwe"] == pytest.approx(1.0)
 
     def test_colour_attachment_respects_the_match_cone_and_existing_colours(self):
@@ -414,10 +416,13 @@ class TestGaiaMatching:
 
         n = cm._attach_gaia_color([distant, already, mpc], gaia_stars)
 
-        assert n == 0
-        assert "_catalog_color" not in distant
+        # Only the star at the Gaia position is enriched: it gains the G
+        # magnitude (a zero-point reference) but keeps the colour it had.
+        assert n == 1
+        assert "_catalog_color" not in distant and "_gaia_mag" not in distant
         assert already["_catalog_color"] == pytest.approx(0.7)
-        assert "_catalog_color" not in mpc
+        assert already["_gaia_mag"] == pytest.approx(15.0)
+        assert "_catalog_color" not in mpc and "_gaia_mag" not in mpc
 
     def test_gaia_error_returns_empty_list(self):
         """If the Gaia query raises, _query_gaia returns []."""

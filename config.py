@@ -581,6 +581,18 @@ PHOTOMETRY_COLOR_TERM_MAX: float = float(_get("PHOTOMETRY_COLOR_TERM_MAX", "1.5"
 # beats none at all.
 PHOTOMETRY_REF_MAX_RUWE: float = float(_get("PHOTOMETRY_REF_MAX_RUWE", "1.4"))
 
+# --- Largest acceptable zero-point uncertainty ------------------------------
+# A frame whose zero point is known worse than this (standard error of the
+# median, 1.2533 × reference scatter / √n, in mag) is left uncalibrated rather
+# than calibrated badly: every star inherits the zero point's error together,
+# and on the NGC 7331 run one frame calibrated off 4 stars with scatter 0.28
+# (standard error 0.18) put all of them 0.4 mag too bright — 25 VARIABLE_STAR
+# alerts from one epoch (2026-09-23). An uncalibrated frame costs only its own
+# Δmag comparisons. Deliberately not a cap on the scatter itself, which a
+# well-populated field of mixed colours legitimately has. In magnitudes, so
+# instrument-independent; <= 0 disables the check.
+PHOTOMETRY_MAX_ZERO_POINT_ERR: float = float(_get("PHOTOMETRY_MAX_ZERO_POINT_ERR", "0.1"))
+
 # --- Sky annulus statistics ------------------------------------------------
 # Sigma-clipping threshold for the per-source sky annulus. Without it the
 # annulus median takes in whatever else happens to fall in the ring — a
@@ -871,6 +883,7 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
     "PHOTOMETRY_COLOR_TERM_MAX": float,
     "PHOTOMETRY_REF_MAX_RUWE": float,
+    "PHOTOMETRY_MAX_ZERO_POINT_ERR": float,
     "PHOTOMETRY_SKY_SIGMA_CLIP": float,
     "PHOTOMETRY_MIN_SNR": float,
     "PHOTOMETRY_GAIN_E_PER_ADU": None,  # special: float, blank → None

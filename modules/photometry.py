@@ -311,6 +311,20 @@ class _ZeroPoint(NamedTuple):
     color_scatter: float
 
 
+def _reference_mag(src: dict) -> float | None:
+    """
+    The Gaia G magnitude a zero-point reference is calibrated against, or None.
+
+    A "Gaia DR3" match carries it as ``catalog_mag``; a star another catalog
+    named first (Simbad, for its object types) carries it as ``_gaia_mag``,
+    attached by catalog_matcher's ``_attach_gaia_color()``. Which catalog named
+    the star must not decide whether it can anchor the calibration.
+    """
+    if src.get("catalog_name") == "Gaia DR3":
+        return src.get("catalog_mag")
+    return src.get("_gaia_mag")
+
+
 def _robust_color_fit(
     colors: np.ndarray,
     deltas: np.ndarray,
@@ -377,8 +391,9 @@ def _compute_zero_point(
     """
     Compute the differential photometry zero-point from Gaia DR3 reference stars.
 
-    Requires at least 3 sources with ``catalog_name == "Gaia DR3"``,
-    a finite ``catalog_mag``, and a finite ``mag_instrumental``. Those are
+    Requires at least 3 sources with a Gaia G magnitude (`_reference_mag()`:
+    ``catalog_mag`` of a "Gaia DR3" match, or ``_gaia_mag`` attached to a star
+    another catalog named) and a finite ``mag_instrumental``. Those are
     first screened through ``_is_usable_reference()`` — Gaia's own
     variable/duplicated/RUWE flags — with a documented fallback to the
     unscreened set when screening would leave too few.
@@ -413,11 +428,12 @@ def _compute_zero_point(
     -------
     _ZeroPoint
         ``zero_point``/``zero_point_err`` are None when fewer than 3 valid
-        references are available. ``color_term`` is 0.0 whenever no colour
+        references are available, or when the references disagree by more
+        than PHOTOMETRY_MAX_ZERO_POINT_ERR. ``color_term`` is 0.0 whenever no colour
         term is configured for the filter (or too few references carry a
         colour), in which case the result is the plain median.
     """
-    candidates = [src for src in sources if src.get("catalog_name") == "Gaia DR3"]
+    candidates = [src for src in sources if _reference_mag(src) is not None]
     screened = [src for src in candidates if _is_usable_reference(src)]
 
     # Screening only ever narrows the set. Dropping below the 3 references a
@@ -453,7 +469,7 @@ def _compute_zero_point(
         # in the frame. See docs/ISSUES.md #2.
         if src.get("saturated"):
             continue
-        cat_mag = src.get("catalog_mag")
+        cat_mag = _reference_mag(src)
         inst_mag = src.get("mag_instrumental")
         if cat_mag is None or inst_mag is None:
             continue
@@ -537,6 +553,26 @@ def _compute_zero_point(
         len(deltas),
         color_term,
     )
+
+    # A zero point this uncertain is not a calibration: every star in the
+    # frame inherits its error together, and one such frame (4 references,
+    # scatter 0.28) put 25 stars past DELTA_MAG_ALERT at once. An uncalibrated
+    # frame only costs its own Δmag comparisons. The test is on the standard
+    # error of the median (1.2533 × scatter / √n), not on the scatter itself:
+    # a field of many stars of different colour scatters widely about the
+    # zero point — the more so with no colour term configured — and still
+    # pins it down well.
+    max_err = config.PHOTOMETRY_MAX_ZERO_POINT_ERR
+    zp_std_err = 1.2533 * mad / math.sqrt(len(deltas))
+    if max_err > 0 and zp_std_err > max_err:
+        logger.warning(
+            "photometry: zero point uncertain by %.3f mag (scatter %.3f over %d "
+            "reference(s)), above PHOTOMETRY_MAX_ZERO_POINT_ERR=%.3f — leaving the "
+            "frame uncalibrated",
+            zp_std_err, mad, len(deltas), max_err,
+        )
+        return _ZeroPoint(None, None, 0.0, None, 0.0)
+
     return _ZeroPoint(zp, mad, color_term, color_ref, color_scatter)
 
 

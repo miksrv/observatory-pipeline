@@ -809,8 +809,11 @@ class TestColorTerm:
         # The configured slope matches the data, so nothing is left over.
         assert sol.zero_point_err == pytest.approx(0.0, abs=1e-9)
 
-    def test_a_frame_that_would_fit_a_different_slope_still_gets_the_configured_one(self):
+    def test_a_frame_that_would_fit_a_different_slope_still_gets_the_configured_one(self, monkeypatch):
         """The whole point: the slope must not change from frame to frame."""
+        # Estimator test with deliberately wide synthetic scatter — not a test of the
+        # zero-point uncertainty guard, which would reject it.
+        monkeypatch.setattr(config, "PHOTOMETRY_MAX_ZERO_POINT_ERR", 0.0)
         sol = photometry._compute_zero_point(self._colored_refs(k=1.0, zp=24.0), fixed_color_term=0.4)
 
         assert sol.color_term == pytest.approx(0.4)
@@ -1082,7 +1085,10 @@ class TestSmallSampleScatter:
     at the moment the calibration is least trustworthy.
     """
 
-    def test_three_references_with_an_outlier_do_not_report_zero_error(self):
+    def test_three_references_with_an_outlier_do_not_report_zero_error(self, monkeypatch):
+        # Estimator test with deliberately wide synthetic scatter — not a test of the
+        # zero-point uncertainty guard, which would reject it.
+        monkeypatch.setattr(config, "PHOTOMETRY_MAX_ZERO_POINT_ERR", 0.0)
         refs = [_ref(24.0, None), _ref(24.0, None), _ref(25.0, None)]
         sol = photometry._compute_zero_point(refs)
 
@@ -1096,11 +1102,14 @@ class TestSmallSampleScatter:
 
         assert sol.zero_point_err == pytest.approx(0.0)
 
-    def test_the_small_sample_correction_fades_with_n(self):
+    def test_the_small_sample_correction_fades_with_n(self, monkeypatch):
         """
         The same relative spread must not be reported as a larger scatter for
         a large reference set than the asymptotic MAD would give.
         """
+        # Estimator test with deliberately wide synthetic scatter — not a test of the
+        # zero-point uncertainty guard, which would reject it.
+        monkeypatch.setattr(config, "PHOTOMETRY_MAX_ZERO_POINT_ERR", 0.0)
         spread = [-1.0, -0.5, 0.0, 0.5, 1.0]
         many = [_ref(24.0 + d, None) for d in spread * 12]
         sol = photometry._compute_zero_point(many)
@@ -1305,3 +1314,47 @@ class TestFwhmFallback:
             result = await photometry.measure(_FITS_PATH, srcs)
 
         assert len(result) == 1
+
+
+class TestZeroPointReferences:
+    """
+    docs/PLAN-OSC-SUPPORT.md T10. References used to be only "Gaia DR3"
+    matches, and Simbad (which runs first) claims most bright stars around a
+    well-known galaxy: the NGC 7331 run calibrated off a median of 3 stars,
+    and a frame calibrated off 4 (scatter 0.28) put every star 0.4 mag too
+    bright.
+    """
+
+    @staticmethod
+    def _simbad_ref(delta: float, inst: float = -10.0) -> dict:
+        return {"catalog_name": "Simbad", "catalog_mag": None,
+                "_gaia_mag": inst + delta, "mag_instrumental": inst, "_catalog_color": None}
+
+    def test_a_star_simbad_named_counts_as_a_reference(self):
+        refs = [self._simbad_ref(24.0), self._simbad_ref(24.02), _ref(23.98, None)]
+        sol = photometry._compute_zero_point(refs)
+        assert sol.zero_point == pytest.approx(24.0)
+
+    def test_a_simbad_star_without_a_gaia_counterpart_is_not_a_reference(self):
+        named_only = {"catalog_name": "Simbad", "catalog_mag": None, "mag_instrumental": -10.0}
+        sol = photometry._compute_zero_point([named_only, _ref(24.0, None), _ref(24.0, None)])
+        assert sol.zero_point is None
+
+    def test_few_disagreeing_references_leave_the_frame_uncalibrated(self):
+        # The NGC 7331 frame: 4 references, scatter ~0.28.
+        refs = [_ref(d, None) for d in (24.0, 24.35, 23.7, 24.4)]
+        sol = photometry._compute_zero_point(refs)
+        assert sol.zero_point is None
+
+    def test_many_references_of_mixed_colour_still_calibrate(self):
+        """The guard is on the median's standard error, not the scatter:
+        a well-populated field scatters widely and still pins the zero point."""
+        rng = np.random.default_rng(1)
+        refs = [_ref(24.0 + d, None) for d in rng.normal(0.0, 0.3, 100)]
+        sol = photometry._compute_zero_point(refs)
+        assert sol.zero_point == pytest.approx(24.0, abs=0.1)
+
+    def test_the_guard_can_be_disabled(self, monkeypatch):
+        monkeypatch.setattr(config, "PHOTOMETRY_MAX_ZERO_POINT_ERR", 0.0)
+        refs = [_ref(d, None) for d in (24.0, 24.35, 23.7, 24.4)]
+        assert photometry._compute_zero_point(refs).zero_point is not None

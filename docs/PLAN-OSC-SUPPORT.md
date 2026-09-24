@@ -204,6 +204,19 @@ rows / 284 MB / 0.8 s (observatory-api `develop`, `ae891fe`). One classification
 intended: the source at ra=339.4096 dec=34.3024 went from `MOVING_UNKNOWN` to `UNKNOWN` — its
 "vacated position" evidence had been a catalogued star missing from this frame.
 
+### T10 — zero point from every star with a Gaia magnitude **[done]**
+From the T8 review of 136 `VARIABLE_STAR` on NGC 7331: references were only "Gaia DR3" matches,
+and Simbad (first in the matching order) names most bright stars around NGC 7331. Median 3
+references per frame, 63 photometry runs with fewer than 3 (uncalibrated), and one frame off 4
+stars (scatter 0.28) put every star 0.4 mag too bright — 25 alerts from one epoch; 34 of the 136
+were in the 4 frames with a frame-wide offset above 0.1 mag.
+- `_attach_gaia_color()` also attaches the Gaia G magnitude (`_gaia_mag`) to a star another
+  catalog named; `photometry._reference_mag()` accepts it.
+- `PHOTOMETRY_MAX_ZERO_POINT_ERR` (0.1 mag): a frame whose zero point's standard error exceeds
+  it is left uncalibrated. On the standard error, not the scatter — a field of mixed colours
+  with no colour term (OSC) scatters widely and still pins the zero point.
+- Real frames (worker container): references 4 → 85, 0 → 17, 3 → 72, 3 → 58.
+
 ## Commits
 One task per commit (T1+T2 may land together if T2 is too thin alone), no co-author lines,
 pushed and merged by the user.

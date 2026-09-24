@@ -893,7 +893,8 @@ re-exports it, so every call site elsewhere in this codebase is unchanged.
   test database: 24 `IC3322A` frames whose mount had desynced by ~10° reached the API with zero
   calibrated sources, although their plate solves and catalog matches were fine. Without a
   passed WCS it falls back to the header, then to astap's `.wcs` side file, as before.
-- Differential photometry against Gaia reference stars in the field (requires ≥3 Gaia DR3 matches to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations
+- Differential photometry against Gaia reference stars in the field (requires ≥3 stars with a Gaia G magnitude to compute a zero-point) — this makes brightness measurements immune to atmospheric transparency variations. A reference is any star with a Gaia G magnitude, whichever catalog named it (`_reference_mag()`: `catalog_mag` of a Gaia DR3 match, or `_gaia_mag` attached to a Simbad-named star — see `modules/catalog_matcher/` below). Only Gaia DR3 matches used to count, and around a well-known galaxy Simbad names most bright stars first: on the NGC 7331 run the median zero point rested on 3 stars, 63 frames had fewer and went uncalibrated, and one frame calibrated off 4 stars put every star 0.4 mag too bright — 25 false `VARIABLE_STAR`s from one epoch (2026-09-23). With Simbad-named stars counted, the same frames had 17–85 references.
+- A frame whose zero point is too uncertain — standard error of the median, `1.2533 × scatter / √n`, above `PHOTOMETRY_MAX_ZERO_POINT_ERR` (0.1 mag) — is left **uncalibrated**: every star would inherit that error together. The cap is on the standard error, not on the scatter itself, which a well-populated field of mixed colours legitimately has (all the more with no colour term configured, as for `OSC`).
 - Each source's sky annulus is **sigma-clipped** (`PHOTOMETRY_SKY_SIGMA_CLIP`, 3σ) before its
   median is taken. The ring is a background sample only in principle — in practice it routinely
   catches a neighbouring star, a cosmic ray, or, worst, the host galaxy's own light under a
@@ -1254,14 +1255,16 @@ external catalogs using
 (`MOVING_CONE_ARCSEC` for the MPC step, since moving objects shift between frames).
 
 A source that Simbad claimed (Simbad runs first, for its object types) still receives the Gaia
-BP−RP colour and quality flags of the Gaia star at its position (`_gaia._attach_gaia_color()`,
-run right after `_match_gaia()`). `modules/photometry.py` applies the colour term per source from
+G magnitude (`_gaia_mag`, which makes it a zero-point reference — see `modules/photometry.py`), BP−RP
+colour and quality flags of the Gaia star at its position (`_gaia._attach_gaia_color()`, run right
+after `_match_gaia()`). `modules/photometry.py` applies the colour term per source from
 `_catalog_color`, which only a Gaia match set — so one and the same star was calibrated *without*
 the colour correction on a night Simbad named it and *with* it on a night forced photometry
 recovered it under its Gaia identity: ~0.8 mag apart for a red star, which the light-curve
 detector reported as variability (2026-09-22 IC3322A test run, a `PM*` star at 14.79 vs 13.89 for
 the same flux). The catalog that names a source must not decide how its magnitude is calibrated.
-MPC objects are excluded (no catalogued colour), as is any source already carrying a colour.
+MPC objects are excluded (no catalogued colour); a colour a source already carries is never
+overwritten.
 
 Every Gaia DR3 star is **proper-motion propagated** from its own `ref_epoch` (J2016.0 for DR3)
 to the frame's `obs_time` before it is used for anything — once, in `match()`, so both the
