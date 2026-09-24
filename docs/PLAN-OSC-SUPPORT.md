@@ -217,6 +217,17 @@ were in the 4 frames with a frame-wide offset above 0.1 mag.
   with no colour term (OSC) scatters widely and still pins the zero point.
 - Real frames (worker container): references 4 → 85, 0 → 17, 3 → 72, 3 → 58.
 
+### T11 — a magnitude change must hold for two epochs **[done]**
+From the T8 review: 116 of 136 `VARIABLE_STAR` triggers were forced-photometry measurements of
+faint stars (16–17.7 mag), 115 of them brighter in one epoch by ~5σ of the star's own light
+curve and normal in the next — the signature of a cosmic ray or hot pixel in the aperture.
+- `_classify._change_is_confirmed()`: the previous `VARIABILITY_CONFIRM_EPOCHS − 1` same-filter
+  epochs must show the change too (same direction, same significance test, against the baseline
+  of the remaining history), for every Δmag branch.
+- On the stored light curves it keeps 55 of 136 — none in the frames T10 fixes; the remainder
+  are edge vignetting on unflattened frames (the "fainter" blind-detection triggers) and short
+  early baselines, left for the rest of the T8 review.
+
 ## Commits
 One task per commit (T1+T2 may land together if T2 is too thin alone), no co-author lines,
 pushed and merged by the user.

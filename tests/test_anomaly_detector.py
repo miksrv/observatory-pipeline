@@ -20,6 +20,17 @@ import config
 import modules.anomaly_detector as ad
 
 
+@pytest.fixture(autouse=True)
+def _single_epoch_changes(monkeypatch):
+    """
+    Most tests here exercise which Δmag branch a change lands in, from a
+    change in the current epoch alone. The multi-epoch confirmation in front
+    of those branches (VARIABILITY_CONFIRM_EPOCHS, docs/PLAN-OSC-SUPPORT.md
+    T11) is tested on its own in TestChangeConfirmation, which sets it back.
+    """
+    monkeypatch.setattr(config, "VARIABILITY_CONFIRM_EPOCHS", 1)
+
+
 # ---------------------------------------------------------------------------
 # Shared constants
 # ---------------------------------------------------------------------------
@@ -1984,3 +1995,65 @@ class TestHistoryPrefetchShape:
             result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
         assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+
+
+# ===========================================================================
+# Multi-epoch confirmation of a magnitude change (docs/PLAN-OSC-SUPPORT.md T11)
+# ===========================================================================
+
+class TestChangeConfirmation:
+    """
+    115 of the 136 VARIABLE_STARs on the NGC 7331 run were one faint star,
+    one frame, brighter, and normal again in the next — a cosmic ray or hot
+    pixel in the aperture. A change must now hold for
+    VARIABILITY_CONFIRM_EPOCHS consecutive same-filter epochs.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _confirm_two(self, monkeypatch):
+        monkeypatch.setattr(config, "VARIABILITY_CONFIRM_EPOCHS", 2)
+
+    @staticmethod
+    def _history(mags: list[float]) -> list[dict]:
+        return [
+            {**_make_hist_source(mag=m), "obs_time": f"2026-09-21T17:{i:02d}:00Z"}
+            for i, m in enumerate(mags)
+        ]
+
+    async def _classify(self, source, history):
+        async def near(positions, radius, before, uncatalogued_only=False):
+            return {} if uncatalogued_only else {"0": history}
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            return await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+    def _star(self, mag):
+        return _make_source(mag=mag, catalog_name="Gaia DR3", catalog_id="1", object_type="STAR")
+
+    async def test_a_single_deviant_epoch_is_not_reported(self):
+        stable = [15.0, 15.02, 14.98, 15.01, 14.99, 15.0]
+        assert await self._classify(self._star(14.2), self._history(stable)) == []
+
+    async def test_a_change_seen_in_the_previous_epoch_too_is_reported(self):
+        history = self._history([15.0, 15.02, 14.98, 15.01, 14.99, 14.25])
+        result = await self._classify(self._star(14.2), history)
+        assert [a["anomaly_type"] for a in result] == ["VARIABLE_STAR"]
+
+    async def test_the_epoch_after_a_spike_is_not_reported_either(self):
+        """Back to normal after a one-frame spike: the current epoch is not a change."""
+        history = self._history([15.0, 15.02, 14.98, 15.01, 14.99, 14.2])
+        assert await self._classify(self._star(15.0), history) == []
+
+    async def test_opposite_directions_do_not_confirm_each_other(self):
+        history = self._history([15.0, 15.02, 14.98, 15.01, 14.99, 15.8])
+        assert await self._classify(self._star(14.2), history) == []
+
+    async def test_confirmation_can_be_disabled(self, monkeypatch):
+        monkeypatch.setattr(config, "VARIABILITY_CONFIRM_EPOCHS", 1)
+        stable = [15.0, 15.02, 14.98, 15.01, 14.99, 15.0]
+        result = await self._classify(self._star(14.2), self._history(stable))
+        assert [a["anomaly_type"] for a in result] == ["VARIABLE_STAR"]

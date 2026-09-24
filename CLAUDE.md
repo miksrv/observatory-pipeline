@@ -1542,6 +1542,16 @@ prior detection at all near a known galaxy, and an already-catalogued/known gala
 more than `DELTA_MAG_ALERT`. Both use the same `MATCH_CONE_ARCSEC` (5″ by default) "near galaxy"
 radius as ordinary star matching — there is no separate, wider radius for extended galaxy disks.
 
+A Δmag branch also fires only when the change is **confirmed**: the previous
+`VARIABILITY_CONFIRM_EPOCHS − 1` same-filter epochs (default 1) must show it too — each departing
+from the baseline formed by the rest of the history, in the same direction, and passing the same
+significance test (`_classify._change_is_confirmed()`). One deviant epoch is what a cosmic ray or
+hot pixel in the aperture produces: on the NGC 7331 run 115 of 136 `VARIABLE_STAR`s were one faint
+star brighter in one frame and normal again in the next (2026-09-23). A persisting change is
+reported one epoch later; a genuine single-epoch event is not reported at all, which is the price.
+On that run's stored light curves the rule alone kept 55 of the 136, the rest being edge
+vignetting on unflattened frames and short early baselines rather than single spikes.
+
 A Δmag branch fires only when the change clears `DELTA_MAG_ALERT` **and** exceeds
 `VARIABILITY_SIGMA` × the source's own noise — its `mag_err` and its same-filter historical
 scatter added in quadrature (`_is_significant_delta()`). A flat threshold is the wrong shape for

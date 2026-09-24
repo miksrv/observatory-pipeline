@@ -339,6 +339,14 @@ VARIABILITY_MIN_EPOCHS: int = int(_get("VARIABILITY_MIN_EPOCHS", "3"))
 # an implausibly tight history can't alert on a photometrically meaningless
 # change.
 VARIABILITY_SIGMA: float = float(_get("VARIABILITY_SIGMA", "3.0"))
+# How many consecutive same-filter epochs — this one included — must show the
+# change before any Δmag classification (VARIABLE_STAR, BINARY_STAR, the
+# brightening SUPERNOVA_CANDIDATE) fires. A single deviant epoch is what a
+# cosmic ray or hot pixel in the aperture produces, and on the NGC 7331 run
+# 115 of the 136 VARIABLE_STARs were exactly that: one faint star, one frame,
+# brighter, and back to normal on the next (2026-09-23). A real change that
+# persists fires one epoch later. 1 disables the confirmation.
+VARIABILITY_CONFIRM_EPOCHS: int = int(_get("VARIABILITY_CONFIRM_EPOCHS", "2"))
 
 # Faintest predicted visual magnitude (V) for an MPC/SkyBot object to be
 # eligible for source matching. Objects fainter than this are almost certainly
@@ -899,6 +907,7 @@ _OVERRIDABLE: dict[str, type] = {
     "DELTA_MAG_ALERT": float,
     "VARIABILITY_MIN_EPOCHS": int,
     "VARIABILITY_SIGMA": float,
+    "VARIABILITY_CONFIRM_EPOCHS": int,
     "MPC_MAG_LIMIT": float,
     # Edge geometry
     "EDGE_MARGIN_FRAC": float,

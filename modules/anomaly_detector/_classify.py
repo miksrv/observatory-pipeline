@@ -15,6 +15,7 @@ import config
 
 from ._geometry import _find_sources_within_radius, _haversine_arcsec, _tile_key
 from ._history import (
+    _extract_mag,
     _history_mag_epochs,
     _history_mag_scatter,
     _history_median_mag,
@@ -110,6 +111,47 @@ def _delta_mag_noise(source: dict, same_filter_history: list[dict]) -> float | N
     if not terms:
         return None
     return math.sqrt(sum(term ** 2 for term in terms))
+
+
+def _change_is_confirmed(delta_mag: float, same_filter_history: list[dict]) -> bool:
+    """
+    True when the most recent `VARIABILITY_CONFIRM_EPOCHS - 1` same-filter
+    epochs of the history show the same change as the current one: each
+    departs, in the same direction, from the baseline formed by the rest of
+    the history, and passes the same significance test
+    (`_is_significant_delta()`) against it.
+
+    One deviant epoch is what a cosmic ray or hot pixel landing in the
+    aperture produces, and on the NGC 7331 run (2026-09-23) 115 of the 136
+    VARIABLE_STARs were exactly that: a faint star brighter in one frame and
+    back to normal in the next. A real change that persists is reported one
+    epoch later instead; a single-epoch event is not reported at all, which is
+    the price of the rule. The history rows carry no mag_err, so the earlier
+    epochs are judged on the baseline's scatter alone.
+    """
+    n_confirm = config.VARIABILITY_CONFIRM_EPOCHS - 1
+    if n_confirm <= 0:
+        return True
+
+    measured = sorted(
+        (src for src in same_filter_history if _extract_mag(src) is not None),
+        key=lambda src: str(src.get("obs_time") or ""),
+    )
+    if len(measured) <= n_confirm:
+        return False
+
+    recent, baseline = measured[-n_confirm:], measured[:-n_confirm]
+    baseline_mag = _history_median_mag(baseline)
+    if baseline_mag is None:
+        return False
+
+    for src in recent:
+        earlier_delta = _extract_mag(src) - baseline_mag
+        if earlier_delta * delta_mag <= 0:
+            return False
+        if not _is_significant_delta(earlier_delta, {}, baseline):
+            return False
+    return True
 
 
 def _is_significant_delta(
@@ -721,6 +763,18 @@ def _classify_source_sync(
         delta_mag is not None
         and _is_significant_delta(delta_mag, source, same_filter_history)
     )
+
+    # ...and not in this epoch alone: a single deviant epoch is what a cosmic
+    # ray or hot pixel in the aperture produces — see _change_is_confirmed().
+    if mag_changed and not _change_is_confirmed(delta_mag, same_filter_history):
+        logger.debug(
+            "Unconfirmed magnitude change at ra=%.4f dec=%.4f delta_mag=%.3f — "
+            "the previous %d same-filter epoch(s) do not show it; waiting for "
+            "the next epoch before classifying",
+            ra, dec, delta_mag, config.VARIABILITY_CONFIRM_EPOCHS - 1,
+            extra=extra,
+        )
+        mag_changed = False
 
     if mag_changed:
         # --- SUPERNOVA_CANDIDATE — brightening in/near an already-known
