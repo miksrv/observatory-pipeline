@@ -228,6 +228,35 @@ curve and normal in the next — the signature of a cosmic ray or hot pixel in t
   are edge vignetting on unflattened frames (the "fainter" blind-detection triggers) and short
   early baselines, left for the rest of the T8 review.
 
+### T12 — recent transients: TNS cross-match, Simbad transients not a stellar identity
+From the T8 review: source `6ab44cee57b6e0.33402578` is SN 2026aaiv (discovered 2026-09-01, in no
+catalog the pipeline queries yet), ~12.3 mag, ~29″ from the NGC 7331 nucleus. It was matched to
+Simbad's "SN 2014C" 3.5″ away (inside `MATCH_CONE_ARCSEC`; ~1.5 FWHM at 0.76″/px, so not
+resolvable here) and reported only as `VARIABLE_STAR` — twice, both in the zero-point-offset
+frames T10 fixes. After T10 it would produce no anomaly at all:
+- neither `SUPERNOVA_CANDIDATE` path can fire for a transient present since the field's first
+  frame: there is no "before", and the first frame of a field has no coverage
+  (`FIRST_OBSERVATION`);
+- "near a galaxy" is the 5″ match cone, and the SN is ~29″ from the nucleus;
+- a Simbad supernova gives the source a permanent, unremarkable stellar identity, although a
+  2014 supernova is far fainter than 12 mag today.
+
+Tasks:
+1. **TNS cross-match** (Transient Name Server, the IAU registry of recent transients — Simbad lags
+   it by weeks to months). Query TNS by cone for each frame (cached like the other catalogs);
+   a detection at a TNS object's position gets its name and type, and a TNS supernova is
+   reported as a known supernova rather than a star. Needs a TNS bot API key — **the operator
+   will create it**; config `TNS_BOT_ID` / `TNS_BOT_NAME` / `TNS_API_KEY`, the query skipped
+   while unset. Rate limits and the cache TTL to be read from the TNS API docs before coding.
+2. **Simbad transient object types** (`SN*`, `SN?`, `Nova`, `No?` and the like) must not claim a
+   source as its stellar identity in `catalog_matcher`. A bright point source at an old
+   supernova's position is a reason to alert, not to suppress; the source should continue to
+   Gaia/2MASS/Pan-STARRS and, if none claims it, be treated as uncatalogued.
+3. Deferred: "near a galaxy" from the galaxy's own extent (Simbad major/minor axes) instead of the
+   5″ cone — noisier (uncatalogued HII regions and knots in the disk), a separate task.
+
+Status: open; 1 waits for the TNS key, 2 can go first.
+
 ## Commits
 One task per commit (T1+T2 may land together if T2 is too thin alone), no co-author lines,
 pushed and merged by the user.
