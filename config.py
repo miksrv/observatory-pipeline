@@ -35,6 +35,10 @@ API_KEY: str = _require("API_KEY")
 FITS_INCOMING: str = _get("FITS_INCOMING", "/fits/incoming")
 FITS_ARCHIVE: str = _get("FITS_ARCHIVE", "/fits/archive")
 FITS_REJECTED: str = _get("FITS_REJECTED", "/fits/rejected")
+# Untouched colour originals of one-shot-colour (Bayer) frames, kept for the
+# operator's own stacking — pipeline.py analyses a mono copy instead (see
+# modules/cfa.py) and never writes here after the initial copy.
+FITS_RAW_ARCHIVE: str = _get("FITS_RAW_ARCHIVE", "/fits/raw")
 
 # ---------------------------------------------------------------------------
 # ASTAP plate solver
@@ -135,7 +139,15 @@ NARROWBAND_FILTERS: frozenset[str] = frozenset(
 # These parameters filter raw SEP detections to keep only point sources (stars)
 # and reject extended objects (nebula parts, galaxies) and artifacts.
 # ---------------------------------------------------------------------------
-STAR_FWHM_MIN_ARCSEC: float = float(_get("STAR_FWHM_MIN_ARCSEC", "2.5"))
+# Hot/warm-pixel floor, in PIXELS: a hot pixel's footprint is fixed by the
+# pixel grid, whatever the optics. With the pipeline's moment-based FWHM
+# (2.3548 * sqrt((a² + b²) / 2)) a single lit pixel measures 0.68 px and a
+# fully lit 2×2 block 1.18 px; no PSF, however well sampled, is that sharp.
+# It used to be STAR_FWHM_MIN_ARCSEC=2.5, which on a 0.38"/px camera
+# (ZWO ASI585MC at 1568 mm, 2026-09-23) sat above nearly every real star.
+# The per-frame PSF bound in astrometry/_extraction.py (psf / 1.5) still
+# does the finer work of rejecting clusters that clear this floor.
+STAR_FWHM_MIN_PX: float = float(_get("STAR_FWHM_MIN_PX", "1.2"))
 STAR_FWHM_MAX_ARCSEC: float = float(_get("STAR_FWHM_MAX_ARCSEC", "8.0"))
 STAR_ELONGATION_MAX: float = float(_get("STAR_ELONGATION_MAX", "1.5"))
 # Upper elongation bound for the LOOSE `sources_all` list that
@@ -327,6 +339,14 @@ VARIABILITY_MIN_EPOCHS: int = int(_get("VARIABILITY_MIN_EPOCHS", "3"))
 # an implausibly tight history can't alert on a photometrically meaningless
 # change.
 VARIABILITY_SIGMA: float = float(_get("VARIABILITY_SIGMA", "3.0"))
+# How many consecutive same-filter epochs — this one included — must show the
+# change before any Δmag classification (VARIABLE_STAR, BINARY_STAR, the
+# brightening SUPERNOVA_CANDIDATE) fires. A single deviant epoch is what a
+# cosmic ray or hot pixel in the aperture produces, and on the NGC 7331 run
+# 115 of the 136 VARIABLE_STARs were exactly that: one faint star, one frame,
+# brighter, and back to normal on the next (2026-09-23). A real change that
+# persists fires one epoch later. 1 disables the confirmation.
+VARIABILITY_CONFIRM_EPOCHS: int = int(_get("VARIABILITY_CONFIRM_EPOCHS", "2"))
 
 # Faintest predicted visual magnitude (V) for an MPC/SkyBot object to be
 # eligible for source matching. Objects fainter than this are almost certainly
@@ -568,6 +588,18 @@ PHOTOMETRY_COLOR_TERM_MAX: float = float(_get("PHOTOMETRY_COLOR_TERM_MAX", "1.5"
 # calibrates off the unscreened set instead — a slightly worse zero point
 # beats none at all.
 PHOTOMETRY_REF_MAX_RUWE: float = float(_get("PHOTOMETRY_REF_MAX_RUWE", "1.4"))
+
+# --- Largest acceptable zero-point uncertainty ------------------------------
+# A frame whose zero point is known worse than this (standard error of the
+# median, 1.2533 × reference scatter / √n, in mag) is left uncalibrated rather
+# than calibrated badly: every star inherits the zero point's error together,
+# and on the NGC 7331 run one frame calibrated off 4 stars with scatter 0.28
+# (standard error 0.18) put all of them 0.4 mag too bright — 25 VARIABLE_STAR
+# alerts from one epoch (2026-09-23). An uncalibrated frame costs only its own
+# Δmag comparisons. Deliberately not a cap on the scatter itself, which a
+# well-populated field of mixed colours legitimately has. In magnitudes, so
+# instrument-independent; <= 0 disables the check.
+PHOTOMETRY_MAX_ZERO_POINT_ERR: float = float(_get("PHOTOMETRY_MAX_ZERO_POINT_ERR", "0.1"))
 
 # --- Sky annulus statistics ------------------------------------------------
 # Sigma-clipping threshold for the per-source sky annulus. Without it the
@@ -836,7 +868,7 @@ _OVERRIDABLE: dict[str, type] = {
     "QC_SKY_BACKGROUND_MAX": float,
     "QC_STARS_MIN_NARROWBAND": int,
     # Star detection filtering
-    "STAR_FWHM_MIN_ARCSEC": float,
+    "STAR_FWHM_MIN_PX": float,
     "STAR_FWHM_MAX_ARCSEC": float,
     "STAR_ELONGATION_MAX": float,
     "SOURCES_ALL_ELONGATION_MAX": float,
@@ -859,6 +891,7 @@ _OVERRIDABLE: dict[str, type] = {
     "PHOTOMETRY_COLOR_TERM_MIN_SPAN": float,
     "PHOTOMETRY_COLOR_TERM_MAX": float,
     "PHOTOMETRY_REF_MAX_RUWE": float,
+    "PHOTOMETRY_MAX_ZERO_POINT_ERR": float,
     "PHOTOMETRY_SKY_SIGMA_CLIP": float,
     "PHOTOMETRY_MIN_SNR": float,
     "PHOTOMETRY_GAIN_E_PER_ADU": None,  # special: float, blank → None
@@ -874,6 +907,7 @@ _OVERRIDABLE: dict[str, type] = {
     "DELTA_MAG_ALERT": float,
     "VARIABILITY_MIN_EPOCHS": int,
     "VARIABILITY_SIGMA": float,
+    "VARIABILITY_CONFIRM_EPOCHS": int,
     "MPC_MAG_LIMIT": float,
     # Edge geometry
     "EDGE_MARGIN_FRAC": float,

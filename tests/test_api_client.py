@@ -844,3 +844,27 @@ class TestNonFiniteWireValues:
 
         json.dumps([_to_wire_source({"ra": 1.0, "dec": 2.0, "snr": float("-inf")})], allow_nan=False)
 
+
+
+class TestGetSourcesNearBatch:
+    async def test_payload_unchanged_without_the_flag(self):
+        resp = _mock_response(status_code=200, json_data={"results": {}})
+        with _patch_client(post_response=resp) as mock_client:
+            await api_client_module.get_sources_near_batch([{"ra": 1.0, "dec": 2.0}], 5.0, "2026-09-23T00:00:00Z")
+
+        _, call_kwargs = mock_client.post.call_args
+        assert call_kwargs["json"] == {
+            "positions": [{"ra": 1.0, "dec": 2.0}],
+            "radius_arcsec": 5.0,
+            "before_time": "2026-09-23T00:00:00Z",
+        }
+
+    async def test_uncatalogued_only_is_sent_when_set(self):
+        resp = _mock_response(status_code=200, json_data={"results": {}})
+        with _patch_client(post_response=resp) as mock_client:
+            await api_client_module.get_sources_near_batch(
+                [{"ra": 1.0, "dec": 2.0}], 600.0, "2026-09-23T00:00:00Z", uncatalogued_only=True)
+
+        _, call_kwargs = mock_client.post.call_args
+        assert call_kwargs["json"]["uncatalogued_only"] is True
+        assert call_kwargs["json"]["radius_arcsec"] == 600.0

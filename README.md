@@ -111,6 +111,7 @@ The pipeline communicates with the API exclusively over HTTPS using an API key. 
 │  /data/fits/incoming    │             │  │  MariaDB           │  │
 │  /data/fits/archive     │             │  └────────────────────┘  │
 │  /data/fits/rejected    │             └──────────────────────────┘
+│  /data/fits/raw         │
 │  /data/astap/catalogs   │
 └─────────────────────────┘
 ```
@@ -136,6 +137,7 @@ observatory-pipeline/
 │   └── anomaly-detector.md    ← deep-dive into modules/anomaly_detector/
 │
 ├── modules/
+│   ├── cfa.py                 ← reduce a colour (Bayer) mosaic to a mono 2×2-superpixel frame
 │   ├── fits_header.py         ← extract FITS headers into structured dict
 │   ├── normalizer.py          ← normalize object/filter/frame-type names and filenames
 │   ├── qc.py                  ← quality control: bad frame detection & rejection
@@ -216,7 +218,20 @@ A QC-failed frame is registered with the API (with its QC metrics and flag, and 
 list) and archived like any other, so an operator can see why it was rejected and a later
 re-analysis can find it again. Astrometry, photometry, catalog matching and anomaly detection
 are skipped for it, and image subtraction never uses it as a reference. `/fits/rejected/` is only
-used by direct callers of `qc.analyze()` with `move_on_reject=True`.
+used by direct callers of `qc.analyze()` with `move_on_reject=True` — and for files that are not
+a single exposure at all (see below).
+
+### One-shot-colour cameras and stacks
+A frame from a colour camera without a filter wheel (a Bayer mosaic, `BAYERPAT` in the header) is
+reduced to a mono frame by averaging each 2×2 pixel block before anything else looks at it
+(`modules/cfa.py`) — the pipeline analyses and archives that mono version. The **untouched colour
+original is copied to `/fits/raw/{object}/`** under its own filename and never modified again:
+use those files for your own colour stacking. A frame with no filter recorded is filed under the
+filter `OSC`.
+
+A debayered colour cube (`NAXIS=3`) or a stack produced by the capture software (`STACKCNT` or
+`NCOMBINE` above 1 — e.g. ZWO ASIAIR's live stacks) is not an exposure the pipeline can analyse:
+it is moved to `/fits/rejected/{object}/UNSUPPORTED_{filename}` and not registered.
 
 ### `modules/astrometry/`
 A package split one file per step of `solve()` (`_astap.py`, `_wcs.py`, `_frame_geometry.py`, `_extraction.py`, `_streak.py` — see CLAUDE.md for the exact map), with `solve()` itself living in `__init__.py` as the orchestrator, so it's still imported and called the same way everywhere else in this codebase. Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
@@ -321,6 +336,7 @@ so it works out of the box for local development without `sudo`:
 mkdir -p ~/observatory-data/fits/incoming
 mkdir -p ~/observatory-data/fits/archive
 mkdir -p ~/observatory-data/fits/rejected
+mkdir -p ~/observatory-data/fits/raw
 mkdir -p ~/observatory-data/astap/catalogs
 ```
 
@@ -332,6 +348,7 @@ side of each volume mount in `docker-compose.yml` accordingly:
 sudo mkdir -p /data/fits/incoming
 sudo mkdir -p /data/fits/archive
 sudo mkdir -p /data/fits/rejected
+sudo mkdir -p /data/fits/raw
 sudo mkdir -p /data/astap/catalogs
 
 sudo chown -R $USER:$USER /data/fits /data/astap
@@ -407,6 +424,7 @@ API_KEY=your-secret-api-key-here
 FITS_INCOMING=/fits/incoming
 FITS_ARCHIVE=/fits/archive
 FITS_REJECTED=/fits/rejected
+FITS_RAW_ARCHIVE=/fits/raw
 
 # ── ASTAP plate solver ────────────────────────────────────────────────────────
 ASTAP_BINARY=/usr/local/bin/astap
@@ -493,6 +511,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `FITS_INCOMING` | `/fits/incoming` | No | Directory to watch for new FITS files |
 | `FITS_ARCHIVE` | `/fits/archive` | No | Directory for successfully processed frames |
 | `FITS_REJECTED` | `/fits/rejected` | No | Directory for frames that fail QC |
+| `FITS_RAW_ARCHIVE` | `/fits/raw` | No | Untouched colour originals of one-shot-colour (Bayer) frames, which are analysed as mono copies |
 | **ASTAP Plate Solver** |
 | `ASTAP_BINARY` | `/usr/local/bin/astap` | No | Path to the astap executable |
 | `ASTAP_CATALOGS` | `/astap/catalogs` | No | Path to ASTAP star catalog directory |
@@ -516,7 +535,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Star Detection Filtering** |
 | `SEP_DETECT_THRESH` | `10.0` | No | Detection threshold in sigma above background for SEP source extraction. Higher = fewer, more reliable detections. |
 | `SEP_MIN_AREA` | `15` | No | Minimum connected pixels for a valid source detection. Filters out hot pixels and noise. |
-| `STAR_FWHM_MIN_ARCSEC` | `2.5` | No | Minimum FWHM in arcseconds. Sources below this are likely hot pixels or cosmic rays. |
+| `STAR_FWHM_MIN_PX` | `1.2` | No | Minimum FWHM in **pixels**. Sources below this are hot pixels or cosmic rays — a property of the pixel grid, so it holds for any optics (a lit 2×2 block measures 1.18 px). |
 | `STAR_FWHM_MAX_ARCSEC` | `8.0` | No | Maximum FWHM in arcseconds. Sources above this are extended objects (nebulae, galaxies) or badly defocused. |
 | `STAR_ELONGATION_MAX` | `1.5` | No | Maximum elongation for valid star detections. Filters out trails and extended objects. |
 | `SOURCES_ALL_ELONGATION_MAX` | `15.0` | No | Maximum elongation for the loose `sources_all` list that catalog matching and anomaly detection operate on — far above `STAR_ELONGATION_MAX` on purpose, since a trailed detection is exactly what `modules/anomaly_detector/` needs in order to classify `SPACE_DEBRIS`. Must stay comfortably above `SPACE_DEBRIS_EDGE_ELONGATION_MIN`, or a trailed near-edge source is cut before the classifier can see it; `modules/astrometry/_extraction.py` logs a warning if it isn't. |
@@ -537,6 +556,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `MOVING_CONE_MAX_ARCSEC` | `600.0` | No | Hard ceiling on the extended cone. Both bounds exist because a cone's false-positive risk grows with its area; without them the extension degenerates into a permanently wide cone. |
 | `DELTA_MAG_ALERT` | `0.5` | No | Magnitude delta threshold that triggers a variability alert. |
 | `VARIABILITY_MIN_EPOCHS` | `3` | No | Minimum number of same-filter historical detections a source needs before `modules/anomaly_detector/` will judge a magnitude change against its own light curve. Below this, a change that no catalog explains is not reported. |
+| `VARIABILITY_CONFIRM_EPOCHS` | `2` | No | How many consecutive same-filter epochs, the current one included, must show a magnitude change before `VARIABLE_STAR`, `BINARY_STAR` or a brightening `SUPERNOVA_CANDIDATE` is reported. A single deviant epoch is what a cosmic ray or hot pixel in the aperture produces. `1` disables. |
 | `VARIABILITY_SIGMA` | `3.0` | No | How many times its own historical scatter a source's magnitude must depart from its same-filter baseline to be reported as a `VARIABLE_STAR` candidate without any catalog classifying it as one. Keeps intrinsically noisy sources quiet; `DELTA_MAG_ALERT` still applies as an absolute floor. |
 | **Edge-of-Frame Geometry** |
 | `EDGE_MARGIN_FRAC` | `0.05` | No | Fraction of NAXIS1/NAXIS2 treated as "near the edge" — coma and other off-axis aberrations stretch a star's PSF near the edges/corners of a wide-field frame, inflating its measured elongation. `modules/astrometry/_extraction.py`/`modules/subtraction.py` flag such sources `near_edge`; tune to your own optics. |
@@ -557,6 +577,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Photometry — Calibration** |
 | `PHOTOMETRY_MIN_SNR` | `3.0` | No | Below this significance a measurement keeps its aperture numbers but is left uncalibrated (`mag_calibrated` stays `None`), so no magnitude-change branch can fire on a source at the detection limit. Same line `FORCED_PHOTOMETRY_MIN_SNR` draws on the other detection path. |
 | `PHOTOMETRY_SKY_SIGMA_CLIP` | `3.0` | No | Sigma clipping applied to each source's sky annulus before its median is taken — the ring routinely catches a neighbouring star, a cosmic ray, or a supernova candidate's own host galaxy. Non-positive restores the unclipped median. |
+| `PHOTOMETRY_MAX_ZERO_POINT_ERR` | `0.1` | No | Largest acceptable zero-point uncertainty in mag (standard error of the median over the reference stars). A frame above it is left uncalibrated rather than calibrated badly, since every star in it would share the error. `0` disables. |
 | `PHOTOMETRY_REF_MAX_RUWE` | `1.4` | No | Maximum Gaia RUWE for a zero-point reference star. Above it the astrometric solution fits badly — usually an unresolved binary or a blend whose aperture holds two stars' flux. Gaia-flagged variable and `duplicated_source` stars are screened out alongside this. |
 | `PHOTOMETRY_COLOR_TERM_ENABLED` | `true` | No | Apply the configured colour term (`zp + k × (BP−RP − color_ref)`) instead of a single median offset. A star's instrumental magnitude differs from Gaia's broadband G by an amount depending on its own colour, so one constant leaves a colour-dependent bias. |
 | `PHOTOMETRY_COLOR_TERMS` | *(empty)* | No | Fixed `k` per normalized filter, e.g. `B:-1.0,G:-0.45,L:-0.40,R:-0.08`. Only the zero point is fitted per frame, so every epoch is transformed identically — a per-frame fitted `k` flipped on and off between neighbouring frames and made every star "vary" between epochs. Calibrate from the `colour term measured on this frame` log lines. A filter with no entry gets no colour term. |
@@ -616,7 +637,7 @@ rebuilding Docker images on the observatory server.
    still starts normally.
 
 **Security:** credentials (`API_KEY`), filesystem paths (`FITS_INCOMING`, `FITS_ARCHIVE`,
-`FITS_REJECTED`, `ASTAP_BINARY`, `ASTAP_CATALOGS`, `CATALOG_CACHE_DIR`), and `API_BASE_URL`
+`FITS_REJECTED`, `FITS_RAW_ARCHIVE`, `ASTAP_BINARY`, `ASTAP_CATALOGS`, `CATALOG_CACHE_DIR`), and `API_BASE_URL`
 cannot be overridden remotely — only the tunable thresholds, toggles, and site parameters
 listed in [docs/API.md section 16](docs/API.md#16-pipeline-configuration-remote-settings) are
 accepted.
@@ -716,6 +737,7 @@ services:
       - ~/observatory-data/fits/incoming:/fits/incoming     # watch this for new frames
       - ~/observatory-data/fits/archive:/fits/archive       # processed frames stored here
       - ~/observatory-data/fits/rejected:/fits/rejected     # bad frames moved here
+      - ~/observatory-data/fits/raw:/fits/raw               # colour originals of OSC frames
       - ~/observatory-data/astap/catalogs:/astap/catalogs   # star catalogs for plate solving
     env_file:
       - .env
@@ -727,6 +749,7 @@ services:
 | `~/observatory-data/fits/incoming` | `/data/fits/incoming` | `/fits/incoming` | Drop new `.fits` / `.fit` files here. The watcher detects them automatically. |
 | `~/observatory-data/fits/archive` | `/data/fits/archive` | `/fits/archive` | Successfully processed frames are moved here, organized by object name. |
 | `~/observatory-data/fits/rejected` | `/data/fits/rejected` | `/fits/rejected` | Frames that fail QC are moved here with a prefix indicating the reason (`BLUR_`, `TRAIL_`, `LOW_STARS_`, `BAD_`). |
+| `~/observatory-data/fits/raw` | `/data/fits/raw` | `/fits/raw` | Untouched colour originals of one-shot-colour frames, under their original filenames — for your own colour stacking. The pipeline itself works on mono copies. |
 | `~/observatory-data/astap/catalogs` | `/data/astap/catalogs` | `/astap/catalogs` | ASTAP star catalog files. Download once; survives container rebuilds. |
 
 To use different host paths, edit the **left side** of each volume entry in `docker-compose.yml` and update the corresponding variables in `.env`. `extra_hosts: host.docker.internal:host-gateway` lets the container reach services running on the host machine.

@@ -821,6 +821,7 @@ Accept: application/json
 | `positions[].dec` | float | yes | Declination in decimal degrees |
 | `radius_arcsec` | float | yes | Cone search radius in arcseconds (same for all positions) |
 | `before_time` | string (ISO 8601) | yes | Only return sources from frames observed strictly before this timestamp |
+| `uncatalogued_only` | bool | no (default `false`) | Only return observations of sources with no catalog identity, or an MPC one. The pipeline sets it on its wide-cone moving-object query (`modules/anomaly_detector/_prefetch.py`): a catalogued star's position is never evidence of motion, and on a field that has been observed many times the unfiltered wide cone is almost entirely stars. An API that predates the field ignores it. |
 
 ### Response
 
@@ -1443,7 +1444,7 @@ is silently ignored):
 | Category | Parameters |
 |---|---|
 | QC thresholds | `QC_FWHM_MAX_ARCSEC`, `QC_ELONGATION_MAX`, `QC_SNR_MIN`, `QC_STARS_MIN`, `QC_SKY_BACKGROUND_MAX`, `QC_STARS_MIN_NARROWBAND` |
-| Star detection | `STAR_FWHM_MIN_ARCSEC`, `STAR_FWHM_MAX_ARCSEC`, `STAR_ELONGATION_MAX`, `STAR_SNR_MIN` |
+| Star detection | `STAR_FWHM_MIN_PX`, `STAR_FWHM_MAX_ARCSEC`, `STAR_ELONGATION_MAX`, `STAR_SNR_MIN` |
 | SEP extraction | `SEP_DETECT_THRESH`, `SEP_MIN_AREA` |
 | Streak masking | `STREAK_DETECT_SIGMA`, `STREAK_ELONGATION_MIN`, `STREAK_MIN_LENGTH_ARCSEC`, `STREAK_MASK_DILATE_ARCSEC` |
 | Saturation | `SATURATION_ADU`, `SATURATION_MASK_RADIUS_ARCSEC` |

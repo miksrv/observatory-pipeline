@@ -230,8 +230,8 @@ def _extract_sources(
         #     A genuine point source's profile is set by the shared
         #     atmospheric/optical PSF, so it cannot be much narrower than
         #     what every other star in the frame actually measures.
-        #     STAR_FWHM_MIN_ARCSEC alone is a static, site-agnostic floor
-        #     (default 2.5") that a hot/warm pixel cluster can sit
+        #     STAR_FWHM_MIN_PX alone is a static floor (default 1.2 px,
+        #     just above a fully lit 2x2 block) that a hot/warm pixel cluster can sit
         #     comfortably above while still being far more compact than any
         #     real star here — this was observed 2026-08-06 on Vesta test
         #     frames, where sensor hot pixels around 2.6-3.0" FWHM sailed
@@ -240,10 +240,13 @@ def _extract_sources(
         # ---------------------------------------------------------
 
         fwhm_max_arcsec = config.STAR_FWHM_MAX_ARCSEC
-        fwhm_min_arcsec = config.STAR_FWHM_MIN_ARCSEC
+        # The static floor is in pixels (a hot pixel's footprint is set by the
+        # grid, not the optics), converted here with the solved scale.
+        fwhm_floor_arcsec = config.STAR_FWHM_MIN_PX * pixel_scale_arcsec
+        fwhm_min_arcsec = fwhm_floor_arcsec
         if psf_fwhm_arcsec is not None and psf_fwhm_arcsec > 0:
             fwhm_max_arcsec = min(config.STAR_FWHM_MAX_ARCSEC, psf_fwhm_arcsec * 1.5)
-            fwhm_min_arcsec = max(config.STAR_FWHM_MIN_ARCSEC, psf_fwhm_arcsec / 1.5)
+            fwhm_min_arcsec = max(fwhm_floor_arcsec, psf_fwhm_arcsec / 1.5)
 
         # Count rejections per criterion for debugging
         mask_elongation = elongations < config.STAR_ELONGATION_MAX
@@ -315,7 +318,7 @@ def _extract_sources(
         #     above — rejects single-pixel hot pixels, and, when a per-frame
         #     PSF estimate is available, multi-pixel hot/warm pixel clusters
         #     too, even when their measured FWHM clears the static
-        #     STAR_FWHM_MIN_ARCSEC default)
+        #     STAR_FWHM_MIN_PX floor)
         #   - elongation < SOURCES_ALL_ELONGATION_MAX (rejects the
         #     degenerate a/b ratios a near-zero minor axis produces, and
         #     hairline cosmic-ray tracks, while still admitting the trailed

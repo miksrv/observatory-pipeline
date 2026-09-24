@@ -15,6 +15,7 @@ import config
 
 from ._geometry import _find_sources_within_radius, _haversine_arcsec, _tile_key
 from ._history import (
+    _extract_mag,
     _history_mag_epochs,
     _history_mag_scatter,
     _history_median_mag,
@@ -110,6 +111,47 @@ def _delta_mag_noise(source: dict, same_filter_history: list[dict]) -> float | N
     if not terms:
         return None
     return math.sqrt(sum(term ** 2 for term in terms))
+
+
+def _change_is_confirmed(delta_mag: float, same_filter_history: list[dict]) -> bool:
+    """
+    True when the most recent `VARIABILITY_CONFIRM_EPOCHS - 1` same-filter
+    epochs of the history show the same change as the current one: each
+    departs, in the same direction, from the baseline formed by the rest of
+    the history, and passes the same significance test
+    (`_is_significant_delta()`) against it.
+
+    One deviant epoch is what a cosmic ray or hot pixel landing in the
+    aperture produces, and on the NGC 7331 run (2026-09-23) 115 of the 136
+    VARIABLE_STARs were exactly that: a faint star brighter in one frame and
+    back to normal in the next. A real change that persists is reported one
+    epoch later instead; a single-epoch event is not reported at all, which is
+    the price of the rule. The history rows carry no mag_err, so the earlier
+    epochs are judged on the baseline's scatter alone.
+    """
+    n_confirm = config.VARIABILITY_CONFIRM_EPOCHS - 1
+    if n_confirm <= 0:
+        return True
+
+    measured = sorted(
+        (src for src in same_filter_history if _extract_mag(src) is not None),
+        key=lambda src: str(src.get("obs_time") or ""),
+    )
+    if len(measured) <= n_confirm:
+        return False
+
+    recent, baseline = measured[-n_confirm:], measured[:-n_confirm]
+    baseline_mag = _history_median_mag(baseline)
+    if baseline_mag is None:
+        return False
+
+    for src in recent:
+        earlier_delta = _extract_mag(src) - baseline_mag
+        if earlier_delta * delta_mag <= 0:
+            return False
+        if not _is_significant_delta(earlier_delta, {}, baseline):
+            return False
+    return True
 
 
 def _is_significant_delta(
@@ -253,7 +295,8 @@ def _classify_source_sync(
     source: dict,
     frame_id: str,
     log_filename: str,
-    history_by_tile: dict[tuple, list],
+    narrow_history: list[dict],
+    wide_pool: list[dict],
     coverage_by_tile: dict[tuple, list],
     current_frame_positions: list[tuple[float, float]],
     obs_time: str = "",
@@ -262,7 +305,11 @@ def _classify_source_sync(
     """
     Classify a single source using PREFETCHED batch data (synchronous).
 
-    No API calls are made here - all data comes from the batch prefetch.
+    No API calls are made here - all data comes from the batch prefetch
+    (`_prefetch._prefetch_history_data()`): ``narrow_history`` is this
+    source's own narrow-cone history, ``wide_pool`` its uncatalogued
+    wide-cone candidates (empty for a catalogued source, which never uses
+    them).
 
     Returns an anomaly dict, or None if no reportable anomaly is found.
     """
@@ -301,8 +348,9 @@ def _classify_source_sync(
     # check (see _is_position_shifted's docstring), and Priority 3 needs the
     # exact same query for the UNKNOWN/FIRST_OBSERVATION/KNOWN_CATALOG_NEW
     # distinction and for delta_mag, so there is no reason to run it twice.
-    tile_sources = history_by_tile.get(tile, [])
-    history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, tile_sources)
+    # Already a MATCH_CONE_ARCSEC query around this very position; the filter
+    # is kept so the cone is defined here, whatever the API returned.
+    history = _find_sources_within_radius(ra, dec, config.MATCH_CONE_ARCSEC, narrow_history)
     n_history = len(history)
 
     # Coverage is read here rather than in Priority 3 where it is mainly used:
@@ -394,7 +442,7 @@ def _classify_source_sync(
         # (audit 2026-08-18, finding H3). See _wide_cone_radius_arcsec() for
         # the two bounds that keep the extension from becoming a permanently
         # wide cone.
-        wide_history, wide_radius = _find_wide_history(ra, dec, tile_sources, obs_time)
+        wide_history, wide_radius = _find_wide_history(ra, dec, wide_pool, obs_time)
 
         # A trail this elongated is, on its own, sufficient evidence of a
         # fast single-exposure mover (satellite / space debris) — unlike a
@@ -715,6 +763,18 @@ def _classify_source_sync(
         delta_mag is not None
         and _is_significant_delta(delta_mag, source, same_filter_history)
     )
+
+    # ...and not in this epoch alone: a single deviant epoch is what a cosmic
+    # ray or hot pixel in the aperture produces — see _change_is_confirmed().
+    if mag_changed and not _change_is_confirmed(delta_mag, same_filter_history):
+        logger.debug(
+            "Unconfirmed magnitude change at ra=%.4f dec=%.4f delta_mag=%.3f — "
+            "the previous %d same-filter epoch(s) do not show it; waiting for "
+            "the next epoch before classifying",
+            ra, dec, delta_mag, config.VARIABILITY_CONFIRM_EPOCHS - 1,
+            extra=extra,
+        )
+        mag_changed = False
 
     if mag_changed:
         # --- SUPERNOVA_CANDIDATE — brightening in/near an already-known

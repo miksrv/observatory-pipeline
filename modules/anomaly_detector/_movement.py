@@ -89,7 +89,7 @@ def _wide_cone_radius_arcsec(obs_time, hist_obs_time) -> float:
 def _find_wide_history(
     ra: float,
     dec: float,
-    tile_sources: list[dict],
+    pool: list[dict],
     obs_time,
 ) -> tuple[list[dict], float]:
     """
@@ -110,7 +110,7 @@ def _find_wide_history(
     candidates: list[dict] = []
     radius_max = config.MOVING_CONE_ARCSEC
 
-    for src in tile_sources:
+    for src in pool:
         src_ra = src.get("ra")
         src_dec = src.get("dec")
         if src_ra is None or src_dec is None:

@@ -194,3 +194,49 @@ class TestRenderQcRejected:
         # A real PNG was still rendered — just with no source markers.
         assert isinstance(result["png_bytes"], bytes)
         assert result["png_bytes"][:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# ---------------------------------------------------------------------------
+# One-shot-colour frames
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def cfa_file(tmp_path):
+    path = tmp_path / "osc.fit"
+    hdu = fits.PrimaryHDU(data=np.full((40, 60), 5000, dtype=np.uint16))
+    hdu.header["BAYERPAT"] = "RGGB"
+    hdu.header["OBJECT"] = "NGC 7331"
+    hdu.writeto(path)
+    return str(path)
+
+
+async def test_cfa_frame_is_rendered_from_a_mono_copy(monkeypatch, cfa_file):
+    seen = {}
+
+    async def fake_render(path):
+        seen["path"] = path
+        with fits.open(path) as hdul:
+            seen["cfaconv"] = hdul[0].header.get("CFACONV")
+            seen["shape"] = hdul[0].data.shape
+        return {"png_bytes": b"", "matched": 0, "total": 0, "quality_flag": "OK"}
+
+    monkeypatch.setattr(catalog_preview, "_render", fake_render)
+    before = open(cfa_file, "rb").read()
+
+    await catalog_preview.render(cfa_file)
+
+    assert seen["path"] != cfa_file
+    assert os.path.basename(seen["path"]) == os.path.basename(cfa_file)
+    assert seen["cfaconv"] is True
+    assert seen["shape"] == (20, 30)
+    assert open(cfa_file, "rb").read() == before
+    assert not os.path.exists(seen["path"])  # the copy is thrown away
+
+
+async def test_mono_frame_is_rendered_in_place(monkeypatch, fits_file):
+    render_mock = AsyncMock(return_value={"png_bytes": b"", "matched": 0, "total": 0, "quality_flag": "OK"})
+    monkeypatch.setattr(catalog_preview, "_render", render_mock)
+
+    await catalog_preview.render(fits_file)
+
+    render_mock.assert_awaited_once_with(fits_file)

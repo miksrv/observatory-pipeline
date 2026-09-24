@@ -233,6 +233,11 @@ async def get_sources_near(
         Cone radius in arcseconds.
     before_time:
         ISO 8601 timestamp — only return sources from frames before this time.
+    uncatalogued_only:
+        Only return observations of sources with no catalog identity (or an
+        MPC one) — the only history the moving-object test can use; see
+        modules/anomaly_detector/_prefetch.py. Ignored by an API that
+        predates it, which then returns everything.
 
     Returns
     -------
@@ -268,6 +273,7 @@ async def _get_sources_near_batch_with_retry(
     positions: list[dict],
     radius_arcsec: float,
     before_time: str,
+    uncatalogued_only: bool = False,
 ) -> dict:
     """Inner retryable core for get_sources_near_batch."""
     payload = {
@@ -275,6 +281,10 @@ async def _get_sources_near_batch_with_retry(
         "radius_arcsec": radius_arcsec,
         "before_time": before_time,
     }
+    # Sent only when set, so every other caller's payload is byte-for-byte
+    # what it was; an API that predates the flag simply ignores it.
+    if uncatalogued_only:
+        payload["uncatalogued_only"] = True
 
     async with _make_client() as client:
         response = await client.post("/sources/near/batch", json=payload)
@@ -293,6 +303,7 @@ async def get_sources_near_batch(
     positions: list[dict],
     radius_arcsec: float,
     before_time: str,
+    uncatalogued_only: bool = False,
 ) -> dict:
     """
     Retrieve historical sources near multiple sky positions from the API
@@ -325,7 +336,9 @@ async def get_sources_near_batch(
         extra={"frame_id": None, "log_filename": None},
     )
     try:
-        return await _get_sources_near_batch_with_retry(positions, radius_arcsec, before_time)
+        return await _get_sources_near_batch_with_retry(
+            positions, radius_arcsec, before_time, uncatalogued_only
+        )
     except Exception as exc:
         logger.error(
             "Error querying /sources/near/batch: %s",

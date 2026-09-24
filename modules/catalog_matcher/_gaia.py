@@ -360,8 +360,18 @@ def _match_gaia(sources: list[dict], gaia_stars: list[dict]) -> None:
 def _attach_gaia_color(sources: list[dict], gaia_stars: list[dict]) -> int:
     """
     Give every source already claimed by a NON-Gaia stellar catalog the Gaia
-    BP-RP colour (and quality flags) of the Gaia star at its position, when
-    there is one within MATCH_CONE_ARCSEC. Returns how many were enriched.
+    G magnitude (`_gaia_mag`), BP-RP colour and quality flags of the Gaia star
+    at its position, when there is one within MATCH_CONE_ARCSEC. Returns how
+    many were enriched.
+
+    `_gaia_mag` makes such a star a zero-point reference in
+    modules/photometry.py. References used to be only sources whose
+    catalog_name was "Gaia DR3", and Simbad — which runs first — claims most
+    bright stars in a field around a well-known galaxy: on the NGC 7331 run
+    (2026-09-23) the median zero point rested on 3 references, 63 frames had
+    fewer than 3 and went uncalibrated, and one frame calibrated off 4 stars
+    (zero_point_err 0.28) put every star in it 0.4 mag too bright — 25
+    VARIABLE_STAR alerts from a single epoch.
 
     The colour term in modules/photometry.py is applied per source from
     `_catalog_color`, which only _match_gaia() set — so a star Simbad claimed
@@ -374,9 +384,9 @@ def _attach_gaia_color(sources: list[dict], gaia_stars: list[dict]) -> int:
     The catalog that names a source must not decide how its magnitude is
     calibrated.
 
-    Never touches a source that already carries a colour, an unmatched one
-    (Gaia would have claimed it), or an MPC object (a moving body has no
-    catalogued colour; this runs before the MPC stage anyway).
+    Never overwrites a colour a source already carries, and never touches an
+    unmatched source (Gaia would have claimed it) or an MPC object (a moving
+    body has no catalogued colour; this runs before the MPC stage anyway).
     """
     if not gaia_stars:
         return 0
@@ -384,7 +394,7 @@ def _attach_gaia_color(sources: list[dict], gaia_stars: list[dict]) -> int:
     todo = [
         i for i, s in enumerate(sources)
         if s.get("catalog_name") not in (None, "Gaia DR3", "MPC")
-        and s.get("_catalog_color") is None
+        and (s.get("_catalog_color") is None or s.get("_gaia_mag") is None)
     ]
     if not todo:
         return 0
@@ -405,10 +415,14 @@ def _attach_gaia_color(sources: list[dict], gaia_stars: list[dict]) -> int:
         if sep2d[k] >= threshold:
             continue
         matched = gaia_stars[idx[k]]
+        g_mag = matched.get("phot_g_mean_mag")
         color = matched.get("bp_rp")
-        if color is None:
+        if g_mag is None and color is None:
             continue
-        sources[i]["_catalog_color"] = color
+        if g_mag is not None:
+            sources[i]["_gaia_mag"] = g_mag
+        if color is not None and sources[i].get("_catalog_color") is None:
+            sources[i]["_catalog_color"] = color
         sources[i].setdefault("_catalog_flags", {
             "ruwe":       matched.get("ruwe"),
             "variable":   matched.get("variable"),
@@ -417,8 +431,9 @@ def _attach_gaia_color(sources: list[dict], gaia_stars: list[dict]) -> int:
         n += 1
     if n:
         logger.info(
-            "Gaia colour attached to %d source(s) claimed by another catalog, so "
-            "their colour term matches the same stars' Gaia-identity epochs",
+            "Gaia magnitude/colour attached to %d source(s) claimed by another "
+            "catalog: they serve as zero-point references, and their colour term "
+            "matches the same stars' Gaia-identity epochs",
             n,
         )
     return n

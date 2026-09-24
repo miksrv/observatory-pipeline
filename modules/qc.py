@@ -503,7 +503,7 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     #                       actually discriminates.
     #
     # Both also require positive flux and reject anything sharper than
-    # STAR_FWHM_MIN_ARCSEC (hot/warm pixel clusters — a floor can only bias
+    # STAR_FWHM_MIN_PX (hot/warm pixel clusters — a floor can only bias
     # the estimate UPWARD, so it cannot hide blur). A subset with fewer than
     # _MEDIAN_MIN_SOURCES members is not a population at all: the raw
     # all-detections median is used instead, which is also what restores
@@ -527,15 +527,14 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     mask_flux: np.ndarray = objects["flux"] > 0
     mask_round: np.ndarray = elongation_arr < config.STAR_ELONGATION_MAX
 
+    # The hot-pixel floor is a property of the pixel grid and applies with or
+    # without a plate scale; only the arcsec upper bound needs one.
+    mask_fwhm_min: np.ndarray = fwhm_pixels_arr >= config.STAR_FWHM_MIN_PX
     fwhm_per_source: np.ndarray | None = None
     if plate_scale is not None:
         fwhm_per_source = fwhm_pixels_arr * plate_scale
-        mask_fwhm_min: np.ndarray = fwhm_per_source >= config.STAR_FWHM_MIN_ARCSEC
         mask_fwhm_max: np.ndarray = fwhm_per_source <= config.STAR_FWHM_MAX_ARCSEC
     else:
-        # Without a plate scale the arcsec bounds are meaningless; only the
-        # scale-free roundness and flux cuts can be applied.
-        mask_fwhm_min = np.ones(raw_detection_count, dtype=bool)
         mask_fwhm_max = np.ones(raw_detection_count, dtype=bool)
 
     fwhm_subset: np.ndarray = mask_flux & mask_fwhm_min & mask_round
@@ -608,11 +607,11 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
 
     if plate_scale is not None:
         logger.debug(
-            "QC: star filter: %d raw → %d stars (elong<%0.1f, fwhm=[%.1f-%.1f]\")  file=%s",
+            "QC: star filter: %d raw → %d stars (elong<%0.1f, fwhm>=%.1f px, fwhm<=%.1f\")  file=%s",
             raw_detection_count,
             star_count,
             config.STAR_ELONGATION_MAX,
-            config.STAR_FWHM_MIN_ARCSEC,
+            config.STAR_FWHM_MIN_PX,
             config.STAR_FWHM_MAX_ARCSEC,
             os.path.basename(fits_path),
         )

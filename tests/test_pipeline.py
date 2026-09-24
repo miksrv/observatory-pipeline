@@ -2719,3 +2719,226 @@ class TestComputePointingError:
         assert payload["pointing_error_arcsec"] == pytest.approx(0.0, abs=1e-6)
         assert payload["pointing_error_ra_arcsec"] == pytest.approx(0.0, abs=1e-6)
         assert payload["pointing_error_dec_arcsec"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — one-shot-colour (Bayer) frames
+# ---------------------------------------------------------------------------
+
+def _write_cfa_frame(path, bayer: str | None = "RGGB") -> None:
+    hdu = fits.PrimaryHDU(data=np.full((40, 60), 5000, dtype=np.uint16))
+    if bayer:
+        hdu.header["BAYERPAT"] = bayer
+    hdu.header["OBJECT"] = "NGC 7331"
+    hdu.header["IMAGETYP"] = "Light"
+    hdu.header["DATE-OBS"] = "2026-09-21T16:56:14"
+    hdu.writeto(path)
+
+
+def _sha(path) -> str:
+    import hashlib
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+@pytest.fixture
+def raw_archive(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "FITS_RAW_ARCHIVE", str(tmp_path / "raw"))
+    monkeypatch.setattr(config, "NORMALIZE_ENABLED", True)
+    return tmp_path / "raw"
+
+
+def test_cfa_frame_converted_in_place_and_original_kept_byte_identical(raw_archive, tmp_path):
+    frame = tmp_path / "incoming" / "Light_NGC 7331_60.0s_0001.fit"
+    frame.parent.mkdir()
+    _write_cfa_frame(frame)
+    original_sha = _sha(frame)
+    inode = os.stat(frame).st_ino
+
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    raw_copy = raw_archive / "NGC7331" / frame.name
+    assert _sha(raw_copy) == original_sha
+    with fits.open(frame) as hdul:
+        assert hdul[0].header["CFACONV"] is True
+        assert hdul[0].data.shape == (20, 30)
+    # Same inode: the watcher sees a modification, never a new file to enqueue.
+    assert os.stat(frame).st_ino == inode
+
+
+def test_cfa_conversion_is_idempotent(raw_archive, tmp_path):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame)
+
+    pipeline._convert_cfa_frame(str(frame), {})
+    converted_sha = _sha(frame)
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    assert _sha(frame) == converted_sha
+    assert len(list((raw_archive / "NGC7331").iterdir())) == 1
+
+
+def test_cfa_raw_copy_never_overwrites_an_earlier_one(raw_archive, tmp_path):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame)
+    earlier = raw_archive / "NGC7331" / "frame.fit"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_bytes(b"an earlier original")
+
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    assert earlier.read_bytes() == b"an earlier original"
+    assert (raw_archive / "NGC7331" / "frame_1.fit").exists()
+
+
+def test_mono_frame_is_left_alone(raw_archive, tmp_path):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame, bayer=None)
+    before = _sha(frame)
+
+    pipeline._convert_cfa_frame(str(frame), {})
+
+    assert _sha(frame) == before
+    assert not raw_archive.exists()
+
+
+def test_unreadable_file_is_left_for_the_ordinary_failure(raw_archive, fits_file):
+    before = fits_file.read_bytes()
+    pipeline._convert_cfa_frame(str(fits_file), {})
+    assert fits_file.read_bytes() == before
+
+
+def test_failed_conversion_touches_nothing(raw_archive, tmp_path, monkeypatch):
+    frame = tmp_path / "frame.fit"
+    _write_cfa_frame(frame)
+    before = _sha(frame)
+    monkeypatch.setattr(pipeline.cfa, "to_superpixel", Mock(side_effect=OSError("disk full")))
+
+    with pytest.raises(OSError):
+        pipeline._convert_cfa_frame(str(frame), {})
+
+    assert _sha(frame) == before
+    assert not raw_archive.exists()
+
+
+async def test_cfa_conversion_runs_before_header_extraction(mock_modules, monkeypatch):
+    order = []
+    monkeypatch.setattr(pipeline, "_convert_cfa_frame", lambda p, extra: order.append(("convert", p)))
+    monkeypatch.setattr(
+        "pipeline.fits_header.extract_headers",
+        lambda p: order.append(("headers", p)) or _GOOD_HEADER,
+    )
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    assert order[0] == ("convert", str(mock_modules))
+    assert order[1][0] == "headers"
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — files that are not a single exposure
+# ---------------------------------------------------------------------------
+
+def _write_frame(path, data: np.ndarray, **cards) -> None:
+    hdu = fits.PrimaryHDU(data=data)
+    hdu.header["OBJECT"] = "NGC 7331"
+    for key, value in cards.items():
+        hdu.header[key] = value
+    hdu.writeto(path)
+
+
+@pytest.fixture
+def rejected_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "FITS_REJECTED", str(tmp_path / "rejected"))
+    monkeypatch.setattr(config, "NORMALIZE_ENABLED", True)
+    return tmp_path / "rejected"
+
+
+def test_colour_cube_is_moved_to_rejected(rejected_dir, tmp_path):
+    frame = tmp_path / "cube.fit"
+    _write_frame(frame, np.zeros((3, 20, 30), dtype=np.uint16), BAYERPAT="RGGB")
+
+    assert pipeline._reject_unsupported_frame(str(frame), {}) is True
+
+    assert not frame.exists()
+    assert (rejected_dir / "NGC7331" / "UNSUPPORTED_cube.fit").exists()
+
+
+@pytest.mark.parametrize("key", ["STACKCNT", "NCOMBINE"])
+def test_stack_is_moved_to_rejected(rejected_dir, tmp_path, key):
+    frame = tmp_path / "stack.fit"
+    _write_frame(frame, np.zeros((20, 30), dtype=np.uint16), **{key: 48})
+
+    assert pipeline._reject_unsupported_frame(str(frame), {}) is True
+    assert (rejected_dir / "NGC7331" / "UNSUPPORTED_stack.fit").exists()
+
+
+@pytest.mark.parametrize("cards", [{}, {"STACKCNT": 1}, {"NCOMBINE": 1}, {"BAYERPAT": "RGGB"}])
+def test_single_exposure_is_accepted(rejected_dir, tmp_path, cards):
+    frame = tmp_path / "single.fit"
+    _write_frame(frame, np.zeros((20, 30), dtype=np.uint16), **cards)
+
+    assert pipeline._reject_unsupported_frame(str(frame), {}) is False
+    assert frame.exists()
+    assert not rejected_dir.exists()
+
+
+def test_unsupported_rejection_never_overwrites(rejected_dir, tmp_path):
+    earlier = rejected_dir / "NGC7331" / "UNSUPPORTED_stack.fit"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_bytes(b"earlier")
+    frame = tmp_path / "stack.fit"
+    _write_frame(frame, np.zeros((20, 30), dtype=np.uint16), STACKCNT=31)
+
+    pipeline._reject_unsupported_frame(str(frame), {})
+
+    assert earlier.read_bytes() == b"earlier"
+    assert (rejected_dir / "NGC7331" / "UNSUPPORTED_stack_1.fit").exists()
+
+
+def test_unreadable_file_is_not_rejected_here(rejected_dir, fits_file):
+    assert pipeline._reject_unsupported_frame(str(fits_file), {}) is False
+    assert fits_file.exists()
+
+
+async def test_unsupported_frame_stops_before_any_analysis(mock_modules, monkeypatch):
+    monkeypatch.setattr(pipeline, "_reject_unsupported_frame", lambda p, extra: True)
+    convert = Mock()
+    monkeypatch.setattr(pipeline, "_convert_cfa_frame", convert)
+
+    result = await pipeline.analyze_frame(str(mock_modules))
+
+    assert result is None
+    convert.assert_not_called()
+    pipeline.qc.analyze.assert_not_called()
+    pipeline.api_client.post_frame.assert_not_called()
+
+
+async def test_cfa_frame_end_to_end_archives_mono_and_keeps_raw(mock_modules, raw_archive, tmp_path, monkeypatch):
+    """
+    A real Bayer frame through analyze_frame(): the archived frame is the
+    mono superpixel version, the colour original sits byte-identical in
+    FITS_RAW_ARCHIVE, and QC ran on the mono file.
+    """
+    frame = tmp_path / "incoming_osc.fit"
+    _write_cfa_frame(frame)
+    original_sha = _sha(frame)
+    seen = {}
+
+    async def fake_qc(path, move_on_reject=True):
+        with fits.open(path) as hdul:
+            seen["qc_shape"] = hdul[0].data.shape
+        return _GOOD_QC
+
+    monkeypatch.setattr("pipeline.qc.analyze", AsyncMock(side_effect=fake_qc))
+
+    await pipeline.analyze_frame(str(frame))
+
+    assert seen["qc_shape"] == (20, 30)
+    # extract_headers is mocked to report M51 — both archives follow it.
+    raw_copy = raw_archive / "M51" / frame.name
+    assert _sha(raw_copy) == original_sha
+    archived = tmp_path / "archive" / "M51" / _NORMALIZED_FILENAME
+    with fits.open(archived) as hdul:
+        assert hdul[0].header["CFACONV"] is True
+        assert hdul[0].data.shape == (20, 30)
+    assert not frame.exists()

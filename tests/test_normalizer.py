@@ -497,3 +497,33 @@ class TestFlatFilenamesCarryTheFilter:
         name = normalizer.generate_normalized_filename("M42", "Flat", "Ha", 3.0, "2024-03-15T18:02:10")
 
         assert _parse_normalized_filename(name) == ("Flat", "Ha")
+
+
+class TestOneShotColour:
+    """
+    An unfiltered Bayer camera's frames, reduced to mono by modules/cfa.py,
+    carry FILTER='OSC'. Broadband — and a token of its own rather than "L",
+    so subtraction never stacks them with a mono camera's luminance frames.
+    """
+
+    @pytest.mark.parametrize("raw", ["OSC", "osc", "CFA", "RGB", "Color", "Colour", "One-Shot Colour"])
+    def test_normalization(self, raw):
+        assert normalizer.normalize_filter_name(raw)[0] == "OSC"
+
+    def test_is_broadband(self):
+        assert normalizer.is_narrowband("OSC") is False
+
+    def test_is_not_luminance(self):
+        assert normalizer.normalize_filter_name("OSC")[0] != normalizer.normalize_filter_name("L")[0]
+
+    def test_filename_carries_the_token(self):
+        filename = normalizer.generate_normalized_filename(
+            object_name="NGC7331", frame_type="Light", filter_name="OSC",
+            exptime=60.0, obs_time="2026-09-21T16:56:14",
+        )
+        assert filename == "NGC7331_Light_OSC_60_2026-09-21T16-56-14.fits"
+
+    def test_subtraction_reads_the_token_back(self):
+        from modules import subtraction
+        assert subtraction._parse_normalized_filename(
+            "NGC7331_Light_OSC_60_2026-09-21T16-56-14.fits") == ("Light", "OSC")
