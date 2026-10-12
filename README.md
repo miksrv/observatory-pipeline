@@ -328,35 +328,26 @@ Minimum required versions: Docker 20.10+, Docker Compose 2.0+.
 
 ### 2. Prepare directories on the host
 
-The pipeline expects four directories on the host machine. The `docker-compose.yml` committed
-to the repo defaults to macOS-friendly paths under your home directory (`~/observatory-data/...`),
-so it works out of the box for local development without `sudo`:
+Every host-side path in `docker-compose.yml` hangs off one directory, `HOST_DATA_DIR`, with the
+same layout underneath. Compose reads it from `.env`; when it is unset it defaults to
+`~/Developer/data`, so macOS development works out of the box without `sudo`:
 
 ```bash
-mkdir -p ~/observatory-data/fits/incoming
-mkdir -p ~/observatory-data/fits/archive
-mkdir -p ~/observatory-data/fits/rejected
-mkdir -p ~/observatory-data/fits/raw
-mkdir -p ~/observatory-data/astap/catalogs
+mkdir -p ~/Developer/data/fits/{incoming,archive,rejected,raw}
+mkdir -p ~/Developer/data/astap/catalogs ~/Developer/data/cache/catalog
 ```
 
-For a **production Linux observatory server**, the convention used throughout the rest of this
-document is `/data/fits/...` / `/data/astap/...` — create those instead and update the left
-side of each volume mount in `docker-compose.yml` accordingly:
+On a **production Linux server** the convention used throughout the rest of this document is
+`/data` — create the same layout there and set `HOST_DATA_DIR=/data` in `.env` (step 4):
 
 ```bash
-sudo mkdir -p /data/fits/incoming
-sudo mkdir -p /data/fits/archive
-sudo mkdir -p /data/fits/rejected
-sudo mkdir -p /data/fits/raw
-sudo mkdir -p /data/astap/catalogs
-
-sudo chown -R $USER:$USER /data/fits /data/astap
+sudo mkdir -p /data && sudo chown $USER:$USER /data
+mkdir -p /data/fits/{incoming,archive,rejected,raw}
+mkdir -p /data/astap/catalogs /data/cache/catalog
 ```
 
-> Either way, these paths are just defaults. You can change them to any location on your
-> server — just update the left side of each volume mount in `docker-compose.yml` and the
-> corresponding environment variables in `.env`.
+> Any other location works the same way — point `HOST_DATA_DIR` at it. `docker-compose.yml`
+> itself never needs editing, so `git pull` stays conflict-free on the server.
 
 ---
 
@@ -417,6 +408,12 @@ nano .env
 # ── Required ──────────────────────────────────────────────────────────────────
 API_BASE_URL=https://your-cloud-host.com/api/v1
 API_KEY=your-secret-api-key-here   # this server's own key: `php spark pipeline:create <name>` on the API host
+
+# ── Host data directory (docker compose only; unset = ~/Developer/data) ───────
+HOST_DATA_DIR=/data
+
+# ── File watcher: false on a Linux server, true on Docker Desktop for macOS ───
+WATCHER_USE_POLLING_OBSERVER=false
 
 # ── FITS directory paths (inside the container) ───────────────────────────────
 # These match the right-hand side of the volume mounts in docker-compose.yml.
@@ -686,86 +683,43 @@ Subsequent builds reuse cached layers and are much faster unless `requirements.t
 
 ### Development on Apple Silicon (M1/M2/M3 Macs)
 
-The repository includes the `astap` binary for **amd64** architecture in `install/astap_amd64.tar.gz`. On Apple Silicon Macs, you have two options:
+`install/` carries the `astap` archive for both architectures — `astap_amd64.tar.gz` (Linux
+servers) and `astap_aarch64.tar.gz` (Apple Silicon, Raspberry Pi). The Dockerfile picks the one
+matching the image's platform, so `docker compose up --build -d` builds natively on either
+without any platform override. To refresh them, download the same file names from
+https://sourceforge.net/projects/astap-program/files/linux_installer/.
 
-**Option 1: Use amd64 emulation (simpler, recommended for development)**
-
-Build and run with amd64 emulation using `DOCKER_DEFAULT_PLATFORM`:
-
-```bash
-# Build and run with amd64 emulation
-
-
-# Or set the variable for your shell session
-export DOCKER_DEFAULT_PLATFORM=linux/amd64
-docker compose up --build -d
-
-# Follow logs
-docker compose logs -f
-```
-
-Or add the platform specification permanently to `docker-compose.yml`:
-
-```yaml
-services:
-  pipeline:
-    platform: linux/amd64
-    build: .
-    # ... rest of config
-```
-
-> **Note:** Running under emulation is slower than native ARM execution, but it works without additional setup.
-
-**Option 2: Use native ARM64 binary (faster)**
-
-Download the ARM64 version of astap and place it in the `install/` directory:
-
-```bash
-cd install/
-rm astap_amd64.tar.gz
-wget -O astap_aarch64.tar.gz "https://sourceforge.net/projects/astap-program/files/linux_installer/astap_aarch64.tar.gz/download"
-```
-
-Then build normally without platform override:
-
-```bash
-docker compose up --build -d
-```
+On Docker Desktop for macOS also set `WATCHER_USE_POLLING_OBSERVER=true` in `.env` — host-side
+file changes in a bind mount don't reliably reach the container as inotify events.
 
 ---
 
 ### External volumes reference
 
-All persistent data lives **outside** the container on the host filesystem. The mapping is defined in `docker-compose.yml`. The version committed to the repo defaults to macOS-friendly home-directory paths:
+All persistent data lives **outside** the container on the host filesystem, under
+`HOST_DATA_DIR` (see [step 2](#2-prepare-directories-on-the-host)). The mapping in
+`docker-compose.yml`:
 
 ```yaml
-services:
-  pipeline:
-    build: .
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
-      # macOS: use paths under home directory (Docker has access by default)
-      # Linux production: change to /data/fits/... paths
-      - ~/observatory-data/fits/incoming:/fits/incoming     # watch this for new frames
-      - ~/observatory-data/fits/archive:/fits/archive       # processed frames stored here
-      - ~/observatory-data/fits/rejected:/fits/rejected     # bad frames moved here
-      - ~/observatory-data/fits/raw:/fits/raw               # colour originals of OSC frames
-      - ~/observatory-data/astap/catalogs:/astap/catalogs   # star catalogs for plate solving
-    env_file:
-      - .env
-    restart: unless-stopped
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/incoming:/fits/incoming
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/archive:/fits/archive
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/rejected:/fits/rejected
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/raw:/fits/raw
+      - ${HOST_DATA_DIR:-~/Developer/data}/astap/catalogs:/astap/catalogs
+      - ${HOST_DATA_DIR:-~/Developer/data}/cache/catalog:/cache/catalog   # worker only
 ```
 
-| Host path (macOS default) | Host path (Linux production) | Container path | Purpose |
-|-----------|-----------|----------------|---------|
-| `~/observatory-data/fits/incoming` | `/data/fits/incoming` | `/fits/incoming` | Drop new `.fits` / `.fit` files here. The watcher detects them automatically. |
-| `~/observatory-data/fits/archive` | `/data/fits/archive` | `/fits/archive` | Successfully processed frames are moved here, organized by object name. |
-| `~/observatory-data/fits/rejected` | `/data/fits/rejected` | `/fits/rejected` | Frames that fail QC are moved here with a prefix indicating the reason (`BLUR_`, `TRAIL_`, `LOW_STARS_`, `BAD_`). |
-| `~/observatory-data/fits/raw` | `/data/fits/raw` | `/fits/raw` | Untouched colour originals of one-shot-colour frames, under their original filenames — for your own colour stacking. The pipeline itself works on mono copies. |
-| `~/observatory-data/astap/catalogs` | `/data/astap/catalogs` | `/astap/catalogs` | ASTAP star catalog files. Download once; survives container rebuilds. |
+| Host path, under `HOST_DATA_DIR` (macOS `~/Developer/data`, Linux `/data`) | Container path | Purpose |
+|-----------|----------------|---------|
+| `fits/incoming` | `/fits/incoming` | Drop new `.fits` / `.fit` files here. The watcher detects them automatically. |
+| `fits/archive` | `/fits/archive` | Successfully processed frames are moved here, organized by object name. |
+| `fits/rejected` | `/fits/rejected` | Unsupported frames (colour cubes, stacks) are moved here with an `UNSUPPORTED_` prefix. |
+| `fits/raw` | `/fits/raw` | Untouched colour originals of one-shot-colour frames, under their original filenames — for your own colour stacking. The pipeline itself works on mono copies. |
+| `astap/catalogs` | `/astap/catalogs` | ASTAP star catalog files. Download once; survives container rebuilds. |
+| `cache/catalog` | `/cache/catalog` | On-disk cache of external catalog queries (`CATALOG_CACHE_DIR`); survives rebuilds. |
 
-To use different host paths, edit the **left side** of each volume entry in `docker-compose.yml` and update the corresponding variables in `.env`. `extra_hosts: host.docker.internal:host-gateway` lets the container reach services running on the host machine.
+`extra_hosts: host.docker.internal:host-gateway` lets the container reach services running on the host machine.
 
 ---
 
@@ -779,12 +733,11 @@ When the Docker image is built, the following are installed **without any manual
 | All Python packages | `pip install -r requirements.txt` | astropy, astroquery, photutils, sep, astroscrappy, astroalign, httpx, tenacity, watchdog, numpy, python-dotenv (plus `pytest`/`pytest-asyncio` for tests) |
 | `libcfitsio` | `apt-get install libcfitsio-dev` | C library required by `astropy.io.fits` and `sep` |
 | `xvfb` + GTK/Pango libs | `apt-get install xvfb libgtk-3-0 ...` | Virtual display required to run `astap` headless |
-| `astap` binary | Extracted from `install/astap_*.tar.gz` | The plate solver executable, bundled in the repository as a pre-downloaded archive |
+| `astap` binary | Extracted from `install/astap_amd64.tar.gz` or `install/astap_aarch64.tar.gz`, by platform | The plate solver executable, bundled in the repository as pre-downloaded archives |
 
 **What is NOT automatic and requires manual action:**
 - ASTAP star catalog files — must be downloaded once as described in [step 3](#3-download-astap-star-catalogs)
 - The `.env` file — must be created from `.env.example`
-- For ARM64 (Raspberry Pi, Apple Silicon): replace `install/astap_amd64.tar.gz` with `astap_aarch64.tar.gz`
 
 ---
 

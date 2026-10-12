@@ -1,0 +1,10 @@
+# Kept out of the build context: secrets (.env is passed at runtime via
+# env_file, never baked into the image) and local tooling. /app is overlaid by
+# the bind-mounted source tree at runtime anyway.
+.env
+.git
+.venv
+.idea
+.claude
+.pytest_cache
+**/__pycache__

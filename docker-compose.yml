@@ -1,8 +1,11 @@
 services:
-  # Watches FITS_INCOMING and runs analyze_frame() synchronously per file, as
-  # before — not yet wired to submit ANALYZE tasks to the queue (see
-  # CLAUDE.md's Known Issues for that gap). Shares every volume with `worker`
-  # below except the cache dir, which watcher.py never reads/writes itself.
+  # Host-side data paths all hang off HOST_DATA_DIR (read from .env for
+  # compose interpolation): unset = ~/Developer/data (macOS development),
+  # HOST_DATA_DIR=/data on a Linux server. The layout underneath is the same.
+  #
+  # Watches FITS_INCOMING and submits arriving frames as batched ANALYZE tasks
+  # (watcher.py); `worker` below does the processing. Shares every volume with
+  # `worker` except the cache dir, which watcher.py never reads/writes itself.
   pipeline:
     build: .
     extra_hosts:
@@ -17,13 +20,11 @@ services:
       # rebuild is still required after changing requirements.txt or the
       # Dockerfile itself.
       - .:/app
-      # macOS local dev: paths under ~/Developer/data (Docker has access by default)
-      # Linux production: change to /data/fits/... paths
-      - ~/Developer/data/fits/incoming:/fits/incoming
-      - ~/Developer/data/fits/archive:/fits/archive
-      - ~/Developer/data/fits/rejected:/fits/rejected
-      - ~/Developer/data/fits/raw:/fits/raw
-      - ~/Developer/data/astap/catalogs:/astap/catalogs
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/incoming:/fits/incoming
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/archive:/fits/archive
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/rejected:/fits/rejected
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/raw:/fits/raw
+      - ${HOST_DATA_DIR:-~/Developer/data}/astap/catalogs:/astap/catalogs
     env_file:
       - .env
     restart: unless-stopped
@@ -42,11 +43,11 @@ services:
     command: ["python", "worker.py"]
     volumes:
       - .:/app
-      - ~/Developer/data/fits/incoming:/fits/incoming
-      - ~/Developer/data/fits/archive:/fits/archive
-      - ~/Developer/data/fits/rejected:/fits/rejected
-      - ~/Developer/data/fits/raw:/fits/raw
-      - ~/Developer/data/astap/catalogs:/astap/catalogs
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/incoming:/fits/incoming
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/archive:/fits/archive
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/rejected:/fits/rejected
+      - ${HOST_DATA_DIR:-~/Developer/data}/fits/raw:/fits/raw
+      - ${HOST_DATA_DIR:-~/Developer/data}/astap/catalogs:/astap/catalogs
       # Deliberately a path OUTSIDE the container's own writable layer (a
       # host directory bind-mounted in, exactly like the /fits/* dirs above)
       # so the on-disk catalog cache (modules/catalog_matcher.py) survives a
@@ -55,7 +56,7 @@ services:
       # often. In a non-Docker production deployment CATALOG_CACHE_DIR is
       # just a plain directory on the host; this bind mount is a dev/Docker
       # convenience, not something the cache logic itself depends on.
-      - ~/Developer/data/cache/catalog:/cache/catalog
+      - ${HOST_DATA_DIR:-~/Developer/data}/cache/catalog:/cache/catalog
     env_file:
       - .env
     restart: unless-stopped

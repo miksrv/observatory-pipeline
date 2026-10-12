@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1
+
+### Patch Changes
+
+- Docker: host data paths set by one `HOST_DATA_DIR` in `.env` (`/data` on Linux servers, `~/Developer/data` by default) — `docker-compose.yml` no longer edited per host
+- Docker: `astap` archives for both amd64 and arm64 bundled, the right one picked automatically at build time
+- Docker: `.env` and local tooling kept out of the image via `.dockerignore`
+
 ## 1.0.0
 
 ### Major Changes
