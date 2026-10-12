@@ -66,6 +66,7 @@ import logging
 import sys
 
 import config
+from logging_setup import configure_logging
 import pipeline
 import api_client
 
@@ -516,11 +517,7 @@ async def run_forever() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-        format="%(asctime)s %(levelname)-5s %(module)s — %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    configure_logging("worker")
 
     try:
         asyncio.run(run_forever())

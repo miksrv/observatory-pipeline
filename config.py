@@ -358,6 +358,15 @@ VARIABILITY_CONFIRM_EPOCHS: int = int(_get("VARIABILITY_CONFIRM_EPOCHS", "2"))
 # approximate detection limit for the typical exposure time.
 MPC_MAG_LIMIT: float = float(_get("MPC_MAG_LIMIT", "19.0"))
 
+# IMCCE's SkyBot intermittently answers a valid cone search with a body that is
+# not a VOTable ("No table found"); the same query moments later succeeds. Every
+# frame hit by such a blip used to lose all MPC matching (lookatstars,
+# 2026-10-12). A failed query is retried up to SKYBOT_MAX_ATTEMPTS times in
+# total, waiting SKYBOT_RETRY_DELAY_SEC before the second attempt and doubling
+# the wait after each further failure. 1 disables retrying.
+SKYBOT_MAX_ATTEMPTS: int = int(_get("SKYBOT_MAX_ATTEMPTS", "3"))
+SKYBOT_RETRY_DELAY_SEC: float = float(_get("SKYBOT_RETRY_DELAY_SEC", "3.0"))
+
 # ---------------------------------------------------------------------------
 # Edge-of-frame geometry (astrometry + subtraction + anomaly_detector modules)
 # ---------------------------------------------------------------------------
@@ -847,6 +856,16 @@ TASK_POLL_BACKOFF_MAX_SEC: float = float(_get("TASK_POLL_BACKOFF_MAX_SEC", "60.0
 # Log verbosity level. Valid values: DEBUG, INFO, WARNING, ERROR.
 # Use INFO for normal operation; DEBUG for troubleshooting.
 LOG_LEVEL: str = _get("LOG_LEVEL", "INFO").upper()
+# Directory for the persistent log files (`watcher.log`, `worker.log`), written
+# alongside stderr by logging_setup.py. Empty = stderr only. docker-compose.yml
+# sets it to /logs and bind-mounts ${HOST_DATA_DIR}/logs there, so the history
+# survives container restarts and recreates (Docker's own log does not).
+LOG_DIR: str = _get("LOG_DIR", "")
+# Each file is rotated at this size; LOG_FILE_BACKUP_COUNT older files are kept
+# (`worker.log.1` … `.N`), so one service never uses more than
+# LOG_FILE_MAX_MB × (LOG_FILE_BACKUP_COUNT + 1) of disk.
+LOG_FILE_MAX_MB: float = float(_get("LOG_FILE_MAX_MB", "20"))
+LOG_FILE_BACKUP_COUNT: int = int(_get("LOG_FILE_BACKUP_COUNT", "10"))
 
 
 # ---------------------------------------------------------------------------

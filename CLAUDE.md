@@ -72,6 +72,10 @@ cameras** — never bake one instrument's numbers into defaults.
   the Dockerfile.
 - `CATALOG_CACHE_DIR` must be bind-mounted from outside the container so the catalog cache
   survives restarts and rebuilds.
+- Logs: `logging_setup.configure_logging()` writes stderr plus, when `LOG_DIR` is set (compose
+  sets `/logs`, bind-mounted from `HOST_DATA_DIR/logs`), a size-rotated `watcher.log` /
+  `worker.log` — one file per service so two processes never rotate the same file. Docker's
+  json log is capped and dies with the container; the files are the history.
 
 ---
 
@@ -404,6 +408,10 @@ submodule references (`_gaia._query_gaia(...)`) so tests can patch them.
 
 - **Order (sequential exclusive):** Simbad → Gaia DR3 → 2MASS → Pan-STARRS DR1 → MPC/SkyBot, cone
   `MATCH_CONE_ARCSEC`. Simbad first for real object types.
+- **SkyBot retries** (`SKYBOT_MAX_ATTEMPTS`, doubling delay) with astroquery's HTTP cache
+  **off**: IMCCE intermittently returns a non-VOTable body ("No table found"), and astroquery
+  caches the raw response before parsing, so a cached bad answer would defeat every retry.
+  Failures are never cached by `_cache` either.
 - **MPC is the exception:** it sees every source. It takes over a stellar-claimed source only when
   the ephemeris position is within `MATCH_CONE_ARCSEC` (a blend); otherwise it matches the nearest
   *unclaimed* source within `MOVING_CONE_ARCSEC`. Takeovers log both identities.

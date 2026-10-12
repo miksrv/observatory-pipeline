@@ -315,7 +315,7 @@ class TestCacheTileGeometry:
 
         class _FakeSkybot:
             @staticmethod
-            def cone_search(coord, rad, epoch):
+            def cone_search(coord, rad, epoch, cache=True):
                 radii.append(rad.to(u.deg).value)
                 return None
 
@@ -325,6 +325,98 @@ class TestCacheTileGeometry:
 
         assert len(radii) == 2
         assert radii[1] > radii[0]
+
+
+# ===========================================================================
+# TestSkybotRetry
+# ===========================================================================
+
+def _skybot_table(ra: float, dec: float) -> Table:
+    """One bright asteroid at (ra, dec), in SkyBot's column layout."""
+    return Table({
+        "Name": ["Krat"], "RA": [ra] * u.deg, "DEC": [dec] * u.deg,
+        "Type": ["MB>Inner"], "V": [15.6],
+    })
+
+
+class TestSkybotRetry:
+    """
+    IMCCE intermittently answers a valid cone search with a non-VOTable body
+    ("No table found"), and the same query succeeds moments later — on
+    lookatstars (2026-10-12) one such blip cost a whole frame its MPC matching.
+    """
+
+    @pytest.fixture(autouse=True)
+    def no_sleep(self, monkeypatch, tmp_path):
+        # Each test starts from an empty disk cache too, not only the
+        # in-process dict the module-level fixture clears.
+        monkeypatch.setattr(config, "CATALOG_CACHE_DIR", str(tmp_path))
+        self.sleeps: list[float] = []
+        monkeypatch.setattr("modules.catalog_matcher._mpc.time.sleep", self.sleeps.append)
+
+    def _fake_skybot(self, outcomes: list):
+        calls: list[dict] = []
+
+        class _FakeSkybot:
+            @staticmethod
+            def cone_search(coord, rad, epoch, cache=True):
+                calls.append({"cache": cache})
+                outcome = outcomes[len(calls) - 1]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        return _FakeSkybot, calls
+
+    def test_a_transient_failure_is_retried(self, monkeypatch):
+        monkeypatch.setattr(config, "SKYBOT_MAX_ATTEMPTS", 3)
+        monkeypatch.setattr(config, "SKYBOT_RETRY_DELAY_SEC", 2.0)
+        fake, calls = self._fake_skybot([ValueError("No table found"), _skybot_table(_RA, _DEC)])
+
+        with patch("astroquery.imcce.Skybot", fake):
+            objects = cm._query_mpc(_RA, _DEC, "2024-03-15T22:01:34", 1.0)
+
+        assert [o["designation"] for o in objects] == ["Krat"]
+        assert len(calls) == 2
+        assert self.sleeps == [2.0]
+
+    def test_astroquerys_http_cache_is_bypassed(self, monkeypatch):
+        """
+        astroquery caches the raw response before parsing it: with its default
+        cache=True a malformed answer would be stored and re-read by every retry.
+        """
+        fake, calls = self._fake_skybot([ValueError("No table found"), _skybot_table(_RA, _DEC)])
+
+        with patch("astroquery.imcce.Skybot", fake):
+            cm._query_mpc(_RA, _DEC, "2024-03-15T22:01:34", 1.0)
+
+        assert calls and all(c["cache"] is False for c in calls)
+
+    def test_gives_up_after_the_configured_attempts_without_caching(self, monkeypatch):
+        monkeypatch.setattr(config, "SKYBOT_MAX_ATTEMPTS", 3)
+        monkeypatch.setattr(config, "SKYBOT_RETRY_DELAY_SEC", 1.0)
+        fake, calls = self._fake_skybot([ValueError("No table found")] * 3 + [_skybot_table(_RA, _DEC)])
+
+        with patch("astroquery.imcce.Skybot", fake):
+            assert cm._query_mpc(_RA, _DEC, "2024-03-15T22:01:34", 1.0) == []
+            assert len(calls) == 3
+            assert self.sleeps == [1.0, 2.0]
+
+            # The failure was not cached: the next caller (forced photometry,
+            # a later frame at the same epoch) queries again and succeeds.
+            objects = cm._query_mpc(_RA, _DEC, "2024-03-15T22:01:34", 1.0)
+
+        assert [o["designation"] for o in objects] == ["Krat"]
+
+    def test_one_attempt_disables_retrying(self, monkeypatch):
+        monkeypatch.setattr(config, "SKYBOT_MAX_ATTEMPTS", 1)
+        fake, calls = self._fake_skybot([ValueError("No table found"), _skybot_table(_RA, _DEC)])
+
+        with patch("astroquery.imcce.Skybot", fake):
+            assert cm._query_mpc(_RA, _DEC, "2024-03-15T22:01:34", 1.0) == []
+
+        assert len(calls) == 1
+        assert self.sleeps == []
 
 
 # ===========================================================================
@@ -610,7 +702,7 @@ class TestMpcMatching:
 
         class _FakeSkybot:
             @staticmethod
-            def cone_search(coord, rad, epoch):
+            def cone_search(coord, rad, epoch, cache=True):
                 captured["rad"] = rad
                 return None
 

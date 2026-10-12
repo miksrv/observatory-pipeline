@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
@@ -25,6 +26,41 @@ from ._cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _cone_search_with_retry(skybot, coord: SkyCoord, radius_arcmin: float, epoch):
+    """
+    `Skybot.cone_search()`, retried on any failure (see SKYBOT_MAX_ATTEMPTS).
+
+    IMCCE intermittently answers a valid query with a body that is not a
+    VOTable, which astropy reports as "No table found"; the identical query
+    succeeds moments later. A genuinely empty field is not a failure — it
+    parses to an empty table — so every exception here is worth a retry.
+
+    `cache=False` is what makes the retry meaningful: astroquery caches the
+    raw HTTP response *before* parsing it, so with its default `cache=True`
+    a malformed answer would be stored and every retry (and every later frame
+    at the same epoch) would re-read the same broken body. Reuse is handled by
+    this package's own cache, which stores only successfully parsed results.
+
+    Blocking sleep, like the query itself: catalog matching already runs these
+    synchronous astroquery calls inline.
+    """
+    attempts = max(1, config.SKYBOT_MAX_ATTEMPTS)
+    delay = config.SKYBOT_RETRY_DELAY_SEC
+    for attempt in range(1, attempts + 1):
+        try:
+            return skybot.cone_search(coord, rad=radius_arcmin * u.arcmin, epoch=epoch, cache=False)
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "SkyBot attempt %d/%d failed (%s) — retrying in %.1fs",
+                attempt, attempts, exc, delay,
+            )
+            time.sleep(delay)
+            delay *= 2
+    raise AssertionError("unreachable")
 
 
 def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: float = 1.0) -> list[dict]:
@@ -93,7 +129,7 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
             key_ra, key_dec, radius_arcmin, epoch.utc.iso,
         )
 
-        result = Skybot.cone_search(coord, rad=radius_arcmin * u.arcmin, epoch=epoch)
+        result = _cone_search_with_retry(Skybot, coord, radius_arcmin, epoch)
 
         if result is None or len(result) == 0:
             logger.info(
