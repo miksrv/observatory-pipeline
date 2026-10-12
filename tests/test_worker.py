@@ -608,5 +608,8 @@ class TestRunForever:
             await worker.run_forever()
 
         assert [call.args[0] for call in sleep_mock.call_args_list] == [1.0, 2.0, 4.0]
-        # order=asc — oldest PENDING task claimed first, not newest.
-        get_tasks_mock.assert_any_call(status="PENDING", limit=1, order="asc")
+        # order=asc — oldest PENDING task claimed first, not newest; and only
+        # tasks this pipeline may claim (its own or untargeted).
+        get_tasks_mock.assert_any_call(
+            status="PENDING", limit=1, order="asc", claimable=True,
+        )

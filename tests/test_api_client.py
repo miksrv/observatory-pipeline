@@ -868,3 +868,30 @@ class TestGetSourcesNearBatch:
         _, call_kwargs = mock_client.post.call_args
         assert call_kwargs["json"]["uncatalogued_only"] is True
         assert call_kwargs["json"]["radius_arcsec"] == 600.0
+
+
+
+# ---------------------------------------------------------------------------
+# Multi-pipeline routing — the worker asks only for tasks it may claim
+# ---------------------------------------------------------------------------
+
+class TestGetTasksClaimable:
+    """The API resolves the caller from its API key; the client only says "mine"."""
+
+    async def test_get_tasks_passes_claimable(self):
+        resp = _mock_response(json_data={"data": []})
+
+        with _patch_client(get_response=resp) as mock_client:
+            await api_client_module.get_tasks(status="PENDING", limit=1, order="asc", claimable=True)
+
+        params = mock_client.get.call_args.kwargs["params"]
+        assert params["claimable"] == 1
+        assert params["status"] == "PENDING"
+
+    async def test_get_tasks_omits_claimable_by_default(self):
+        resp = _mock_response(json_data={"data": []})
+
+        with _patch_client(get_response=resp) as mock_client:
+            await api_client_module.get_tasks(status="PENDING")
+
+        assert "claimable" not in mock_client.get.call_args.kwargs["params"]

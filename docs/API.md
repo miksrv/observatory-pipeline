@@ -27,7 +27,9 @@ Every request must include the following headers:
 | `Content-Type` | `application/json` | Required for all POST requests |
 | `Accept` | `application/json` | Expected response format |
 
-The API key is configured via the `API_KEY` environment variable in `.env`.  
+The API key is configured via the `API_KEY` environment variable in `.env`. Every server has its
+own key (issued with `php spark pipeline:create <name>` on the API host); the key also tells the API
+which pipeline is calling — frame ownership and task routing, see §14.  
 The observatory server's outbound IP should be whitelisted on the cloud firewall.
 
 ---
@@ -1319,9 +1321,16 @@ ANALYZE/DETECT_ANOMALIES/GENERATE_CHARTS production chain; see CLAUDE.md's job-q
 `RESTART` is a signal task — the worker marks it completed and exits so Docker restarts the
 container with fresh remote settings.
 
+**Several pipelines** (one per observatory server, each with its own local FITS archive) can
+share one API, each with its own API key, which is how the API knows the caller. `POST /frames`
+records the caller as the frame's owner (and answers `409` if another pipeline already owns that `filename`); a task's
+`pipeline_id` names the only pipeline allowed to claim it (`null` = any). The API's debug UI
+targets frame tasks at the frame's owner and `GENERATE_CHARTS` at the owner of the source's latest
+frame; `RESTART` is queued once per known pipeline.
+
 ```
 POST /tasks
-GET  /tasks?status={s}&type={t}&object={o}&limit={n}&order={asc|desc}
+GET  /tasks?status={s}&type={t}&object={o}&limit={n}&order={asc|desc}&claimable=1
 GET  /tasks/{id}
 PATCH /tasks/{id}
 POST /tasks/{id}/items/progress
@@ -1329,6 +1338,8 @@ POST /tasks/{id}/items/progress
 
 **`POST /tasks`** — `api_client.create_task(task_type, items, scope=None, parent_task_id=None)`.
 Body: `{"type": "ANALYZE"|"DETECT_ANOMALIES"|"GENERATE_CHARTS"|"PREVIEW_CATALOG_MATCH"|"RESTART", "items": [...], "scope": {...}?, "parent_task_id": "..."?}`.
+The API targets the task at the calling pipeline — everything the pipeline queues itself (watcher
+batches, recovery re-queues) refers to files in its own archive.
 `RESTART` is a signal task — `items` may be omitted or empty; the API ignores any items passed
 for this type. For all other types, `items` must be a non-empty array where each item needs
 exactly one of `filename` (`ANALYZE` and `PREVIEW_CATALOG_MATCH` — the FULL path
@@ -1338,9 +1349,12 @@ to the FITS file, not just a basename), `frame_id` (`DETECT_ANOMALIES`), or `sou
 it, since `task_items` has no other place to carry that forward). Response: `{"id", "type",
 "status", "total_items", "message"}`.
 
-**`GET /tasks`** — `api_client.get_tasks(status=None, task_type=None, object_name=None, limit=50, order=None)`.
+**`GET /tasks`** — `api_client.get_tasks(status=None, task_type=None, object_name=None, limit=50, order=None, claimable=False)`.
 `order="asc"` claims the OLDEST `PENDING` task first — this is what `worker.py` passes; the API's
-own default (`desc`, omit `order`) suits a human/dashboard view instead. Response: `{"data": [...]}`.
+own default (`desc`, omit `order`) suits a human/dashboard view instead. `worker.py` also passes
+`claimable=True`: only tasks targeted at the caller or untargeted, so another pipeline's
+task never blocks the head of its queue. Response: `{"data": [...]}`, each task carrying
+`pipeline_id` (target) and `claimed_by`.
 
 **`GET /tasks/{id}`** — `api_client.get_task(task_id)`. Response: `{"task": {...}, "items": [...]}`,
 each item carrying its own `status` (`PENDING`/`DONE`/`FAILED`) — `worker.py` only ever processes
@@ -1349,7 +1363,9 @@ already-finished items.
 
 **`PATCH /tasks/{id}`** — `api_client.update_task(task_id, status, error=None)`. `worker.py` sets
 `RUNNING` when it claims a task and `FAILED` (with `error`) on an unhandled exception; reaching
-`COMPLETED` happens automatically on the API side once every item resolves.
+`COMPLETED` happens automatically on the API side once every item resolves. The claim answers
+`409` if another worker got there first or if the task is targeted at a different pipeline
+(the caller's key belongs to a different pipeline than `pipeline_id`); either way the worker leaves the task alone.
 
 **`POST /tasks/{id}/items/progress`** — `api_client.post_task_items_progress(task_id, items)`.
 Body: `{"items": [{"item_id": ..., "status": "DONE"|"FAILED", "frame_id": ...?, "error": ...?, "payload": {...}?}]}`.
