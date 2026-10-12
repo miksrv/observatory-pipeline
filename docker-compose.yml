@@ -25,8 +25,21 @@ services:
       - ${HOST_DATA_DIR:-~/Developer/data}/fits/rejected:/fits/rejected
       - ${HOST_DATA_DIR:-~/Developer/data}/fits/raw:/fits/raw
       - ${HOST_DATA_DIR:-~/Developer/data}/astap/catalogs:/astap/catalogs
+      # Persistent log files (logging_setup.py, LOG_DIR below): watcher.log and
+      # worker.log, size-rotated. Docker's own log is deleted with the container
+      # on every `down` / recreate; this directory survives both.
+      - ${HOST_DATA_DIR:-~/Developer/data}/logs:/logs
     env_file:
       - .env
+    environment:
+      LOG_DIR: /logs
+    # The file logs above are the history to keep; Docker's own copy only
+    # needs to cover `docker compose logs`, so it is capped (3 × 10 MB).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   # Polls the observatory-api task queue (ANALYZE / DETECT_ANOMALIES /
@@ -57,6 +70,15 @@ services:
       # just a plain directory on the host; this bind mount is a dev/Docker
       # convenience, not something the cache logic itself depends on.
       - ${HOST_DATA_DIR:-~/Developer/data}/cache/catalog:/cache/catalog
+      - ${HOST_DATA_DIR:-~/Developer/data}/logs:/logs
     env_file:
       - .env
+    environment:
+      LOG_DIR: /logs
+    # Same log setup as `pipeline` above.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped

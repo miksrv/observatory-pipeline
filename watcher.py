@@ -53,6 +53,7 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 import config
+from logging_setup import configure_logging
 import api_client
 
 logger = logging.getLogger(__name__)
@@ -308,11 +309,7 @@ async def _fetch_and_apply_remote_settings() -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-        format="%(asctime)s %(levelname)-5s %(module)s — %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    configure_logging("watcher")
 
     # Fetch remote configuration from the API before anything else.
     # If the API is unreachable or returns an error, all local defaults

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.0
+
+### Minor Changes
+
+- Logging: `watcher.log` and `worker.log` written to `HOST_DATA_DIR/logs` with size rotation (`LOG_DIR`, `LOG_FILE_MAX_MB`, `LOG_FILE_BACKUP_COUNT`), surviving container restarts and recreates; uncaught crashes are logged there too
+- Docker: the containers' own json logs capped at 3 × 10 MB per service
+
+### Patch Changes
+
+- Catalog matching: a failed MPC/SkyBot query is retried (`SKYBOT_MAX_ATTEMPTS`, `SKYBOT_RETRY_DELAY_SEC`) with astroquery's HTTP cache off, so an intermittent malformed IMCCE answer no longer costs a frame its asteroid matching
+
 ## 1.0.1
 
 ### Patch Changes

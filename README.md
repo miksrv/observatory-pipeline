@@ -334,7 +334,7 @@ same layout underneath. Compose reads it from `.env`; when it is unset it defaul
 
 ```bash
 mkdir -p ~/Developer/data/fits/{incoming,archive,rejected,raw}
-mkdir -p ~/Developer/data/astap/catalogs ~/Developer/data/cache/catalog
+mkdir -p ~/Developer/data/astap/catalogs ~/Developer/data/cache/catalog ~/Developer/data/logs
 ```
 
 On a **production Linux server** the convention used throughout the rest of this document is
@@ -343,7 +343,7 @@ On a **production Linux server** the convention used throughout the rest of this
 ```bash
 sudo mkdir -p /data && sudo chown $USER:$USER /data
 mkdir -p /data/fits/{incoming,archive,rejected,raw}
-mkdir -p /data/astap/catalogs /data/cache/catalog
+mkdir -p /data/astap/catalogs /data/cache/catalog /data/logs
 ```
 
 > Any other location works the same way — point `HOST_DATA_DIR` at it. `docker-compose.yml`
@@ -615,6 +615,8 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Catalog Query Cache** |
 | `CATALOG_CACHE_DIR` | `/cache/catalog` | No | On-disk directory for cached Gaia/Simbad/2MASS/Pan-STARRS/MPC query results. Mount from a host path OUTSIDE the container (see `docker-compose.yml`'s `worker` service) so it survives a container rebuild — important since this gets restarted often during testing. |
 | `CACHE_TTL_HOURS` | `1.0` | No | How long a cached catalog query result stays valid, in hours. |
+| `SKYBOT_MAX_ATTEMPTS` | `3` | No | Total attempts for one MPC/SkyBot cone search. IMCCE intermittently returns a malformed answer ("No table found") that succeeds on a retry; a frame whose query fails every attempt gets no MPC matching. `1` disables retrying. |
+| `SKYBOT_RETRY_DELAY_SEC` | `3.0` | No | Wait before the second SkyBot attempt, doubled after each further failure. |
 | **Job Queue Worker** |
 | `TASK_POLL_INTERVAL_SEC` | `10.0` | No | How often `worker.py` polls `GET /tasks?status=PENDING` when idle. |
 | `TASK_POLL_BACKOFF_MAX_SEC` | `60.0` | No | Idle polling backs off exponentially up to this ceiling, resetting the moment a task is found. |
@@ -626,7 +628,10 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Normalization** |
 | `NORMALIZE_ENABLED` | `true` | No | Enable automatic normalization of FITS header values and filenames. Normalizes object names (`M 51` → `M51`), filter names (`Blue` → `B`, `Luminance` → `L`, `H-Alpha` → `Ha`), frame types (`Light Frame` → `Light`), and renames files to standard format `{Object}_{Type}_{Filter}_{Exp}_{DateTime}.fits`. Ensures consistency across different capture software. |
 | **Logging** |
-| `LOG_LEVEL` | `INFO` | No | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Set via `watcher.py`'s `logging.basicConfig()`. |
+| `LOG_LEVEL` | `INFO` | No | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, or `ERROR`. Applied by `logging_setup.configure_logging()` in both services; a remote value takes effect after the settings fetch at startup. |
+| `LOG_DIR` | *(empty)* | No | Directory for persistent, size-rotated log files (`watcher.log`, `worker.log`), written alongside stderr. Empty = stderr only. `docker-compose.yml` sets it to `/logs` and mounts `HOST_DATA_DIR/logs` there. |
+| `LOG_FILE_MAX_MB` | `20` | No | Size at which a log file is rotated. |
+| `LOG_FILE_BACKUP_COUNT` | `10` | No | Rotated log files kept per service (`worker.log.1` … `.N`). |
 
 #### Remote Configuration via API
 
@@ -666,6 +671,9 @@ docker compose up --build -d
 
 # Follow live logs
 docker compose logs -f
+
+# Persistent log history (survives `down`, rebuilds and recreates)
+tail -f "$HOST_DATA_DIR/logs/worker.log"
 
 # Stop the pipeline
 docker compose down
@@ -708,6 +716,7 @@ All persistent data lives **outside** the container on the host filesystem, unde
       - ${HOST_DATA_DIR:-~/Developer/data}/fits/raw:/fits/raw
       - ${HOST_DATA_DIR:-~/Developer/data}/astap/catalogs:/astap/catalogs
       - ${HOST_DATA_DIR:-~/Developer/data}/cache/catalog:/cache/catalog   # worker only
+      - ${HOST_DATA_DIR:-~/Developer/data}/logs:/logs
 ```
 
 | Host path, under `HOST_DATA_DIR` (macOS `~/Developer/data`, Linux `/data`) | Container path | Purpose |
@@ -718,6 +727,7 @@ All persistent data lives **outside** the container on the host filesystem, unde
 | `fits/raw` | `/fits/raw` | Untouched colour originals of one-shot-colour frames, under their original filenames — for your own colour stacking. The pipeline itself works on mono copies. |
 | `astap/catalogs` | `/astap/catalogs` | ASTAP star catalog files. Download once; survives container rebuilds. |
 | `cache/catalog` | `/cache/catalog` | On-disk cache of external catalog queries (`CATALOG_CACHE_DIR`); survives rebuilds. |
+| `logs` | `/logs` | `watcher.log` and `worker.log`, size-rotated (`LOG_DIR`, set by `docker-compose.yml`). Docker's own log is capped at 3 × 10 MB per service and is lost when a container is recreated; these files are the history. |
 
 `extra_hosts: host.docker.internal:host-gateway` lets the container reach services running on the host machine.
 
