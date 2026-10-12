@@ -55,14 +55,16 @@ An automated Python service on a **dedicated observatory server** that:
 └─────────────────────────┘
 ```
 
-`/data/...` is the production (Linux) convention; local development uses `~/observatory-data/`.
+Host paths hang off `HOST_DATA_DIR` (compose-only, from `.env`): `/data` on a Linux server, unset →
+`~/Developer/data` for macOS development — `docker-compose.yml` is never edited per host.
 The API key lives in `.env` and is never committed. Frames come from **several telescopes and
 cameras** — never bake one instrument's numbers into defaults.
 
 ## Docker notes (why, not how)
 
-- `astap` is installed from a pre-downloaded archive in `install/` (offline, reproducible builds);
-  default amd64, swap in `astap_aarch64.tar.gz` for ARM64.
+- `astap` is installed from pre-downloaded archives in `install/` (offline, reproducible builds):
+  `astap_amd64.tar.gz` and `astap_aarch64.tar.gz`, picked by the image's platform.
+- `.dockerignore` keeps `.env` out of the image — secrets arrive only via `env_file` at runtime.
 - `xvfb` + GTK/Pango are needed because astap requires a (virtual) display even headless;
   `modules/astrometry/_astap.py` runs it via `xvfb-run`.
 - The source tree is bind-mounted to `/app`, so code edits need only

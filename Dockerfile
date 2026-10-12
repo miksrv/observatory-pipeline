@@ -12,10 +12,16 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install astap binary from local archive
-# Download manually from: https://sourceforge.net/projects/astap-program/files/linux_installer/
-# Place the appropriate tar.gz for your architecture in install/ directory
+# Downloaded from: https://sourceforge.net/projects/astap-program/files/linux_installer/
+# install/ holds one archive per architecture; the one matching the image's
+# platform is picked (amd64 servers, arm64 Apple Silicon / Raspberry Pi).
 COPY install/astap_*.tar.gz /tmp/
-RUN tar -xzf /tmp/astap_*.tar.gz -C / && \
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) ASTAP_ARCHIVE=astap_amd64.tar.gz ;; \
+        arm64) ASTAP_ARCHIVE=astap_aarch64.tar.gz ;; \
+        *) echo "ERROR: no astap archive for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac && \
+    tar -xzf "/tmp/$ASTAP_ARCHIVE" -C / && \
     chmod +x /opt/astap/astap && \
     mkdir -p /usr/local/bin && \
     ln -sf /opt/astap/astap /usr/local/bin/astap && \
