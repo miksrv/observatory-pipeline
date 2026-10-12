@@ -1,8 +1,8 @@
 """
 worker.py — Task-queue consumer for observatory-pipeline.
 
-Polls `GET /tasks?status=PENDING` on observatory-api and dispatches each
-task's items to the matching pipeline.py stage function:
+Polls `GET /tasks?status=PENDING&claimable=1` on observatory-api and
+dispatches each task's items to the matching pipeline.py stage function:
 
     ANALYZE                -> pipeline.analyze_frame(fits_path)
     DETECT_ANOMALIES       -> pipeline.detect_anomalies_for_frame_id(frame_id)
@@ -44,6 +44,13 @@ Politeness ("не нагружать сервер"):
     task's item count grows large enough for that to matter, batching every
     N items is a small, local change (see TasksController::postItemsProgress
     in observatory-api, which already accepts an array either way).
+
+Several pipelines (one per observatory server) can share one API, each with
+its own API_KEY — the key is how the API knows which pipeline is calling. A
+task that needs local files is targeted at the pipeline that registered
+them, polling asks only for `claimable` tasks (its own or untargeted), and
+the API refuses a claim on another pipeline's task (409) — the same "could
+not claim" path as losing a race to another worker.
 
 Known limitation: a task that a worker claims (PATCH status=RUNNING) and
 then crashes on — before finishing — stays stuck at RUNNING forever; this
@@ -488,7 +495,9 @@ async def run_forever() -> None:
 
     while True:
         try:
-            tasks = await api_client.get_tasks(status="PENDING", limit=1, order="asc")
+            tasks = await api_client.get_tasks(
+                status="PENDING", limit=1, order="asc", claimable=True,
+            )
         except Exception:
             logger.exception("Failed to poll for pending tasks")
             tasks = []

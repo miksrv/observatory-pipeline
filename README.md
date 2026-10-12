@@ -416,7 +416,7 @@ nano .env
 ```env
 # ── Required ──────────────────────────────────────────────────────────────────
 API_BASE_URL=https://your-cloud-host.com/api/v1
-API_KEY=your-secret-api-key-here
+API_KEY=your-secret-api-key-here   # this server's own key: `php spark pipeline:create <name>` on the API host
 
 # ── FITS directory paths (inside the container) ───────────────────────────────
 # These match the right-hand side of the volume mounts in docker-compose.yml.
@@ -489,6 +489,19 @@ LOG_LEVEL=INFO                 # DEBUG, INFO, WARNING, or ERROR
 ```
 
 > `API_KEY` must never be committed to git. It is listed in `.gitignore`.
+>
+> **Several observatory servers, one API.** Run one pipeline per server (each with its own
+> `FITS_*` directories) against the same API, each with its **own** `API_KEY` — issued on the API
+> host with `php spark pipeline:create <name>` (also `pipeline:list`, `pipeline:rotate`,
+> `pipeline:revoke`, `pipeline:rename`). The key is the pipeline's identity: the API records the
+> frames a pipeline registers as its own and routes every task that needs those files
+> (`ANALYZE`, `PREVIEW_CATALOG_MATCH`, `DELETE_FRAME`, `DETECT_ANOMALIES`, `GENERATE_CHARTS`) to
+> that pipeline only; history, coverage and anomalies are shared. Rotating or renaming keeps a
+> pipeline's frames; two servers must never share a key. Remote settings (`GET /settings`) are shared by
+> all pipelines and override each server's `.env`; to tune a numeric threshold per site
+> (e.g. `QC_SKY_BACKGROUND_MAX`, `QC_FWHM_MAX_ARCSEC`), leave it blank in the API's settings so the
+> local value is kept. A finder chart is drawn by the pipeline holding the source's latest frame
+> and includes only the epochs whose files that server has.
 >
 > `.env.example` is kept in sync with `config.py`'s real defaults: `MOVING_CONE_ARCSEC=120.0`
 > (widened because fast movers like Vesta travel ~60"/hr and 30" was too tight to reliably catch

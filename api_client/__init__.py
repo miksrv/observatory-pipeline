@@ -37,7 +37,7 @@ Full list:
   get_frame_sources(frame_id)                                → list
 
   create_task(task_type, items, scope, parent_task_id)       → dict | None
-  get_tasks(status, task_type, object_name, limit, order)    → list
+  get_tasks(status, task_type, object_name, limit, order, claimable) → list
   get_task(task_id)                                          → dict | None
   update_task(task_id, status, error)                        → dict | None
   post_task_items_progress(task_id, items)                   → dict | None

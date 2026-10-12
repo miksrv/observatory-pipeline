@@ -83,6 +83,10 @@ async def create_task(
     parent_task_id:
         Optional — links a re-run to the task it re-runs.
 
+    The API targets the task at this pipeline (identified by its API key):
+    everything the pipeline queues itself (watcher batches, recovery
+    re-queues) refers to files in its own local archive.
+
     Returns
     -------
     dict | None
@@ -115,9 +119,12 @@ async def _get_tasks_with_retry(
     object_name: str | None,
     limit: int,
     order: str | None,
+    claimable: bool,
 ) -> list:
     """Inner retryable core for get_tasks."""
     params: dict = {"limit": limit}
+    if claimable:
+        params["claimable"] = 1
     if status is not None:
         params["status"] = status
     if task_type is not None:
@@ -145,6 +152,7 @@ async def get_tasks(
     object_name: str | None = None,
     limit: int = 50,
     order: str | None = None,
+    claimable: bool = False,
 ) -> list:
     """
     List tasks, filtered by status/type/object.
@@ -159,6 +167,11 @@ async def get_tasks(
         "asc" or "desc" (API default "desc" — most recent first). A FIFO
         worker polling for PENDING work should pass "asc" to claim the
         oldest queued task first rather than whatever was just submitted.
+    claimable:
+        Only tasks this pipeline may claim — targeted at it (the API knows
+        which pipeline this is from its API key) or untargeted. The worker
+        polls with it, so a task waiting for another (possibly offline)
+        pipeline never blocks its queue.
 
     Returns
     -------
@@ -172,7 +185,7 @@ async def get_tasks(
         extra={"frame_id": None, "log_filename": None},
     )
     try:
-        return await _get_tasks_with_retry(status, task_type, object_name, limit, order)
+        return await _get_tasks_with_retry(status, task_type, object_name, limit, order, claimable)
     except Exception as exc:
         logger.error(
             "Error querying /tasks: %s",
