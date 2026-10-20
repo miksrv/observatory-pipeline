@@ -1355,9 +1355,10 @@ task never blocks the head of its queue. Response: `{"data": [...]}`, each task 
 `pipeline_id` (target) and `claimed_by`.
 
 **`GET /tasks/{id}`** — `api_client.get_task(task_id)`. Response: `{"task": {...}, "items": [...]}`,
-each item carrying its own `status` (`PENDING`/`DONE`/`FAILED`) — `worker.py` only ever processes
-the ones still `PENDING`, so a task interrupted mid-run resumes cleanly rather than redoing
-already-finished items.
+each item carrying its own `status` (`PENDING`/`RUNNING`/`DONE`/`FAILED`) — `worker.py` only ever
+processes the ones still `PENDING`, so a task interrupted mid-run resumes cleanly rather than
+redoing already-finished items. `RUNNING` is a non-terminal, best-effort live-progress hint (see
+below) — it is not something `worker.py` filters on itself.
 
 **`PATCH /tasks/{id}`** — `api_client.update_task(task_id, status, error=None)`. `worker.py` sets
 `RUNNING` when it claims a task and `FAILED` (with `error`) on an unhandled exception; reaching
@@ -1366,11 +1367,14 @@ already-finished items.
 (the caller's key belongs to a different pipeline than `pipeline_id`); either way the worker leaves the task alone.
 
 **`POST /tasks/{id}/items/progress`** — `api_client.post_task_items_progress(task_id, items)`.
-Body: `{"items": [{"item_id": ..., "status": "DONE"|"FAILED", "frame_id": ...?, "error": ...?, "payload": {...}?}]}`.
+Body: `{"items": [{"item_id": ..., "status": "RUNNING"|"DONE"|"FAILED", "frame_id": ...?, "error": ...?, "payload": {...}?}]}`.
 `worker.py` calls this immediately after EACH item finishes (one-item list per call), not batched
 across the whole task — batching would leave `task_items`/`tasks.completed_items` stuck showing
 every item as `PENDING` for the task's entire duration, with no live progress visibility while
-it's still running. `payload` here is a RESULT overwriting the item's stored payload — e.g.
+it's still running. It also sends one extra, best-effort call per item with `status: "RUNNING"`
+right before real work on that item starts, so the operator can see which item is currently being
+worked on rather than only ever seeing `PENDING` flip straight to `DONE`/`FAILED`; a dropped
+`RUNNING` call is never retried (see `worker.py`'s `_mark_running()`). `payload` here is a RESULT overwriting the item's stored payload — e.g.
 `PREVIEW_CATALOG_MATCH` reports `{"matched", "total", "quality_flag", "chart_uploaded"}` once that
 file's chart has been rendered and uploaded (see `POST .../items/{item_id}/chart` below) — the same
 field `GENERATE_CHARTS` reads as *input* at task-creation time (section above); which direction

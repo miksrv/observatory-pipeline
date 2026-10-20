@@ -114,6 +114,47 @@ class TestRecoveryAttemptCounter:
 
 
 # ---------------------------------------------------------------------------
+# _run_analyze_task
+# ---------------------------------------------------------------------------
+
+
+class TestRunAnalyzeTask:
+    async def test_marks_running_before_terminal_report(self, monkeypatch):
+        """A RUNNING hint is sent for an item right before real work starts
+        on it, strictly before that same item's terminal DONE/FAILED report."""
+        monkeypatch.setattr(
+            worker.pipeline, "analyze_frame",
+            AsyncMock(return_value={"frame_id": "frame-1"}),
+        )
+        progress_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", progress_mock)
+
+        task = {"id": "t1"}
+        items = [{"id": "item-1", "filename": "/fits/incoming/a.fits"}]
+
+        await worker._run_analyze_task(task, items)
+
+        assert [c.args for c in progress_mock.call_args_list] == [
+            ("t1", [{"item_id": "item-1", "status": "RUNNING"}]),
+            ("t1", [{"item_id": "item-1", "status": "DONE", "frame_id": "frame-1"}]),
+        ]
+
+    async def test_missing_filename_never_marks_running(self, monkeypatch):
+        """An item that fails validation (no filename) goes straight to
+        FAILED, with no RUNNING report ever sent for it — no work started."""
+        analyze_mock = AsyncMock()
+        monkeypatch.setattr(worker.pipeline, "analyze_frame", analyze_mock)
+        progress_mock = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", progress_mock)
+
+        await worker._run_analyze_task({"id": "t1"}, [{"id": "item-1"}])
+
+        analyze_mock.assert_not_called()
+        assert progress_mock.call_count == 1
+        assert progress_mock.call_args.args[1][0]["status"] == "FAILED"
+
+
+# ---------------------------------------------------------------------------
 # _run_detect_task
 # ---------------------------------------------------------------------------
 
@@ -142,13 +183,17 @@ class TestRunDetectTask:
         # Progress reported immediately after EACH item, not batched into one
         # call at the end — otherwise task_items/tasks.completed_items would
         # only ever update once the whole task finishes, with no live
-        # visibility while it's still running.
-        assert post_progress_mock.call_count == 2
+        # visibility while it's still running. Each item also gets one extra
+        # RUNNING call right before it is processed, so there are 2 calls per
+        # item (RUNNING, then DONE/FAILED) instead of 1.
+        assert post_progress_mock.call_count == 4
         reported = {}
         for call in post_progress_mock.call_args_list:
             (_, items_arg) = call.args
             assert len(items_arg) == 1  # one item per call
             reported[items_arg[0]["item_id"]] = items_arg[0]["status"]
+        # The dict keeps only the LAST status seen per item_id, i.e. the
+        # terminal one — RUNNING always arrives first.
         assert reported == {"item-1": "DONE", "item-2": "DONE"}
 
     async def test_no_automatic_charts_task_created(self, monkeypatch):
@@ -229,9 +274,14 @@ class TestRunChartsTask:
             ({"src-a": ["UNKNOWN"]}, {}),
             ({"src-b": ["ASTEROID"]}, {"src-b": "Vesta"}),
         ]
+        # Every item in a source_id's group gets a RUNNING call before the
+        # group's generate_charts_for_source_ids() call, followed by the
+        # terminal outcome call for that group.
         reports = [c.args[1] for c in progress_mock.call_args_list]
         assert [[(p["item_id"], p["status"]) for p in r] for r in reports] == [
+            [("item-1", "RUNNING")],
             [("item-1", "DONE")],
+            [("item-2", "RUNNING")],
             [("item-2", "FAILED")],
         ]
 
@@ -286,6 +336,8 @@ class TestRunChartsTask:
         await worker._run_charts_task({"id": "chart-task-1"}, items)
 
         generate_mock.assert_not_called()
+        # No RUNNING call either — a malformed item never starts real work.
+        assert worker.api_client.post_task_items_progress.call_count == 1
         progress = worker.api_client.post_task_items_progress.call_args.args[1]
         assert len(progress) == 1
         assert progress[0]["item_id"] == "item-1"
@@ -315,7 +367,9 @@ class TestRunPreviewTask:
         # needs both to build the chart-upload URL.
         preview_mock.assert_called_once_with("/fits/incoming/frame.fits", "t1", "item-1")
 
-        post_progress_mock.assert_called_once()
+        # One RUNNING call before preview_catalog_match(), one terminal call after.
+        assert post_progress_mock.call_count == 2
+        assert post_progress_mock.call_args_list[0].args[1][0]["status"] == "RUNNING"
         reported = post_progress_mock.call_args.args[1][0]
         assert reported["item_id"] == "item-1"
         assert reported["status"] == "DONE"
@@ -346,6 +400,8 @@ class TestRunPreviewTask:
         await worker._run_preview_task({"id": "t1"}, [{"id": "item-1"}])
 
         preview_mock.assert_not_called()
+        # No RUNNING call either — a missing filename never starts real work.
+        assert post_progress_mock.call_count == 1
         assert post_progress_mock.call_args.args[1][0]["status"] == "FAILED"
 
     async def test_multiple_items_reported_immediately_per_item_not_batched(self, monkeypatch):
@@ -362,7 +418,8 @@ class TestRunPreviewTask:
         ]
         await worker._run_preview_task({"id": "t1"}, items)
 
-        assert post_progress_mock.call_count == 2
+        # 2 items x (1 RUNNING + 1 terminal) = 4 progress calls.
+        assert post_progress_mock.call_count == 4
         assert preview_mock.call_count == 2
 
 
@@ -428,6 +485,8 @@ class TestRunDeleteFrameTask:
         await worker._run_delete_frame_task({"id": "del-task-1"}, [{"id": "item-1"}])
 
         get_frame_mock.assert_not_called()
+        # No RUNNING call either — a missing frame_id never starts real work.
+        assert post_progress_mock.call_count == 1
         reported = post_progress_mock.call_args.args[1][0]
         assert reported["item_id"] == "item-1"
         assert reported["status"] == "FAILED"
@@ -642,9 +701,11 @@ class TestGracefulShutdown:
 
         assert processed == ["item-0"]
         # The finished item is still reported — only unstarted ones are left.
-        worker.api_client.post_task_items_progress.assert_called_once_with(
-            "t1", [{"item_id": "item-0", "status": "DONE"}],
-        )
+        # One RUNNING call precedes the terminal DONE call for that item.
+        assert [c.args for c in worker.api_client.post_task_items_progress.call_args_list] == [
+            ("t1", [{"item_id": "item-0", "status": "RUNNING"}]),
+            ("t1", [{"item_id": "item-0", "status": "DONE"}]),
+        ]
 
     async def test_an_interrupted_task_goes_back_to_pending(self, monkeypatch):
         detail = {
@@ -736,6 +797,9 @@ class TestLostProgressReports:
         monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
         monkeypatch.setattr(worker, "_handle_analyze_item",
                             AsyncMock(return_value={"item_id": "item-1", "status": "DONE"}))
+        # The best-effort RUNNING hint is unrelated to this retry mechanism —
+        # neutralize it so it doesn't consume a side_effect slot below.
+        monkeypatch.setattr(worker, "_mark_running", AsyncMock())
         progress = AsyncMock(side_effect=[None, {"results": []}])
         monkeypatch.setattr(worker.api_client, "post_task_items_progress", progress)
 

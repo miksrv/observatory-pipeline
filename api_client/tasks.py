@@ -322,15 +322,22 @@ async def _post_task_items_progress_with_retry(task_id: str, items: list[dict]) 
 
 async def post_task_items_progress(task_id: str, items: list[dict]) -> dict | None:
     """
-    Report the outcome of one or more task items in a single call.
+    Report the outcome — or current progress — of one or more task items in
+    a single call.
 
     Parameters
     ----------
     task_id:
         The task these items belong to.
     items:
-        List of {"item_id": ..., "status": "DONE"|"FAILED", "frame_id": ...
-        (optional, ANALYZE items only), "error": ... (optional)}.
+        List of {"item_id": ..., "status": "RUNNING"|"DONE"|"FAILED",
+        "frame_id": ... (optional, ANALYZE items only), "error": ...
+        (optional)}. "RUNNING" is a best-effort, non-terminal live-progress
+        hint worker.py sends right before starting real work on an item
+        (see its _mark_running()) — never retried and never routed through
+        the same unreported-outcome queue as the terminal DONE/FAILED call,
+        so a delayed RUNNING report can never be replayed after that item's
+        real outcome already landed.
 
     Returns
     -------
