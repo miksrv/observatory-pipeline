@@ -43,6 +43,7 @@ import logging
 import math
 import os
 import re
+import warnings
 from typing import Any, Optional
 
 import astropy.units as u
@@ -183,6 +184,7 @@ def _find_archive_frames(
     psf_fwhm_arcsec: Optional[float] = None,
     *,
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
+    pixel_scale_arcsec: Optional[float] = None,
     exclude_path: Optional[str] = None,
 ) -> list[str]:
     """
@@ -209,6 +211,9 @@ def _find_archive_frames(
     instrument:
         The new frame's own ``(TELESCOP, INSTRUME)`` — see
         _screen_by_quality(). None skips the instrument screen.
+    pixel_scale_arcsec:
+        The new frame's own solved plate scale — see _screen_by_quality().
+        None skips the plate-scale screen.
     exclude_path:
         The new frame's own path. Re-analysing an archived frame passes a
         file that sits in archive_dir itself; it is dropped here, before the
@@ -286,7 +291,9 @@ def _find_archive_frames(
             n_calibration, archive_dir,
         )
 
-    science_files = _screen_by_quality(science_files, psf_fwhm_arcsec, instrument)
+    science_files = _screen_by_quality(
+        science_files, psf_fwhm_arcsec, instrument, pixel_scale_arcsec=pixel_scale_arcsec,
+    )
 
     candidates = science_files
     if filter_name:
@@ -369,6 +376,34 @@ def _same_instrument(
     return all(c is None or n is None or c == n for c, n in zip(candidate, new))
 
 
+def _scale_of(header: Optional[Any]) -> Optional[float]:
+    """
+    The plate scale (arcsec/px) of a header's celestial WCS — for an archived
+    frame, the astap solve pipeline.py wrote into it. None without one.
+    """
+    if header is None:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wcs = WCS(header)
+    except Exception:
+        return None
+    if not wcs.has_celestial:
+        return None
+    return _pixel_scale_arcsec("", wcs=wcs.celestial)
+
+
+def _same_scale(candidate: Optional[float], new: Optional[float]) -> bool:
+    """
+    False only when both scales are known and differ by more than
+    SUBTRACTION_REF_MAX_SCALE_DIFF (fractional). Unknown on either side → kept.
+    """
+    if candidate is None or new is None or new <= 0:
+        return True
+    return abs(candidate / new - 1.0) <= config.SUBTRACTION_REF_MAX_SCALE_DIFF
+
+
 def _qc_of(header: Optional[Any]) -> tuple[Optional[str], Optional[float]]:
     """
     The QCFLAG/QCFWHM pair pipeline.py stamps into a frame's header at
@@ -399,6 +434,8 @@ def _screen_by_quality(
     paths: list[str],
     psf_fwhm_arcsec: Optional[float],
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
+    *,
+    pixel_scale_arcsec: Optional[float] = None,
 ) -> list[str]:
     """
     Drop reference candidates that would damage the difference image: frames
@@ -411,6 +448,14 @@ def _screen_by_quality(
     no fallback: a blurred reference degrades the difference image, another
     instrument's frame (different PSF, scale, field distortion, bandpass)
     makes a wrong one.
+
+    TELESCOP alone does not identify the optics: INDI writes the mount's name
+    there ('EQMod Mount'), so two telescopes swapped on one mount with the
+    same camera look identical to it. The plate scale does tell them apart —
+    the new frame's solved *pixel_scale_arcsec* against each candidate's
+    archived solve, within SUBTRACTION_REF_MAX_SCALE_DIFF (it also separates
+    binning modes and a reducer fitted or removed). Same rule as the keyword
+    screen: no fallback, and a candidate without a WCS is kept.
 
     Reference selection used to be recency (plus PA-closeness) alone and never
     looked at quality at all. That was harmless while QC-failed frames were
@@ -442,6 +487,19 @@ def _screen_by_quality(
                 "another telescope/camera than %s",
                 len(paths) - len(same), len(paths),
                 " / ".join(v or "?" for v in instrument),
+            )
+        paths = same
+        if not paths:
+            return paths
+
+    if pixel_scale_arcsec is not None:
+        same = [p for p in paths if _same_scale(_scale_of(headers[p]), pixel_scale_arcsec)]
+        if len(same) != len(paths):
+            logger.info(
+                "Subtraction: excluded %d of %d reference candidate(s) whose plate "
+                "scale differs from this frame's %.3f\"/px by more than %.0f%%",
+                len(paths) - len(same), len(paths), pixel_scale_arcsec,
+                config.SUBTRACTION_REF_MAX_SCALE_DIFF * 100,
             )
         paths = same
         if not paths:
@@ -1670,6 +1728,7 @@ async def run(
     archive_files = _find_archive_frames(
         archive_dir, filter_name, new_position_angle_deg, psf_fwhm_arcsec,
         instrument=_read_instrument(fits_path),
+        pixel_scale_arcsec=_pixel_scale_arcsec(fits_path, wcs=wcs) if wcs is not None else None,
         exclude_path=fits_path,
     )
     # Exclude the new frame's own file from its candidate reference stack —

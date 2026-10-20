@@ -432,6 +432,13 @@ SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG
 # the frame its subtraction: if it would leave fewer than
 # SUBTRACTION_MIN_FRAMES, the unscreened set is used instead.
 SUBTRACTION_REF_MAX_FWHM_RATIO: float = float(_get("SUBTRACTION_REF_MAX_FWHM_RATIO", "1.5"))
+# Largest fractional plate-scale difference between the new frame's solve and
+# a reference's archived one. TELESCOP cannot separate optics (INDI writes the
+# mount's name there), so two telescopes on one mount with the same camera are
+# told apart by scale; so are binning modes and a reducer. One instrument's own
+# solves agree to well under 1%. No fallback — another optics' frame makes a
+# wrong difference image, not a degraded one.
+SUBTRACTION_REF_MAX_SCALE_DIFF: float = float(_get("SUBTRACTION_REF_MAX_SCALE_DIFF", "0.05"))
 
 # --- Edge-zone diff candidates ---------------------------------------------
 # Every candidate in the EDGE_MARGIN_FRAC zone used to be dropped outright, on
@@ -936,6 +943,7 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_DETECT_SIGMA": float,
     "SUBTRACTION_PREROTATE_MIN_DEG": float,
     "SUBTRACTION_REF_MAX_FWHM_RATIO": float,
+    "SUBTRACTION_REF_MAX_SCALE_DIFF": float,
     "SUBTRACTION_EDGE_ELONGATION_MAX": float,
     "SUBTRACTION_EDGE_SNR_MIN": float,
     "SUBTRACTION_RESIDUAL_RADIUS_FWHM": float,

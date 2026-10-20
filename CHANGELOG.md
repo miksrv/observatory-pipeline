@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1
+
+### Patch Changes
+
+- Analysis: cross-catalog duplicate removal takes milliseconds instead of 3–8 minutes per frame (same result)
+- Subtraction: reference frames whose plate scale differs from the new frame's by more than `SUBTRACTION_REF_MAX_SCALE_DIFF` (default 5%) are no longer stacked — INDI writes the mount's name into `TELESCOP`, so two telescopes on one mount with the same camera used to be mixed
+
 ## 1.3.0
 
 ### Minor Changes
