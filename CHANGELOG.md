@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.0
+
+### Minor Changes
+
+- Archive: Lights filed by object and filter (`{object}/{filter}/`, `NONE` without a filter), calibration under `_calibration/{night}/{type}/` with the camera instead of the object in the filename — laid out to serve as a read-only FTP root; run `tools/migrate_archive_layout.py` once after deploying (see README "File Organization")
+- Subtraction: reference frames only from the same telescope and camera (`TELESCOP`/`INSTRUME`), with no fallback to other instruments
+
+### Patch Changes
+
+- Catalog preview: subtraction looks for references under the normalized object name and filter, as ingest archives them
+- Subtraction: a re-analysed frame no longer costs its own reference stack a slot
+- Frame deletion: a file already in `rejected` is no longer overwritten
+- Photometry: when catalog matching corrects a systematic WCS offset, the solved WCS is shifted too — apertures, forced photometry and the archived header no longer sit off the stars by the correction
+- Anomaly detection: an API outage while fetching history, coverage or a frame's sources no longer replaces the frame's stored anomalies with an empty or wrong set; detection is re-queued (history) or the item fails (sources)
+- Catalog matching: an asteroid that takes over a catalogued star no longer becomes a zero-point reference with that star's Gaia magnitude
+- Catalog matching: the WCS offset is found in fields straddling RA 0h; corrected RA stays within 0–360°
+- Catalog cache: `CACHE_TTL_HOURS` from the API settings takes effect; an entry read from disk expires with its file; a malformed SkyBot answer is no longer cached
+- Photometry: saturated stars are dropped before the reference quality screen, so a frame is no longer left uncalibrated when enough usable stars exist
+- Astrometry: saturation is judged from the raw peak pixel instead of the peak plus the global sky, so saturated cores on a bright local background are flagged
+- Photometry: pixel scale is the geometric mean of both axes everywhere, as in astrometry
+- Anomaly detection: a near-edge subtraction candidate is judged on its difference-image SNR, not on an aperture SNR that photometry may not have measured
+- Worker: an item report the API did not take is retried, and the task is re-queued instead of staying `RUNNING` (failed after `API_RECOVERY_MAX_ATTEMPTS` re-queues); an unexpected API response no longer crashes the worker with a task claimed
+- Worker: a second `Ctrl+C`/SIGTERM exits at once even during a long CPU step; a terminal `Ctrl+C` no longer kills astap mid-solve
+- Watcher: a restart no longer resubmits files that queued ANALYZE tasks already carry; a stop during the startup scan is handled; up to 1 minute to submit buffered files on stop
+- Worker: graceful shutdown — on `docker compose stop`/`down` the item in progress finishes and an interrupted task goes back to the queue instead of staying `RUNNING`; the worker gets up to 5 minutes to stop
+- Watcher: on `docker compose stop`/`down` the buffered files are submitted before exiting instead of being dropped by Docker's kill
+- Docs: `.env.example` and README show the real `QC_SKY_BACKGROUND_MAX` default (50000)
+
 ## 1.1.0
 
 ### Minor Changes

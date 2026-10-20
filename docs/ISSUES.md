@@ -1,134 +1,116 @@
-# ISSUES.md — вопросы по данным в БД `observatory-api`, требующие разбора
+# ISSUES.md — open questions and deferred follow-ups
 
-Зафиксировано 2026-08-05 по итогам разбора реальных данных в таблице `anomalies`
-(и связанной `sources`); дополнено 2026-08-07 по итогам отдельного разбора
-(пункты 3 и 4 ниже — написаны на английском, см. правило про язык
-markdown-документов в CLAUDE.md). Уже реализованные и протестированные
-исправления сюда не переносятся — их история в `git log`; там, где фикс
-закрыл только часть пункта, здесь остаётся только реально открытый хвост.
-Обновлено 2026-08-11.
+Open items found on real data or in review and consciously deferred. A fixed item is deleted —
+`git log` is its history. Numbers are never reused, so a gap means a closed item.
 
----
-
-## 1. Аномально много записей `MOVING_UNKNOWN` и `UNKNOWN`
-
-**Наблюдение:** в `anomalies.anomaly_type` доминируют `MOVING_UNKNOWN` и `UNKNOWN`.
-
-**Разбор:**
-- Отсутствие порога по магнитуде в `UNKNOWN`-ветке — уже задокументированный
-  Known Issues #1 в CLAUDE.md (`modules/anomaly_detector/_classify.py`, TODO ~строка 335).
-  Это единственная из трёх причин ниже, которая **до сих пор не устранена**.
-- `MOVING_CONE_ARCSEC=120″` — широкий конус, из-за которого почти любой мелкий шум
-  около предыдущей позиции детекции трактовался как «сдвиг» → `MOVING_UNKNOWN`.
-  Устранено `_is_position_shifted()` (требует, чтобы старая позиция реально
-  «опустела»), уже в коде.
-- Мусорные кандидаты из `modules/subtraction.py` возле ярких/насыщенных звёзд,
-  не матчащиеся ни в один каталог. Устранено saturation-флагом +
-  near_edge-подавлением (`modules/anomaly_detector/_classify.py`), уже в коде.
-
-**Что осталось сделать** (требует доступа к БД на проде — вне возможностей
-этой сессии, поскольку `observatory-pipeline` не имеет прямого доступа к БД
-по архитектуре — см. CLAUDE.md "Why pipeline → API, not pipeline → DB
-directly"):
-- [ ] После деплоя проверить `SELECT anomaly_type, COUNT(*) FROM anomalies GROUP BY anomaly_type;`
-      и сравнить долю `UNKNOWN`/`MOVING_UNKNOWN` до/после фиксов
-- [ ] Решить, реализовывать ли порог по магнитуде / `FAINT_UNCATALOGUED`
-      (Known Issues #1 в CLAUDE.md) — решение до сих пор не принято
+Not here: things that cannot be done in this repository (`docs/API-TASKS.md`), new capabilities
+under discussion (`ROADMAP.md`), and the two limitations in `CLAUDE.md` "Known issues" (faint
+`UNKNOWN` sources; `QC_SNR_MIN` not enforced), which stay there because that file is read every
+session.
 
 ---
 
-## 2. Frequent `0 calibrated` frames (open sub-question from the extreme-`magnitude` investigation)
+## 1. Too many `MOVING_UNKNOWN` / `UNKNOWN` anomalies
 
-**Background:** the original observation — `anomalies`/`sources` rows with impossibly
-bright `magnitude` (e.g. −13.8722 and brighter than the full Moon) — has been root-caused
-and fixed in code: `astrometry.py` flags saturated sources so `photometry.py` never
-measures them, and `pipeline.py` now sets `mag = None` for an uncalibrated source instead
-of falling back to raw `mag_instrumental`. That part is closed.
+**Observation (2026-08-05):** the two types dominated `anomalies.anomaly_type`. The remaining
+known cause is the missing magnitude threshold in the `UNKNOWN` branch (`CLAUDE.md` Known
+issue #1).
 
-**Still open:** the test run that surfaced this (Vesta, 5 frames) also showed 2 of those
-5 frames coming back `0 calibrated` from `photometry.py` (`zero_point=None` — fewer than
-3 Gaia DR3 matches in the field), a much higher failure rate than expected and never
-investigated further:
-- Is `fov_deg` too narrow around Vesta specifically?
-- Is `MATCH_CONE_ARCSEC` too strict for the Gaia cross-match?
-- Or is that patch of sky genuinely Gaia-sparse?
+**Still open:**
+- [ ] After a deployment with real traffic, compare the share of `UNKNOWN`/`MOVING_UNKNOWN`
+      before and after (`SELECT anomaly_type, COUNT(*) FROM anomalies GROUP BY anomaly_type`).
+      Never done; the test campaigns since (IC3322A, NGC 7331) were on truncated databases.
+- [ ] Decide on the magnitude threshold / `FAINT_UNCATALOGUED` type (needs the API enum too).
 
-**What's left to do:**
-- [ ] Investigate why Gaia DR3 zero-point calibration fails so often on these test
-      frames — check the three hypotheses above against real data
-- [ ] File a separate GitHub Issue for this if it needs formal tracking (not created yet)
+## 3. → observatory-api — orphaned finder charts after re-running `DETECT_ANOMALIES`
 
----
+Re-running detection replaces the frame's anomaly set (`POST /frames/{id}/anomalies`), but a
+chart already uploaded for a `source_id` whose anomaly no longer reproduces is neither deleted
+nor regenerated — chart generation is operator-triggered and only touches sources that still
+have an anomaly. The stale chart stays in observatory-api until cleaned up there. Every
+classifier fix that removes previously valid anomalies (the Gaia-magnitude zero point, the
+two-epoch confirmation of a magnitude change, the `SPACE_DEBRIS` edge threshold) leaves such orphans.
 
-## 3. Orphaned finder charts after re-running `DETECT_ANOMALIES` (residual from the coma/edge-elongation fix)
+- [ ] Decide whether the API should drop charts of sources with no remaining anomaly when a
+      frame's anomaly set is replaced, or offer a cleanup endpoint. Belongs in
+      `docs/API-TASKS.md` once decided; recorded here because the symptom is pipeline-visible.
 
-**Background:** the original observation — 4 `T_CrB` frames producing 305 anomalies,
-almost all false `SPACE_DEBRIS` from coma-elongated corner stars — has been root-caused
-and fixed: `modules/anomaly_detector/`'s `SPACE_DEBRIS` shortcut now uses a higher,
-edge-aware elongation threshold (`SPACE_DEBRIS_EDGE_ELONGATION_MIN`) for sources flagged
-`near_edge`. That part is closed.
+## 5. Recent transients: TNS cross-match, Simbad transient types
 
-**Still open (known limitation of the fix):** re-running `DETECT_ANOMALIES` for an
-already-processed frame replaces that frame's anomaly set via
-`POST /frames/{id}/anomalies` (a previously false `SPACE_DEBRIS` row disappears), but a
-finder chart already uploaded for that `source_id` is **not** deleted or regenerated —
-`POST /sources/{id}/chart` only touches `source_id`s that still have a resolved anomaly
-in the new run (see `modules/finder_chart.py` / `worker.py`'s `GENERATE_CHARTS`
-batching). A stale chart for a now-non-anomalous source stays orphaned in
-`observatory-api` until cleaned up there directly.
+**Observation (NGC 7331 run, 2026-09-23):** SN 2026aaiv (discovered 2026-09-01, ~12.3 mag,
+29″ from the nucleus) was matched to Simbad's "SN 2014C" 3.5″ away and reported only as
+`VARIABLE_STAR`; with today's zero point it produces nothing. A transient present since the field's
+first frame has no "before", "near a galaxy" is the 5″ match cone, and a Simbad supernova
+gives the source a permanent, unremarkable stellar identity although a 2014 supernova is far
+fainter than 12 mag today.
 
-**What's left to do:**
-- [ ] Re-run `DETECT_ANOMALIES` on the 4 `T_CrB` frames and compare the anomaly count
-      before/after
-- [ ] Manually clean up orphaned charts in `observatory-api` for source_ids whose
-      `SPACE_DEBRIS`/`MOVING_UNKNOWN` anomaly no longer reproduces after this fix
-- [ ] Decide whether `observatory-api` needs an automated cleanup mechanism for orphaned
-      charts, so this doesn't require manual intervention every time a classifier fix
-      removes previously-valid anomalies
+- [ ] **Simbad transient object types** (`SN*`, `SN?`, `Nova`, `No?`, …) must not claim a
+      source as its stellar identity in `catalog_matcher`; the source continues to
+      Gaia/2MASS/Pan-STARRS and, if none claims it, is treated as uncatalogued. Can go first;
+      without it SN 2026aaiv becomes a silent `KNOWN_CATALOG_NEW` once older frames provide
+      coverage, with it one `UNKNOWN` alert on the first 2026 frame.
+- [ ] **TNS cross-match** (Transient Name Server; Simbad lags it by weeks to months): cone
+      query per frame, cached like the other catalogs; a detection at a TNS position gets its
+      name and type and is reported as a known transient. Needs a TNS bot key
+      (`TNS_BOT_ID` / `TNS_BOT_NAME` / `TNS_API_KEY`, skipped while unset) — **the operator
+      creates it**; read the TNS rate limits before coding.
+- [ ] Deferred: "near a galaxy" from the galaxy's own extent (Simbad major/minor axes) instead
+      of the 5″ cone — noisier (HII regions and knots in the disk), a separate task.
 
----
+## 7. Per-instrument photometry and history
 
-## 4. Possible density-dependent WCS-offset correction failure on star-rich frames
+Frames come from several telescopes and cameras, but two things are keyed by filter alone:
 
-**Observation (2026-08-07):** on frames with a large number of detected sources
-(~1000), the sky position reported for a source — and consequently the link generated
-to the Aladin portal — appears slightly off from the actual star. On sparser frames
-(~300 sources) the same kind of link lands precisely on the star.
+- [ ] `PHOTOMETRY_COLOR_TERMS` — the colour term belongs to the instrument + filter, not the
+      filter. Needs a key such as `{TELESCOP}/{INSTRUME}/{filter}` and the per-frame fit that
+      `photometry.py` already logs as calibration data for it.
+- [ ] Light-curve history in the Δmag branches is same-filter but instrument-agnostic; two
+      cameras' `L` are not the same bandpass. Either carry the instrument into the history
+      filter (API joins it) or accept the scatter it adds to `VARIABILITY_SIGMA`.
 
-**Hypothesis (not yet verified against logs — reasoned from code, not confirmed by a real
-repro):** `modules/catalog_matcher/_wcs_offset.py::_compute_wcs_offset()` receives the frame's full
-`sources_all` list (loose filter — every detection, not just strict stars) together with
-Gaia DR3 stars for the same field, then:
-1. Runs a quick nearest-neighbour check and exits early with no correction
-   (`return 0.0, 0.0`) whenever `median_sep <= 10.0` arcsec — treating the WCS as
-   "already accurate".
-2. Otherwise falls back to an all-pairs vote accumulator (`search_around_sky` +
-   histogram peak) to estimate a systematic offset.
+## 8. Streak → asteroid identity should check the trail length
 
-On a star-dense field, both `sources_all` and the Gaia catalog for that sky region are
-correspondingly dense, so the chance nearest-neighbour separation between an arbitrary
-source and an unrelated, nearby-but-wrong Gaia star can be small purely from geometry —
-independent of whether a genuine systematic WCS offset (typical for astap, up to ~30″)
-is actually present. This could make step 1's `median_sep <= 10.0` shortcut fire
-incorrectly on crowded fields, silently skipping the offset correction that a sparser
-field of the same real WCS quality would correctly apply. The vote accumulator's
-background-pair count (`expected_bg`) also scales with source density, which could weaken
-its significance test in the same regime.
+A `_streak=True` detection matched to an MPC object within `MOVING_CONE_ARCSEC` becomes
+`ASTEROID`; nothing checks that the trail's length is what SkyBot's rate × exposure predicts.
+A satellite trail crossing an asteroid's position inherits its name.
 
-This is **not** an issue with `modules/astrometry/_astap.py`'s astap invocation — astap receives
-only the raw FITS file and does its own internal star detection/matching; it never sees
-`sources`/`sources_all`, so limiting the sep-detected source count would not change
-astap's own WCS solve at all. Any fix belongs in `catalog_matcher.py`'s offset-correction
-logic, not in source extraction, and catalog matching itself should keep using the full
-source list (`sources_all`) as it does today.
+- [ ] Require trail length ≈ rate × `EXPTIME` (within a tolerance) before accepting the
+      identity; otherwise keep it `SPACE_DEBRIS`.
 
-**What's left to do:**
-- [ ] Compare pipeline logs for a real dense (~1000 sources) frame vs. a sparse
-      (~300 sources) frame of similar depth: check whether `"Gaia match (raw): min=...
-      median=..."` and `"WCS offset detected: dRA=... dDec=..."` show the correction
-      being skipped on the dense frame but applied on the sparse one
-- [ ] If confirmed, make the `median_sep <= 10.0` early-exit density-aware (or drop it
-      and always rely on the vote accumulator) instead of capping the number of sources
-      fed into `_compute_wcs_offset()`
-- [ ] Re-verify the vote accumulator's significance test (`MIN_PEAK_VOTES`/`SIGMA_MARGIN`)
-      still holds up as source/Gaia density increases
+## 9. Diffuse subtraction residuals
+
+Candidates with FWHM ≫ the frame's PSF (cloud edges, gradients, galaxy-core misregistration)
+pass the sharpness screen (which only rejects *sharper* than `psf/1.5`) and reach the anomaly
+detector. Reviewed by eye on the charts so far.
+
+- [ ] Add an upper FWHM bound for subtraction candidates (a multiple of the frame PSF), or
+      route them to the real/bogus scorer once `docs/PLAN-real-bogus.md` lands.
+
+## 10. `FORCED_PHOTOMETRY_MAG_LIMIT` too deep for short exposures
+
+The default (20 mag) is below what a 300 s frame on the test telescope reaches; forced
+photometry then measures sky at thousands of Gaia positions, and the ones that pass
+`FORCED_PHOTOMETRY_MIN_SNR` by chance feed one-epoch `VARIABLE_STAR` triggers (now suppressed
+by `VARIABILITY_CONFIRM_EPOCHS`). A site setting today.
+
+- [ ] Derive the limit per frame from the frame's own depth (e.g. the faintest blind detection
+      at `PHOTOMETRY_MIN_SNR`, plus a margin) instead of a fixed magnitude.
+
+## 11. Edge-vignetting `VARIABLE_STAR` triggers on unflattened frames
+
+After the zero-point and confirmation fixes, the remaining false `VARIABLE_STAR` on NGC 7331 were stars near the frame edge on
+unflattened frames: fainter by vignetting in one epoch, normal in another where they sat nearer
+the centre. The confirmation rule does not help when several epochs share the same pointing.
+
+- [ ] Options: a radial zero-point term (fit against Gaia per frame, like the colour term), or
+      excluding `near_edge` detections from the Δmag branches. Not decided.
+
+## 12. Catalog cache never expires on disk
+
+`modules/catalog_matcher/_cache.py` honours `CACHE_TTL_HOURS` on read but never deletes an
+expired file, and the MPC/SkyBot key includes the exact epoch, so every frame writes a file that
+is never read again (137 files for one NGC 7331 night). Old-format and expired files were
+deleted by hand on 2026-09-23.
+
+- [ ] Sweep expired files at startup or on write (cheap: the TTL is in the file's
+      `fetched_at`), and consider rounding the MPC epoch key to a few minutes.

@@ -12,6 +12,7 @@ flows between them. Facts that already have a home elsewhere are not repeated he
 | Open data-quality questions; API-side work queued from here | [docs/ISSUES.md](docs/ISSUES.md), [docs/API-TASKS.md](docs/API-TASKS.md) |
 | Every setting and its default | `config.py` (`.env.example` mirrors it, kept in sync by hand) |
 | Current version, what changed in each release | [CHANGELOG.md](CHANGELOG.md) (see "Versioning and releases") |
+| Proposed new capabilities (not scheduled) | [ROADMAP.md](ROADMAP.md) |
 
 Detailed per-function reasoning lives in the module docstrings. When something changes, update
 it in its one home — don't copy it here.
@@ -93,7 +94,8 @@ independently re-runnable modules.
    copied to `FITS_RAW_ARCHIVE/{object}/`.
 1. `fits_header.extract_headers()` → metadata dict.
 2. `normalizer` → normalized object name, filter, frame type.
-3. `Dark`/`Flat`/`Bias` → rename, archive to `FITS_ARCHIVE/{object}/`, **stop**.
+3. `Dark`/`Flat`/`Bias` → rename (`{Camera}_…`), archive to `FITS_ARCHIVE/_calibration/{night}/{type}/`,
+   **stop** — not registered with the API.
 4. `qc.analyze(fits_path, move_on_reject=False)` → metrics + `quality_flag`. The pipeline, not
    `qc.py`, owns the file's fate.
 5. Non-`OK` flag → steps 6–10.5 are skipped, but the frame is **still registered** (with its QC
@@ -121,12 +123,13 @@ independently re-runnable modules.
 9. `photometry.measure(..., wcs=solved_wcs, filter_name=...)` → calibrated magnitudes.
 9.5. `forced_photometry.run()` — measures every in-footprint Gaia/MPC entry blind detection missed.
 10. Unified `mag` = `mag_calibrated` if calibrated, else `None` — **never** the instrumental
-    magnitude (it has no zero point; see docs/ISSUES.md #2).
+    magnitude (it has no zero point).
 11. `api_client.post_frame()` → `frame_id`. Payload includes `pointing_error_arcsec` (+RA/Dec
     components): mount-reported target vs plate-solved centre; all `None` if either is missing.
 12. `api_client.post_sources()` → `source_ids` (positionally parallel), attached as `_source_id`.
-12.5. Archive to `FITS_ARCHIVE/{object}/`, first writing astap's solve into the header
-    (`_write_solved_wcs()`, clearing stale `CD`/`PC`/`CDELT`/`CROTA` first) and stamping
+12.5. Archive to `FITS_ARCHIVE/{object}/{filter}/` (`archive_layout.destination_for()`), first
+    writing astap's solve into the header (`_write_solved_wcs()`, clearing stale
+    `CD`/`PC`/`CDELT`/`CROTA` first) and stamping
     `QCFLAG`/`QCFWHM` (`_write_qc_headers()`) — the header is the only place a later frame's
     subtraction reference screen and finder charts can read them from.
 
@@ -135,11 +138,15 @@ independently re-runnable modules.
 13. `anomaly_detector.detect()` with batched history/coverage calls.
 14. `api_client.post_anomalies()` — this **replaces** the frame's anomaly set, so it is called
     **only** when detection completed. Posting `[]` after a failure would erase earlier results.
+    `HistoryUnavailable` (an API outage during the prefetch) re-queues `DETECT_ANOMALIES`; a
+    failed `GET /frames/{id}/sources` fails the item.
 
-Entry points: `pipeline.detect_anomalies_for_frame_data()` (in-memory, right after Module 1) or
-`pipeline.detect_anomalies_for_frame_id(frame_id)` (standalone; rebuilds sources from
-`GET /frames/{id}` + `/sources`, no FITS access). Anomaly history/coverage queries use `obs_time`;
-position-computing consumers use `obs_time_mid` (see `fits_header` below).
+Entry points: `pipeline.detect_anomalies_for_frame_id(frame_id)` — what a `DETECT_ANOMALIES` task
+runs; rebuilds sources from `GET /frames/{id}` + `/sources`, no FITS access — or
+`pipeline.detect_anomalies_for_frame_data()` (in-memory, used only by `pipeline.run()`). Nothing
+chains detection after ingest: the operator submits `DETECT_ANOMALIES` for the frames they want.
+Anomaly history/coverage queries use `obs_time`; position-computing consumers use `obs_time_mid`
+(see `fits_header` below).
 
 ### Module 3 — finder charts
 
@@ -156,8 +163,8 @@ ingestion path goes through the task queue.
 ### Recovery after API failures
 
 API calls retry 3 times total on 5xx/transport errors (never 4xx). If `POST /sources` or
-`POST /anomalies` still fails, `pipeline._queue_recovery_task()` re-queues an `ANALYZE` (archive
-path) or `DETECT_ANOMALIES` task; both endpoints are idempotent. The re-queue count rides in the
+`POST /anomalies` still fails, or the anomaly history prefetch does, `pipeline._queue_recovery_task()`
+re-queues an `ANALYZE` (archive path) or `DETECT_ANOMALIES` task; both endpoints are idempotent. The re-queue count rides in the
 item `payload`, capped by `API_RECOVERY_MAX_ATTEMPTS`; if even that fails the item is logged at
 ERROR for manual submission.
 
@@ -174,7 +181,9 @@ ERROR for manual submission.
 - Flushes always run on a `threading.Timer`, never in the observer thread, so a slow
   `POST /tasks` never delays detection.
 - The startup scan (`process_existing_files()`) uses the same path, so a backlog becomes a few
-  bulk batches. `KeyboardInterrupt` flushes what's buffered. Nothing here ever moves a file.
+  bulk batches; files that `PENDING`/`RUNNING` ANALYZE tasks already carry are skipped
+  (`_mark_already_queued()`), so a restart does not queue them twice. `KeyboardInterrupt` stops
+  the observer, then flushes what's buffered. Nothing here ever moves a file.
 
 ### `worker.py`
 Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
@@ -185,11 +194,13 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
 | `DETECT_ANOMALIES` | `pipeline.detect_anomalies_for_frame_id(item["frame_id"])` | `frame_id` |
 | `GENERATE_CHARTS` | `pipeline.generate_charts_for_source_ids(...)`, one call per `source_id` | `source_id` (required), optional `anomaly_id`, `payload` `{anomaly_type, designation}` |
 | `PREVIEW_CATALOG_MATCH` | `pipeline.preview_catalog_match(filename, task_id, item_id)` | full FITS path |
+| `DELETE_FRAME` | `pipeline.move_archived_file_to_rejected(filename, object)` after `GET /frames/{id}`; the API cascades the DB delete once the item is `DONE` | `frame_id` |
 | `RESTART` | clean exit → Docker restarts → settings re-fetched | none |
 
 - **Bare basenames** (the API's debug page only knows `frames.filename`) are resolved by
-  `pipeline._resolve_bare_filename()` against `FITS_ARCHIVE/*/`; zero or multiple matches pass
-  through unchanged so the normal "file not found" surfaces.
+  `pipeline._resolve_bare_filename()` via `archive_layout.find_archived()`; no match passes
+  through unchanged so the normal "file not found" surfaces, several are logged and the first
+  wins.
 - **`GENERATE_CHARTS`**: `payload.anomaly_type` is optional (a chart requested straight from a
   source sends only `source_id`; `None` falls back to before_after/stamp_strip). One task may carry
   several items per `source_id` with different types; they're grouped into one call and each item's
@@ -211,8 +222,19 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   The API records the frames a pipeline registers as its own and targets every task needing them
   at it (`tasks.pipeline_id`); tasks the pipeline creates itself (`api_client.create_task()`) are
   targeted at itself. Shared: history, coverage, anomalies and remote settings.
-- **Known limitation:** no lease/heartbeat. A worker that dies mid-task (e.g. OOM kill) leaves it
-  `RUNNING` forever — reset by hand with `PATCH /tasks/{id} {"status": "PENDING"}`.
+- **Shutdown:** SIGTERM/SIGINT is checked only *between* items (an item cut halfway could register
+  a frame without its sources). The item in progress finishes, nothing new starts, and a task
+  with unstarted items is `PATCH`ed back to `PENDING`; compose's `stop_grace_period: 5m` covers a
+  long ANALYZE item. A second signal exits at once — the handler is `signal.signal()`, not the
+  loop's, because CPU-bound steps hold the loop for minutes. astap runs in its own session, so a
+  terminal Ctrl+C does not kill it mid-solve. The watcher maps SIGTERM onto its Ctrl+C path
+  (flush the pending batch) — as PID 1 it would otherwise ignore SIGTERM until Docker's SIGKILL.
+- **Lost progress reports:** an item outcome the API did not take (`post_task_items_progress()`
+  → `None`) is retried once the handler returns; if it still fails, the task goes back to
+  `PENDING` (its unreported items are redone) instead of sitting at `RUNNING` forever.
+- **Known limitation:** no lease/heartbeat. A worker that dies mid-task without that chance (OOM
+  kill, SIGKILL after the grace period) leaves it `RUNNING` forever — reset by hand with
+  `PATCH /tasks/{id} {"status": "PENDING"}`.
 
 ---
 
@@ -254,14 +276,33 @@ and frame types (`Light`/`Dark`/`Flat`/`Bias`). Full mapping tables are in the c
 Filenames (`NORMALIZE_ENABLED=true`):
 ```
 Light:     {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
-Flat:      {Object}_Flat_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
-Dark/Bias: {Object}_{FrameType}_{Exptime}_{DateTime}[_{Seq}].fits
+Flat:      {Camera}_Flat_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits
+Dark/Bias: {Camera}_{FrameType}_{Exptime}_{DateTime}[_{Seq}].fits
 ```
-Flats carry the filter (they are filter-specific; without it they overwrote each other).
+Flats carry the filter (they are filter-specific; without it they overwrote each other). A
+missing filter is the token `NONE`. Calibration is named after the sanitized `INSTRUME`
+(`_UNKNOWN` when missing), not the object — it says which camera the frame fits. Filter and camera
+tokens have `_` turned into `-` so they stay one positional token.
 `modules/subtraction.py` parses these names **positionally** from the DateTime token leftward
-(object names may contain `_`), and still understands the legacy `L`/`D`/`F`/`B` type codes.
+(object names may contain `_`), and still understands the legacy `L`/`D`/`F`/`B` type codes and
+the legacy filter-less Light name.
 
-Archive directory names: spaces → `_`, special characters removed, missing `OBJECT` → `_UNKNOWN`.
+### `modules/archive_layout.py`
+The one home of the archive layout (`config.py` keeps only the roots); nothing else composes
+paths under `FITS_ARCHIVE` by hand. `FITS_ARCHIVE` doubles as the root of a public read-only FTP
+share, so the layout is for browsing:
+
+- Lights → `{object}/{filter}/` (`NONE` without a filter, `_UNKNOWN` without `OBJECT`); no
+  instrument level — subtraction's instrument screen keeps optics apart instead.
+- Dark/Flat/Bias → `_calibration/{night}/{type}/`, chosen by the **frame type**, never `OBJECT`
+  (capture software writes the current target into calibration frames). Night = UTC date of
+  `obs_time − 12 h`.
+- `find_archived(filename, object)` resolves an API basename: own object's filter dirs, every
+  object's, `_calibration`, then the legacy flat `{object}/` (a half-migrated archive still
+  works). `tools/migrate_archive_layout.py` moves a flat archive once (Lights keep their names —
+  the API stores them; calibration is renamed to the camera scheme).
+- Object directory names: spaces → `_`, special characters removed (`sanitize_object_name()`,
+  which also strips leading underscores, so `_calibration`/`_UNKNOWN` cannot collide).
 
 ### `modules/cfa.py`
 One-shot-colour support: `is_cfa(header)`, `to_superpixel(src, dest)`. The Bayer mosaic's channel
@@ -325,7 +366,7 @@ Package: `_astap.py` (runs astap), `_wcs.py` (read/validate WCS), `_frame_geomet
 - **FWHM bounds** tighten around the frame's own PSF when known: `[psf/1.5, psf×1.5]` (rejects hot
   pixels and compact galaxies); otherwise `STAR_FWHM_MIN_PX` × scale / `STAR_FWHM_MAX_ARCSEC`.
   Applies to both lists.
-- **Elongation** = `a / max(b, 1/√12 px)` — a degenerate sep fit no longer yields millions.
+- **Elongation** = `a / max(b, 1/√12 px)`, so a degenerate sep fit cannot yield millions.
   The same clamp is duplicated in `qc.py`, `subtraction.py`, `_streak.py`.
 - Background RMS is re-measured with the streak mask excluded (it sets threshold and SNR).
 - Returns `{ra_center, dec_center, fov_deg, position_angle_deg, pixel_scale_arcsec, naxis1,
@@ -358,7 +399,8 @@ still hold a mount estimate), falling back to header then `.wcs` file.
 - **Noise:** `flux_err = sqrt(|net|/gain + area × sky_sigma²)`; gain from `_resolve_gain()`:
   argument → `PHOTOMETRY_GAIN_E_PER_ADU` → header `EGAIN` before `GAIN` (`GAIN` is often a vendor
   setting); implausible → 1.0 with a warning. `snr = flux/flux_err`, overwriting any provisional
-  value.
+  value — except on a subtraction candidate, which keeps its difference-image SNR (the one the
+  near-edge rule is tuned for; the aperture value goes to `_aperture_snr`).
 - Sky annulus is sigma-clipped (`PHOTOMETRY_SKY_SIGMA_CLIP`).
 - **Not measured:** `saturated` sources, `_streak` sources, annulus wider than a quarter frame,
   non-finite flux. Below `PHOTOMETRY_MIN_SNR` the aperture numbers are kept but it stays
@@ -370,11 +412,15 @@ still hold a mount estimate), falling back to header then `.wcs` file.
 Catalog-independent detection: difference the new frame against a median stack of archived
 frames of the same object. `performed=False` with fewer than `SUBTRACTION_MIN_FRAMES` references.
 
-1. **Reference selection** — same filter preferred (fallback: any). Never Dark/Flat/Bias (parsed
-   positionally from the filename). `_screen_by_quality()` excludes `QCFLAG != OK` and
-   `QCFWHM` worse than `SUBTRACTION_REF_MAX_FWHM_RATIO` × the new frame's; frames without the
-   keywords are kept; if screening leaves too few, the unscreened set is used. Position-angle
-   closeness ranks the whole candidate list as a soft tiebreaker.
+1. **Reference selection** — from the object directory's filter subdirectories (plus legacy flat
+   files); same filter preferred (fallback: any), the new frame's own file excluded. Never
+   Dark/Flat/Bias (parsed positionally from the filename — a defence for un-migrated archives).
+   `_screen_by_quality()` first drops any candidate whose `TELESCOP`/`INSTRUME` differs from the
+   new frame's — **no fallback**: another optics' frame makes a wrong difference image, not a
+   degraded one. It then excludes `QCFLAG != OK` and `QCFWHM` worse than
+   `SUBTRACTION_REF_MAX_FWHM_RATIO` × the new frame's; if that leaves too few, the
+   same-instrument unscreened set is used. Frames without a keyword are kept on that keyword.
+   Position-angle closeness ranks the whole candidate list as a soft tiebreaker.
 2. **Pre-rotation** (`_prerotate_reference()`) by the known PA difference above
    `SUBTRACTION_PREROTATE_MIN_DEG`, growing the canvas (`reshape=True`) and marking fill as invalid.
    Never excludes a reference for rotation — astroalign handles even 180°.
@@ -423,12 +469,16 @@ submodule references (`_gaia._query_gaia(...)`) so tests can patch them.
   objects; never overwrites.
 - **WCS offset correction:** a Gaia vote accumulator estimates a systematic offset and applies it
   in place to every source's `ra`/`dec` — skipped when the median separation is already ≤ 2″.
+  `pipeline._apply_wcs_offset_to_solution()` then shifts the solved WCS's `CRVAL` (and the frame
+  centre) by the same offset, so photometry, forced photometry and the archived header project
+  sky positions onto the right pixels.
 - Matched sources gain `catalog_name, catalog_id, catalog_mag, object_type` (`catalog_mag`: G for
   Gaia, J for 2MASS, r for Pan-STARRS, `None` for Simbad/MPC). Unmatched → `catalog_name = None`.
 - **Cache:** in-process dict + files in `CATALOG_CACHE_DIR`, TTL `CACHE_TTL_HOURS`. Keys are 0.1°
   **tiles**: each catalog queries around the tile centre with the tile half-diagonal added to the
   radius (`_cache_position()`, `_cache_radius_margin_deg()`). Disk-write failures degrade to
-  in-memory only.
+  in-memory only. The TTL is read at call time (remote settings arrive after import); a disk hit
+  keeps the file's own age.
 
 ### `modules/forced_photometry.py`
 Reverse matching ("precovery"): for every Gaia DR3 star (≤ `FORCED_PHOTOMETRY_MAG_LIMIT`) and
@@ -455,7 +505,9 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 
 - **Prefetch** (batched, one call per frame): a **narrow** history query (`MATCH_CONE_ARCSEC`)
   around every source (existence + light curve), a **wide** one only around uncatalogued sources
-  with `uncatalogued_only`, and `POST /frames/covering/batch` for coverage.
+  with `uncatalogued_only`, and `POST /frames/covering/batch` for coverage. A failed request
+  (the API client returns `None`, never `{}`) raises `HistoryUnavailable`: classifying without
+  history would read every source as never observed.
 - Every anomaly carries `source_id` (from `_source_id`, or `None`).
 - **Classification table:**
 
@@ -467,11 +519,11 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Unmatched, no detection within `MATCH_CONE_ARCSEC`, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (`…_EDGE_…` near the edge) | `SPACE_DEBRIS` — recorded, not an alert; no "vacated position" proof needed |
 | Unmatched, shifted (see below), not near edge | `MOVING_UNKNOWN` → alert |
 | Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star within `SUBTRACTION_RESIDUAL_MAX_DMAG` | suppressed (that star's residual) |
-| No coverage, normal detection | `FIRST_OBSERVATION` (note only) |
+| No coverage, normal detection | `FIRST_OBSERVATION` — logged only, not posted |
 | No coverage, subtraction candidate, catalogued | suppressed (registration residual) |
 | No coverage, subtraction candidate, uncatalogued | `UNKNOWN` → alert |
 | Covered, no history, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → alert |
-| Covered, no history, catalogued | `KNOWN_CATALOG_NEW` |
+| Covered, no history, catalogued | `KNOWN_CATALOG_NEW` — logged only, not posted |
 | Covered, no history, uncatalogued | `UNKNOWN` → alert |
 | History, significant brightening, near galaxy | `SUPERNOVA_CANDIDATE` → alert |
 | History, significant Δmag, Simbad binary / variable | `BINARY_STAR` / `VARIABLE_STAR` |
@@ -512,7 +564,7 @@ namespace.
 | `track_gif`, `stamp_strip_gif` | companions to the two above (`CHART_GIF_ENABLED`) | independent renderers: fixed canvas, each frame from that epoch's own pixels |
 
 - Flow: `POST /sources/tracks/batch` → cap at `CHART_MAX_EPOCHS` → load each epoch from
-  `FITS_ARCHIVE/{object}/{filename}` (missing files skipped) → render each distinct style the
+  `archive_layout.find_archived(filename, object)` (missing files skipped) → render each distinct style the
   source's anomaly types imply (`_group_types_by_style()`) → upload. API side stores
   `UNIQUE(source_id, style)`.
 - Title: `anomaly_type`, plus `(designation)` when catalogued.
@@ -633,7 +685,10 @@ one above it first. Format, as in the existing sections:
 - A change that needs the matching release of observatory-api says so on its line, e.g.
   `(requires observatory-api 1.2.0)` — the two are deployed separately.
 
-**Pull request:** from the feature branch into `main`, titled with the new version (`v1.2.0`),
+**Release branch:** a version's work is collected on `release/X.Y.Z` (e.g. `release/1.2.0`),
+branched from `main`; feature branches for that version merge into it, or commit there directly.
+
+**Pull request:** from the release branch into `main`, titled with the new version (`v1.2.0`),
 the body summarising that version's `CHANGELOG.md` section.
 
 ## Release

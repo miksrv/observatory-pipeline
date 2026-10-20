@@ -36,7 +36,7 @@ Automated Python service for processing astronomical FITS frames from an observa
 
 ## Overview
 
-The pipeline monitors an incoming directory for new FITS files. Each file is processed through a sequence of steps: quality check → plate solving → image subtraction → catalog matching → photometry → anomaly detection → archiving. Bad frames are rejected locally without involving the API, keeping the remote database clean.
+The pipeline monitors an incoming directory for new FITS files. Each file is processed through a sequence of steps: quality check → plate solving → image subtraction → catalog matching → photometry → registration with the API → archiving. A frame that fails QC is still registered (with its QC metrics and no sources) and archived, so the operator can see why it failed. Anomaly detection and finder charts are separate stages, run as their own tasks when the operator requests them.
 
 ```
 New FITS file
@@ -67,24 +67,20 @@ qc.analyze()                    ← check quality
                          api_client.post_sources()  ← save all sources
                                          │
                                          ▼
-                         anomaly_detector.detect()  ← classify anomalies
-                                         │
-                                         ▼
-                         api_client.post_anomalies()
-                                         │
-                                         ▼
-                         finder_chart.update_charts_for_sources()  ← per-source discovery chart (optional)
-                                         │
-                                         ▼
-                         /fits/archive/{object}/    ← archive frame
+                         FITS_ARCHIVE/{object}/{filter}/   ← archive frame
+
+
+DETECT_ANOMALIES task (operator-triggered, per frame_id)
+     anomaly_detector.detect() → api_client.post_anomalies()
+
+GENERATE_CHARTS task (operator-triggered, per source_id)
+     finder_chart.update_charts_for_sources() → POST /sources/{id}/chart
 ```
 
 > **Note:** catalog matching and photometry run *before* the frame/sources are posted to the
-> API (not after, as older diagrams of this pipeline showed) — this lets matched Gaia DR3 stars
-> serve as the photometric zero-point reference. Image subtraction is a newer step, inserted
-> between astrometry and catalog matching. Finder-chart generation is the newest step, running
-> after anomalies are posted — for every anomaly with a resolved `source_id` it (re)builds a
-> small PNG from that source's full detection history and uploads it to the API.
+> API — this lets matched Gaia DR3 stars serve as the photometric zero-point reference.
+> Anomaly detection needs only what the API stores, so it can be re-run over an object's whole
+> history without touching the FITS files; finder charts need the archived files.
 
 ---
 
@@ -104,8 +100,9 @@ The pipeline communicates with the API exclusively over HTTPS using an API key. 
 ┌─────────────────────────┐             ┌──────────────────────────┐
 │  docker-compose         │             │  CodeIgniter 4 API       │
 │  ┌───────────────────┐  │   HTTPS +   │  ┌────────────────────┐  │
-│  │  pipeline service │──┼──API Key───▶│  │  REST endpoints    │  │
-│  └───────────────────┘  │             │  └────────────────────┘  │
+│  │  pipeline (watch) │──┼──API Key───▶│  │  REST endpoints    │  │
+│  │  worker   (tasks) │  │             │  └────────────────────┘  │
+│  └───────────────────┘  │             │                          │
 │                         │             │           │              │
 │  Volumes (on host disk):│             │  ┌────────▼───────────┐  │
 │  /data/fits/incoming    │             │  │  MariaDB           │  │
@@ -122,49 +119,48 @@ The pipeline communicates with the API exclusively over HTTPS using an API key. 
 
 ```
 observatory-pipeline/
-├── CLAUDE.md                  ← AI assistant context and project spec
+├── CLAUDE.md                  ← design context (AI assistant and humans)
+├── CHANGELOG.md               ← release notes; the top heading is the current version
+├── ROADMAP.md                 ← proposed future capabilities
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml         ← two services: pipeline (watcher) and worker
 ├── .env.example               ← environment variable template
 ├── requirements.txt
-├── config.py                  ← loads all settings from .env
-├── watcher.py                 ← entry point, monitors incoming folder
-├── pipeline.py                ← orchestrator for a single FITS file
+├── config.py                  ← loads all settings from .env (+ remote settings)
+├── logging_setup.py           ← stderr + rotated per-service log files
+├── watcher.py                 ← monitors FITS_INCOMING, submits ANALYZE tasks
+├── worker.py                  ← polls the API task queue, dispatches to pipeline.py
+├── pipeline.py                ← the processing stages for one frame
 │
 ├── docs/
 │   ├── API.md                 ← REST API endpoint reference
-│   ├── ISSUES.md              ← open data-quality questions for observatory-api
-│   └── anomaly-detector.md    ← deep-dive into modules/anomaly_detector/
+│   ├── API-TASKS.md           ← work queued for observatory-api
+│   ├── ISSUES.md              ← open questions and deferred follow-ups
+│   ├── AUDIT-2026-08-18.md    ← rationale behind the audit finding IDs cited in code
+│   ├── anomaly-detector.md    ← deep-dive into modules/anomaly_detector/
+│   └── PLAN-*.md              ← plans of work in progress
 │
 ├── modules/
+│   ├── archive_layout.py      ← where a frame lives under FITS_ARCHIVE
 │   ├── cfa.py                 ← reduce a colour (Bayer) mosaic to a mono 2×2-superpixel frame
 │   ├── fits_header.py         ← extract FITS headers into structured dict
 │   ├── normalizer.py          ← normalize object/filter/frame-type names and filenames
-│   ├── qc.py                  ← quality control: bad frame detection & rejection
-│   ├── astrometry.py          ← plate solving (astap) + source extraction (sep)
-│   ├── photometry.py          ← aperture photometry (photutils)
-│   ├── subtraction.py         ← image subtraction: align + diff archived frames (transients/movers)
-│   ├── catalog_matcher.py     ← cross-match: Simbad, Gaia DR3, 2MASS, Pan-STARRS DR1, MPC
-│   ├── anomaly_detector.py    ← comparison with history + anomaly classification
+│   ├── qc.py                  ← quality control: bad frame detection
+│   ├── astrometry/            ← plate solving (astap) + source extraction (sep)
+│   ├── photometry.py          ← aperture photometry (photutils), Gaia zero point
+│   ├── forced_photometry.py   ← photometry at catalog positions blind detection missed
+│   ├── subtraction.py         ← image subtraction against archived frames (transients/movers)
+│   ├── catalog_matcher/       ← cross-match: Simbad, Gaia DR3, 2MASS, Pan-STARRS DR1, MPC
+│   ├── anomaly_detector/      ← comparison with history + anomaly classification
 │   ├── ephemeris.py           ← JPL Horizons queries for solar system objects
-│   └── finder_chart/          ← per-source discovery-chart PNG (track / stamp-strip) generation + upload
+│   ├── finder_chart/          ← per-source finder charts (track / stamp strip / before-after, GIFs)
+│   └── catalog_preview.py     ← PREVIEW_CATALOG_MATCH diagnostic chart
 │
-├── api_client/
-│   └── client.py              ← all HTTP calls to observatory-api
+├── api_client/                ← all HTTP calls to observatory-api, split by resource
+├── tools/
+│   └── migrate_archive_layout.py  ← one-off: flat archive → object/filter + _calibration
 │
-└── tests/
-    ├── test_fits_header.py
-    ├── test_normalizer.py
-    ├── test_qc.py
-    ├── test_astrometry.py
-    ├── test_photometry.py
-    ├── test_api_client.py
-    ├── test_catalog_matcher.py
-    ├── test_ephemeris.py
-    ├── test_anomaly_detector.py
-    ├── test_subtraction.py
-    ├── test_finder_chart.py
-    └── test_pipeline.py
+└── tests/                     ← one test file per module, plus conftest.py
 ```
 
 > Every module in `modules/` has dedicated unit tests, including `subtraction.py`.
@@ -177,7 +173,7 @@ observatory-pipeline/
 Entry point. Uses `watchdog` to monitor `FITS_INCOMING` for new `.fits` / `.fit` files. Does not call the pipeline itself — buffers arriving paths and, after a `WATCHER_DEBOUNCE_SEC` quiet period (or immediately if `WATCHER_MAX_BATCH_SIZE` is reached), submits everything buffered as one `ANALYZE` task to observatory-api's job queue. `worker.py` is what actually processes each item. See CLAUDE.md's `watcher.py` and "Job queue" sections for the full design.
 
 ### `pipeline.py`
-Three independently callable stages, plus `run()` composing all three for one file (still what `watcher.py` calls): `analyze_frame()` (QC → astrometry → image subtraction → catalog matching → photometry → `post_frame`/`post_sources` → archive — catalog matching and photometry intentionally run *before* the frame is posted to the API, so matched Gaia DR3 stars can be used as the photometric zero-point reference), `detect_anomalies_for_frame_data()`/`detect_anomalies_for_frame_id()` (anomaly detection → `post_anomalies`), and `generate_charts_for_anomalies()`/`generate_charts_for_source_ids()` (finder charts). Each stage handles failures in the modules it calls gracefully — a crash in catalog matching does not abort the frame.
+Three independently callable stages, plus `run()` composing all three for one file (used by tests and ad hoc runs; the live path goes through the task queue): `analyze_frame()` (QC → astrometry → image subtraction → catalog matching → photometry → `post_frame`/`post_sources` → archive — catalog matching and photometry intentionally run *before* the frame is posted to the API, so matched Gaia DR3 stars can be used as the photometric zero-point reference), `detect_anomalies_for_frame_data()`/`detect_anomalies_for_frame_id()` (anomaly detection → `post_anomalies`), and `generate_charts_for_anomalies()`/`generate_charts_for_source_ids()` (finder charts). Each stage handles failures in the modules it calls gracefully — a crash in catalog matching does not abort the frame.
 
 ### `worker.py`
 Entry point for the job-queue worker (separate `docker-compose.yml` service). Polls observatory-api's `GET /tasks?status=PENDING` and dispatches each task's items to the matching `pipeline.py` stage — see CLAUDE.md's "Job queue" section. Lets any of the three production stages be re-run independently (e.g. re-classifying an object's whole observation history under a fixed anomaly-detection bug, without re-running astrometry/photometry on every frame again). Also dispatches a fourth, non-production task type, `PREVIEW_CATALOG_MATCH` — a diagnostic tool (see `modules/catalog_preview.py` below) that renders a PNG per frame with detected sources circled green (catalog-matched) or red (unmatched) and uploads it to observatory-api, without ever registering a frame/source or touching the input file.
@@ -189,7 +185,7 @@ Backs `PREVIEW_CATALOG_MATCH`. Runs `qc.analyze()` (never moving a rejected fram
 Reads the FITS primary header using `astropy.io.fits`. Normalizes keyword aliases (e.g., `CCD-TEMP` vs `CCDTEMP`, `EXPTIME` vs `EXPOSURE`, and pixel-scale aliases `XPIXSZ`/`PIXSIZE`/`PIXSCALE1`/`PIXELSZ`/`PIXSCALE`). Returns a structured dict ready for the API payload.
 
 ### `modules/normalizer.py`
-Normalizes FITS header values and filenames for consistency across different capture software: object names (`M 51` → `M51`, plus Caldwell/Sharpless/Abell/UGC/PGC/MCG/Mrk/Arp/VCC/ESO catalog prefixes), filter names (`Blue` → `B`, `Luminance` → `L`, `H-Alpha` → `Ha`, plus `G`, `NII`, and standard Johnson-Cousins/SDSS filters), and frame types (`Light Frame` → `Light`, `domeflat` → `Flat`, `science` → `Light`). Also generates the standardized filename `{Object}_{Type}_{Filter}_{Exp}_{DateTime}.fits` when `NORMALIZE_ENABLED=true`.
+Normalizes FITS header values and filenames for consistency across different capture software: object names (`M 51` → `M51`, plus Caldwell/Sharpless/Abell/UGC/PGC/MCG/Mrk/Arp/VCC/ESO catalog prefixes), filter names (`Blue` → `B`, `Luminance` → `L`, `H-Alpha` → `Ha`, plus `G`, `NII`, and standard Johnson-Cousins/SDSS filters), and frame types (`Light Frame` → `Light`, `domeflat` → `Flat`, `science` → `Light`). Also generates the standardized filename when `NORMALIZE_ENABLED=true`: `{Object}_Light_{Filter}_{Exp}_{DateTime}.fits` for Lights, `{Camera}_{Type}[_{Filter}]_{Exp}_{DateTime}.fits` for calibration frames (filter on Flats only; a missing filter is written `NONE`).
 
 ### `modules/qc.py`
 Computes quality metrics without plate solving:
@@ -234,7 +230,7 @@ A debayered colour cube (`NAXIS=3`) or a stack produced by the capture software 
 it is moved to `/fits/rejected/{object}/UNSUPPORTED_{filename}` and not registered.
 
 ### `modules/astrometry/`
-A package split one file per step of `solve()` (`_astap.py`, `_wcs.py`, `_frame_geometry.py`, `_extraction.py`, `_streak.py` — see CLAUDE.md for the exact map), with `solve()` itself living in `__init__.py` as the orchestrator, so it's still imported and called the same way everywhere else in this codebase. Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving. Parses the resulting WCS header written back into the FITS file. Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
+A package split one file per step of `solve()` (`_astap.py`, `_wcs.py`, `_frame_geometry.py`, `_extraction.py`, `_streak.py` — see CLAUDE.md for the exact map), with `solve()` itself in `__init__.py`. Calls the `astap` binary as a subprocess (via `xvfb-run`, since astap needs a display even headless) for plate solving, and reads the solution from astap's `.wcs` side file (astap never writes into the FITS file; the header WCS is only a fallback). Runs `sep` (SourceExtractor Python wrapper) for source detection. Converts pixel coordinates to (RA, Dec) using `astropy.wcs.WCS`.
 
 Returns a dict with `ra_center`, `dec_center`, `fov_deg`, `naxis1`/`naxis2`, the `wcs` object itself, and two source lists: `sources` (strict star filter) and `sources_all` (a looser filter that also keeps bright/saturated and faint detections, used for catalog matching and WCS offset correction so moving/transient objects aren't lost). Every source also carries a `saturated` bool (peak ADU ≥ `SATURATION_ADU`) and a `near_edge` bool (pixel position within `EDGE_MARGIN_FRAC` of any frame edge — see the anomaly detector's `SPACE_DEBRIS` classification below).
 
@@ -242,10 +238,10 @@ Returns a dict with `ra_center`, `dec_center`, `fov_deg`, `naxis1`/`naxis2`, the
 Aperture photometry via `photutils`. Performs differential photometry against Gaia DR3 reference stars in the field (requires ≥3 Gaia matches for a zero-point) — this makes brightness measurements immune to atmospheric transparency variations. Adds `flux_aperture`, `mag_instrumental`, `mag_calibrated`, `mag_err`, `calibrated`, `zero_point` (and a few more) to each source. A source flagged `saturated=True` is never measured (its aperture flux is not physically meaningful) and is excluded from the Gaia zero-point reference set.
 
 ### `modules/subtraction.py`
-Image subtraction (difference imaging) — a second detection path for transients and moving objects that catalog matching alone would miss. If ≥`SUBTRACTION_MIN_FRAMES` frames of the same object are already archived, aligns them with `astroalign`, builds a median reference image, subtracts it from the new frame, masks out the vicinity of any saturated pixel (`SATURATION_MASK_RADIUS_ARCSEC`, to suppress astroalign residual artifacts around bright stars), and runs `sep` on the (masked) difference image (threshold `SUBTRACTION_DETECT_SIGMA`). Candidates are merged into the source list, flagged `_from_subtraction=True` so `anomaly_detector.py` can treat them with different coverage rules. Skipped gracefully when too few reference frames exist yet — e.g. for a brand-new target.
+Image subtraction (difference imaging) — a second detection path for transients and moving objects that catalog matching alone would miss. If ≥`SUBTRACTION_MIN_FRAMES` frames of the same object are already archived, aligns them with `astroalign`, builds a median reference image, subtracts it from the new frame, masks out the vicinity of any saturated pixel (`SATURATION_MASK_RADIUS_ARCSEC`, to suppress astroalign residual artifacts around bright stars), and runs `sep` on the (masked) difference image (threshold `SUBTRACTION_DETECT_SIGMA`). Candidates are merged into the source list, flagged `_from_subtraction=True` so `modules/anomaly_detector/` can treat them with different coverage rules. Skipped gracefully when too few reference frames exist yet — e.g. for a brand-new target.
 
 ### `modules/catalog_matcher/`
-A package, one file per catalog (`_gaia.py`, `_simbad.py`, `_2mass.py`, `_panstarrs.py`, `_mpc.py`) plus shared `_cache.py`/`_wcs_offset.py` and the `_match.py` orchestrator — see CLAUDE.md for the exact split. `__init__.py` re-exports `match()`/`get_gaia_stars()`/`get_mpc_objects()`, so it's still imported and called the same way everywhere else in this codebase. Cross-matches the source list against external catalogs using `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC` (`MOVING_CONE_ARCSEC` for MPC). Also computes a Gaia-based WCS offset correction applied in-place to every source's coordinates before the remaining catalogs are queried.
+A package, one file per catalog (`_gaia.py`, `_simbad.py`, `_2mass.py`, `_panstarrs.py`, `_mpc.py`) plus shared `_cache.py`/`_wcs_offset.py` and the `_match.py` orchestrator — see CLAUDE.md for the exact split. `__init__.py` re-exports `match()`/`get_gaia_stars()`/`get_mpc_objects()`. Cross-matches the source list against external catalogs using `astropy.coordinates.SkyCoord.match_to_catalog_sky()` with cone radius `MATCH_CONE_ARCSEC` (`MOVING_CONE_ARCSEC` for MPC). Also computes a Gaia-based WCS offset correction applied in-place to every source's coordinates before the remaining catalogs are queried (and, in `pipeline.py`, to the solved WCS itself).
 
 Catalogs, queried in order:
 1. **Simbad** — named objects: variable stars, double stars, galaxies, nebulae — provides rich `object_type`
@@ -255,10 +251,10 @@ Catalogs, queried in order:
 5. **MPC** — all known asteroids and comets with orbital elements, at the observation epoch
 
 ### `modules/forced_photometry.py`
-**Forced photometry / reverse matching** (precovery) — the reverse of `catalog_matcher.py` above: for every Gaia DR3 star / MPC object in the frame's footprint with no corresponding entry in `sources`, measures the flux at its predicted pixel position anyway, instead of treating it as "not detected". Recovers objects too faint for blind detection's threshold, and bright catalog stars the blind extractor's own filters happened to miss. Reuses the Gaia/MPC field lists `catalog_matcher.py` already fetched (no new network calls) and photometry.py's aperture-photometry math against the frame's already-computed zero-point. A genuine non-detection is dropped, not reported as an "upper limit". Gated by `FORCED_PHOTOMETRY_ENABLED`.
+**Forced photometry / reverse matching** (precovery) — the reverse of `modules/catalog_matcher/` above: for every Gaia DR3 star / MPC object in the frame's footprint with no corresponding entry in `sources`, measures the flux at its predicted pixel position anyway, instead of treating it as "not detected". Recovers objects too faint for blind detection's threshold, and bright catalog stars the blind extractor's own filters happened to miss. Reuses the Gaia/MPC field lists `modules/catalog_matcher/` already fetched (no new network calls) and photometry.py's aperture-photometry math against the frame's already-computed zero-point. A genuine non-detection is dropped, not reported as an "upper limit". Gated by `FORCED_PHOTOMETRY_ENABLED`.
 
 ### `modules/anomaly_detector/`
-Core science logic. A package split by concern (`types.py`, `_classify.py`, `_prefetch.py`, etc. — see CLAUDE.md for the exact map), with `__init__.py` re-exporting `detect()`/`AnomalyType` so it's still imported and called the same way everywhere else in this codebase. Queries the API in a single batched call per frame (`POST /sources/near/batch`, `POST /frames/covering/batch`) for historical observations near every source at once, then classifies:
+Core science logic. A package split by concern (`types.py`, `_classify.py`, `_prefetch.py`, etc. — see CLAUDE.md for the exact map), with `__init__.py` re-exporting `detect()`/`AnomalyType`. Queries the API in a single batched call per frame (`POST /sources/near/batch`, `POST /frames/covering/batch`) for historical observations near every source at once, then classifies:
 
 `anomaly_type` is a fixed enum of 10 values — `AnomalyType(str, Enum)` in `modules/anomaly_detector/types.py`, mirrored by `AnomalyModel::ALLOWED_TYPES` and an `ENUM` column constraint on the `observatory-api` side:
 
@@ -299,7 +295,7 @@ one source_id is logged and only downgrades that source_id's own result, never a
 other source_id in the same call or frame processing overall.
 
 ### `api_client/`
-All HTTP communication with the remote API. A package split by REST resource (`frames.py`, `sources.py`, `anomalies.py`, `tasks.py`, `settings.py`, plus an internal `_shared.py`) — see CLAUDE.md for the exact split — with `__init__.py` re-exporting every public function, so the rest of the codebase just does `import api_client; api_client.post_frame(...)`. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `anomaly_detector.py` actually calls, plus `get_source_tracks_batch` for `modules/finder_chart.py` (the single-item `get_source_track` is still implemented/exported, just no longer called by that module). Chart uploads use the per-source `upload_source_chart` endpoint — one request per chart. Also provides `get_settings()` for fetching remote configuration from the API at startup (see [Remote Configuration](#remote-configuration-via-api) below).
+All HTTP communication with the remote API. A package split by REST resource (`frames.py`, `sources.py`, `anomalies.py`, `tasks.py`, `settings.py`, plus an internal `_shared.py`) — see CLAUDE.md for the exact split — with `__init__.py` re-exporting every public function, so the rest of the codebase just does `import api_client; api_client.post_frame(...)`. Uses `httpx` with async support and `tenacity` for automatic retry on transient failures (up to 3 attempts total — 2 retries — with exponential backoff). Sends `X-API-Key` and `Content-Type: application/json` on every request. Besides the single-position `get_sources_near`/`get_frames_covering`, it also exposes batched `get_sources_near_batch`/`get_frames_covering_batch`, which is what `modules/anomaly_detector/` actually calls, plus `get_source_tracks_batch` for `modules/finder_chart/` (the single-item `get_source_track` is still implemented/exported, just no longer called by that module). Chart uploads use the per-source `upload_source_chart` endpoint — one request per chart. Also provides `get_settings()` for fetching remote configuration from the API at startup (see [Remote Configuration](#remote-configuration-via-api) below).
 
 ---
 
@@ -439,7 +435,7 @@ QC_ELONGATION_MAX=2.0
 QC_SNR_MIN=5.0
 QC_STARS_MIN=10
 QC_STARS_MIN_NARROWBAND=5     # softer floor for Hα/[OIII]/[SII]/[NII] frames — see below
-QC_SKY_BACKGROUND_MAX=20000.0
+QC_SKY_BACKGROUND_MAX=50000.0
 
 # ── Narrowband filters (modules/normalizer.py, modules/qc.py, modules/photometry.py) ──
 NARROWBAND_FILTERS=Ha,OIII,SII,NII
@@ -473,7 +469,7 @@ FORCED_PHOTOMETRY_ENABLED=true
 FORCED_PHOTOMETRY_MAG_LIMIT=20.0
 FORCED_PHOTOMETRY_MIN_SNR=3.0
 
-# ── Finder charts (modules/finder_chart.py) ────────────────────────────────────
+# ── Finder charts (modules/finder_chart/) ─────────────────────────────────────
 CHART_ENABLED=true
 CHART_STAMP_SIZE_ARCSEC=60.0
 CHART_MAX_EPOCHS=12
@@ -519,7 +515,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `API_RECOVERY_MAX_ATTEMPTS` | `2` | No | How many times a frame whose `POST /sources` or `POST /anomalies` exhausted its retries may re-queue itself as a recovery task. A 4xx is never retried, so without a bound such a frame would re-queue forever; past it the exact item is logged at ERROR for manual submission. |
 | **FITS Directories** |
 | `FITS_INCOMING` | `/fits/incoming` | No | Directory to watch for new FITS files |
-| `FITS_ARCHIVE` | `/fits/archive` | No | Directory for successfully processed frames |
+| `FITS_ARCHIVE` | `/fits/archive` | No | Archive of every processed frame — layout in [File Organization](#file-organization) |
 | `FITS_REJECTED` | `/fits/rejected` | No | Directory for frames that fail QC |
 | `FITS_RAW_ARCHIVE` | `/fits/raw` | No | Untouched colour originals of one-shot-colour (Bayer) frames, which are analysed as mono copies |
 | **ASTAP Plate Solver** |
@@ -539,7 +535,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `QC_SNR_MIN` | `5.0` | No | Minimum acceptable median SNR of detected sources. |
 | `QC_STARS_MIN` | `10` | No | Minimum number of detected stars. Frames with fewer stars are rejected as `LOW_STARS`. |
 | `QC_STARS_MIN_NARROWBAND` | `5` | No | Same as `QC_STARS_MIN`, but used instead of it when the frame's own filter is narrowband (see `NARROWBAND_FILTERS` below) — a narrowband frame of the same field genuinely detects far fewer stars than a broadband one. |
-| `QC_SKY_BACKGROUND_MAX` | `20000.0` | No | Maximum acceptable median sky background in ADU. Frames exceeding this are rejected as `HIGH_BACKGROUND` (twilight, moonlight, cloud, stray light). Tune to your own site's typical dark-sky background. |
+| `QC_SKY_BACKGROUND_MAX` | `50000.0` | No | Maximum acceptable median sky background in ADU. Frames exceeding this are rejected as `HIGH_BACKGROUND` (twilight, moonlight, cloud, stray light). Tune to your own site's typical dark-sky background. |
 | **Narrowband Filters** |
 | `NARROWBAND_FILTERS` | `Ha,OIII,SII,NII` | No | Comma-separated, normalized filter short codes too narrow to carry a representative star sample or a trustworthy Gaia DR3 zero-point. Frames shot in one of these use `QC_STARS_MIN_NARROWBAND` above, and `modules/photometry.py` never attempts magnitude calibration on them (see CLAUDE.md's "Filters — real astronomy context"). |
 | **Star Detection Filtering** |
@@ -601,7 +597,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `FORCED_PHOTOMETRY_MAX_CATALOG_DEVIATION_MAG` | `1.5` | No | A forced recovery whose calibrated magnitude disagrees with the star's own Gaia G by more than this measured something other than that star (a galaxy's light, a neighbour's wing) and is dropped — on a test run most recoveries of G≈19–20 stars were off by >2 mag and fed false `VARIABLE_STAR` alerts. `0` disables. |
 | `FORCED_PHOTOMETRY_BLEND_FWHM` | `2.0` | No | A forced position with another catalog entry closer than this many frame FWHM is skipped: two stars that close share most of their light, so the aperture measures the pair and reports it as one star's magnitude. `0` disables the check, as does an unknown frame FWHM. |
 | **Finder Charts** |
-| `CHART_ENABLED` | `true` | No | Enable/disable per-source finder-chart generation (`modules/finder_chart.py`). |
+| `CHART_ENABLED` | `true` | No | Enable/disable per-source finder-chart generation (`modules/finder_chart/`). |
 | `CHART_STAMP_SIZE_ARCSEC` | `60.0` | No | Half-width of the per-epoch crop for the `stamp_strip` style (stationary anomalies), in arcseconds. |
 | `CHART_MAX_EPOCHS` | `12` | No | Cap on the number of epochs drawn on one chart (oldest dropped first). |
 | `CHART_GIF_ENABLED` | `true` | No | Also render an animated GIF companion (`track_gif` / `stamp_strip_gif`) beside the static chart. A bonus asset — a GIF failure never downgrades the static chart's own result. |
@@ -679,6 +675,12 @@ tail -f "$HOST_DATA_DIR/logs/worker.log"
 docker compose down
 ```
 
+Stopping is graceful: the worker finishes the item it is processing (up to 5 minutes —
+`stop_grace_period` in `docker-compose.yml`), puts any unstarted items of that task back on the
+queue, and exits; the watcher submits the files it has buffered. A worker killed before that
+(OOM, a second `Ctrl+C`) leaves its task `RUNNING` — reset it with
+`PATCH /tasks/{id} {"status": "PENDING"}`.
+
 On the **first build**, Docker will:
 1. Pull the `python:3.11-slim` base image
 2. Install system packages (`libcfitsio-dev`, `file`, `libgtk-3-0`, `libharfbuzz-gobject0`, `libpango-1.0-0`, `libpangocairo-1.0-0`, `xvfb`)
@@ -722,7 +724,7 @@ All persistent data lives **outside** the container on the host filesystem, unde
 | Host path, under `HOST_DATA_DIR` (macOS `~/Developer/data`, Linux `/data`) | Container path | Purpose |
 |-----------|----------------|---------|
 | `fits/incoming` | `/fits/incoming` | Drop new `.fits` / `.fit` files here. The watcher detects them automatically. |
-| `fits/archive` | `/fits/archive` | Successfully processed frames are moved here, organized by object name. |
+| `fits/archive` | `/fits/archive` | Every processed frame (including QC failures): Lights under `{object}/{filter}/`, calibration under `_calibration/{night}/{type}/`. Suitable as the root of a read-only FTP share. |
 | `fits/rejected` | `/fits/rejected` | Unsupported frames (colour cubes, stacks) are moved here with an `UNSUPPORTED_` prefix. |
 | `fits/raw` | `/fits/raw` | Untouched colour originals of one-shot-colour frames, under their original filenames — for your own colour stacking. The pipeline itself works on mono copies. |
 | `astap/catalogs` | `/astap/catalogs` | ASTAP star catalog files. Download once; survives container rebuilds. |
@@ -787,24 +789,55 @@ You will also need `astap` installed locally and a catalog downloaded to the pat
 
 ## File Organization
 
-Frames are organized into subdirectories by the `OBJECT` FITS header keyword:
+`FITS_ARCHIVE` is laid out for browsing — it is meant to be the root of a public, read-only FTP
+share (the FTP server itself is a host service, not part of this repo). `modules/archive_layout.py`
+owns the rules:
 
 ```
 /fits/archive/
-├── M51/
-│   ├── frame_20240315_220134.fits
-│   └── frame_20240315_220434.fits
-├── NGC_1234/
-└── _UNKNOWN/           ← frames without OBJECT header
+├── _calibration/
+│   └── 2026-04-12/                 ← observing night: UTC date of obs_time − 12 h
+│       ├── Bias/  ASI1600MM_Bias_0_2026-04-12T18-02-10.fits
+│       ├── Dark/  ASI1600MM_Dark_300_2026-04-13T02-10-41.fits
+│       └── Flat/  ASI1600MM_Flat_L_3_2026-04-12T18-30-05.fits
+├── _UNKNOWN/                       ← Lights without OBJECT
+│   └── L/
+└── M51/
+    ├── L/     M51_Light_L_300_2026-04-12T22-15-03.fits
+    ├── Ha/
+    └── NONE/  M51_Light_NONE_300_2026-04-12T22-15-03.fits   ← no filter recorded
 
-/fits/rejected/
-├── M51/
-│   ├── BLUR_frame_20240315_221034.fits
-│   └── TRAIL_frame_20240315_221534.fits
-└── _UNKNOWN/
+/fits/rejected/                     ← not shared
+└── M51/   UNSUPPORTED_frame.fits   ← colour cubes / capture-software stacks; DELETE_FRAME moves here
+
+/fits/raw/                          ← not shared
+└── M51/   colour originals of one-shot-colour frames
 ```
 
-Object name is sanitized: spaces become underscores, special characters are removed. If the `OBJECT` header is missing, frames go to `_UNKNOWN`.
+- The **frame type** decides calibration, whatever `OBJECT` says (capture software writes the
+  current target into Darks and Flats). Calibration files are named after the camera
+  (`INSTRUME`), not the object.
+- There is no instrument level: `M51/L/` holds every L frame of M51 from any telescope. The
+  instrument stays in the FITS header, and image subtraction only stacks references taken with
+  the same `TELESCOP`/`INSTRUME`.
+- Object names are sanitized: spaces become underscores, special characters are removed.
+- The observatory-api database is the only index; it stores each frame's basename, and the
+  pipeline finds the file by searching the archive.
+
+**Migrating an archive from the old flat `{object}/` layout** — once, with both containers
+stopped:
+
+```bash
+docker compose stop
+docker compose run --rm --no-deps worker python tools/migrate_archive_layout.py --dry-run
+docker compose run --rm --no-deps worker python tools/migrate_archive_layout.py
+docker compose start
+```
+
+It moves Lights into their filter directory (names unchanged — the API stores them) and
+calibration into `_calibration/` (renamed to the camera scheme), never overwrites, and leaves
+astap side files and anything it cannot read where they are. A half-migrated archive still
+works: lookups fall back to the flat layout.
 
 ---
 
@@ -826,11 +859,9 @@ pytest --cov=. --cov-report=term-missing
 pytest tests/test_anomaly_detector.py
 ```
 
-As of the last manual check, coverage was around **95%** overall, with all critical modules
-above 80% — every module under `modules/`, including `subtraction.py` and `finder_chart.py`,
-has its own dedicated test file. Coverage is not tracked in CI: the GitHub Actions workflow runs
-plain `pytest tests/ -v --tb=short`, not `pytest --cov`. Run the `--cov` command above locally
-if you need an up-to-date number.
+Every module under `modules/` has its own test file. CI (GitHub Actions) copies `.env.test` over
+`.env` and runs `pytest tests/ -v --tb=short` — run the suite under both env files before pushing.
+Coverage is not tracked in CI; use the `--cov` command above locally.
 
 ---
 
@@ -841,17 +872,16 @@ Full request/response documentation for every endpoint is in **[docs/API.md](doc
 | Method | Endpoint | Purpose | Docs |
 |--------|----------|---------|------|
 | `POST` | `/frames` | Register a new processed frame | [→ docs/API.md](docs/API.md#1-register-a-frame) |
-| `POST` | `/frames/{id}/sources` | Save detected sources for a frame | [→ docs/API.md](docs/API.md#2-save-sources-for-a-frame) |
-| `POST` | `/frames/{id}/anomalies` | Save detected anomalies | [→ docs/API.md](docs/API.md#3-save-anomalies-for-a-frame) |
-| `GET` | `/sources/near` | Get historical sources near a single (RA, Dec) — implemented, but no longer called by `anomaly_detector.py` | [→ docs/API.md](docs/API.md#4-get-historical-sources-near-a-sky-position) |
-| `GET` | `/frames/covering` | Get frames that covered a single sky point — same caveat as above | [→ docs/API.md](docs/API.md#5-get-frames-covering-a-sky-position) |
-| `POST` | `/sources/near/batch` | Get historical sources near **multiple** positions in one call — what `anomaly_detector.py` actually uses | [→ docs/API.md](docs/API.md#6-get-historical-sources-near-multiple-positions-batch) |
-| `POST` | `/frames/covering/batch` | Coverage check for **multiple** sky positions in one call — what `anomaly_detector.py` actually uses | [→ docs/API.md](docs/API.md#7-get-frames-covering-multiple-positions-batch) |
-| `GET` | `/sources/{id}/track` | Per-epoch position track for a source — implemented, but no longer called by `modules/finder_chart.py` | [→ docs/API.md](docs/API.md#8-get-a-sources-position-track) |
-| `POST` | `/sources/{id}/chart` | Upload/replace a source's finder-chart PNG — same caveat as above | [→ docs/API.md](docs/API.md#9-upload-a-sources-finder-chart) |
-| `GET` | `/sources/{id}/chart.png` | Fetch a source's stored finder-chart PNG — not called by the pipeline itself | [→ docs/API.md](docs/API.md#10-get-a-sources-finder-chart) |
-| `POST` | `/sources/tracks/batch` | Get position tracks for **multiple** sources in one call — what `modules/finder_chart.py` actually uses | [→ docs/API.md](docs/API.md#11-get-position-tracks-for-multiple-sources-batch) |
-| `GET` | `/settings` | Fetch remote pipeline configuration from the API's `settings` table — called once at startup by both `watcher.py` and `worker.py` | [→ docs/API.md](docs/API.md#16-pipeline-configuration-remote-settings) |
+| `POST` | `/frames/{id}/sources` | Save (replace) a frame's sources | [→ docs/API.md](docs/API.md#2-save-sources-for-a-frame) |
+| `POST` | `/frames/{id}/anomalies` | Save (replace) a frame's anomalies | [→ docs/API.md](docs/API.md#3-save-anomalies-for-a-frame) |
+| `POST` | `/sources/near/batch` | Historical sources near many positions, one call per frame (anomaly detection) | [→ docs/API.md](docs/API.md#6-get-historical-sources-near-multiple-positions-batch) |
+| `POST` | `/frames/covering/batch` | Coverage check for many sky positions (anomaly detection) | [→ docs/API.md](docs/API.md#7-get-frames-covering-multiple-positions-batch) |
+| `POST` | `/sources/tracks/batch` | Position tracks for many sources (finder charts) | [→ docs/API.md](docs/API.md#11-get-position-tracks-for-multiple-sources-batch) |
+| `POST` | `/sources/{id}/chart` | Upload/replace a source's finder chart | [→ docs/API.md](docs/API.md#9-upload-a-sources-finder-chart) |
+| `GET` | `/frames/nearest-before` | The nearest earlier frame of an object (before/after charts) | [→ docs/API.md](docs/API.md#12-get-the-nearest-earlier-frame-of-an-object) |
+| `GET` | `/frames`, `/frames/{id}`, `/frames/{id}/sources` | Stored frames and their sources (standalone `DETECT_ANOMALIES`, `DELETE_FRAME`) | [→ docs/API.md](docs/API.md#13-list--get-frames) |
+| | `/tasks…` | Task queue: list, claim, progress, preview chart upload | [→ docs/API.md](docs/API.md#14-task-queue) |
+| `GET` | `/settings` | Remote pipeline configuration, read once at startup by `watcher.py` and `worker.py` | [→ docs/API.md](docs/API.md#16-pipeline-configuration-remote-settings) |
 
 **Authentication:** every request sends `X-API-Key: <value>` and `Content-Type: application/json`. The key is read from `API_KEY` in `.env`.
 
@@ -871,7 +901,7 @@ and the reasoning behind the ~2s spacing are in [docs/API.md](docs/API.md#error-
 | `sep` | >=1.4 | Fast source extraction (SourceExtractor wrapper) |
 | `astroscrappy` | >=1.1 | Cosmic ray detection and removal |
 | `astroalign` | >=2.4 | Frame alignment for `modules/subtraction.py` (image subtraction) |
-| `matplotlib` | >=3.8 | PNG rendering for `modules/finder_chart.py` (finder/discovery charts) |
+| `matplotlib` | >=3.8 | PNG rendering for `modules/finder_chart/` (finder/discovery charts) |
 | `numpy` | >=1.26 | Numerical operations |
 | `scipy` | >=1.11 | Binary dilation of the saturation mask in `modules/subtraction.py` |
 | `httpx` | >=0.27 | Async HTTP client for API calls |
@@ -894,7 +924,9 @@ and the reasoning behind the ~2s spacing are in [docs/API.md](docs/API.md#error-
 
 ## Task Tracking
 
-All project tasks are tracked as **GitHub Issues** in this repository.
+Open questions and deferred follow-ups: [docs/ISSUES.md](docs/ISSUES.md); work queued for
+observatory-api: [docs/API-TASKS.md](docs/API-TASKS.md); proposed capabilities:
+[ROADMAP.md](ROADMAP.md).
 
 ---
 
