@@ -2065,6 +2065,76 @@ class TestDedupeCrossCatalogDuplicates:
         assert len(result) == 1
         assert result[0] is gaia
 
+    @staticmethod
+    def _pairwise_reference(sources: list) -> list:
+        """The original O(n²) implementation, kept verbatim as the oracle."""
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+
+        positions = [i for i, s in enumerate(sources) if s.get("catalog_name") is not None]
+        if len(positions) < 2:
+            return sources
+        threshold = config.MATCH_CONE_ARCSEC * u.arcsec
+        dropped: set[int] = set()
+        for a_pos, idx_a in enumerate(positions):
+            if idx_a in dropped:
+                continue
+            src_a = sources[idx_a]
+            for idx_b in positions[a_pos + 1:]:
+                if idx_b in dropped:
+                    continue
+                src_b = sources[idx_b]
+                if src_a.get("catalog_name") == src_b.get("catalog_name"):
+                    continue
+                sep = SkyCoord(ra=src_a["ra"] * u.deg, dec=src_a["dec"] * u.deg).separation(
+                    SkyCoord(ra=src_b["ra"] * u.deg, dec=src_b["dec"] * u.deg)
+                )
+                if sep >= threshold:
+                    continue
+                if pipeline._prefer_catalog(src_b, src_a):
+                    dropped.add(idx_a)
+                    break
+                dropped.add(idx_b)
+        return [s for i, s in enumerate(sources) if i not in dropped]
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_matches_the_pairwise_implementation(self, seed):
+        """
+        The k-d tree pre-search must not change which entries survive:
+        dense random fields with chains and triples of cross-catalog
+        neighbours, unmatched sources mixed in, at a high declination and
+        across RA = 0.
+        """
+        rng = np.random.default_rng(seed)
+        catalogs = ["Simbad", "Gaia DR3", "2MASS", "Pan-STARRS", "MPC", None]
+        cone_deg = config.MATCH_CONE_ARCSEC / 3600.0
+        sources = []
+        for k in range(400):
+            ra_c, dec_c = (rng.uniform(-0.02, 0.02) % 360.0, 70.0) if k % 2 else (120.0, 10.0)
+            sources.append({
+                "ra": float((ra_c + rng.uniform(0, 40 * cone_deg)) % 360.0),
+                "dec": float(dec_c + rng.uniform(0, 10 * cone_deg)),
+                "catalog_name": catalogs[int(rng.integers(len(catalogs)))],
+                "catalog_id": str(k),
+                "mag": float(rng.uniform(8, 20)),
+            })
+
+        # Near the pole, and exact duplicates of earlier positions.
+        for k in range(40):
+            sources.append({
+                "ra": float(rng.uniform(0, 360)), "dec": float(90.0 - rng.uniform(0, 4 * cone_deg)),
+                "catalog_name": catalogs[int(rng.integers(len(catalogs)))],
+                "catalog_id": f"p{k}", "mag": 10.0,
+            })
+        for k in range(0, 400, 25):
+            sources.append({**sources[k], "catalog_name": catalogs[(k // 25) % 5], "catalog_id": f"d{k}"})
+
+        result = pipeline._dedupe_cross_catalog_duplicates(sources, {})
+
+        expected = self._pairwise_reference(sources)
+        assert len(expected) < len(sources)  # the fixture does exercise merging
+        assert [id(s) for s in result] == [id(s) for s in expected]
+
 
 @pytest.mark.asyncio
 async def test_pipeline_dedupes_duplicate_catalog_matches_before_posting(mock_modules):

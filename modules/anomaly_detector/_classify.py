@@ -779,9 +779,8 @@ def _classify_source_sync(
     if mag_changed:
         # --- SUPERNOVA_CANDIDATE — brightening in/near an already-known
         # galaxy. Checked first, before BINARY_STAR/VARIABLE_STAR: a genuine
-        # supernova should take priority, and in practice the checks don't
-        # overlap since the galaxy OTYPE tokens in _GALAXY_OTYPES are
-        # disjoint from the binary/variable ones. Only "brightening"
+        # supernova should take priority; the binary branch below excludes
+        # galaxies itself, since its substring test matches LSB and SBG. Only "brightening"
         # (delta_mag negative — mag = mag - median_hist_mag, so lower mag
         # means brighter) counts here; a host galaxy's own foreground star
         # simply fading is not a supernova signature. ---
@@ -808,8 +807,11 @@ def _classify_source_sync(
                 ),
             }
 
-        # --- BINARY_STAR — check before VARIABLE_STAR (more specific match) ---
-        if _is_binary_star(object_type):
+        # --- BINARY_STAR — check before VARIABLE_STAR (more specific match).
+        # Not for a galaxy: the binary substring test also matches LSB and
+        # SBG, and a galaxy's "fading" is measurement (see the extended-object
+        # note below). ---
+        if _is_binary_star(object_type) and not _is_galaxy(object_type):
             logger.info(
                 "BINARY_STAR: ra=%.4f dec=%.4f delta_mag=%.3f object_type=%s",
                 ra, dec, delta_mag, object_type,

@@ -16,6 +16,7 @@ import httpx
 import tenacity
 
 import config
+import version
 
 logger = logging.getLogger(__name__)
 
@@ -93,15 +94,15 @@ def _normalize_batch_results(resp_json: object, keys: list[str] | None = None) -
 
 def _make_client() -> httpx.AsyncClient:
     """Return a configured AsyncClient for the observatory API."""
-    return httpx.AsyncClient(
-        base_url=config.API_BASE_URL,
-        headers={
-            "X-API-Key": config.API_KEY,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        timeout=30.0,
-    )
+    headers = {
+        "X-API-Key": config.API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if version.VERSION is not None:
+        # Recorded with the heartbeat and shown on the API's dashboard.
+        headers["X-Pipeline-Version"] = version.VERSION
+    return httpx.AsyncClient(base_url=config.API_BASE_URL, headers=headers, timeout=30.0)
 
 
 # ---------------------------------------------------------------------------

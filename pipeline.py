@@ -2107,42 +2107,60 @@ def _dedupe_cross_catalog_duplicates(sources: list, extra: dict) -> list:
     itself would have kept, had both detections reached it as a single
     candidate instead of one arriving later via forced photometry.
     """
-    from astropy.coordinates import SkyCoord
+    from astropy.coordinates import SkyCoord, search_around_sky
     import astropy.units as u
 
-    candidate_positions = [i for i, s in enumerate(sources) if s.get("catalog_name") is not None]
+    candidate_positions = [
+        i for i, s in enumerate(sources)
+        if s.get("catalog_name") is not None
+        and isinstance(s.get("ra"), (int, float)) and math.isfinite(s["ra"])
+        and isinstance(s.get("dec"), (int, float)) and math.isfinite(s["dec"])
+    ]
     if len(candidate_positions) < 2:
         return sources
 
+    # Every close cross-catalog pair, found once with a k-d tree. This used to
+    # build two SkyCoords per pair inside a double loop — ~4M of them for a
+    # 2900-source frame, 3.5–8.5 minutes per frame on the deployment host.
+    # The search radius is padded slightly and the exact test below is the
+    # same `separation() < threshold` as before, so no pair right at the
+    # boundary is gained or lost to the tree's chord-distance arithmetic.
     threshold = config.MATCH_CONE_ARCSEC * u.arcsec
+    coords = SkyCoord(
+        ra=[sources[i]["ra"] for i in candidate_positions] * u.deg,
+        dec=[sources[i]["dec"] for i in candidate_positions] * u.deg,
+    )
+    pos_a, pos_b, seps, _ = search_around_sky(coords, coords, threshold * 1.001)
+    neighbours: dict[int, list[int]] = {}
+    for a, b, sep in zip(pos_a, pos_b, seps):
+        if a >= b or sep >= threshold:
+            continue
+        idx_a, idx_b = candidate_positions[a], candidate_positions[b]
+        if sources[idx_a].get("catalog_name") == sources[idx_b].get("catalog_name"):
+            # Same catalog — either the same identity (already
+            # _dedupe_by_catalog_identity()'s job, run before this) or two
+            # genuinely distinct objects in that catalog. Either way, not
+            # this function's concern.
+            continue
+        neighbours.setdefault(idx_a, []).append(idx_b)
+
+    # The same greedy pass as always, over those pairs only: candidates in
+    # source order, each paired against its later neighbours in source order,
+    # so which entry of a cluster survives is unchanged.
     dropped: set[int] = set()
     n_merged = 0
 
-    for a_pos, idx_a in enumerate(candidate_positions):
+    for idx_a in candidate_positions:
         if idx_a in dropped:
             continue
         src_a = sources[idx_a]
 
-        for idx_b in candidate_positions[a_pos + 1:]:
+        for idx_b in sorted(neighbours.get(idx_a, ())):
             if idx_b in dropped:
-                continue
-            src_b = sources[idx_b]
-
-            if src_a.get("catalog_name") == src_b.get("catalog_name"):
-                # Same catalog — either the same identity (already
-                # _dedupe_by_catalog_identity()'s job, run before this) or
-                # two genuinely distinct objects in that catalog. Either
-                # way, not this function's concern.
-                continue
-
-            sep = SkyCoord(ra=src_a["ra"] * u.deg, dec=src_a["dec"] * u.deg).separation(
-                SkyCoord(ra=src_b["ra"] * u.deg, dec=src_b["dec"] * u.deg)
-            )
-            if sep >= threshold:
                 continue
 
             n_merged += 1
-            if _prefer_catalog(src_b, src_a):
+            if _prefer_catalog(sources[idx_b], src_a):
                 dropped.add(idx_a)
                 break  # src_a lost; stop pairing it against further candidates
             dropped.add(idx_b)

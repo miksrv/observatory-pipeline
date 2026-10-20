@@ -56,6 +56,7 @@ from watchdog.observers.polling import PollingObserver
 import config
 from logging_setup import configure_logging
 import api_client
+import version
 
 logger = logging.getLogger(__name__)
 
@@ -381,8 +382,8 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
 
         logger.info(
-            "Starting watcher on %s (log level: %s, debounce: %.1fs, max batch: %d)",
-            config.FITS_INCOMING, config.LOG_LEVEL, config.WATCHER_DEBOUNCE_SEC, config.WATCHER_MAX_BATCH_SIZE,
+            "Starting watcher %s on %s (log level: %s, debounce: %.1fs, max batch: %d)",
+            version.VERSION or "(unknown version)", config.FITS_INCOMING, config.LOG_LEVEL, config.WATCHER_DEBOUNCE_SEC, config.WATCHER_MAX_BATCH_SIZE,
         )
 
         # Enqueue any FITS files that already exist in the incoming directory

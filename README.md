@@ -128,6 +128,7 @@ observatory-pipeline/
 ├── requirements.txt
 ├── config.py                  ← loads all settings from .env (+ remote settings)
 ├── logging_setup.py           ← stderr + rotated per-service log files
+├── version.py                 ← release from CHANGELOG.md, sent as X-Pipeline-Version
 ├── watcher.py                 ← monitors FITS_INCOMING, submits ANALYZE tasks
 ├── worker.py                  ← polls the API task queue, dispatches to pipeline.py
 ├── pipeline.py                ← the processing stages for one frame
@@ -572,6 +573,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `SUBTRACTION_MIN_FRAMES` | `3` | No | Minimum number of archived reference frames of the same object required before `modules/subtraction.py` will attempt image subtraction. |
 | `SUBTRACTION_DETECT_SIGMA` | `5.0` | No | Detection threshold on the difference image, in multiples of background RMS. |
 | `SUBTRACTION_REF_MAX_FWHM_RATIO` | `1.5` | No | A reference frame is excluded when its stamped `QCFWHM` exceeds the new frame's own measured FWHM by more than this factor. QC-failed frames are archived rather than dropped, so the reference directory mixes them in with good ones, and differencing a sharp frame against a blurred reference leaves a ring residual at every star. |
+| `SUBTRACTION_REF_MAX_SCALE_DIFF` | `0.05` | No | A reference frame is excluded when its archived plate solve differs from the new frame's scale by more than this fraction — no fallback. INDI writes the mount's name into `TELESCOP`, so the scale is what keeps two telescopes on one mount (same camera) apart; it also separates binning modes and a reducer. |
 | `SUBTRACTION_EDGE_ELONGATION_MAX` | `1.3` | No | A difference-image candidate inside the `EDGE_MARGIN_FRAC` zone survives only if it is this round *and* at least `SUBTRACTION_EDGE_SNR_MIN` strong. Deliberately stricter than the whole-frame equivalents — coma residuals near the edge are elongated and usually weak, and that is where the false positives concentrate. |
 | `SUBTRACTION_EDGE_SNR_MIN` | `10.0` | No | See `SUBTRACTION_EDGE_ELONGATION_MAX` above. |
 | `SUBTRACTION_RESIDUAL_RADIUS_FWHM` | `2.5` | No | An uncatalogued subtraction candidate within this many of its own FWHM (never less than `MATCH_CONE_ARCSEC`; in FWHM so it holds across telescopes) of a catalogued star of about the same brightness is that star's residual (coma-shifted or imperfectly cancelled PSF), not a transient — suppressed instead of alerted `UNKNOWN`. A transient much fainter than a neighbour this close is suppressed too. `0` disables. |

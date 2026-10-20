@@ -1,5 +1,5 @@
 """
-modules/anomaly_detector/_otypes.py — Simbad OTYPE substring classifiers.
+modules/anomaly_detector/_otypes.py — Simbad OTYPE classifiers.
 
 Internal helpers only — not part of this package's public surface (leading
 underscore on the filename, same convention as api_client/_shared.py).
@@ -8,7 +8,7 @@ underscore on the filename, same convention as api_client/_shared.py).
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Simbad object-type substring classifiers
+# Simbad object-type classifiers
 # ---------------------------------------------------------------------------
 
 # Known variable-star OTYPE substrings (Simbad OTYPE field)
@@ -17,8 +17,25 @@ _VARIABLE_STAR_OTYPES: tuple[str, ...] = ("V*", "RR", "Cep", "BY", "RS", "Ell", 
 # Known binary/eclipsing-binary OTYPE substrings
 _BINARY_STAR_OTYPES: tuple[str, ...] = ("**", "EB", "SB")
 
-# Galaxy-related OTYPE substrings — proximity triggers SUPERNOVA_CANDIDATE
-_GALAXY_OTYPES: tuple[str, ...] = ("G", "SFG", "AGN", "GiG")
+# Simbad OTYPEs that count as a galaxy (a possible supernova host) — matched
+# exactly, as the short code Simbad returns or its long label. Taken from
+# Simbad's own `otypedef` table (checked 2026-10-20): the "G" branch of its
+# hierarchy plus the galaxy systems (ClG, GrG, IG, PaG, PoG), candidates ("?")
+# included. Left out on purpose: the QSO/blazar subtree (G > AGN > QSO) —
+# point-like, and its own variability must not read as a supernova — and the
+# high-redshift aggregates SCG/PCG and lensed images LeG.
+_GALAXY_OTYPES: frozenset[str] = frozenset({
+    # short codes
+    "G", "G?", "AGN", "AG?", "LIN", "SyG", "Sy1", "Sy2", "rG", "EmG", "GiC",
+    "BiC", "GiG", "GiP", "H2G", "LSB", "SBG", "bCG", "ClG", "C?G", "GrG",
+    "Gr?", "CGG", "IG", "PaG", "PoG",
+    # long labels
+    "Galaxy", "Galaxy_Candidate", "AGN_Candidate", "LINER", "Seyfert",
+    "Seyfert1", "Seyfert2", "RadioG", "EmissionG", "GtowardsCl", "BrightestCG",
+    "GtowardsGroup", "GinPair", "HIIG", "LowSurfBrghtG", "StarburstG",
+    "BlueCompactG", "ClG_Candidate", "GroupG", "GroupG_Candidate",
+    "Compact_Gr_G", "InteractingG", "PairG", "PartofG",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -41,31 +58,19 @@ def _is_binary_star(object_type: str | None) -> bool:
 
 def _is_galaxy(object_type: str | None) -> bool:
     """
-    Return True if the Simbad OTYPE contains any of `_GALAXY_OTYPES` as a
-    plain substring — in practice, almost always the bare letter "G".
+    Return True if the Simbad OTYPE is one of `_GALAXY_OTYPES`.
 
-    This docstring used to describe a word-boundary-aware check, under which
-    each token had to appear as a standalone word, and claimed the substring
-    check was merely an equivalent simplification. Neither half was true: the
-    code has always been a plain substring test, and a standalone-word rule
-    would in fact be *wrong* for this vocabulary (audit 2026-08-18, finding
-    L2). Simbad uses "G" as a trailing marker on a whole family
-    of genuine galaxy codes — `EmG`, `RadioG`, `SBG`, `H2G`, `LSB_G` — every
-    one of which a standalone-word rule would reject. The substring test is
-    the right shape here; what was wrong was the description of it.
-
-    What it costs: the bare "G" also matches OTYPEs that merely contain the
-    letter and are not galaxies at all. The one realistic in an observatory
-    frame is `GlC` — a globular cluster, which by definition sits in fields
-    worth imaging. A new point source projected near one is then reported
-    `SUPERNOVA_CANDIDATE` rather than `UNKNOWN`. Both are alerts and both put
-    the source in front of a person, so this misnames an alert rather than
-    losing one; it is recorded here rather than papered over with an
-    exclusion list, since getting such a list right needs Simbad's actual
-    OTYPE vocabulary checked against the version astroquery returns, not
-    guessed at.
+    This used to be a substring test for "G", on the grounds that Simbad ends
+    a family of galaxy codes with it (`EmG`, `SBG`, `H2G`). But Simbad's
+    vocabulary has as many non-galaxies carrying the letter: `RG*` (a red
+    giant), `GlC` (globular cluster), `GNe` (nebula), `CGb` (cometary
+    globule), `MGr` (moving group) — and galaxy codes without it (`LIN`,
+    `Sy1`, `Sy2`, `rG`, `LSB`). On the first lookatstars run (2026-10-20,
+    NGC 7129) a red giant undetected in one frame was posted twice as
+    SUPERNOVA_CANDIDATE "near galaxy object_type=RG*". The exact set closes
+    both directions; a non-galaxy Simbad object now takes the ordinary
+    catalogued-object branches like any other star.
     """
     if object_type is None:
         return False
-    # Check each token directly — Simbad OTYPEs are short codes, not sentences.
-    return any(token in object_type for token in _GALAXY_OTYPES)
+    return object_type.strip() in _GALAXY_OTYPES

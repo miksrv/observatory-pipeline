@@ -114,3 +114,16 @@ deleted by hand on 2026-09-23.
 
 - [ ] Sweep expired files at startup or on write (cheap: the TTL is in the file's
       `fetched_at`), and consider rounding the MPC epoch key to a few minutes.
+
+## 13. Variable/binary Simbad OTYPE tests are substring matches
+
+`_is_galaxy()` became an exact set from Simbad's `otypedef` table after a red giant (`RG*`) was
+posted as `SUPERNOVA_CANDIDATE` (2026-10-20, lookatstars NGC 7129). Checked against the same
+table, `_is_variable_star()` / `_is_binary_star()` (`modules/anomaly_detector/_otypes.py`)
+have the same shape of problem: `HV*` (high-velocity star) reads as variable, the galaxies
+`LSB`/`SBG` read as binary, and `Ce*`, `El*`, `Ro*`, `Pu*`, `Er*`, `Ir*`, `No*` and the X-ray
+binaries (`XB*`, `LXB`, `HXB`) are missed — `Cep`/`Ell` never match a current code. A missed
+type still reaches the light-curve `VARIABLE_STAR` branch; a wrong one misnames an alert.
+
+- [ ] Exact sets per class, decided code by code from `otypedef` (variability is spread across
+  several branches of Simbad's hierarchy, so a subtree rule is not enough).

@@ -2098,3 +2098,72 @@ class TestArchiveLayoutReferences:
         paths = [_write_instrument_frame(tmp_path / f"o{i}.fits", "Newton 200", "QHY268M") for i in range(3)]
 
         assert subtraction._screen_by_quality(paths, None, (None, None)) == paths
+
+
+def _write_scaled_frame(path, scale_arcsec=None, telescope="EQMOD MOUNT", camera="ASI1600MM"):
+    """A tiny FITS file carrying a celestial WCS at the given plate scale (″/px)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdu = fits.PrimaryHDU(np.ones((8, 8), dtype=np.float32))
+    hdu.header["TELESCOP"] = telescope
+    hdu.header["INSTRUME"] = camera
+    if scale_arcsec is not None:
+        w = AstropyWCS(naxis=2)
+        w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        w.wcs.crval = [326.0, 66.1]
+        w.wcs.crpix = [4.0, 4.0]
+        w.wcs.cd = [[-scale_arcsec / 3600.0, 0.0], [0.0, scale_arcsec / 3600.0]]
+        hdu.header.update(w.to_header())
+    hdu.writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestPlateScaleScreen:
+    """
+    INDI writes the mount's name into TELESCOP ('EQMod Mount'), so two
+    telescopes swapped on one mount with the same camera pass the keyword
+    screen. The archived solve's plate scale tells them apart.
+    """
+
+    def test_another_telescope_on_the_same_mount_and_camera_is_excluded(self, tmp_path):
+        same = [_write_scaled_frame(tmp_path / f"s{i}.fits", 0.777) for i in range(3)]
+        other = _write_scaled_frame(tmp_path / "o.fits", 1.30)
+
+        kept = subtraction._screen_by_quality(
+            same + [other], None, ("EQMOD MOUNT", "ASI1600MM"), pixel_scale_arcsec=0.780,
+        )
+
+        assert set(kept) == set(same)
+
+    def test_a_scale_within_the_tolerance_is_kept(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "SUBTRACTION_REF_MAX_SCALE_DIFF", 0.05)
+        near = _write_scaled_frame(tmp_path / "n.fits", 0.777 * 1.04)
+        far = _write_scaled_frame(tmp_path / "f.fits", 0.777 * 1.06)
+
+        kept = subtraction._screen_by_quality([near, far], None, pixel_scale_arcsec=0.777)
+
+        assert kept == [near]
+
+    def test_the_scale_screen_has_no_fallback(self, tmp_path):
+        others = [_write_scaled_frame(tmp_path / f"o{i}.fits", 1.55) for i in range(4)]
+
+        assert subtraction._screen_by_quality(others, None, pixel_scale_arcsec=0.777) == []
+
+    def test_a_candidate_without_a_wcs_is_kept(self, tmp_path):
+        bare = _write_scaled_frame(tmp_path / "bare.fits")
+
+        assert subtraction._screen_by_quality([bare], None, pixel_scale_arcsec=0.777) == [bare]
+
+    def test_no_new_frame_scale_screens_nothing(self, tmp_path):
+        paths = [_write_scaled_frame(tmp_path / f"o{i}.fits", 1.55) for i in range(3)]
+
+        assert subtraction._screen_by_quality(paths, None) == paths
+
+    def test_find_archive_frames_forwards_the_scale(self, tmp_path):
+        for i in range(3):
+            _write_scaled_frame(tmp_path / "L" / f"M51_Light_L_60_2024-03-1{i}T00-00-00.fits", 0.777)
+        _write_scaled_frame(tmp_path / "L" / "M51_Light_L_60_2024-03-19T00-00-00.fits", 1.55)
+
+        found = subtraction._find_archive_frames(str(tmp_path), "L", pixel_scale_arcsec=0.777)
+
+        assert len(found) == 3
+        assert not any("03-19" in f for f in found)

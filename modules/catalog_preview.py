@@ -235,7 +235,7 @@ async def _render(fits_path: str) -> dict:
 
         archive_dir = archive_layout.object_dir(object_name)
         try:
-            sub_result = await subtraction.run(fits_path, archive_dir, filter_name)
+            sub_result = await subtraction.run(fits_path, archive_dir, filter_name, wcs=astro.get("wcs"))
             logger.info(
                 "Subtraction: performed=%s reference_frame_count=%d candidates=%d",
                 sub_result.get("performed"),
