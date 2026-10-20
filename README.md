@@ -679,7 +679,7 @@ Stopping is graceful: the worker finishes the item it is processing (up to 5 min
 `stop_grace_period` in `docker-compose.yml`), puts any unstarted items of that task back on the
 queue, and exits; the watcher submits the files it has buffered. A worker killed before that
 (OOM, a second `Ctrl+C`) leaves its task `RUNNING` — reset it with
-`PATCH /tasks/{id} {"status": "PENDING"}`.
+`PATCH /tasks/{id} {"status": "PENDING"}`; the item it was processing is then redone.
 
 On the **first build**, Docker will:
 1. Pull the `python:3.11-slim` base image

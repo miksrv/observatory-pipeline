@@ -156,8 +156,14 @@ def _until_shutdown(items: Iterable) -> Iterator:
 # Progress reporting
 # ---------------------------------------------------------------------------
 
+# An item still waiting for its outcome: PENDING, or RUNNING once _mark_running()
+# reached the API but the item's DONE/FAILED never did (lost report, or the
+# worker died mid-item). Both count as unfinished — filtering on PENDING alone
+# would skip a RUNNING item on the next claim, and the task would never settle.
+_UNFINISHED_ITEM_STATUSES = ("PENDING", "RUNNING")
+
 # Item outcomes of the task in progress whose report never reached the API.
-# Such an item stays PENDING there, so the API never settles the task: it
+# Such an item stays PENDING (or RUNNING) there, so the API never settles the task: it
 # would sit at RUNNING forever. _process_one_task() retries them once the
 # handler returns and puts the task back in the queue if they still fail.
 _unreported: list[dict] = []
@@ -201,11 +207,14 @@ async def _mark_running(task_id: str, item_id: str) -> None:
     Best-effort live-progress hint sent right before work starts on an item.
 
     Deliberately NOT routed through _report_progress()/_unreported: that
-    retry queue is replayed later by _settle_unreported(), and if a RUNNING
-    report failed to send and got queued there, it could still be replayed
-    AFTER the item's real DONE/FAILED outcome already landed, flipping a
-    finished item's status backwards. A dropped RUNNING hint only costs a
-    late UI update, never correctness, so it is not retried.
+    queue is replayed later by _settle_unreported(), after the item's real
+    DONE/FAILED outcome may already have landed. (observatory-api also never
+    moves a DONE/FAILED item back to RUNNING, so even a late one is harmless.)
+    The HTTP call itself still gets api_client's usual transport retries; once
+    those are exhausted the hint is dropped — that only costs a late UI
+    update, never correctness. A RUNNING item is still unfinished
+    (_UNFINISHED_ITEM_STATUSES), so it is picked up again if its outcome is
+    lost.
     """
     if await api_client.post_task_items_progress(task_id, [{"item_id": item_id, "status": "RUNNING"}]) is None:
         logger.debug("Could not mark item_id=%s RUNNING on task_id=%s (best-effort)", item_id, task_id)
@@ -565,7 +574,7 @@ async def _process_one_task(task_summary: dict) -> None:
         return
 
     task = detail["task"]
-    items = [i for i in detail["items"] if i["status"] == "PENDING"]
+    items = [i for i in detail["items"] if i["status"] in _UNFINISHED_ITEM_STATUSES]
 
     # Signal tasks (e.g. RESTART) have no items — the task itself is the action.
     is_signal_task = task["type"] in _SIGNAL_TASK_TYPES
@@ -643,7 +652,7 @@ async def _process_one_task(task_summary: dict) -> None:
 async def _release_unfinished_task(task_id: str) -> None:
     """
     Put a task interrupted by shutdown back in the queue — only if it still
-    has PENDING items. One whose items were all reported has already been
+    has unfinished (PENDING or RUNNING) items. One whose items were all reported has already been
     settled by the API (COMPLETED); flipping that back would re-queue
     finished work.
     """
@@ -652,7 +661,7 @@ async def _release_unfinished_task(task_id: str) -> None:
         logger.warning("Could not re-check task_id=%s on shutdown — it may stay RUNNING", task_id)
         return
 
-    remaining = sum(1 for i in detail["items"] if i["status"] == "PENDING")
+    remaining = sum(1 for i in detail["items"] if i["status"] in _UNFINISHED_ITEM_STATUSES)
     if remaining == 0:
         return
 

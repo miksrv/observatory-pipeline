@@ -567,6 +567,29 @@ class TestProcessOneTask:
         passed_items = handler_mock.call_args.args[1]
         assert [i["id"] for i in passed_items] == ["item-2"]
 
+    async def test_running_items_are_passed_to_handler_too(self, monkeypatch):
+        """An item left RUNNING (its DONE/FAILED report was lost, or the worker
+        died mid-item) is unfinished, not skipped — otherwise the task could
+        never settle on the API."""
+        detail = {
+            "task": {"id": "t1", "type": "ANALYZE"},
+            "items": [
+                {"id": "item-1", "status": "DONE", "filename": "/a.fits"},
+                {"id": "item-2", "status": "RUNNING", "filename": "/b.fits"},
+                {"id": "item-3", "status": "PENDING", "filename": "/c.fits"},
+            ],
+        }
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(return_value=detail))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock())
+        handler_mock = AsyncMock()
+        monkeypatch.setattr(worker, "_HANDLERS", {**worker._HANDLERS, "ANALYZE": handler_mock})
+
+        await worker._process_one_task({"id": "t1"})
+
+        worker.api_client.update_task.assert_called_once_with("t1", "RUNNING")
+        passed_items = handler_mock.call_args.args[1]
+        assert [i["id"] for i in passed_items] == ["item-2", "item-3"]
+
     async def test_no_pending_items_skips_handler_and_running_transition(self, monkeypatch):
         detail = {
             "task": {"id": "t1", "type": "ANALYZE"},
@@ -716,6 +739,29 @@ class TestGracefulShutdown:
             ],
         }
         after = {**detail, "items": [{**detail["items"][0], "status": "DONE"}, detail["items"][1]]}
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(side_effect=[detail, after]))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
+
+        async def _handler(task, items):
+            worker._shutdown.set()
+
+        monkeypatch.setattr(worker, "_HANDLERS", {**worker._HANDLERS, "ANALYZE": _handler})
+
+        await worker._process_one_task({"id": "t1"})
+
+        assert [c.args for c in worker.api_client.update_task.call_args_list] == [
+            ("t1", "RUNNING"), ("t1", "PENDING"),
+        ]
+
+    async def test_a_task_with_an_item_left_running_goes_back_to_pending(self, monkeypatch):
+        """The item's RUNNING hint reached the API but its outcome did not:
+        it is still unfinished, so the task must be re-queued, not left
+        RUNNING forever."""
+        detail = {
+            "task": {"id": "t1", "type": "ANALYZE"},
+            "items": [{"id": "item-1", "status": "PENDING", "filename": "/1.fits"}],
+        }
+        after = {**detail, "items": [{**detail["items"][0], "status": "RUNNING"}]}
         monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(side_effect=[detail, after]))
         monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
 

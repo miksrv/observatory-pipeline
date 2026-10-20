@@ -334,10 +334,9 @@ async def post_task_items_progress(task_id: str, items: list[dict]) -> dict | No
         "frame_id": ... (optional, ANALYZE items only), "error": ...
         (optional)}. "RUNNING" is a best-effort, non-terminal live-progress
         hint worker.py sends right before starting real work on an item
-        (see its _mark_running()) — never retried and never routed through
-        the same unreported-outcome queue as the terminal DONE/FAILED call,
-        so a delayed RUNNING report can never be replayed after that item's
-        real outcome already landed.
+        (see its _mark_running()) — never put in the unreported-outcome
+        queue that replays the terminal DONE/FAILED call, and the API never
+        lets a late RUNNING move a DONE/FAILED item back.
 
     Returns
     -------

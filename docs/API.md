@@ -1356,9 +1356,11 @@ task never blocks the head of its queue. Response: `{"data": [...]}`, each task 
 
 **`GET /tasks/{id}`** — `api_client.get_task(task_id)`. Response: `{"task": {...}, "items": [...]}`,
 each item carrying its own `status` (`PENDING`/`RUNNING`/`DONE`/`FAILED`) — `worker.py` only ever
-processes the ones still `PENDING`, so a task interrupted mid-run resumes cleanly rather than
-redoing already-finished items. `RUNNING` is a non-terminal, best-effort live-progress hint (see
-below) — it is not something `worker.py` filters on itself.
+processes the unfinished ones (`PENDING` or `RUNNING`), so a task interrupted mid-run resumes cleanly
+rather than redoing already-finished items. `RUNNING` is a non-terminal, best-effort live-progress
+hint (see below); an item left `RUNNING` (its `DONE`/`FAILED` report was lost, or the worker died
+mid-item) is processed again like a `PENDING` one, and shutdown re-queues a task while it still has
+either.
 
 **`PATCH /tasks/{id}`** — `api_client.update_task(task_id, status, error=None)`. `worker.py` sets
 `RUNNING` when it claims a task and `FAILED` (with `error`) on an unhandled exception; reaching
@@ -1373,8 +1375,10 @@ across the whole task — batching would leave `task_items`/`tasks.completed_ite
 every item as `PENDING` for the task's entire duration, with no live progress visibility while
 it's still running. It also sends one extra, best-effort call per item with `status: "RUNNING"`
 right before real work on that item starts, so the operator can see which item is currently being
-worked on rather than only ever seeing `PENDING` flip straight to `DONE`/`FAILED`; a dropped
-`RUNNING` call is never retried (see `worker.py`'s `_mark_running()`). `payload` here is a RESULT overwriting the item's stored payload — e.g.
+worked on rather than only ever seeing `PENDING` flip straight to `DONE`/`FAILED`. A `RUNNING`
+call that still fails after the client's transport retries is dropped, never queued for later
+(see `worker.py`'s `_mark_running()`); the API only moves `PENDING` → `RUNNING` and never moves a
+`DONE`/`FAILED` item back, answering `"note": "Already resolved, status unchanged"` instead. `payload` here is a RESULT overwriting the item's stored payload — e.g.
 `PREVIEW_CATALOG_MATCH` reports `{"matched", "total", "quality_flag", "chart_uploaded"}` once that
 file's chart has been rendered and uploaded (see `POST .../items/{item_id}/chart` below) — the same
 field `GENERATE_CHARTS` reads as *input* at task-creation time (section above); which direction
