@@ -45,6 +45,7 @@ against observatory-api.
 import asyncio
 import logging
 import os
+import signal
 import threading
 import time
 
@@ -308,61 +309,124 @@ async def _fetch_and_apply_remote_settings() -> None:
         logger.info("No remote settings fetched — using local defaults only")
 
 
+async def _mark_already_queued() -> int:
+    """
+    Remember the incoming files that ANALYZE tasks still waiting in the queue
+    already carry, so the startup scan does not submit them a second time.
+
+    `_in_flight_realpaths` lives in memory only: after a watcher restart with
+    tasks still queued, every file still in FITS_INCOMING would otherwise be
+    submitted again, and the duplicate items would fail as "file not found"
+    once the first copy had been processed and archived. Best-effort: if the
+    API cannot be asked, the scan submits everything, as before.
+    """
+    summaries: list[dict] = []
+    for status in ("PENDING", "RUNNING"):
+        summaries.extend(await api_client.get_tasks(
+            status=status, task_type="ANALYZE", limit=500, claimable=True,
+        ))
+    # The task details are independent requests — fetched a few at a time,
+    # not one round trip after another on every start with a backlog queued.
+    limit = asyncio.Semaphore(8)
+
+    async def _detail(task_id: str) -> dict | None:
+        async with limit:
+            return await api_client.get_task(task_id)
+
+    details = await asyncio.gather(*(_detail(t["id"]) for t in summaries))
+
+    marked = 0
+    for detail in details:
+        if detail is None:
+            continue
+        for item in detail.get("items") or []:
+            path = item.get("filename")
+            if item.get("status") == "PENDING" and path and os.path.exists(path):
+                _in_flight_realpaths.add(os.path.realpath(path))
+                marked += 1
+    return marked
+
+
+async def _startup_api_calls() -> None:
+    await _fetch_and_apply_remote_settings()
+    try:
+        marked = await _mark_already_queued()
+    except Exception as exc:
+        logger.warning("Could not list queued ANALYZE tasks (%s) — rescanning everything", exc)
+        return
+    if marked:
+        logger.info("%d file(s) in incoming are already queued — not resubmitting them", marked)
+
+
+def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
     configure_logging("watcher")
 
-    # Fetch remote configuration from the API before anything else.
-    # If the API is unreachable or returns an error, all local defaults
-    # from config.py remain in effect — the watcher still starts normally.
-    asyncio.run(_fetch_and_apply_remote_settings())
+    # `docker compose stop` sends SIGTERM, and as PID 1 in its container this
+    # process would otherwise ignore it until Docker's SIGKILL, dropping the
+    # pending batch. Route it into the same path as Ctrl+C — installed first,
+    # so a stop during the startup scan is handled too.
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
-    # Re-apply log level in case the remote settings changed it.
-    logging.getLogger().setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
-
-    logger.info(
-        "Starting watcher on %s (log level: %s, debounce: %.1fs, max batch: %d)",
-        config.FITS_INCOMING, config.LOG_LEVEL, config.WATCHER_DEBOUNCE_SEC, config.WATCHER_MAX_BATCH_SIZE,
-    )
-
-    # Enqueue any FITS files that already exist in the incoming directory
-    existing_count = process_existing_files(config.FITS_INCOMING)
-    if existing_count > 0:
-        logger.info("Enqueued %d existing file(s)", existing_count)
-
-    # Now start watching for new files. WATCHER_USE_POLLING_OBSERVER picks
-    # PollingObserver (periodic directory listing/diff) instead of the
-    # platform-native, inotify-based Observer — see config.py's own comment
-    # for why: on Docker Desktop for macOS, FITS_INCOMING is a bind-mounted
-    # host directory, and host-side changes to it don't reliably generate
-    # inotify events inside the Linux container.
-    event_handler = FitsEventHandler()
-    if config.WATCHER_USE_POLLING_OBSERVER:
-        observer = PollingObserver(timeout=config.WATCHER_POLLING_INTERVAL_SEC)
-        logger.info(
-            "Using PollingObserver (WATCHER_USE_POLLING_OBSERVER=true), polling every %.1fs",
-            config.WATCHER_POLLING_INTERVAL_SEC,
-        )
-    else:
-        observer = Observer()
-    observer.schedule(event_handler, config.FITS_INCOMING, recursive=True)
-    observer.start()
-
-    logger.info("Watching for new FITS files in %s", config.FITS_INCOMING)
-
+    observer = None
     try:
+        # Remote configuration first; if the API is unreachable, the local
+        # defaults from config.py stay in effect and the watcher still starts.
+        asyncio.run(_startup_api_calls())
+
+        # Re-apply log level in case the remote settings changed it.
+        logging.getLogger().setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+
+        logger.info(
+            "Starting watcher on %s (log level: %s, debounce: %.1fs, max batch: %d)",
+            config.FITS_INCOMING, config.LOG_LEVEL, config.WATCHER_DEBOUNCE_SEC, config.WATCHER_MAX_BATCH_SIZE,
+        )
+
+        # Enqueue any FITS files that already exist in the incoming directory
+        existing_count = process_existing_files(config.FITS_INCOMING)
+        if existing_count > 0:
+            logger.info("Enqueued %d existing file(s)", existing_count)
+
+        # Now start watching for new files. WATCHER_USE_POLLING_OBSERVER picks
+        # PollingObserver (periodic directory listing/diff) instead of the
+        # platform-native, inotify-based Observer — see config.py's own comment
+        # for why: on Docker Desktop for macOS, FITS_INCOMING is a bind-mounted
+        # host directory, and host-side changes to it don't reliably generate
+        # inotify events inside the Linux container.
+        event_handler = FitsEventHandler()
+        if config.WATCHER_USE_POLLING_OBSERVER:
+            observer = PollingObserver(timeout=config.WATCHER_POLLING_INTERVAL_SEC)
+            logger.info(
+                "Using PollingObserver (WATCHER_USE_POLLING_OBSERVER=true), polling every %.1fs",
+                config.WATCHER_POLLING_INTERVAL_SEC,
+            )
+        else:
+            observer = Observer()
+        observer.schedule(event_handler, config.FITS_INCOMING, recursive=True)
+        observer.start()
+
+        logger.info("Watching for new FITS files in %s", config.FITS_INCOMING)
+
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutdown requested — stopping")
-        observer.stop()
-        # Submit whatever's still buffered right now rather than dropping it
-        # silently — otherwise files that arrived just before the debounce
-        # window would have fired are lost from the task queue's view (they
-        # remain on disk, but nothing would ever pick them up again until
-        # the watcher restarts and rescans FITS_INCOMING).
-        with _pending_lock:
-            _cancel_flush_timer_locked()
-        flush_pending_batch()
 
-    observer.join()
+    # Stop the observer and wait for its thread BEFORE the final flush: an
+    # event it was still handling would otherwise enqueue a file after the
+    # flush, arming a daemon timer that dies with the process.
+    if observer is not None:
+        observer.stop()
+        observer.join()
+    # Submit whatever's still buffered right now rather than dropping it
+    # silently — otherwise files that arrived just before the debounce
+    # window would have fired are lost from the task queue's view (they
+    # remain on disk, but nothing would ever pick them up again until the
+    # watcher restarts and rescans FITS_INCOMING).
+    with _pending_lock:
+        _cancel_flush_timer_locked()
+    flush_pending_batch()
     logger.info("Watcher stopped")

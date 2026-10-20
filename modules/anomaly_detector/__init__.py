@@ -46,6 +46,7 @@ import api_client  # noqa: F401 — see docstring above; patch() target resoluti
 from modules import ephemeris  # noqa: F401 — same reason, for ephemeris.query patches.
 
 from ._detect import detect
+from ._prefetch import HistoryUnavailable
 from ._geometry import _haversine_arcsec
 from ._history import (
     _history_mag_scatter,
@@ -64,5 +65,6 @@ from .types import AnomalyType
 
 __all__ = [
     "detect",
+    "HistoryUnavailable",
     "AnomalyType",
 ]

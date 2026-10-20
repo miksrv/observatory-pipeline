@@ -49,7 +49,7 @@ async def post_frame(frame_data: dict) -> str:
         "POST %s filename=%s",
         url,
         filename,
-        extra={"frame_id": None, "log_filename": filename},
+        extra={"frame_id": None, "fits_filename": filename},
     )
 
     async with _make_client() as client:
@@ -61,7 +61,7 @@ async def post_frame(frame_data: dict) -> str:
                 "API rejected POST /frames with HTTP %d: %s",
                 response.status_code,
                 response.text,
-                extra={"frame_id": None, "log_filename": filename},
+                extra={"frame_id": None, "fits_filename": filename},
             )
             raise RuntimeError(
                 f"API returned HTTP {response.status_code} for POST /frames"
@@ -81,7 +81,7 @@ async def post_frame(frame_data: dict) -> str:
         "Frame registered, frame_id=%s filename=%s",
         frame_id,
         filename,
-        extra={"frame_id": frame_id, "log_filename": filename},
+        extra={"frame_id": frame_id, "fits_filename": filename},
     )
     return frame_id
 
@@ -139,7 +139,7 @@ async def get_frames_covering(
         "GET /frames/covering ra=%.4f dec=%.4f",
         ra,
         dec,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_frames_covering_with_retry(ra, dec, before_time)
@@ -149,7 +149,7 @@ async def get_frames_covering(
             ra,
             dec,
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return []
 
@@ -206,7 +206,7 @@ async def get_nearest_frame_before(object_name: str, before_time: str) -> dict |
         "GET /frames/nearest-before object=%s before_time=%s",
         object_name,
         before_time,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_nearest_frame_before_with_retry(object_name, before_time)
@@ -215,7 +215,7 @@ async def get_nearest_frame_before(object_name: str, before_time: str) -> dict |
             "Error querying /frames/nearest-before object=%s: %s",
             object_name,
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return None
 
@@ -251,7 +251,7 @@ async def _get_frames_covering_batch_with_retry(
 async def get_frames_covering_batch(
     positions: list[dict],
     before_time: str,
-) -> dict:
+) -> dict | None:
     """
     Retrieve frames covering multiple sky positions from the API
     in a single batch request.
@@ -269,7 +269,10 @@ async def get_frames_covering_batch(
     dict
         Dictionary mapping position index (as string) to list of frame dicts.
         Example: {"0": [frame1, frame2], "1": [], "2": [frame3]}
-        Returns {} on any failure.
+        ``{}`` for an empty *positions*; ``None`` when the request failed —
+        "no frame covers these positions" and "the API could not be asked"
+        must stay distinguishable, because the anomaly detector reads the
+        first as "never observed here" and alerts on it.
     """
     if not positions:
         return {}
@@ -277,7 +280,7 @@ async def get_frames_covering_batch(
     logger.debug(
         "POST /frames/covering/batch positions=%d",
         len(positions),
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_frames_covering_batch_with_retry(positions, before_time)
@@ -285,9 +288,9 @@ async def get_frames_covering_batch(
         logger.error(
             "Error querying /frames/covering/batch: %s",
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
-        return {}
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +362,7 @@ async def get_frames(
     logger.debug(
         "GET /frames object=%s date_from=%s date_to=%s",
         object_name, date_from, date_to,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_frames_with_retry(object_name, date_from, date_to, limit, offset)
@@ -367,7 +370,7 @@ async def get_frames(
         logger.error(
             "Error querying /frames object=%s: %s",
             object_name, exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return []
 
@@ -418,7 +421,7 @@ async def get_frame(frame_id: str) -> dict | None:
     logger.debug(
         "GET /frames/%s",
         frame_id,
-        extra={"frame_id": frame_id, "log_filename": None},
+        extra={"frame_id": frame_id, "fits_filename": None},
     )
     try:
         return await _get_frame_with_retry(frame_id)
@@ -426,7 +429,7 @@ async def get_frame(frame_id: str) -> dict | None:
         logger.error(
             "Error querying /frames/%s: %s",
             frame_id, exc,
-            extra={"frame_id": frame_id, "log_filename": None},
+            extra={"frame_id": frame_id, "fits_filename": None},
         )
         return None
 
@@ -458,7 +461,7 @@ async def _get_frame_sources_with_retry(frame_id: str) -> list:
     return data if isinstance(data, list) else []
 
 
-async def get_frame_sources(frame_id: str) -> list:
+async def get_frame_sources(frame_id: str) -> list | None:
     """
     Retrieve the sources currently linked to a frame, each with that frame's
     own measured values (ra, dec, mag, elongation, saturated,
@@ -476,12 +479,15 @@ async def get_frame_sources(frame_id: str) -> list:
         docs/API.md's GET /frames/{id}/sources) — NOT yet translated into
         the internal shape anomaly_detector.py expects (leading-underscore
         keys etc.); see pipeline.py's detect_anomalies_for_frame_id() for
-        that translation. [] on any failure or if the frame has no sources.
+        that translation. [] if the frame has no sources (or does not
+        exist); None when the request failed — a caller must not mistake an
+        outage for an empty frame (posting anomalies for "no sources" would
+        replace the frame's stored set with nothing).
     """
     logger.debug(
         "GET /frames/%s/sources",
         frame_id,
-        extra={"frame_id": frame_id, "log_filename": None},
+        extra={"frame_id": frame_id, "fits_filename": None},
     )
     try:
         return await _get_frame_sources_with_retry(frame_id)
@@ -489,6 +495,6 @@ async def get_frame_sources(frame_id: str) -> list:
         logger.error(
             "Error querying /frames/%s/sources: %s",
             frame_id, exc,
-            extra={"frame_id": frame_id, "log_filename": None},
+            extra={"frame_id": frame_id, "fits_filename": None},
         )
-        return []
+        return None

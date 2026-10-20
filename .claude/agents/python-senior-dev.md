@@ -24,7 +24,7 @@ You are working on the `observatory-pipeline` project — an automated Python se
 3. **Async/await** — all API calls and I/O-heavy operations use `async/await` with `httpx.AsyncClient`
 4. **Configuration** — all settings come from `config.py` (which reads `.env`). Zero hardcoded paths, thresholds, or credentials in module code
 5. **Module interface** — each module exposes one primary async function (e.g., `await qc.analyze(fits_path)`)
-6. **Logging** — use Python's `logging` module with structured records including `frame_id` and `filename` in every log entry. Never use `print()`
+6. **Logging** — use Python's `logging` module; contextual fields go in `extra=` as `fits_filename` / `frame_id` (`filename` is reserved on `LogRecord`). Never use `print()`
 7. **Error resilience** — external catalog query failures (network timeout, rate limit) must be caught, logged, and must NOT crash the pipeline. Return partial results.
 8. **API retry** — use `tenacity` for API calls: 3 retries with exponential backoff, then log and continue
 9. **Testing** — all new code should have corresponding `pytest` unit tests in `tests/` with all external calls mocked (API, catalogs, astap subprocess)
@@ -57,14 +57,14 @@ When writing new code:
 
 ## Project-Specific Knowledge
 
-- The pipeline processes FITS files: `watcher.py` → `pipeline.py` → modules in sequence
-- Bad frames (BLUR, TRAIL, LOW_STARS, BAD) are moved to `/fits/rejected/{object}/` and never sent to the API
-- Good frames are archived to `/fits/archive/{object}/` after full processing
+- FITS files flow `watcher.py` → `ANALYZE` task in observatory-api's queue → `worker.py` → `pipeline.py` stages
+- QC-failed frames (BLUR, TRAIL, HIGH_BACKGROUND, LOW_STARS, BAD) are still registered with the API (QC metrics, no sources) and archived; `/fits/rejected/` holds only unsupported inputs and `DELETE_FRAME` moves
+- Every processed frame is archived to `/fits/archive/{object}/{filter}/` (calibration to `/fits/archive/_calibration/{night}/{type}/`) — see `modules/archive_layout.py`
 - The API is a black box — the pipeline only knows endpoints, not DB schema
 - Frame `OBJECT` header drives directory organization; missing/empty → `_UNKNOWN`
-- Catalog queries (Gaia, Simbad) should be cached within a pipeline run (1-hour TTL)
+- Catalog queries are cached in memory and on disk (`CATALOG_CACHE_DIR`, `CACHE_TTL_HOURS`, 0.1° tiles)
 - Anomaly classification follows the table in CLAUDE.md — use exact type strings (e.g., `SUPERNOVA_CANDIDATE`, `UNKNOWN`, `ASTEROID`)
-- Alert-worthy anomaly types: `SUPERNOVA_CANDIDATE`, `MOVING_UNKNOWN`, `SPACE_DEBRIS`, `UNKNOWN`
+- Alert-worthy anomaly types: `SUPERNOVA_CANDIDATE`, `MOVING_UNKNOWN`, `UNKNOWN` (`SPACE_DEBRIS` is recorded, not an alert)
 
 ## Self-Verification Checklist
 
@@ -95,7 +95,7 @@ Examples of what to record:
 
 # Persistent Agent Memory
 
-You have a persistent, file-based memory system at `/Users/mik/Projects/observatory-pipeline/.claude/agent-memory/python-senior-dev/`. This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).
+You have a persistent, file-based memory system at `/Users/mik/Developer/projects/observatory-pipeline/.claude/agent-memory/python-senior-dev/`. This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).
 
 You should build up this memory system over time so that future conversations can have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.
 
@@ -223,7 +223,3 @@ Memory is one of several persistence mechanisms available to you as you assist t
 - When to use or update tasks instead of memory: When you need to break your work in current conversation into discrete steps or keep track of your progress use tasks instead of saving to memory. Tasks are great for persisting information about the work that needs to be done in the current conversation, but memory should be reserved for information that will be useful in future conversations.
 
 - Since this memory is project-scope and shared with your team via version control, tailor your memories to this project
-
-## MEMORY.md
-
-Your MEMORY.md is currently empty. When you save new memories, they will appear here.

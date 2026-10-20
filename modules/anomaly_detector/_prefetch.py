@@ -18,6 +18,14 @@ import config
 
 from ._geometry import _tile_key
 
+
+class HistoryUnavailable(RuntimeError):
+    """
+    The API could not be asked for history/coverage. Detection must stop
+    rather than classify as if the sky had never been observed — see
+    _prefetch_history_data().
+    """
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +73,7 @@ async def _prefetch_history_data(
     catalogued history in the wide pool as well: the previous semantics,
     without the saving.
     """
-    extra = {"frame_id": frame_id, "log_filename": log_filename}
+    extra = {"frame_id": frame_id, "fits_filename": log_filename}
 
     narrow_by_source: list[list[dict]] = [[] for _ in sources]
     wide_by_source: dict[int, list[dict]] = {}
@@ -123,37 +131,46 @@ async def _prefetch_history_data(
                 coverage_positions, obs_time
             ) if coverage_positions else _none(),
         )
-
-        for k, i in enumerate(narrow_idx):
-            narrow_by_source[i] = narrow_result.get(str(k), [])
-        for k, i in enumerate(wide_idx):
-            wide_by_source[i] = wide_result.get(str(k), [])
-        for k, tile in enumerate(tile_list):
-            coverage_by_tile[tile] = coverage_result.get(str(k), [])
-
-        n_narrow = sum(len(v) for v in narrow_by_source)
-        n_wide = sum(len(v) for v in wide_by_source.values())
-        n_coverage = sum(len(v) for v in coverage_by_tile.values())
-        logger.info(
-            "Batch prefetch complete: %d narrow-cone history results, %d "
-            "wide-cone results, %d coverage results",
-            n_narrow, n_wide, n_coverage,
-            extra=extra,
-        )
-        if n_narrow == 0 and n_coverage == 0:
-            logger.warning(
-                "API returned empty history AND empty coverage — "
-                "either this is the first frame of this field, or the API batch "
-                "endpoints (/sources/near/batch, /frames/covering/batch) are not "
-                "returning saved data. All sources will be classified as "
-                "FIRST_OBSERVATION and no anomalies will be reported.",
-                extra=extra,
-            )
-
     except Exception as exc:
-        logger.error(
-            "Batch prefetch failed: %s — will classify without history data",
-            exc,
+        raise HistoryUnavailable(f"history prefetch failed: {exc}") from exc
+
+    # A failed request comes back as None, never as {}: classifying without
+    # history would read every source as never observed before (no coverage,
+    # no light curve), and the frame's stored anomaly set would then be
+    # replaced by that. Refuse instead, so the caller posts nothing.
+    failed = [
+        name for name, result in (
+            ("narrow history", narrow_result),
+            ("wide history", wide_result),
+            ("coverage", coverage_result),
+        ) if result is None
+    ]
+    if failed:
+        raise HistoryUnavailable(f"API request(s) failed: {', '.join(failed)}")
+
+    for k, i in enumerate(narrow_idx):
+        narrow_by_source[i] = narrow_result.get(str(k), [])
+    for k, i in enumerate(wide_idx):
+        wide_by_source[i] = wide_result.get(str(k), [])
+    for k, tile in enumerate(tile_list):
+        coverage_by_tile[tile] = coverage_result.get(str(k), [])
+
+    n_narrow = sum(len(v) for v in narrow_by_source)
+    n_wide = sum(len(v) for v in wide_by_source.values())
+    n_coverage = sum(len(v) for v in coverage_by_tile.values())
+    logger.info(
+        "Batch prefetch complete: %d narrow-cone history results, %d "
+        "wide-cone results, %d coverage results",
+        n_narrow, n_wide, n_coverage,
+        extra=extra,
+    )
+    if n_narrow == 0 and n_coverage == 0:
+        logger.warning(
+            "API returned empty history AND empty coverage — "
+            "either this is the first frame of this field, or the API batch "
+            "endpoints (/sources/near/batch, /frames/covering/batch) are not "
+            "returning saved data. All sources will be classified as "
+            "FIRST_OBSERVATION and no anomalies will be reported.",
             extra=extra,
         )
 

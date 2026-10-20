@@ -165,8 +165,7 @@ async def solve(
         naxis2      int     – image height in pixels
         sources     list    – list of source dicts; each has:
                               ra, dec, flux, fwhm (arcsec), elongation (a/b),
-                              saturated (bool — peak ADU >= config.SATURATION_ADU;
-                              see docs/ISSUES.md #2),
+                              saturated (bool — peak ADU >= config.SATURATION_ADU),
                               near_edge (bool — pixel position within
                               config.EDGE_MARGIN_FRAC of any frame edge; lets
                               anomaly_detector.py demand stronger elongation

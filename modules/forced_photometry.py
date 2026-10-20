@@ -10,8 +10,7 @@ A second, independent pass run AFTER catalog_matcher.py's forward matching
 every MPC/SkyBot object within this frame's footprint that has no
 corresponding entry in `sources`, measure the flux at that exact predicted
 pixel position anyway, instead of silently treating it as "not detected".
-Originally proposed as ROADMAP.md #1 (see git log for that history). This closes
-two gaps forward matching alone leaves open:
+This closes two gaps forward matching alone leaves open:
 
   - A star/object genuinely too faint for the blind SEP extraction's
     necessarily-high detection threshold (SEP_DETECT_THRESH) to have found
@@ -27,8 +26,7 @@ two gaps forward matching alone leaves open:
     since it never depends on SEP having found the source in the first
     place.
 
-Scope decisions for this pass (see the "Open considerations" in ROADMAP.md #1's
-original proposal — git log — for the tradeoffs behind them):
+Scope decisions for this pass:
   - Catalogs: Gaia DR3 + MPC/SkyBot only. 2MASS/Pan-STARRS are not forced
     here (still available via forward matching in catalog_matcher.py) —
     left for a possible future pass.
@@ -571,8 +569,11 @@ async def run(
     naxis2 = naxis2 or naxis2_actual
 
     try:
+        # Geometric mean of both axes — same as photometry._pixel_scale_from_wcs().
         ps_matrix = wcs.pixel_scale_matrix
-        pixel_scale_arcsec = float(np.sqrt(ps_matrix[0, 0] ** 2 + ps_matrix[1, 0] ** 2)) * 3600.0
+        pixel_scale_arcsec = float(np.sqrt(
+            np.hypot(ps_matrix[0, 0], ps_matrix[1, 0]) * np.hypot(ps_matrix[0, 1], ps_matrix[1, 1])
+        )) * 3600.0
     except Exception:
         pixel_scale_arcsec = 0.0
 

@@ -417,7 +417,7 @@ Accept: application/json
 | `sources` | array | yes | List of detected source objects. An empty array `[]` is valid |
 | `sources[].ra` | float | yes | Source right ascension in decimal degrees |
 | `sources[].dec` | float | yes | Source declination in decimal degrees |
-| `sources[].mag` | float\|null | no | Gaia-calibrated magnitude, or `null` when the frame couldn't be photometrically calibrated (fewer than 3 Gaia DR3 references) — the pipeline never sends the raw uncalibrated instrumental magnitude here, since it has no absolute zero-point (see observatory-pipeline's docs/ISSUES.md #2) |
+| `sources[].mag` | float\|null | no | Gaia-calibrated magnitude, or `null` when the frame couldn't be photometrically calibrated (fewer than 3 Gaia DR3 references) — the pipeline never sends the raw uncalibrated instrumental magnitude here, since it has no absolute zero-point |
 | `sources[].flux` | float | no | Raw aperture flux in ADU |
 | `sources[].flux_err` | float\|null | no | Flux uncertainty (Poisson + sky noise in quadrature) from `modules/photometry.py`'s aperture photometry, or `null` when the source wasn't measured (saturated, out of bounds, or a frame-level photometry failure) |
 | `sources[].mag_err` | float\|null | no | `1.0857 * flux_err / flux_aperture` — magnitude uncertainty from `modules/photometry.py`; `null` under the same conditions as `flux_err` |
@@ -587,7 +587,8 @@ Accept: application/json
 | `COMET` | No | Moving object matched in MPC comet catalog |
 | `SUPERNOVA_CANDIDATE` | **YES** | New point source near a galaxy, not in any catalog |
 | `MOVING_UNKNOWN` | **YES** | Moving object not found in MPC |
-| `SPACE_DEBRIS` | **YES** | Fast linear trail not in MPC (highly elongated detection) |
+| `UNKNOWN` | **YES** | Uncatalogued source in a covered area with no history, or an uncatalogued subtraction candidate |
+| `SPACE_DEBRIS` | No | Fast linear trail not in MPC (highly elongated detection) — recorded, not an alert |
 | `UNKNOWN` | **YES** | New point source in a well-covered area, not in any catalog |
 
 > **Note:** `FIRST_OBSERVATION` and `KNOWN_CATALOG_NEW` are handled internally by the pipeline and are never included in the anomalies payload sent to this endpoint.
@@ -622,7 +623,7 @@ Accept: application/json
 
 ## 4. Get Historical Sources Near a Sky Position
 
-Returns all previously detected sources within a cone radius of a given sky position, observed before a given time. Used by the anomaly detector to determine whether a source has been seen before.
+Returns all previously detected sources within a cone radius of a given sky position, observed before a given time. Not called by the pipeline — the anomaly detector uses the batch variant (section 6).
 
 ### Request
 
@@ -703,7 +704,7 @@ Returns `{"data": []}` (empty array) when no prior detections exist — this is 
 
 ## 5. Get Frames Covering a Sky Position
 
-Returns all previously processed frames whose field of view covered a given sky position, observed before a given time. Used by the anomaly detector to establish whether the sky area has ever been imaged — a source absent from history is only an anomaly if the area was actually observed before.
+Returns all previously processed frames whose field of view covered a given sky position, observed before a given time. Not called by the pipeline — the anomaly detector uses the batch variant (section 7). It establishes whether the sky area has ever been imaged — a source absent from history is only an anomaly if the area was actually observed before.
 
 ### Request
 
@@ -975,11 +976,8 @@ Each frame in the results has the same fields as the single-position endpoint (s
 Full chronological position track for a source — one entry per frame it was detected on, each
 with the (RA, Dec) it was *actually* detected at on that specific frame (a moving object's
 position differs epoch to epoch, so this is not the same as a single fixed source position).
-Used by `modules/finder_chart.py` to build a source's finder/discovery chart.
-
-For a frame with several anomalies, `modules/finder_chart.py` fetches every one of their tracks
-in a single call via the batch variant instead (section 11) — this single-source endpoint
-remains available for any other consumer that only needs one source's track.
+Not called by the pipeline: `modules/finder_chart/` fetches tracks through the batch variant
+(section 11).
 
 ### Request
 
@@ -1020,7 +1018,7 @@ Accept: application/json
 | `source_id` | string | The queried source's id |
 | `epochs` | array | Chronologically ordered (oldest first). `[]` if the source has no observations |
 | `epochs[].frame_id` | string | The frame this epoch was detected on |
-| `epochs[].filename` | string | Frame's stored filename — combine with `object` to locate the FITS file in the local archive (`FITS_ARCHIVE/{object}/{filename}`) |
+| `epochs[].filename` | string | Frame's stored filename — the pipeline resolves it to a local archive path from `object` + `filename` |
 | `epochs[].object` | string | Frame's normalized object/archive-directory name |
 | `epochs[].obs_time` | string (ISO 8601) | Observation timestamp |
 | `epochs[].ra`, `epochs[].dec` | float | Position the source was detected at on this specific frame |
@@ -1038,7 +1036,7 @@ Accept: application/json
 ## 9. Upload a Source's Finder Chart
 
 Store the finder-chart PNG for a source, fully replacing any previous chart of the **same style**
-for that source — `modules/finder_chart.py` always regenerates the whole image from the source's
+for that source — `modules/finder_chart/` always regenerates the whole image from the source's
 current track (section 8) rather than patching an existing file. The request body is the **raw
 PNG bytes** — not JSON, not multipart — since the body is entirely consumed by the image; `style`
 and `frame_count` travel as query parameters instead.
@@ -1047,12 +1045,12 @@ A source can hold **one chart per style** (`track`, `stamp_strip`, `before_after
 just one chart total: `modules/anomaly_detector/` classifies a source independently on every
 frame it appears on, so the same source_id can legitimately collect anomalies of more than one
 `anomaly_type` over its lifetime (e.g. `UNKNOWN` on the frame it was first seen, `MOVING_UNKNOWN`
-once it had moved) — see `modules/finder_chart.py`'s module docstring for the real incident this
+once it had moved) — see `modules/finder_chart/`'s package docstring for the real incident this
 was fixed for. A second style uploaded for a source that already has a chart of a *different*
 style leaves that other style's chart untouched; uploading the *same* style again still fully
 replaces it, same as before.
 
-For a frame with several anomalies, `modules/finder_chart.py` uploads each chart individually
+For a frame with several anomalies, `modules/finder_chart/` uploads each chart individually
 via this endpoint — one `POST /sources/{id}/chart` request per (source_id, style) pair.
 
 ### Request
@@ -1149,7 +1147,7 @@ Raw PNG bytes, `Content-Type: image/png`.
 ## 11. Get Position Tracks for Multiple Sources (Batch)
 
 Batch variant of section 8 — returns the position track for **multiple** sources in a single
-request. `modules/finder_chart.py` uses this so that a frame with several anomalies fetches
+request. `modules/finder_chart/` uses this so that a frame with several anomalies fetches
 every one of their tracks in one round trip instead of one `GET /sources/{id}/track` per
 source_id.
 
@@ -1216,7 +1214,7 @@ Accept: application/json
 ## 12. Get the Nearest Earlier Frame of an Object
 
 The single most recent frame of a given object strictly before a given time. Used by
-`modules/finder_chart.py`'s `"before_after"` chart style: for a source detected on only one frame
+`modules/finder_chart/`'s `"before_after"` chart style: for a source detected on only one frame
 so far, a crop of an earlier frame of the same object at that exact sky position (nothing expected
 there yet) next to a crop of the frame the source was actually detected on. Distinct from
 `GET /frames/covering` (section 5) — that one answers "was this sky position ever imaged", a
@@ -1268,7 +1266,7 @@ GET /frames/nearest-before?object=Vesta_A807_FA&before_time=2021-03-14T18%3A05%3
 |-------|------|--------------|
 | `frame` | object or null | `null` if no earlier frame of this object exists (e.g. this is the object's first-ever frame) |
 | `frame.id` | string | Frame ID |
-| `frame.filename` | string | Frame's stored filename — combine with `frame.object` to locate the FITS file in the local archive (`FITS_ARCHIVE/{object}/{filename}`), same convention as section 8's track epochs |
+| `frame.filename` | string | Frame's stored filename — the pipeline resolves it to a local archive path from `frame.object` + `filename`, same as section 8's track epochs |
 | `frame.object` | string | Echoes the query's `object` parameter |
 | `frame.obs_time` | string (ISO 8601) | Observation timestamp |
 
@@ -1337,13 +1335,13 @@ POST /tasks/{id}/items/progress
 ```
 
 **`POST /tasks`** — `api_client.create_task(task_type, items, scope=None, parent_task_id=None)`.
-Body: `{"type": "ANALYZE"|"DETECT_ANOMALIES"|"GENERATE_CHARTS"|"PREVIEW_CATALOG_MATCH"|"RESTART", "items": [...], "scope": {...}?, "parent_task_id": "..."?}`.
+Body: `{"type": "ANALYZE"|"DETECT_ANOMALIES"|"GENERATE_CHARTS"|"PREVIEW_CATALOG_MATCH"|"DELETE_FRAME"|"RESTART", "items": [...], "scope": {...}?, "parent_task_id": "..."?}`.
 The API targets the task at the calling pipeline — everything the pipeline queues itself (watcher
 batches, recovery re-queues) refers to files in its own archive.
 `RESTART` is a signal task — `items` may be omitted or empty; the API ignores any items passed
 for this type. For all other types, `items` must be a non-empty array where each item needs
 exactly one of `filename` (`ANALYZE` and `PREVIEW_CATALOG_MATCH` — the FULL path
-to the FITS file, not just a basename), `frame_id` (`DETECT_ANOMALIES`), or `source_id`
+to the FITS file, not just a basename), `frame_id` (`DETECT_ANOMALIES`, `DELETE_FRAME`), or `source_id`
 (`GENERATE_CHARTS`), plus an optional `payload` (arbitrary JSON — a `GENERATE_CHARTS` item's
 `{"anomaly_type": ..., "designation": ...}`, set once by the `DETECT_ANOMALIES` task that produced
 it, since `task_items` has no other place to carry that forward). Response: `{"id", "type",

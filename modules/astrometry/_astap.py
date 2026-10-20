@@ -158,6 +158,11 @@ async def _run_astap_attempt(
             capture_output=True,
             text=True,
             timeout=timeout_sec,
+            # Its own session, out of the worker's process group: Ctrl+C in
+            # a terminal signals the whole foreground group, which would kill
+            # astap mid-solve while the worker is still finishing its item
+            # gracefully (worker.py's shutdown handling).
+            start_new_session=True,
         )
     except subprocess.TimeoutExpired:
         logger.warning(

@@ -26,17 +26,17 @@ Called from `pipeline.py` after `photometry.measure()`, and after
 `api_client.post_sources()` has returned `source_ids` for each source (see Steps 12–13
 in `CLAUDE.md`). The input source list has already been through:
 
-- plate solving and source extraction (`astrometry.py`, sources flagged `saturated=True`
+- plate solving and source extraction (`modules/astrometry/`, sources flagged `saturated=True`
   when their peak ADU reaches `SATURATION_ADU`, and `near_edge=True` when their pixel
   position falls within `EDGE_MARGIN_FRAC` of any frame edge — see the `SPACE_DEBRIS`
   branch below),
 - optional image subtraction (`subtraction.py`, candidates flagged `_from_subtraction=True`;
   the vicinity of any saturated pixel is masked out of diff-image detection before
   candidates are even produced — see docs/ISSUES.md #1, #2),
-- catalog cross-matching (`catalog_matcher.py`: Simbad, Gaia DR3, 2MASS, Pan-STARRS DR1, MPC),
+- catalog cross-matching (`modules/catalog_matcher/`: Simbad, Gaia DR3, 2MASS, Pan-STARRS DR1, MPC),
 - photometry (`photometry.py`, `mag` field, set by `pipeline.py` to `mag_calibrated` when the
   source was calibrated, `None` otherwise — never the raw `mag_instrumental`, which has no
-  absolute zero-point; see docs/ISSUES.md #2).
+  absolute zero-point).
 
 The output is a list of anomaly dicts ready to be sent to `POST /frames/{id}/anomalies`.
 `FIRST_OBSERVATION` and `KNOWN_CATALOG_NEW` are **never included** in this list — they
@@ -58,13 +58,6 @@ module makes **at most three** batch requests for the entire frame (`O(1)`), con
    not move; a missing detection of one tonight is a non-detection, not a vacated position.
    Skipped when every source is catalogued.
 3. `POST /frames/covering/batch` — which `0.1°×0.1°` tiles (`_tile_key()`) earlier frames covered.
-
-Until 2026-09-23 a single history query per 0.1° tile, radius `MOVING_CONE_MAX_ARCSEC + 400″`,
-served both cones. On a field smaller than that radius every tile query returned the whole
-field's history, so each observation arrived once per tile: 870 828 rows for a database of
-62 353 observations on the 228-frame NGC 7331 run (2.3 GB RSS, 38 s per frame), and the worker
-was OOM-killed. The split query returned 82k rows (343 MB, 4 s) for the same frame even before
-the API honoured `uncatalogued_only`, with the same classification.
 
 Important: **history is fetched for every source without exception**, including
 already catalog-matched ones — it's needed not only to detect position shifts (movers)
@@ -271,8 +264,8 @@ one condition matches, the function returns and no further checks run:
      `catalog_name is not None`, in which case it's a known object (not an anomaly at
      all), most likely an ordinary astroalign registration residual near it rather
      than a real transient (real incident, 2026-08-14, source_id
-     `6a7cfbae64e706.89320404`, a Gaia DR3 star — this branch used to ignore
-     `catalog_name` entirely; see CLAUDE.md's "camera rotation" discussion);
+     `6a7cfbae64e706.89320404`, a Gaia DR3 star; see CLAUDE.md's "camera rotation"
+     discussion);
    - covered, no history, near a galaxy (Simbad OTYPE) → `SUPERNOVA_CANDIDATE`;
    - covered, no history, not in any catalog → `UNKNOWN` — **suppressed** instead when
      `near_edge` (coma shifts the centroid off the star's catalog position so matching
@@ -342,7 +335,7 @@ Table of Simbad OTYPE substrings used by the classifiers:
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |
 | `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening by a significant Δmag (as above) | **Yes** |
 | `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold | **Yes** |
-| `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | No (recorded so a fast mover's track is never erased and does not pollute `UNKNOWN`; an operator need not act on a satellite pass — decided 2026-09-22). The API mirrors this in its own `ALERT_TYPES`, see docs/API-TASKS.md #2 |
+| `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | No (recorded so a fast mover's track is never erased and does not pollute `UNKNOWN`; an operator need not act on a satellite pass — decided 2026-09-22). The API mirrors this in its own `AnomalyModel::ALERT_TYPES` |
 | `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()` | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match
@@ -381,9 +374,11 @@ dicts before they're returned.
 
 ## Error handling
 
-- A failure in the batch history/coverage prefetch (`_prefetch_history_data`) is
-  caught entirely — classification continues with empty dicts (every source falls
-  through to `FIRST_OBSERVATION`/no anomaly rather than crashing the frame).
+- A failure in the batch history/coverage prefetch (`_prefetch_history_data`) — an
+  exception, or an API request reported as `None` — raises `HistoryUnavailable`.
+  Classifying without history would read every source as never observed, and the
+  caller would replace the frame's stored anomalies with that; `pipeline.py` posts
+  nothing and re-queues `DETECT_ANOMALIES` instead.
 - A failure classifying a single source (`_classify_source_sync`) is caught at the
   loop level in `detect()` — the rest of the frame's sources are still processed normally.
 
@@ -397,16 +392,5 @@ dicts before they're returned.
   [../CLAUDE.md](../CLAUDE.md)).
 - Both "galaxy" branches (`SUPERNOVA_CANDIDATE`) use the same `MATCH_CONE_ARCSEC`
   radius (5″ by default) — there is no separate, wider radius for extended galaxy disks.
-- The saturated-artifact suppression (priority 2 above) only ever returns `None` for a
-  matching source — it does not by itself confirm how much of the historically observed
-  `UNKNOWN`/`MOVING_UNKNOWN` volume was actually caused by saturation artifacts, since
-  that requires comparing anomaly counts before/after the fix against the deployed
-  database (see docs/ISSUES.md #1's remaining checklist). If a large volume of
-  `UNKNOWN` persists after deploying this fix and the `MOVING_CONE_ARCSEC` fix below,
-  the more likely remaining cause is the missing magnitude threshold discussed above.
-
-Resolved issues in this module (history not queried for catalog-matched sources,
-`source_id` not propagated to anomalies, etc.) are no longer tracked in the docs — see
-`git log -- modules/anomaly_detector.py modules/anomaly_detector/` for that history
-(the first path covers commits before the file was split into a package, the second
-everything since).
+- Whether the `UNKNOWN`/`MOVING_UNKNOWN` volume has dropped on real traffic is not yet
+  measured — see `docs/ISSUES.md` #1.

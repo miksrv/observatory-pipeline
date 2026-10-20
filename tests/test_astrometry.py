@@ -704,7 +704,7 @@ class TestSourceFormat:
 
 
 # ---------------------------------------------------------------------------
-# Test 2.5 — Saturation flag (docs/ISSUES.md #2)
+# Test 2.5 — Saturation flag
 # ---------------------------------------------------------------------------
 
 class TestSaturationFlag:
@@ -1578,3 +1578,38 @@ class TestStreakMasking:
         coarse_data, _ = calls[0]
         final_data, _ = calls[1]
         assert np.array_equal(coarse_data, final_data)
+
+
+class TestRawPeakUsesThePixelItself:
+    """
+    A saturated core on a bright local sky (moon gradient, galaxy disk) has a
+    background-subtracted peak + GLOBAL background below SATURATION_ADU; the
+    raw pixel is what saturates.
+    """
+
+    def test_the_raw_pixel_at_the_peak_is_read(self):
+        from modules.astrometry import _extraction
+
+        data = np.full((10, 10), 30000.0)
+        data[4, 7] = 65535.0
+        objects = np.zeros(1, dtype=[("peak", "f8"), ("xpeak", "i4"), ("ypeak", "i4")])
+        objects["peak"] = 35535.0         # above the LOCAL sky of 30000
+        objects["xpeak"], objects["ypeak"] = 7, 4
+
+        class _Bkg:
+            globalback = 800.0
+
+        raw = _extraction._raw_peak_adu(objects, data, _Bkg())
+
+        assert raw[0] == 65535.0          # peak + globalback would be 36335
+
+    def test_falls_back_without_peak_coordinates(self):
+        from modules.astrometry import _extraction
+
+        objects = np.zeros(1, dtype=[("peak", "f8")])
+        objects["peak"] = 1000.0
+
+        class _Bkg:
+            globalback = 800.0
+
+        assert _extraction._raw_peak_adu(objects, np.zeros((5, 5)), _Bkg())[0] == 1800.0

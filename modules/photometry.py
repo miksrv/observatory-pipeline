@@ -192,14 +192,16 @@ def _pixel_scale_from_wcs(wcs: WCS) -> float:
     """
     Derive the plate scale in arcsec/pixel from a WCS object.
 
-    Uses the column-norm of the pixel_scale_matrix (handles rotation / shear).
-    The result matches the formula used in astrometry.py for consistency.
+    The geometric mean of the two axes' scales (column norms of the
+    pixel_scale_matrix — handles rotation / shear), the same formula as
+    modules/astrometry/_frame_geometry.py, so aperture sizes agree with the
+    pixel scale the frame is registered with even for anisotropic pixels.
+    Hand-duplicated in forced_photometry.py and subtraction.py.
     """
     ps_matrix = wcs.pixel_scale_matrix   # (2, 2), units deg/px
-    pixel_scale_deg: float = float(
-        np.sqrt(ps_matrix[0, 0] ** 2 + ps_matrix[1, 0] ** 2)
-    )
-    return pixel_scale_deg * 3600.0      # arcsec/px
+    scale_x_deg = float(np.hypot(ps_matrix[0, 0], ps_matrix[1, 0]))
+    scale_y_deg = float(np.hypot(ps_matrix[0, 1], ps_matrix[1, 1]))
+    return float(np.sqrt(scale_x_deg * scale_y_deg)) * 3600.0      # arcsec/px
 
 
 # Finite-sample correction factors for the median absolute deviation
@@ -309,6 +311,26 @@ class _ZeroPoint(NamedTuple):
     color_term: float
     color_ref: float | None
     color_scatter: float
+
+
+def _is_measurable_reference(src: dict) -> bool:
+    """
+    A star that can anchor the zero point at all: a Gaia G magnitude and a
+    finite instrumental magnitude, and not saturated — a saturated star's
+    aperture flux is not a physically meaningful measurement (its PSF core
+    is clipped), so it would corrupt the zero point for every other source
+    in the frame.
+    """
+    if src.get("saturated"):
+        return False
+    cat_mag = _reference_mag(src)
+    inst_mag = src.get("mag_instrumental")
+    if cat_mag is None or inst_mag is None:
+        return False
+    try:
+        return math.isfinite(float(cat_mag)) and math.isfinite(float(inst_mag))
+    except (TypeError, ValueError):
+        return False
 
 
 def _reference_mag(src: dict) -> float | None:
@@ -433,7 +455,12 @@ def _compute_zero_point(
         term is configured for the filter (or too few references carry a
         colour), in which case the result is the plain median.
     """
-    candidates = [src for src in sources if _reference_mag(src) is not None]
+    # Only stars that can actually be measured against their catalog value
+    # count as candidates, BEFORE the quality screen decides whether enough
+    # survive: screening first and dropping unusable ones afterwards could
+    # pick a screened set of 3 that shrinks below 3, while the unscreened
+    # fallback had plenty.
+    candidates = [src for src in sources if _is_measurable_reference(src)]
     screened = [src for src in candidates if _is_usable_reference(src)]
 
     # Screening only ever narrows the set. Dropping below the 3 references a
@@ -462,20 +489,7 @@ def _compute_zero_point(
     deltas: list[float] = []
     colors: list[float] = []
     for src in references:
-        # A saturated star's aperture flux is not a physically meaningful
-        # measurement (its PSF core is clipped), so it must never be used as
-        # a zero-point reference even if it happens to be Gaia-matched —
-        # otherwise it would corrupt the zero-point for every other source
-        # in the frame. See docs/ISSUES.md #2.
-        if src.get("saturated"):
-            continue
-        cat_mag = _reference_mag(src)
-        inst_mag = src.get("mag_instrumental")
-        if cat_mag is None or inst_mag is None:
-            continue
-        if not (math.isfinite(cat_mag) and math.isfinite(inst_mag)):
-            continue
-        deltas.append(cat_mag - inst_mag)
+        deltas.append(_reference_mag(src) - src["mag_instrumental"])
 
         color = src.get("_catalog_color")
         colors.append(
@@ -589,6 +603,41 @@ async def measure(
     filter_name: str | None = None,
 ) -> list[dict]:
     """
+    Aperture photometry and calibration — see _measure() for the full
+    contract — with one exception to its "snr is the aperture SNR" rule:
+    an image-subtraction candidate keeps the difference-image SNR subtraction
+    gave it (the aperture one goes to `_aperture_snr`).
+
+    That is the significance the candidate was detected and screened at, and
+    the one anomaly_detector's near-edge rule (`_survives_edge_zone()`)
+    compares against `SUBTRACTION_EDGE_SNR_MIN`, tuned for it. The aperture
+    SNR on the new frame measures something else — a supernova on a galaxy
+    has the host's light in its sky annulus — and is None whenever photometry
+    skips the source, which used to suppress a near-edge candidate that
+    subtraction had kept. Stored as `snr`, so the standalone DETECT_ANOMALIES
+    path reads the same value.
+    """
+    output = await _measure(
+        fits_path, sources, skip_calibration=skip_calibration, gain=gain,
+        wcs=wcs, filter_name=filter_name,
+    )
+    if len(output) == len(sources):
+        for src, out in zip(sources, output):
+            if src.get("_from_subtraction") and src.get("snr") is not None:
+                out["_aperture_snr"] = out.get("snr")
+                out["snr"] = src["snr"]
+    return output
+
+
+async def _measure(
+    fits_path: str,
+    sources: list[dict],
+    skip_calibration: bool = False,
+    gain: float | None = None,
+    wcs=None,
+    filter_name: str | None = None,
+) -> list[dict]:
+    """
     Perform aperture photometry and differential magnitude calibration.
 
     The function is declared async for pipeline interface consistency even
@@ -677,8 +726,8 @@ async def measure(
         zero_point_err      float | None   robust scatter of the reference
                                             stars about the fitted solution
 
-    A source carrying ``saturated=True`` (set by ``astrometry.solve()``; see
-    docs/ISSUES.md #2) is never measured — its photometry keys stay None
+    A source carrying ``saturated=True`` (set by ``astrometry.solve()``)
+    is never measured — its photometry keys stay None
     just like an out-of-bounds source, since aperture flux on a saturated
     PSF core is not a physically meaningful measurement and was the root
     cause of extreme (e.g. -14) magnitudes reaching the API. Saturated
@@ -872,7 +921,7 @@ async def measure(
         # aperture photometry on a clipped PSF core returns a hugely
         # inflated net_flux, which -2.5*log10() legitimately turns into an
         # extreme (e.g. -14) magnitude that is not physically meaningful.
-        # See docs/ISSUES.md #2. flux_aperture/mag_* stay None, "saturated"
+        # flux_aperture/mag_* stay None, "saturated"
         # itself is already carried over from `src` via dict(src) above.
         if bool(src.get("saturated")):
             output.append(out)

@@ -340,7 +340,7 @@ def _classify_source_sync(
     # or this source was skipped by the API (invalid ra/dec).
     source_id:        str | None = source.get("_source_id")
 
-    extra = {"frame_id": frame_id, "log_filename": log_filename}
+    extra = {"frame_id": frame_id, "fits_filename": log_filename}
     tile = _tile_key(ra, dec)
 
     # Narrow-cone (MATCH_CONE_ARCSEC) history at THIS source's own position.

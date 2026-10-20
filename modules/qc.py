@@ -278,7 +278,7 @@ async def analyze(fits_path: str, move_on_reject: bool = True) -> dict:
     fits_path:
         Absolute path to the FITS file on disk.
     move_on_reject:
-        When True (the default — what pipeline.py relies on), a non-"OK"
+        When True (the default, for ad hoc callers), a non-"OK"
         quality_flag moves fits_path to FITS_REJECTED before returning, same
         as always. Pass False to compute metrics/flag only and leave the
         file exactly where it is — used by pipeline.py's analyze_frame()

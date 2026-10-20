@@ -37,7 +37,7 @@ async def _post_anomalies_with_retry(
         "POST %s count=%d",
         url,
         len(anomalies),
-        extra={"frame_id": frame_id, "log_filename": filename},
+        extra={"frame_id": frame_id, "fits_filename": filename},
     )
 
     async with _make_client() as client:
@@ -52,7 +52,7 @@ async def _post_anomalies_with_retry(
                 url,
                 response.status_code,
                 response.text,
-                extra={"frame_id": frame_id, "log_filename": filename},
+                extra={"frame_id": frame_id, "fits_filename": filename},
             )
             return False
 
@@ -88,7 +88,7 @@ async def post_anomalies(frame_id: str, filename: str, anomalies: list) -> bool:
         "Posting %d anomalies for frame_id=%s",
         len(anomalies),
         frame_id,
-        extra={"frame_id": frame_id, "log_filename": filename},
+        extra={"frame_id": frame_id, "fits_filename": filename},
     )
     try:
         return bool(await _post_anomalies_with_retry(frame_id, filename, anomalies))
@@ -97,6 +97,6 @@ async def post_anomalies(frame_id: str, filename: str, anomalies: list) -> bool:
             "All retries exhausted posting anomalies for frame_id=%s: %s",
             frame_id,
             exc,
-            extra={"frame_id": frame_id, "log_filename": filename},
+            extra={"frame_id": frame_id, "fits_filename": filename},
         )
     return False

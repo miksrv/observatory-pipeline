@@ -59,14 +59,13 @@ renders; nothing from this stage is kept locally, on disk, after it returns.
 
 `move_archived_file_to_rejected()` backs the `DELETE_FRAME` task type (see
 worker.py's `_run_delete_frame_task()`) — the operator-initiated deletion
-flow. It only relocates the file (FITS_ARCHIVE/{object}/ -> FITS_REJECTED/{object}/,
+flow. It only relocates the file (FITS_ARCHIVE/... -> FITS_REJECTED/{object}/,
 never deletes it); observatory-api performs the actual DB-side cascade
 delete once the move is reported done.
 """
 
 from __future__ import annotations
 
-import glob
 import logging
 import math
 import os
@@ -75,7 +74,7 @@ import shutil
 import tempfile
 
 import config
-from modules import cfa, fits_header, qc
+from modules import archive_layout, cfa, fits_header, qc
 
 # ---------------------------------------------------------------------------
 # Optional modules — each wrapped in try/except ImportError so that the
@@ -104,8 +103,14 @@ except ImportError:
 
 try:
     from modules import anomaly_detector
+    # Bound here, not looked up on the module at `except` time: tests replace
+    # `anomaly_detector` with a mock, whose attributes are not exceptions.
+    from modules.anomaly_detector import HistoryUnavailable
 except ImportError:
     anomaly_detector = None  # type: ignore[assignment]
+
+    class HistoryUnavailable(Exception):  # type: ignore[no-redef]
+        """Placeholder — never raised without the anomaly detector."""
 
 try:
     from modules import normalizer
@@ -366,6 +371,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
             filter_name=observation.get("filter"),
             exptime=observation.get("exptime"),
             obs_time=header.get("obs_time"),
+            camera=(header.get("instrument") or {}).get("camera"),
         )
     else:
         normalized_filename = basename
@@ -379,11 +385,14 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # Step 1.5 — Early exit for calibration frames (Dark, Flat, Bias)
     # ------------------------------------------------------------------
     frame_type: str | None = header.get("observation", {}).get("frame_type")
-    if frame_type in ("Dark", "Flat", "Bias"):
-        dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
+    if archive_layout.is_calibration(frame_type):
+        dest_dir = archive_layout.destination_for(header)
         dest_path = os.path.join(dest_dir, normalized_filename)
         os.makedirs(dest_dir, exist_ok=True)
         if os.path.abspath(fits_path) != os.path.abspath(dest_path):
+            # One night directory holds every object's calibration frames,
+            # named by camera — never overwrite one already there.
+            dest_path = qc._unique_destination(dest_path)
             shutil.move(fits_path, dest_path)
         _cleanup_astap_files(fits_path)
         _cleanup_empty_incoming_parents(fits_path)
@@ -397,7 +406,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # (see Step 8 below) instead of letting qc.py move it out from under us
     # before the frame + its QC metrics can be registered with the API. A
     # QC-failed frame is no longer silently dropped — it's still archived
-    # under FITS_ARCHIVE/{object}/ like any other frame, just with no
+    # under FITS_ARCHIVE/{object}/{filter}/ like any other frame, just with no
     # sources/astrometry/photometry run against it (see the quality_flag
     # branch right below).
     # ------------------------------------------------------------------
@@ -560,7 +569,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     if subtraction is not None and astro_result:
         try:
             filter_name = header.get("observation", {}).get("filter")
-            archive_object_dir = os.path.join(config.FITS_ARCHIVE, object_name)
+            archive_object_dir = archive_layout.object_dir(object_name)
             sub_result = await subtraction.run(
                 fits_path=fits_path,
                 archive_dir=archive_object_dir,
@@ -619,6 +628,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 "obs_time_mid": header.get("obs_time_mid"),
             }
             sources = await catalog_matcher.match(sources, frame_meta)
+            _apply_wcs_offset_to_solution(astro_result, sources, extra)
             matched_count = sum(1 for s in sources if s.get("catalog_name") is not None)
             logger.info(
                 "Catalog matching complete: %d/%d sources matched",
@@ -659,7 +669,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # subtraction-candidate pair. _dedupe_by_catalog_identity() above only
     # catches this when both sides share a catalog identity; an
     # uncatalogued object (e.g. a comet MPC/SkyBot has no ephemeris data
-    # for — see docs/ISSUES.md) has none, so its ordinary sep detection and
+    # for) has none, so its ordinary sep detection and
     # its own subtraction candidate both survived as separate `sources`
     # entries (real incident, 2026-08-11, C_2020_R4_ATLAS frames: every
     # frame produced two MOVING_UNKNOWN anomalies — one per detection path —
@@ -744,7 +754,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # field), photometry.py sets calibrated=False for every source in it, and
     # an earlier revision of this step fell back to mag_instrumental in that
     # case — which is exactly what produced the extreme (e.g. -15) "magnitude"
-    # values investigated in docs/ISSUES.md #2. Sources without a calibrated
+    # values once seen in the anomalies table. Sources without a calibrated
     # magnitude simply get mag=None — delta_mag-based classifications
     # correctly don't fire for them rather than firing on a meaningless number.
     # ------------------------------------------------------------------
@@ -769,8 +779,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
 
     # ------------------------------------------------------------------
     # Step 5.6 — Forced photometry / reverse matching (see
-    # modules/forced_photometry.py; originally proposed as ROADMAP.md #1,
-    # see git log for that history).
+    # modules/forced_photometry.py).
     #
     # A second, independent pass: for every Gaia DR3 star / MPC object in
     # this frame's footprint with no corresponding entry in `sources`,
@@ -956,8 +965,8 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
         # quantity, so the two have to be measured the same way.
         _write_qc_headers(fits_path, qc_result, fwhm_arcsec=psf_fwhm_arcsec)
 
-        # Use object name for directory structure (normalized if normalization enabled)
-        dest_dir = os.path.join(config.FITS_ARCHIVE, object_name)
+        # {object}/{filter}/ — see modules/archive_layout.py
+        dest_dir = archive_layout.destination_for(header)
         os.makedirs(dest_dir, exist_ok=True)
 
         # Rename file to normalized filename (if normalization enabled)
@@ -1102,6 +1111,22 @@ async def detect_anomalies_for_frame_data(
                 len(anomalies),
                 extra=extra,
             )
+        except HistoryUnavailable as exc:
+            # The API could not be asked for history — a transient outage, so
+            # the same detection is worth redoing later from stored data.
+            logger.error(
+                "Anomaly detection stopped: %s — stored anomalies left untouched, "
+                "re-queueing detection",
+                exc,
+                extra=extra,
+            )
+            await _queue_recovery_task(
+                "DETECT_ANOMALIES",
+                {"frame_id": frame_id},
+                recovery_attempt,
+                f"frame_id={frame_id}: history unavailable during anomaly detection",
+                extra,
+            )
         except Exception as exc:
             logger.error(
                 "Anomaly detection failed: %s — leaving this frame's stored "
@@ -1237,6 +1262,10 @@ async def detect_anomalies_for_frame_id(frame_id: str, recovery_attempt: int = 0
         return []
 
     api_sources = await api_client.get_frame_sources(frame_id)
+    if api_sources is None:
+        # Not "a frame with no sources": classifying an empty list would post
+        # [] and replace the frame's stored anomalies. Fail the item instead.
+        raise RuntimeError(f"could not fetch the sources of frame_id={frame_id}")
     frame_filter = frame.get("filter")
     sources = [_from_wire_source(s, frame_filter) for s in api_sources]
 
@@ -1542,13 +1571,12 @@ def move_archived_file_to_rejected(filename: str, object_name: str) -> str | Non
     backs the DELETE_FRAME task type (see worker.py's `_run_delete_frame_task()`).
 
     Per the file-lifecycle invariant this pipeline maintains: FITS_INCOMING
-    holds only unprocessed files, FITS_ARCHIVE/{object}/ holds every
-    processed frame regardless of `quality_flag` (see analyze_frame()'s Step
-    8 — a QC-rejected frame is archived exactly like an OK one), and
-    FITS_REJECTED is used exclusively by this deletion flow, never by QC
-    rejection itself. A registered frame's file can therefore only ever be
-    found at FITS_ARCHIVE/{object_name}/{filename} — no need to also search
-    FITS_INCOMING.
+    holds only unprocessed files, FITS_ARCHIVE holds every processed frame
+    regardless of `quality_flag` (see analyze_frame()'s Step 8 — a
+    QC-rejected frame is archived exactly like an OK one), and FITS_REJECTED
+    is used exclusively by this deletion flow, never by QC rejection itself.
+    A registered frame's file is therefore found by
+    archive_layout.find_archived() — no need to also search FITS_INCOMING.
 
     Never deletes the file — only relocates it, so an operator can still
     recover it by hand if a deletion was a mistake. observatory-api is
@@ -1566,17 +1594,17 @@ def move_archived_file_to_rejected(filename: str, object_name: str) -> str | Non
         best-effort, not fatal: the API's DB-side deletion is the actual
         goal here, and a missing file doesn't block it.
     """
-    src_path = os.path.join(config.FITS_ARCHIVE, object_name, filename)
-    if not os.path.isfile(src_path):
+    src_path = archive_layout.find_archived(filename, object_name)
+    if src_path is None:
         logger.warning(
-            "move_archived_file_to_rejected: %s not found at expected archive path %s",
-            filename, src_path,
+            "move_archived_file_to_rejected: %s (object %s) not found in the archive",
+            filename, object_name,
         )
         return None
 
-    dest_dir = os.path.join(config.FITS_REJECTED, object_name)
+    dest_dir = os.path.join(config.FITS_REJECTED, archive_layout.object_token(object_name))
     os.makedirs(dest_dir, exist_ok=True)
-    dest_path = os.path.join(dest_dir, filename)
+    dest_path = qc._unique_destination(os.path.join(dest_dir, filename))
     shutil.move(src_path, dest_path)
     logger.info("Moved %s to rejected (frame deletion): %s → %s", filename, src_path, dest_path)
     return dest_path
@@ -1608,30 +1636,16 @@ def _resolve_bare_filename(fits_path: str) -> str:
 
     A path that already has a directory component (relative or absolute) is
     returned unchanged — this only kicks in for a bare basename, which is
-    unambiguous: a real path is never mistaken for one. Searches every
-    FITS_ARCHIVE/{object}/ subdirectory for an exact filename match and
-    returns the first hit. Zero or more than one match returns the input
-    unchanged, so the caller's normal "file not found" failure still
-    surfaces rather than a confusing resolver-internal one; more than one
-    match is also logged, since normalized filenames are expected to be
-    unique across the whole archive.
+    unambiguous: a real path is never mistaken for one. The archive is
+    searched by archive_layout.find_archived() (first hit wins, duplicates
+    logged); no match returns the input unchanged, so the caller's normal
+    "file not found" failure still surfaces rather than a confusing
+    resolver-internal one.
     """
     if os.path.dirname(fits_path):
         return fits_path
 
-    matches = sorted(glob.glob(os.path.join(config.FITS_ARCHIVE, "*", fits_path)))
-
-    if len(matches) == 1:
-        return matches[0]
-
-    if len(matches) > 1:
-        logger.warning(
-            "Bare filename %r matches multiple archived frames; using the first: %s",
-            fits_path, matches,
-        )
-        return matches[0]
-
-    return fits_path
+    return archive_layout.find_archived(fits_path) or fits_path
 
 
 def _object_dir_name(fits_path: str) -> str:
@@ -2143,6 +2157,51 @@ def _dedupe_cross_catalog_duplicates(sources: list, extra: dict) -> list:
         )
 
     return [s for i, s in enumerate(sources) if i not in dropped]
+
+
+def _apply_wcs_offset_to_solution(astro_result: dict, sources: list, extra: dict) -> None:
+    """
+    Carry catalog_matcher's systematic WCS-offset correction over to the
+    solution itself, in place.
+
+    match() shifts every source's ra/dec by the offset it measured against
+    Gaia (and tags each with `_wcs_offset_ra`/`_wcs_offset_dec`), but the
+    solved WCS still maps pixels to the uncorrected sky. Everything after
+    matching projects sky positions back to pixels through that WCS —
+    photometry's apertures at the corrected source positions, forced
+    photometry at true catalog positions — so each aperture would land off
+    its star by the whole correction (up to 90″), and the archived header
+    would disagree with the stored positions. Shifting CRVAL by the same
+    offset makes the WCS agree again: a CRVAL1 change moves every pixel's RA
+    by exactly that amount, and a CRVAL2 change of a few tens of arcsec is a
+    uniform shift to well below the centroiding noise across a field.
+    """
+    wcs = astro_result.get("wcs") if astro_result else None
+    if wcs is None:
+        return
+    tagged = next((s for s in sources if "_wcs_offset_ra" in s), None)
+    if tagged is None:
+        return
+    d_ra = float(tagged["_wcs_offset_ra"])
+    d_dec = float(tagged["_wcs_offset_dec"])
+    if d_ra == 0.0 and d_dec == 0.0:
+        return
+
+    corrected = wcs.deepcopy()
+    corrected.wcs.crval = [
+        (float(corrected.wcs.crval[0]) + d_ra) % 360.0,
+        float(corrected.wcs.crval[1]) + d_dec,
+    ]
+    corrected.wcs.set()
+    astro_result["wcs"] = corrected
+    if astro_result.get("ra_center") is not None:
+        astro_result["ra_center"] = (float(astro_result["ra_center"]) + d_ra) % 360.0
+    if astro_result.get("dec_center") is not None:
+        astro_result["dec_center"] = float(astro_result["dec_center"]) + d_dec
+    logger.info(
+        "Solved WCS shifted by the catalog offset dRA=%.2f\" dDec=%.2f\"",
+        d_ra * 3600.0, d_dec * 3600.0, extra=extra,
+    )
 
 
 def _write_solved_wcs(fits_path: str, wcs) -> bool:

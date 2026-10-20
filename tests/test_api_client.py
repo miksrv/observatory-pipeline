@@ -895,3 +895,32 @@ class TestGetTasksClaimable:
             await api_client_module.get_tasks(status="PENDING")
 
         assert "claimable" not in mock_client.get.call_args.kwargs["params"]
+
+
+class TestHistoryFailuresAreDistinguishable:
+    """
+    A failed history/coverage/source fetch must not look like an empty answer:
+    the anomaly detector reads "nothing here" as "never observed" and the
+    caller would replace the frame's stored anomalies with that result.
+    """
+
+    async def test_sources_near_batch_failure_is_none(self):
+        with patch.object(_sources_module, "_get_sources_near_batch_with_retry",
+                          AsyncMock(side_effect=httpx.ConnectError("down"))):
+            assert await api_client_module.get_sources_near_batch(
+                [{"ra": 1.0, "dec": 2.0}], 5.0, "2026-09-23T00:00:00Z") is None
+
+    async def test_frames_covering_batch_failure_is_none(self):
+        with patch.object(_frames_module, "_get_frames_covering_batch_with_retry",
+                          AsyncMock(side_effect=httpx.ConnectError("down"))):
+            assert await api_client_module.get_frames_covering_batch(
+                [{"ra": 1.0, "dec": 2.0}], "2026-09-23T00:00:00Z") is None
+
+    async def test_empty_positions_are_still_an_empty_answer(self):
+        assert await api_client_module.get_sources_near_batch([], 5.0, "t") == {}
+        assert await api_client_module.get_frames_covering_batch([], "t") == {}
+
+    async def test_frame_sources_failure_is_none(self):
+        with patch.object(_frames_module, "_get_frame_sources_with_retry",
+                          AsyncMock(side_effect=httpx.ConnectError("down"))):
+            assert await api_client_module.get_frame_sources("frame-1") is None

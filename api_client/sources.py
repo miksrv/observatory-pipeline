@@ -103,7 +103,7 @@ async def _post_sources_with_retry(
         "POST %s count=%d",
         url,
         len(sources),
-        extra={"frame_id": frame_id, "log_filename": filename},
+        extra={"frame_id": frame_id, "fits_filename": filename},
     )
 
     wire_sources = [_to_wire_source(s) for s in sources]
@@ -120,7 +120,7 @@ async def _post_sources_with_retry(
                 url,
                 response.status_code,
                 response.text,
-                extra={"frame_id": frame_id, "log_filename": filename},
+                extra={"frame_id": frame_id, "fits_filename": filename},
             )
             return None  # 4xx: do not retry, just log
 
@@ -171,7 +171,7 @@ async def post_sources(frame_id: str, filename: str, sources: list) -> list | No
         "Posting %d sources for frame_id=%s",
         len(sources),
         frame_id,
-        extra={"frame_id": frame_id, "log_filename": filename},
+        extra={"frame_id": frame_id, "fits_filename": filename},
     )
     try:
         return await _post_sources_with_retry(frame_id, filename, sources)
@@ -180,7 +180,7 @@ async def post_sources(frame_id: str, filename: str, sources: list) -> list | No
             "All retries exhausted posting sources for frame_id=%s: %s",
             frame_id,
             exc,
-            extra={"frame_id": frame_id, "log_filename": filename},
+            extra={"frame_id": frame_id, "fits_filename": filename},
         )
     return None
 
@@ -249,7 +249,7 @@ async def get_sources_near(
         ra,
         dec,
         radius_arcsec,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_sources_near_with_retry(ra, dec, radius_arcsec, before_time)
@@ -259,7 +259,7 @@ async def get_sources_near(
             ra,
             dec,
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return []
 
@@ -304,7 +304,7 @@ async def get_sources_near_batch(
     radius_arcsec: float,
     before_time: str,
     uncatalogued_only: bool = False,
-) -> dict:
+) -> dict | None:
     """
     Retrieve historical sources near multiple sky positions from the API
     in a single batch request.
@@ -324,7 +324,8 @@ async def get_sources_near_batch(
     dict
         Dictionary mapping position index (as string) to list of source dicts.
         Example: {"0": [source1, source2], "1": [], "2": [source3]}
-        Returns {} on any failure.
+        ``{}`` for an empty *positions*; ``None`` when the request failed, so
+        the anomaly detector can tell an outage from "no history here".
     """
     if not positions:
         return {}
@@ -333,7 +334,7 @@ async def get_sources_near_batch(
         "POST /sources/near/batch positions=%d radius=%.1f",
         len(positions),
         radius_arcsec,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_sources_near_batch_with_retry(
@@ -343,9 +344,9 @@ async def get_sources_near_batch(
         logger.error(
             "Error querying /sources/near/batch: %s",
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
-        return {}
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +396,7 @@ async def get_source_track(source_id: str) -> list:
     logger.debug(
         "GET /sources/%s/track",
         source_id,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_source_track_with_retry(source_id)
@@ -404,7 +405,7 @@ async def get_source_track(source_id: str) -> list:
             "Error querying /sources/%s/track: %s",
             source_id,
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return []
 
@@ -462,7 +463,7 @@ async def get_source_tracks_batch(source_ids: list[str]) -> dict:
     logger.debug(
         "POST /sources/tracks/batch source_ids=%d",
         len(source_ids),
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_source_tracks_batch_with_retry(source_ids)
@@ -470,7 +471,7 @@ async def get_source_tracks_batch(source_ids: list[str]) -> dict:
         logger.error(
             "Error querying /sources/tracks/batch: %s",
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return {}
 
@@ -508,7 +509,7 @@ async def _upload_source_chart_with_retry(
                 url,
                 response.status_code,
                 response.text,
-                extra={"frame_id": None, "log_filename": None},
+                extra={"frame_id": None, "fits_filename": None},
             )
             return False
 
@@ -558,7 +559,7 @@ async def upload_source_chart(
         source_id,
         frame_count,
         len(png_bytes),
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _upload_source_chart_with_retry(source_id, png_bytes, style, frame_count)
@@ -567,6 +568,6 @@ async def upload_source_chart(
             "All retries exhausted uploading chart for source_id=%s: %s",
             source_id,
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
     return False

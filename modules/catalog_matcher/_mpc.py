@@ -156,10 +156,11 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
         mag_col   = col_map.get("V") or col_map.get("MV") or col_map.get("VMAG")
 
         if not ra_col or not dec_col or not name_col:
+            # A malformed answer, not an empty sky: never cached, so the next
+            # frame of this field asks again.
             logger.warning(
                 "SkyBot result missing expected columns. Available: %s", list(result.colnames)
             )
-            _cache_set(cache_key, [])
             return []
 
         mag_limit = config.MPC_MAG_LIMIT
@@ -365,15 +366,18 @@ def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:
         # A takeover inherits nothing from the star it displaced: its Gaia
         # BP-RP would otherwise be applied through the colour term to the
         # moving object's own calibrated magnitude (photometry.py reads
-        # _catalog_color regardless of catalog_name).
+        # _catalog_color regardless of catalog_name), and its G magnitude
+        # would make the moving object a zero-point reference — with its
+        # quality flags gone, one that even passes the reference screen.
         source.pop("_catalog_color", None)
         source.pop("_catalog_flags", None)
+        source.pop("_gaia_mag", None)
 
 
 # ---------------------------------------------------------------------------
 # Public accessor for the already-fetched, region-wide MPC field list
 #
-# modules/forced_photometry.py's reverse-matching pass (ROADMAP.md #1) needs
+# modules/forced_photometry.py's reverse-matching pass needs
 # the exact same MPC/SkyBot field list _match.match() already queried for
 # forward matching. See _gaia.get_gaia_stars()'s docstring for the full
 # rationale — this is the same pattern, just for MPC objects instead of
