@@ -95,7 +95,15 @@ def _cache_radius_margin_deg() -> float:
 
 
 _cache: dict[str, dict[str, Any]] = {}
-_CACHE_TTL = datetime.timedelta(hours=config.CACHE_TTL_HOURS)
+
+
+def _cache_ttl() -> datetime.timedelta:
+    """
+    The TTL, read at call time: worker.py applies remote settings
+    (`GET /settings`) after this module is imported, so a module-level copy
+    would silently keep the `.env` value.
+    """
+    return datetime.timedelta(hours=config.CACHE_TTL_HOURS)
 
 
 # Bumped whenever what a key MEANS changes, so an on-disk entry written under
@@ -123,8 +131,9 @@ def _cache_get(key: str) -> Any | None:
     on-disk entry is treated the same as a miss — the caller re-queries the
     network and _cache_set() overwrites the bad file.
     """
+    ttl = _cache_ttl()
     entry = _cache.get(key)
-    if entry and (datetime.datetime.now(datetime.timezone.utc) - entry["fetched_at"]) < _CACHE_TTL:
+    if entry and (datetime.datetime.now(datetime.timezone.utc) - entry["fetched_at"]) < ttl:
         return entry["data"]
 
     path = _cache_file_path(key)
@@ -133,10 +142,9 @@ def _cache_get(key: str) -> Any | None:
     except OSError:
         return None  # no on-disk entry either
 
-    age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromtimestamp(
-        mtime, tz=datetime.timezone.utc
-    )
-    if age >= _CACHE_TTL:
+    fetched_at = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+    age = datetime.datetime.now(datetime.timezone.utc) - fetched_at
+    if age >= ttl:
         return None  # stale on-disk entry — treat as a miss, re-query and overwrite it
 
     try:
@@ -149,7 +157,9 @@ def _cache_get(key: str) -> Any | None:
         )
         return None
 
-    _cache[key] = {"data": data, "fetched_at": datetime.datetime.now(datetime.timezone.utc)}
+    # The file's own age, not "now": the entry must expire when the file
+    # does, not a whole TTL after this read.
+    _cache[key] = {"data": data, "fetched_at": fetched_at}
     return data
 
 

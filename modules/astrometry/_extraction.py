@@ -162,17 +162,20 @@ def _extract_sources(
         snr: np.ndarray = objects["peak"] / bkg.globalrms
 
         # ---------------------------------------------------------
-        # Saturation flag — see docs/ISSUES.md #2.
+        # Saturation flag.
         #
-        # sep's "peak" field is background-SUBTRACTED, so add the global
-        # background level back to approximate the true raw ADU value at
-        # the object's brightest pixel. This is a coarse per-object check
-        # (not pixel-exact), but sufficient to flag the saturated cores
-        # that were otherwise silently producing extreme (e.g. -14 mag)
-        # magnitudes downstream in photometry.py, since aperture flux on
-        # a clipped PSF core is not a physically meaningful measurement.
+        # The raw ADU value of each object's brightest pixel (sep's
+        # xpeak/ypeak — xcpeak/ycpeak is the peak of the CONVOLVED image and
+        # can sit beside a single saturated pixel), read from the
+        # unsubtracted frame. sep's own "peak"
+        # is background-SUBTRACTED, and adding the GLOBAL background back
+        # misses saturated cores wherever the local sky is brighter than
+        # average (moon, twilight gradient, a galaxy's disk) — those then
+        # reached photometry and could anchor the zero point, although
+        # aperture flux on a clipped PSF core is not a physically meaningful
+        # measurement.
         # ---------------------------------------------------------
-        raw_peak: np.ndarray = objects["peak"] + bkg.globalback
+        raw_peak: np.ndarray = _raw_peak_adu(objects, data, bkg)
         saturated_mask: np.ndarray = raw_peak >= config.SATURATION_ADU
         n_saturated = int(np.sum(saturated_mask))
         if n_saturated:
@@ -416,6 +419,31 @@ def _extract_sources(
     return sources, sources_all
 
 
+def _raw_peak_adu(objects: np.ndarray, data: np.ndarray, bkg) -> np.ndarray:
+    """Raw pixel value at each object's peak pixel; peak + global sky if unavailable."""
+    try:
+        ys = np.clip(objects["ypeak"].astype(int), 0, data.shape[0] - 1)
+        xs = np.clip(objects["xpeak"].astype(int), 0, data.shape[1] - 1)
+        return data[ys, xs]
+    except (KeyError, ValueError, IndexError):
+        return objects["peak"] + bkg.globalback
+
+
+def _local_background(bkg, back: np.ndarray | None, x: float, y: float) -> float:
+    """
+    The sky level of sep's background map *back* (``bkg.back()``, built once
+    by the caller) at (x, y); the global level when there is no map.
+    """
+    try:
+        if back is None:
+            raise ValueError("no background map")
+        yi = min(max(int(round(y)), 0), back.shape[0] - 1)
+        xi = min(max(int(round(x)), 0), back.shape[1] - 1)
+        return float(back[yi, xi])
+    except Exception:
+        return float(bkg.globalback)
+
+
 def _streak_sources(
     features: list[dict],
     wcs,
@@ -439,6 +467,14 @@ def _streak_sources(
     margin_x = config.EDGE_MARGIN_FRAC * naxis1
     margin_y = config.EDGE_MARGIN_FRAC * naxis2
 
+    # The full-frame background map, built once rather than per streak.
+    back: np.ndarray | None = None
+    if features:
+        try:
+            back = bkg.back()
+        except Exception:
+            back = None
+
     for feature in features:
         try:
             coord = wcs.all_pix2world([[feature["x"], feature["y"]]], 0)[0]
@@ -457,7 +493,10 @@ def _streak_sources(
             "flux":       feature["flux"],
             "fwhm":       fwhm_px * pixel_scale_arcsec,
             "elongation": feature["elongation"],
-            "saturated":  bool(feature["peak"] + bkg.globalback >= config.SATURATION_ADU),
+            "saturated":  bool(
+                feature["peak"] + _local_background(bkg, back, feature["x"], feature["y"])
+                >= config.SATURATION_ADU
+            ),
             "near_edge":  bool(
                 feature["x"] < margin_x or feature["x"] > naxis1 - margin_x
                 or feature["y"] < margin_y or feature["y"] > naxis2 - margin_y

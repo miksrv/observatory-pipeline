@@ -25,8 +25,7 @@ def _single_epoch_changes(monkeypatch):
     """
     Most tests here exercise which Δmag branch a change lands in, from a
     change in the current epoch alone. The multi-epoch confirmation in front
-    of those branches (VARIABILITY_CONFIRM_EPOCHS, docs/PLAN-OSC-SUPPORT.md
-    T11) is tested on its own in TestChangeConfirmation, which sets it back.
+    of those branches (VARIABILITY_CONFIRM_EPOCHS) is tested on its own in TestChangeConfirmation, which sets it back.
     """
     monkeypatch.setattr(config, "VARIABILITY_CONFIRM_EPOCHS", 1)
 
@@ -1841,8 +1840,12 @@ class TestDetectSaturatedArtifacts:
 
 class TestDetectResilienceAndMixedSources:
 
-    async def test_detect_api_failure_continues(self):
-        """get_sources_near_batch raising an exception must not crash; sources processed with empty data."""
+    async def test_detect_api_failure_stops_detection(self):
+        """
+        A history request that raises must stop detection: classifying without
+        history reads every source as never observed, and the caller would then
+        replace the frame's stored anomalies with that.
+        """
         source = _make_source(catalog_name=None)
 
         with (
@@ -1854,15 +1857,22 @@ class TestDetectResilienceAndMixedSources:
                 "modules.anomaly_detector.api_client.get_frames_covering_batch",
                 side_effect=Exception("simulated timeout"),
             ),
+            pytest.raises(ad.HistoryUnavailable),
         ):
-            # Must not raise — pipeline continues
-            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+            await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
-        # Source is not classified as UNKNOWN because we don't have coverage data
-        # (batch failed), so it's treated as FIRST_OBSERVATION (no coverage = suppressed)
-        assert isinstance(result, list)
-        # With no data at all, sources get n_coverage=0 → FIRST_OBSERVATION → suppressed
-        assert result == []
+    async def test_a_failed_request_returning_none_stops_detection(self):
+        """api_client reports a failed batch request as None, never as {}."""
+        source = _make_source(catalog_name=None)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = None
+            with pytest.raises(ad.HistoryUnavailable, match="coverage"):
+                await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
 
     async def test_detect_multiple_sources_mixed(self):
         """
@@ -1900,7 +1910,7 @@ class TestDetectResilienceAndMixedSources:
 
 
 # ===========================================================================
-# History prefetch shape (docs/PLAN-OSC-SUPPORT.md, T9)
+# History prefetch shape (narrow + uncatalogued-only wide cone)
 # ===========================================================================
 
 class TestHistoryPrefetchShape:
@@ -1998,7 +2008,7 @@ class TestHistoryPrefetchShape:
 
 
 # ===========================================================================
-# Multi-epoch confirmation of a magnitude change (docs/PLAN-OSC-SUPPORT.md T11)
+# Multi-epoch confirmation of a magnitude change (VARIABILITY_CONFIRM_EPOCHS)
 # ===========================================================================
 
 class TestChangeConfirmation:

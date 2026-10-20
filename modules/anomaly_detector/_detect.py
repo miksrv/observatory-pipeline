@@ -67,7 +67,7 @@ async def detect(
     # the start time, which is what the frame is registered under.
     obs_time_mid = str(frame_meta.get("obs_time_mid") or obs_time)
     log_filename = str(frame_meta.get("filename", "<unknown>"))
-    extra        = {"frame_id": frame_id, "log_filename": log_filename}
+    extra        = {"frame_id": frame_id, "fits_filename": log_filename}
 
     logger.info(
         "Anomaly detection started: %d source(s) frame_id=%s",

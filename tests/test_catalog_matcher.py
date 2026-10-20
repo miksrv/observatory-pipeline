@@ -166,6 +166,33 @@ class TestCacheLogic:
         result = cm._cache_get("stale_key")
         assert result is None
 
+    def test_the_ttl_is_read_at_call_time(self, monkeypatch):
+        """Remote settings are applied after import; a changed TTL must take effect."""
+        one_hour_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+        cm._cache["ttl_key"] = {"data": "x", "fetched_at": one_hour_ago}
+
+        monkeypatch.setattr(config, "CACHE_TTL_HOURS", 2.0)
+        assert cm._cache_get("ttl_key") == "x"
+        monkeypatch.setattr(config, "CACHE_TTL_HOURS", 0.5)
+        assert cm._cache_get("ttl_key") is None
+
+    def test_a_disk_hit_keeps_the_files_own_age(self, tmp_path, monkeypatch):
+        import importlib
+        cache_mod = importlib.import_module("modules.catalog_matcher._cache")
+        monkeypatch.setattr(config, "CATALOG_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(config, "CACHE_TTL_HOURS", 24.0)
+        key = "disk_age_key"
+        path = cache_mod._cache_file_path(key)
+        with open(path, "w") as f:
+            f.write("[1]")
+        ten_hours_ago = datetime.datetime.now().timestamp() - 10 * 3600
+        os.utime(path, (ten_hours_ago, ten_hours_ago))
+        cache_mod._cache.pop(key, None)
+
+        assert cache_mod._cache_get(key) == [1]
+        age = datetime.datetime.now(datetime.timezone.utc) - cache_mod._cache[key]["fetched_at"]
+        assert age > datetime.timedelta(hours=9)
+
     def test_a_pre_versioned_disk_entry_is_not_read_back(self, tmp_path, monkeypatch):
         """
         A disk file written before the cache's key meaning changed (M5) must
@@ -794,6 +821,7 @@ class TestMpcMatching:
         source["object_type"]    = "STAR"
         source["_catalog_color"] = 2.7
         source["_catalog_flags"] = {"ruwe": 1.0}
+        source["_gaia_mag"]      = 13.0
 
         mpc_objects = [{"ra": _RA, "dec": _DEC, "designation": "2024 AB1", "object_type": "ASTEROID"}]
 
@@ -802,6 +830,8 @@ class TestMpcMatching:
         assert source["catalog_name"] == "MPC"
         assert "_catalog_color" not in source
         assert "_catalog_flags" not in source
+        # Otherwise the asteroid anchors the zero point with the star's G.
+        assert "_gaia_mag" not in source
 
     def test_mpc_leaves_a_distant_catalogued_source_alone(self):
         """
@@ -1284,6 +1314,30 @@ class TestComputeWcsOffset:
         assert recovered_dra_arcsec  == pytest.approx(true_dra,  abs=5.0)
         assert recovered_ddec_arcsec == pytest.approx(true_ddec, abs=5.0)
 
+    def test_recovers_an_offset_across_ra_zero(self):
+        """True pairs 359.99° vs 0.01° apart must vote for a few arcsec, not ±360°."""
+        true_dra, true_ddec = 20.0, -40.0
+        dec = 10.0
+        cos_dec = math.cos(math.radians(dec))
+        rng = np.random.default_rng(7)
+        sources, gaia_stars = [], []
+        for i in range(30):
+            ra = (rng.uniform(-0.1, 0.1)) % 360.0
+            d = dec + rng.uniform(-0.1, 0.1)
+            src = _make_source(ra=ra, dec=d)
+            src["catalog_name"] = None
+            sources.append(src)
+            gaia_stars.append({
+                "ra": (ra + true_dra / (cos_dec * 3600.0)) % 360.0,
+                "dec": d + true_ddec / 3600.0,
+                "source_id": f"g{i}", "phot_g_mean_mag": 14.0,
+            })
+
+        offset_ra_deg, offset_dec_deg = cm._compute_wcs_offset(sources, gaia_stars)
+
+        assert offset_ra_deg * cos_dec * 3600.0 == pytest.approx(true_dra, abs=3.0)
+        assert offset_dec_deg * 3600.0 == pytest.approx(true_ddec, abs=3.0)
+
     def test_no_offset_needed_returns_zero(self):
         """Sources already aligned with Gaia (median separation small) → no correction."""
         sources = [_make_source(ra=_RA + i * 0.001, dec=_DEC) for i in range(10)]
@@ -1331,7 +1385,7 @@ class TestComputeWcsOffset:
 
 
 # ===========================================================================
-# TestGaiaProperMotionFields — forced-photometry support (originally proposed as ROADMAP.md #1)
+# TestGaiaProperMotionFields — forced-photometry support
 # ===========================================================================
 
 

@@ -14,8 +14,8 @@ from enum import Enum
 # dict equality against literal strings (e.g. in tests), and API payload
 # serialization all work exactly as they did with the old bare string
 # constants. Must stay in sync with the ENUM column definition in
-# observatory-api's 2026-04-03-000005_CreateAnomaliesTable.php and with the
-# "Anomaly Types Reference" table in CLAUDE.md.
+# observatory-api's 2026-04-03-000005_CreateAnomaliesTable.php and
+# AnomalyModel::ALLOWED_TYPES (CLAUDE.md, anomaly_detector section).
 
 
 class AnomalyType(str, Enum):
@@ -37,8 +37,8 @@ class AnomalyType(str, Enum):
 # does not pollute UNKNOWN, but it is nothing an operator needs to act on
 # (decided 2026-09-22 after the IC3322A test run: 38 trails on 7 frames, all
 # ordinary satellite passes). observatory-api decides the persisted
-# `is_alert` flag itself from its own AnomalyModel::ALERT_TYPES — see
-# docs/API-TASKS.md #2 for the matching change there.
+# `is_alert` flag itself from its own AnomalyModel::ALERT_TYPES, which
+# excludes it too.
 _ALERT_TYPES: frozenset[AnomalyType] = frozenset({
     AnomalyType.SUPERNOVA_CANDIDATE,
     AnomalyType.MOVING_UNKNOWN,

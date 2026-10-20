@@ -129,7 +129,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         offset_ra_deg, offset_dec_deg = _wcs_offset._compute_wcs_offset(sources, gaia_stars)
         if offset_ra_deg != 0.0 or offset_dec_deg != 0.0:
             for source in sources:
-                source["ra"]  += offset_ra_deg
+                source["ra"]   = (source["ra"] + offset_ra_deg) % 360.0
                 source["dec"] += offset_dec_deg
                 source["_wcs_offset_ra"]  = offset_ra_deg
                 source["_wcs_offset_dec"] = offset_dec_deg

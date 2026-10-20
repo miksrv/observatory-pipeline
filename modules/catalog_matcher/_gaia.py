@@ -442,7 +442,7 @@ def _attach_gaia_color(sources: list[dict], gaia_stars: list[dict]) -> int:
 # ---------------------------------------------------------------------------
 # Public accessor for the already-fetched, region-wide Gaia field list
 #
-# modules/forced_photometry.py's reverse-matching pass (ROADMAP.md #1) needs
+# modules/forced_photometry.py's reverse-matching pass needs
 # the exact same Gaia DR3 field list _match.match() already queried for
 # forward matching — measuring flux at a catalog star's predicted pixel
 # position is only worth doing for a star this frame's footprint actually

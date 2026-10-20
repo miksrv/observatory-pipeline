@@ -1137,7 +1137,7 @@ class TestDegenerateMinorAxisIsClamped:
 
 
 # ---------------------------------------------------------------------------
-# Hot-pixel floor in pixels (docs/PLAN-OSC-SUPPORT.md, T5)
+# Hot-pixel floor in pixels (STAR_FWHM_MIN_PX)
 # ---------------------------------------------------------------------------
 
 class TestHotPixelFloorIsInPixels:

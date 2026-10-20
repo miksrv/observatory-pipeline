@@ -1162,7 +1162,7 @@ class TestSkipCalibration:
 
 
 # ---------------------------------------------------------------------------
-# Test 6.5 — Saturated sources (docs/ISSUES.md #2)
+# Test 6.5 — Saturated sources
 # ---------------------------------------------------------------------------
 
 class TestSaturatedSources:
@@ -1318,7 +1318,7 @@ class TestFwhmFallback:
 
 class TestZeroPointReferences:
     """
-    docs/PLAN-OSC-SUPPORT.md T10. References used to be only "Gaia DR3"
+    References used to be only "Gaia DR3"
     matches, and Simbad (which runs first) claims most bright stars around a
     well-known galaxy: the NGC 7331 run calibrated off a median of 3 stars,
     and a frame calibrated off 4 (scatter 0.28) put every star 0.4 mag too
@@ -1358,3 +1358,60 @@ class TestZeroPointReferences:
         monkeypatch.setattr(config, "PHOTOMETRY_MAX_ZERO_POINT_ERR", 0.0)
         refs = [_ref(d, None) for d in (24.0, 24.35, 23.7, 24.4)]
         assert photometry._compute_zero_point(refs).zero_point is not None
+
+
+class TestSaturatedReferencesBeforeTheScreen:
+    def test_saturated_stars_do_not_count_toward_the_screened_minimum(self):
+        """
+        3 references pass the quality screen but 2 of them are saturated; the
+        unscreened set has 4 usable stars. Screening must not decide on the
+        saturated ones and then leave the frame uncalibrated.
+        """
+        def ref(i, saturated=False, ruwe=1.0):
+            return {
+                "catalog_name": "Gaia DR3", "catalog_id": f"g{i}", "catalog_mag": 14.0 + 0.1 * i,
+                "mag_instrumental": -10.0 + 0.1 * i, "saturated": saturated,
+                "_catalog_flags": {"ruwe": ruwe},
+            }
+
+        refs = [ref(0), ref(1, saturated=True), ref(2, saturated=True)]
+        refs += [ref(3 + i, ruwe=5.0) for i in range(3)]   # fail the RUWE screen
+
+        sol = photometry._compute_zero_point(refs)
+
+        assert sol.zero_point == pytest.approx(24.0)
+
+
+def test_pixel_scale_is_the_geometric_mean_of_both_axes():
+    """Same formula as astrometry's registered pixel scale, also for anisotropic pixels."""
+    from astropy.wcs import WCS
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.cdelt = [-1.0 / 3600.0, 4.0 / 3600.0]
+
+    assert photometry._pixel_scale_from_wcs(wcs) == pytest.approx(2.0)
+
+
+class TestSubtractionCandidatesKeepTheirDifferenceSnr:
+    async def test_a_candidate_keeps_the_difference_image_snr(self):
+        srcs = _make_sources(n=3)
+        srcs[0]["_from_subtraction"] = True
+        srcs[0]["snr"] = 42.0
+        with _patch_photometry():
+            result = await photometry.measure(_FITS_PATH, srcs)
+
+        assert result[0]["snr"] == 42.0
+        assert result[0]["_aperture_snr"] is not None
+        assert result[0]["_aperture_snr"] != 42.0
+        assert "_aperture_snr" not in result[1]
+
+    async def test_a_skipped_candidate_still_has_its_snr(self):
+        """Photometry failing (here: no WCS) must not erase the candidate's significance."""
+        srcs = _make_sources(n=1)
+        srcs[0]["_from_subtraction"] = True
+        srcs[0]["snr"] = 9.0
+        with patch.object(photometry, "_open_wcs", return_value=None, create=True):
+            result = await photometry.measure("/does/not/exist.fits", srcs)
+
+        assert result[0]["snr"] == 9.0

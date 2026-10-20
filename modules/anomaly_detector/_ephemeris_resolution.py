@@ -35,7 +35,7 @@ async def _resolve_ephemerides(
       - Sets "ephemeris" key to the dict returned by ephemeris.query(), or None.
       - Removes the private "_needs_ephemeris" sentinel key.
     """
-    extra = {"frame_id": frame_id, "log_filename": log_filename}
+    extra = {"frame_id": frame_id, "fits_filename": log_filename}
 
     pending = [a for a in anomalies if a.get("_needs_ephemeris") and a.get("mpc_designation")]
 

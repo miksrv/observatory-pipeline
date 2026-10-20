@@ -127,8 +127,11 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
     mean_dec = float(np.mean([s["dec"] for s in sources]))
     cos_dec  = math.cos(math.radians(mean_dec))
 
+    # RA difference wrapped into (-180°, 180°]: in a field straddling 0h a
+    # true pair is 359.99° - 0.01° apart and would land outside the histogram.
     dra_arcsec  = np.array([
-        (gaia_stars[idx_cat[k]]["ra"]  - sources[idx_src[k]]["ra"])  * cos_dec * 3600.0
+        ((gaia_stars[idx_cat[k]]["ra"] - sources[idx_src[k]]["ra"] + 180.0) % 360.0 - 180.0)
+        * cos_dec * 3600.0
         for k in range(n_pairs)
     ])
     ddec_arcsec = np.array([
