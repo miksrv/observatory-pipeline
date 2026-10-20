@@ -650,6 +650,27 @@ class TestDetectStationaryClassifications:
         assert len(result) == 1
         assert result[0]["anomaly_type"] == "BINARY_STAR"
 
+    @pytest.mark.parametrize("otype", ["LSB", "SBG"])
+    async def test_a_fading_galaxy_is_not_a_binary_star(self, otype):
+        """
+        The binary substring test matches the galaxy codes LSB and SBG ("SB").
+        A galaxy's fading is aperture measurement, not a binary — the same
+        false positive the extended-object guard exists for.
+        """
+        source = _make_source(mag=14.5, catalog_name="Simbad", object_type=otype)
+        hist   = [_make_hist_source(mag=12.0)]
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
+
     async def test_detect_no_anomaly_stable_star(self):
         """Catalog-matched source with no history at all → KNOWN_CATALOG_NEW
         (suppressed, not an anomaly)."""

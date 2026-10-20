@@ -380,6 +380,10 @@ def _scale_of(header: Optional[Any]) -> Optional[float]:
     """
     The plate scale (arcsec/px) of a header's celestial WCS — for an archived
     frame, the astap solve pipeline.py wrote into it. None without one.
+
+    A frame archived without a solve still carries whatever WCS the capture
+    software wrote, possibly at nominal optics; such frames are QC-failed in
+    practice, and the QCFLAG screen drops those anyway.
     """
     if header is None:
         return None
@@ -495,7 +499,8 @@ def _screen_by_quality(
     if pixel_scale_arcsec is not None:
         same = [p for p in paths if _same_scale(_scale_of(headers[p]), pixel_scale_arcsec)]
         if len(same) != len(paths):
-            logger.info(
+            logger.log(
+                logging.WARNING if not same else logging.INFO,
                 "Subtraction: excluded %d of %d reference candidate(s) whose plate "
                 "scale differs from this frame's %.3f\"/px by more than %.0f%%",
                 len(paths) - len(same), len(paths), pixel_scale_arcsec,

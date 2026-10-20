@@ -2119,6 +2119,16 @@ class TestDedupeCrossCatalogDuplicates:
                 "mag": float(rng.uniform(8, 20)),
             })
 
+        # Near the pole, and exact duplicates of earlier positions.
+        for k in range(40):
+            sources.append({
+                "ra": float(rng.uniform(0, 360)), "dec": float(90.0 - rng.uniform(0, 4 * cone_deg)),
+                "catalog_name": catalogs[int(rng.integers(len(catalogs)))],
+                "catalog_id": f"p{k}", "mag": 10.0,
+            })
+        for k in range(0, 400, 25):
+            sources.append({**sources[k], "catalog_name": catalogs[(k // 25) % 5], "catalog_id": f"d{k}"})
+
         result = pipeline._dedupe_cross_catalog_duplicates(sources, {})
 
         expected = self._pairwise_reference(sources)

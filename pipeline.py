@@ -2113,7 +2113,8 @@ def _dedupe_cross_catalog_duplicates(sources: list, extra: dict) -> list:
     candidate_positions = [
         i for i, s in enumerate(sources)
         if s.get("catalog_name") is not None
-        and math.isfinite(s["ra"]) and math.isfinite(s["dec"])
+        and isinstance(s.get("ra"), (int, float)) and math.isfinite(s["ra"])
+        and isinstance(s.get("dec"), (int, float)) and math.isfinite(s["dec"])
     ]
     if len(candidate_positions) < 2:
         return sources
