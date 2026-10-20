@@ -52,10 +52,16 @@ them, polling asks only for `claimable` tasks (its own or untargeted), and
 the API refuses a claim on another pipeline's task (409) — the same "could
 not claim" path as losing a race to another worker.
 
-Known limitation: a task that a worker claims (PATCH status=RUNNING) and
-then crashes on — before finishing — stays stuck at RUNNING forever; this
-first version has no lease/heartbeat/timeout mechanism to recover it
-automatically. During testing, reset it back to PENDING by hand
+Graceful shutdown: SIGTERM (`docker compose stop`/`down`) or SIGINT lets the
+item in progress finish, then stops — no further item or task is started. A
+task left with unprocessed items is put back to PENDING, so the next start
+(this worker or another) picks up exactly the rest. docker-compose.yml gives
+the worker a long `stop_grace_period` for that; a second signal exits at once.
+
+Known limitation: a task whose worker dies without that chance — killed
+(OOM, SIGKILL after the grace period), or crashed — stays stuck at RUNNING
+forever; there is no lease/heartbeat/timeout mechanism to recover it
+automatically. Reset it back to PENDING by hand
 (`PATCH /tasks/{id} {"status": "PENDING"}`) if that happens.
 """
 
@@ -63,7 +69,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import sys
+from collections.abc import Iterable, Iterator
 
 import config
 from logging_setup import configure_logging
@@ -75,6 +84,112 @@ logger = logging.getLogger(__name__)
 
 class RestartRequested(Exception):
     """Raised by the RESTART task handler to signal a clean exit + restart."""
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+
+# Set by the SIGTERM/SIGINT handler installed in run_forever(). Checked only
+# between items, never inside one: an item interrupted halfway could have
+# registered a frame without its sources, or moved a file without reporting it.
+_shutdown = asyncio.Event()
+
+
+def _request_shutdown(signame: str) -> None:
+    """Runs on the event loop (scheduled by the signal handler below)."""
+    if _shutdown.is_set():
+        # A second signal means "now": the item in progress is abandoned and
+        # its task stays RUNNING, exactly like a kill.
+        logger.warning("%s received again — exiting immediately", signame)
+        os._exit(1)
+    logger.info(
+        "%s received — finishing the current item, then stopping (send it again to exit at once)",
+        signame,
+    )
+    _shutdown.set()
+
+
+# Signals received by this process; counted in the handler itself, so a
+# second one is recognised even before the loop has run the first one's callback.
+_signals_seen = 0
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> dict:
+    """
+    SIGTERM/SIGINT through signal.signal(), not loop.add_signal_handler():
+    the latter only runs once the event loop regains control, and QC,
+    extraction, subtraction and photometry run synchronously on the loop's
+    thread for minutes — a second signal would wait them out instead of
+    exiting at once. A Python-level handler runs between bytecodes of
+    whatever is executing; the first signal still only hands the request to
+    the loop (call_soon_threadsafe), so no loop state is touched mid-callback.
+    """
+    global _signals_seen
+    _signals_seen = 0
+
+    def _handler(signum: int, frame: object) -> None:
+        global _signals_seen
+        _signals_seen += 1
+        name = signal.Signals(signum).name
+        if _signals_seen > 1:
+            logger.warning("%s received again — exiting immediately", name)
+            os._exit(1)
+        loop.call_soon_threadsafe(_request_shutdown, name)
+
+    return {sig: signal.signal(sig, _handler) for sig in (signal.SIGTERM, signal.SIGINT)}
+
+
+def _until_shutdown(items: Iterable) -> Iterator:
+    """Yield items until a shutdown is requested; the rest stay PENDING on the API."""
+    for item in items:
+        if _shutdown.is_set():
+            return
+        yield item
+
+
+# ---------------------------------------------------------------------------
+# Progress reporting
+# ---------------------------------------------------------------------------
+
+# Item outcomes of the task in progress whose report never reached the API.
+# Such an item stays PENDING there, so the API never settles the task: it
+# would sit at RUNNING forever. _process_one_task() retries them once the
+# handler returns and puts the task back in the queue if they still fail.
+_unreported: list[dict] = []
+
+# How often each task has been put back in the queue because item reports
+# were lost — see _process_one_task(); capped by API_RECOVERY_MAX_ATTEMPTS.
+_lost_report_requeues: dict[str, int] = {}
+
+
+async def _report_progress(task_id: str, outcomes: list[dict]) -> None:
+    """Report item outcomes; remember the ones the API did not take."""
+    if await api_client.post_task_items_progress(task_id, outcomes) is None:
+        logger.warning(
+            "Progress for %d item(s) of task_id=%s was not recorded — will retry",
+            len(outcomes), task_id,
+        )
+        _unreported.extend(outcomes)
+
+
+async def _settle_unreported(task_id: str) -> bool:
+    """
+    Retry the outcomes _report_progress() could not deliver. True when
+    nothing is left unreported.
+    """
+    if not _unreported:
+        return True
+    pending = list(_unreported)
+    _unreported.clear()
+    if await api_client.post_task_items_progress(task_id, pending) is not None:
+        logger.info("Delivered %d late item report(s) for task_id=%s", len(pending), task_id)
+        return True
+    logger.error(
+        "Could not report %d item outcome(s) of task_id=%s: %s",
+        len(pending), task_id, pending,
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +264,9 @@ async def _run_analyze_task(task: dict, items: list[dict]) -> None:
     duration and then flip them all to DONE/FAILED at once — no live
     visibility into which file is currently being processed.
     """
-    for item in items:
+    for item in _until_shutdown(items):
         outcome = await _handle_analyze_item(item)
-        await api_client.post_task_items_progress(task["id"], [outcome])
+        await _report_progress(task["id"], [outcome])
 
 
 async def _run_detect_task(task: dict, items: list[dict]) -> None:
@@ -165,10 +280,10 @@ async def _run_detect_task(task: dict, items: list[dict]) -> None:
     and submits a GENERATE_CHARTS task from the UI, referencing specific
     anomaly_ids from the anomalies table.
     """
-    for item in items:
+    for item in _until_shutdown(items):
         frame_id = item.get("frame_id")
         if not frame_id:
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"], [{"item_id": item["id"], "status": "FAILED", "error": "Item has no frame_id"}],
             )
             continue
@@ -177,12 +292,12 @@ async def _run_detect_task(task: dict, items: list[dict]) -> None:
             await pipeline.detect_anomalies_for_frame_id(frame_id, _recovery_attempt(item))
         except Exception as exc:
             logger.exception("DETECT_ANOMALIES item failed for frame_id=%s", frame_id)
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"], [{"item_id": item["id"], "status": "FAILED", "error": str(exc)}],
             )
             continue
 
-        await api_client.post_task_items_progress(task["id"], [{"item_id": item["id"], "status": "DONE"}])
+        await _report_progress(task["id"], [{"item_id": item["id"], "status": "DONE"}])
 
 
 
@@ -234,9 +349,9 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
         items_by_source_id.setdefault(source_id, []).append(item)
 
     if malformed:
-        await api_client.post_task_items_progress(task["id"], malformed)
+        await _report_progress(task["id"], malformed)
 
-    for source_id, source_items in items_by_source_id.items():
+    for source_id, source_items in _until_shutdown(items_by_source_id.items()):
         payloads = [item.get("payload") or {} for item in source_items]
         designations = [p["designation"] for p in payloads if p.get("designation")]
 
@@ -262,7 +377,7 @@ async def _run_charts_task(task: dict, items: list[dict]) -> None:
                     **({} if ok else {"error": "Chart update failed or was skipped"}),
                 })
 
-        await api_client.post_task_items_progress(task["id"], progress)
+        await _report_progress(task["id"], progress)
 
 
 async def _run_preview_task(task: dict, items: list[dict]) -> None:
@@ -276,11 +391,11 @@ async def _run_preview_task(task: dict, items: list[dict]) -> None:
     that item's own `payload` (visible via GET /tasks/{id}) so the outcome
     is discoverable from the task itself without digging through logs.
     """
-    for item in items:
+    for item in _until_shutdown(items):
         fits_path = item.get("filename")
 
         if not fits_path:
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"], [{"item_id": item["id"], "status": "FAILED", "error": "Item has no filename"}],
             )
             continue
@@ -289,12 +404,12 @@ async def _run_preview_task(task: dict, items: list[dict]) -> None:
             result = await pipeline.preview_catalog_match(fits_path, task["id"], item["id"])
         except Exception as exc:
             logger.exception("PREVIEW_CATALOG_MATCH item failed for %s", fits_path)
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"], [{"item_id": item["id"], "status": "FAILED", "error": str(exc)}],
             )
             continue
 
-        await api_client.post_task_items_progress(
+        await _report_progress(
             task["id"],
             [{
                 "item_id": item["id"],
@@ -319,7 +434,7 @@ async def _run_delete_frame_task(task: dict, items: list[dict]) -> None:
     builds these directly off an operator's frame selection — see
     CLAUDE.md's job-queue table). For each one:
       1. Fetch the frame via GET /frames/{id} for its `filename`/`object`.
-      2. Physically move the file from FITS_ARCHIVE/{object}/ to
+      2. Physically move the file from its FITS_ARCHIVE location to
          FITS_REJECTED/{object}/ via pipeline.move_archived_file_to_rejected()
          — never deletes it.
       3. Report the item DONE. observatory-api's own
@@ -333,10 +448,10 @@ async def _run_delete_frame_task(task: dict, items: list[dict]) -> None:
     treated as a failure — the actual goal is the DB-side deletion, which
     doesn't depend on the physical file still being found.
     """
-    for item in items:
+    for item in _until_shutdown(items):
         frame_id = item.get("frame_id")
         if not frame_id:
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"], [{"item_id": item["id"], "status": "FAILED", "error": "Item has no frame_id"}],
             )
             continue
@@ -345,13 +460,13 @@ async def _run_delete_frame_task(task: dict, items: list[dict]) -> None:
             frame = await api_client.get_frame(frame_id)
         except Exception as exc:
             logger.exception("DELETE_FRAME item failed to fetch frame_id=%s", frame_id)
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"], [{"item_id": item["id"], "status": "FAILED", "error": str(exc)}],
             )
             continue
 
         if frame is None:
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"],
                 [{"item_id": item["id"], "status": "FAILED", "error": f"frame_id={frame_id} not found"}],
             )
@@ -364,12 +479,12 @@ async def _run_delete_frame_task(task: dict, items: list[dict]) -> None:
             pipeline.move_archived_file_to_rejected(filename, object_name)
         except Exception as exc:
             logger.exception("DELETE_FRAME item failed to move file for frame_id=%s", frame_id)
-            await api_client.post_task_items_progress(
+            await _report_progress(
                 task["id"], [{"item_id": item["id"], "status": "FAILED", "error": str(exc)}],
             )
             continue
 
-        await api_client.post_task_items_progress(task["id"], [{"item_id": item["id"], "status": "DONE"}])
+        await _report_progress(task["id"], [{"item_id": item["id"], "status": "DONE"}])
 
 
 async def _run_restart_task(task: dict, items: list[dict]) -> None:
@@ -452,6 +567,7 @@ async def _process_one_task(task_summary: dict) -> None:
         task_id, task["type"], len(items),
     )
 
+    _unreported.clear()
     try:
         await handler(task, items)
     except RestartRequested:
@@ -460,6 +576,56 @@ async def _process_one_task(task_summary: dict) -> None:
     except Exception as exc:
         logger.exception("Task_id=%s (%s) failed", task_id, task["type"])
         await api_client.update_task(task_id, "FAILED", error=str(exc))
+        return
+
+    all_reported = await _settle_unreported(task_id)
+    if all_reported:
+        _lost_report_requeues.pop(task_id, None)
+    else:
+        # Bounded like pipeline._queue_recovery_task(): a report the API keeps
+        # refusing (a 4xx is never retried) or a progress endpoint that stays
+        # down would otherwise re-queue the task, have it re-claimed at once
+        # and its items redone, forever.
+        requeues = _lost_report_requeues.get(task_id, 0) + 1
+        if requeues > config.API_RECOVERY_MAX_ATTEMPTS:
+            _lost_report_requeues.pop(task_id, None)
+            logger.error(
+                "Task_id=%s: item reports still undeliverable after %d re-queue(s) — failing the task",
+                task_id, requeues - 1,
+            )
+            await api_client.update_task(
+                task_id, "FAILED", error="Item progress could not be reported to the API",
+            )
+            return
+        _lost_report_requeues[task_id] = requeues
+
+    if _shutdown.is_set() or not all_reported:
+        # Shutdown: the unstarted items go back in the queue. Lost reports:
+        # those items are still PENDING on the API, which would otherwise
+        # leave the task RUNNING forever; re-queued, they are redone.
+        await _release_unfinished_task(task_id)
+
+
+async def _release_unfinished_task(task_id: str) -> None:
+    """
+    Put a task interrupted by shutdown back in the queue — only if it still
+    has PENDING items. One whose items were all reported has already been
+    settled by the API (COMPLETED); flipping that back would re-queue
+    finished work.
+    """
+    detail = await api_client.get_task(task_id)
+    if detail is None:
+        logger.warning("Could not re-check task_id=%s on shutdown — it may stay RUNNING", task_id)
+        return
+
+    remaining = sum(1 for i in detail["items"] if i["status"] == "PENDING")
+    if remaining == 0:
+        return
+
+    if await api_client.update_task(task_id, "PENDING") is None:
+        logger.warning("Could not release task_id=%s on shutdown — it stays RUNNING", task_id)
+        return
+    logger.info("Released task_id=%s back to PENDING with %d unprocessed item(s)", task_id, remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -467,11 +633,34 @@ async def _process_one_task(task_summary: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _idle_wait(seconds: float) -> None:
+    """Sleep between empty polls, but wake the moment a shutdown is requested."""
+    try:
+        await asyncio.wait_for(_shutdown.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def run_forever() -> None:
     """
-    Poll for PENDING tasks forever, one at a time (oldest first), backing
-    off when idle. Runs until cancelled (KeyboardInterrupt in __main__).
+    Poll for PENDING tasks, one at a time (oldest first), backing off when
+    idle, until SIGTERM/SIGINT requests a shutdown (see _request_shutdown()).
     """
+    # A fresh event per run: an asyncio.Event binds to the first loop that
+    # waits on it, and each asyncio.run() (each test, too) is a new loop.
+    global _shutdown
+    _shutdown = asyncio.Event()
+    previous_handlers = _install_signal_handlers(asyncio.get_running_loop())
+    try:
+        await _poll_until_shutdown()
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+
+async def _poll_until_shutdown() -> None:
+    """run_forever()'s body: settings, then the poll loop."""
+
     # Fetch remote configuration from the API before entering the poll loop.
     # If the API is unreachable or returns an error, all local defaults from
     # config.py remain in effect — the worker still starts normally.
@@ -494,7 +683,7 @@ async def run_forever() -> None:
         base_interval, max_interval,
     )
 
-    while True:
+    while not _shutdown.is_set():
         try:
             tasks = await api_client.get_tasks(
                 status="PENDING", limit=1, order="asc", claimable=True,
@@ -512,14 +701,13 @@ async def run_forever() -> None:
                 sys.exit(0)
             continue  # check again immediately — the queue may have more work
 
-        await asyncio.sleep(interval)
+        await _idle_wait(interval)
         interval = min(interval * 2, max_interval)
+
+    logger.info("Worker stopped")
 
 
 if __name__ == "__main__":
     configure_logging("worker")
 
-    try:
-        asyncio.run(run_forever())
-    except KeyboardInterrupt:
-        logger.info("Shutdown requested — stopping worker")
+    asyncio.run(run_forever())

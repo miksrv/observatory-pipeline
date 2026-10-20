@@ -10,6 +10,9 @@ services:
     build: .
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # On SIGTERM the watcher submits its buffered files as one ANALYZE task;
+    # with the API client's retries that can outlast Docker's default 10 s.
+    stop_grace_period: 1m
     volumes:
       # Bind-mount the source tree itself so code edits on the host are picked
       # up by a container restart (`docker compose restart pipeline`) instead
@@ -43,7 +46,8 @@ services:
     restart: unless-stopped
 
   # Polls the observatory-api task queue (ANALYZE / DETECT_ANOMALIES /
-  # GENERATE_CHARTS / RESTART) and dispatches items to the corresponding
+  # GENERATE_CHARTS / PREVIEW_CATALOG_MATCH / DELETE_FRAME / RESTART) and
+  # dispatches items to the corresponding
   # pipeline.py entry point — see worker.py and CLAUDE.md's job-queue section.
   # A separate service (not a thread inside `pipeline`) so it can be scaled,
   # restarted, or stopped independently of the filesystem watcher. RESTART
@@ -54,6 +58,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: ["python", "worker.py"]
+    # On SIGTERM the worker finishes the item in progress before exiting (an
+    # ANALYZE item takes a minute or more), then puts any unstarted items back
+    # on the queue. Docker's default 10 s would SIGKILL it mid-item and leave
+    # the task stuck RUNNING.
+    stop_grace_period: 5m
     volumes:
       - .:/app
       - ${HOST_DATA_DIR:-~/Developer/data}/fits/incoming:/fits/incoming

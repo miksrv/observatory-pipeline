@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from ._shared import _content_type_for_image_bytes, _make_client, _retry, _RETRYABLE
+from ._shared import _content_type_for_image_bytes, _make_client, _retry
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ async def _create_task_with_retry(
             logger.error(
                 "API rejected POST /tasks (type=%s) with HTTP %d: %s",
                 task_type, response.status_code, response.text,
-                extra={"frame_id": None, "log_filename": None},
+                extra={"frame_id": None, "fits_filename": None},
             )
             return None
 
@@ -70,10 +70,11 @@ async def create_task(
     ----------
     task_type:
         "ANALYZE", "DETECT_ANOMALIES", "GENERATE_CHARTS",
-        "PREVIEW_CATALOG_MATCH", or "RESTART".
+        "PREVIEW_CATALOG_MATCH", "DELETE_FRAME", or "RESTART".
     items:
         List of item dicts, each with exactly one of "filename" (ANALYZE),
-        "frame_id" (DETECT_ANOMALIES), or "source_id" (GENERATE_CHARTS) —
+        "frame_id" (DETECT_ANOMALIES, DELETE_FRAME), or "source_id"
+        (GENERATE_CHARTS) —
         plus an optional "payload" (arbitrary JSON-encodable value, e.g. a
         GENERATE_CHARTS item's {"anomaly_type": ..., "designation": ...}).
         May be None or empty for signal tasks (RESTART).
@@ -99,15 +100,15 @@ async def create_task(
     logger.info(
         "POST /tasks type=%s items=%d",
         task_type, len(items),
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _create_task_with_retry(task_type, items, scope, parent_task_id)
-    except _RETRYABLE as exc:
+    except Exception as exc:  # see update_task()
         logger.error(
             "All retries exhausted creating task type=%s: %s",
             task_type, exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
     return None
 
@@ -182,7 +183,7 @@ async def get_tasks(
     logger.debug(
         "GET /tasks status=%s type=%s object=%s order=%s",
         status, task_type, object_name, order,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_tasks_with_retry(status, task_type, object_name, limit, order, claimable)
@@ -190,7 +191,7 @@ async def get_tasks(
         logger.error(
             "Error querying /tasks: %s",
             exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return []
 
@@ -226,7 +227,7 @@ async def get_task(task_id: str) -> dict | None:
     logger.debug(
         "GET /tasks/%s",
         task_id,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _get_task_with_retry(task_id)
@@ -234,7 +235,7 @@ async def get_task(task_id: str) -> dict | None:
         logger.error(
             "Error querying /tasks/%s: %s",
             task_id, exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
         return None
 
@@ -253,7 +254,7 @@ async def _update_task_with_retry(task_id: str, status: str, error: str | None) 
             logger.error(
                 "API rejected PATCH /tasks/%s with HTTP %d: %s",
                 task_id, response.status_code, response.text,
-                extra={"frame_id": None, "log_filename": None},
+                extra={"frame_id": None, "fits_filename": None},
             )
             return None
 
@@ -281,15 +282,18 @@ async def update_task(task_id: str, status: str, error: str | None = None) -> di
     logger.info(
         "PATCH /tasks/%s status=%s",
         task_id, status,
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
+    # Any exception, not only the retryable ones: a 2xx with a non-JSON body
+    # (a hosting error page) raises ValueError, and an exception escaping here
+    # would crash the worker with the claimed task stuck at RUNNING.
     try:
         return await _update_task_with_retry(task_id, status, error)
-    except _RETRYABLE as exc:
+    except Exception as exc:
         logger.error(
             "All retries exhausted updating task_id=%s to status=%s: %s",
             task_id, status, exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
     return None
 
@@ -304,7 +308,7 @@ async def _post_task_items_progress_with_retry(task_id: str, items: list[dict]) 
             logger.error(
                 "API rejected POST /tasks/%s/items/progress with HTTP %d: %s",
                 task_id, response.status_code, response.text,
-                extra={"frame_id": None, "log_filename": None},
+                extra={"frame_id": None, "fits_filename": None},
             )
             return None
 
@@ -343,15 +347,15 @@ async def post_task_items_progress(task_id: str, items: list[dict]) -> dict | No
     logger.debug(
         "POST /tasks/%s/items/progress items=%d",
         task_id, len(items),
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _post_task_items_progress_with_retry(task_id, items)
-    except _RETRYABLE as exc:
+    except Exception as exc:  # see update_task()
         logger.error(
             "All retries exhausted reporting item progress for task_id=%s: %s",
             task_id, exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
     return None
 
@@ -392,7 +396,7 @@ async def _upload_task_item_chart_with_retry(
             logger.error(
                 "API rejected POST %s with HTTP %d: %s",
                 url, response.status_code, response.text,
-                extra={"frame_id": None, "log_filename": None},
+                extra={"frame_id": None, "fits_filename": None},
             )
             return False
 
@@ -435,14 +439,14 @@ async def upload_task_item_chart(
     logger.info(
         "Uploading %s chart for task_id=%s item_id=%s (%d bytes)",
         style, task_id, item_id, len(png_bytes),
-        extra={"frame_id": None, "log_filename": None},
+        extra={"frame_id": None, "fits_filename": None},
     )
     try:
         return await _upload_task_item_chart_with_retry(task_id, item_id, png_bytes, style, frame_count)
-    except _RETRYABLE as exc:
+    except Exception as exc:  # see update_task()
         logger.error(
             "All retries exhausted uploading chart for task_id=%s item_id=%s: %s",
             task_id, item_id, exc,
-            extra={"frame_id": None, "log_filename": None},
+            extra={"frame_id": None, "fits_filename": None},
         )
     return False

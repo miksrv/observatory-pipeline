@@ -7,6 +7,7 @@ mocked. No real FITS I/O or network calls occur.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -602,7 +603,7 @@ class TestRunForever:
         monkeypatch.setattr(worker.api_client, "get_tasks", get_tasks_mock)
         monkeypatch.setattr(worker, "_process_one_task", AsyncMock(side_effect=RuntimeError("stop test")))
         sleep_mock = AsyncMock()
-        monkeypatch.setattr(worker.asyncio, "sleep", sleep_mock)
+        monkeypatch.setattr(worker, "_idle_wait", sleep_mock)
 
         with pytest.raises(RuntimeError, match="stop test"):
             await worker.run_forever()
@@ -613,3 +614,185 @@ class TestRunForever:
         get_tasks_mock.assert_any_call(
             status="PENDING", limit=1, order="asc", claimable=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown (SIGTERM / SIGINT)
+# ---------------------------------------------------------------------------
+
+
+class TestGracefulShutdown:
+    @pytest.fixture(autouse=True)
+    def fresh_shutdown_event(self, monkeypatch):
+        monkeypatch.setattr(worker, "_shutdown", asyncio.Event())
+
+    async def test_the_item_in_progress_finishes_and_no_further_item_starts(self, monkeypatch):
+        processed: list[str] = []
+
+        async def _analyze(item):
+            processed.append(item["id"])
+            worker._request_shutdown("SIGTERM")  # arrives while this item runs
+            return {"item_id": item["id"], "status": "DONE"}
+
+        monkeypatch.setattr(worker, "_handle_analyze_item", _analyze)
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock())
+        items = [{"id": f"item-{n}", "filename": f"/{n}.fits"} for n in range(3)]
+
+        await worker._run_analyze_task({"id": "t1"}, items)
+
+        assert processed == ["item-0"]
+        # The finished item is still reported — only unstarted ones are left.
+        worker.api_client.post_task_items_progress.assert_called_once_with(
+            "t1", [{"item_id": "item-0", "status": "DONE"}],
+        )
+
+    async def test_an_interrupted_task_goes_back_to_pending(self, monkeypatch):
+        detail = {
+            "task": {"id": "t1", "type": "ANALYZE"},
+            "items": [
+                {"id": "item-1", "status": "PENDING", "filename": "/1.fits"},
+                {"id": "item-2", "status": "PENDING", "filename": "/2.fits"},
+            ],
+        }
+        after = {**detail, "items": [{**detail["items"][0], "status": "DONE"}, detail["items"][1]]}
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(side_effect=[detail, after]))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
+
+        async def _handler(task, items):
+            worker._shutdown.set()
+
+        monkeypatch.setattr(worker, "_HANDLERS", {**worker._HANDLERS, "ANALYZE": _handler})
+
+        await worker._process_one_task({"id": "t1"})
+
+        assert [c.args for c in worker.api_client.update_task.call_args_list] == [
+            ("t1", "RUNNING"), ("t1", "PENDING"),
+        ]
+
+    async def test_a_task_whose_items_were_all_reported_is_not_requeued(self, monkeypatch):
+        detail = {
+            "task": {"id": "t1", "type": "ANALYZE"},
+            "items": [{"id": "item-1", "status": "PENDING", "filename": "/1.fits"}],
+        }
+        after = {**detail, "items": [{**detail["items"][0], "status": "DONE"}]}
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(side_effect=[detail, after]))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
+
+        async def _handler(task, items):
+            worker._shutdown.set()
+
+        monkeypatch.setattr(worker, "_HANDLERS", {**worker._HANDLERS, "ANALYZE": _handler})
+
+        await worker._process_one_task({"id": "t1"})
+
+        worker.api_client.update_task.assert_called_once_with("t1", "RUNNING")
+
+    async def test_an_idle_worker_stops_without_waiting_out_its_interval(self, monkeypatch):
+        monkeypatch.setattr(worker.config, "TASK_POLL_INTERVAL_SEC", 3600.0)
+        monkeypatch.setattr(worker.api_client, "get_settings", AsyncMock(return_value={}))
+
+        async def _poll(**kwargs):
+            asyncio.get_running_loop().call_soon(worker._request_shutdown, "SIGTERM")
+            return []
+
+        monkeypatch.setattr(worker.api_client, "get_tasks", AsyncMock(side_effect=_poll))
+
+        await asyncio.wait_for(worker.run_forever(), timeout=5)
+
+        assert worker.api_client.get_tasks.call_count == 1
+
+    def test_a_second_signal_exits_at_once(self, monkeypatch):
+        exits: list[int] = []
+        monkeypatch.setattr(worker.os, "_exit", exits.append)
+
+        worker._request_shutdown("SIGTERM")
+        assert exits == []
+        worker._request_shutdown("SIGTERM")
+        assert exits == [1]
+
+
+class TestLostProgressReports:
+    """
+    An item whose outcome never reached the API stays PENDING there, so the
+    API never settles the task — it would sit at RUNNING forever.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_state(self, monkeypatch):
+        monkeypatch.setattr(worker, "_shutdown", asyncio.Event())
+        worker._unreported.clear()
+        worker._lost_report_requeues.clear()
+
+    def _detail(self):
+        detail = {
+            "task": {"id": "t1", "type": "ANALYZE"},
+            "items": [{"id": "item-1", "status": "PENDING", "filename": "/1.fits"}],
+        }
+        return detail
+
+    async def test_a_late_report_is_delivered_and_the_task_left_alone(self, monkeypatch):
+        detail = self._detail()
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(return_value=detail))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
+        monkeypatch.setattr(worker, "_handle_analyze_item",
+                            AsyncMock(return_value={"item_id": "item-1", "status": "DONE"}))
+        progress = AsyncMock(side_effect=[None, {"results": []}])
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", progress)
+
+        await worker._process_one_task({"id": "t1"})
+
+        assert progress.call_count == 2
+        assert progress.call_args.args == ("t1", [{"item_id": "item-1", "status": "DONE"}])
+        worker.api_client.update_task.assert_called_once_with("t1", "RUNNING")
+
+    async def test_an_undeliverable_report_puts_the_task_back_in_the_queue(self, monkeypatch):
+        detail = self._detail()
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(return_value=detail))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
+        monkeypatch.setattr(worker, "_handle_analyze_item",
+                            AsyncMock(return_value={"item_id": "item-1", "status": "DONE"}))
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock(return_value=None))
+
+        await worker._process_one_task({"id": "t1"})
+
+        assert [c.args for c in worker.api_client.update_task.call_args_list] == [
+            ("t1", "RUNNING"), ("t1", "PENDING"),
+        ]
+
+    async def test_a_task_whose_reports_never_get_through_is_failed_not_requeued_forever(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(worker.config, "API_RECOVERY_MAX_ATTEMPTS", 2)
+        monkeypatch.setattr(worker.api_client, "get_task", AsyncMock(return_value=self._detail()))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "t1"}))
+        monkeypatch.setattr(worker, "_handle_analyze_item",
+                            AsyncMock(return_value={"item_id": "item-1", "status": "DONE"}))
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", AsyncMock(return_value=None))
+
+        for _ in range(3):
+            await worker._process_one_task({"id": "t1"})
+
+        statuses = [c.args[1] for c in worker.api_client.update_task.call_args_list]
+        assert statuses == ["RUNNING", "PENDING", "RUNNING", "PENDING", "RUNNING", "FAILED"]
+
+
+class TestSignalHandlers:
+    async def test_a_second_signal_exits_without_waiting_for_the_loop(self, monkeypatch):
+        import signal as _signal
+
+        monkeypatch.setattr(worker, "_shutdown", asyncio.Event())
+        exits: list[int] = []
+        monkeypatch.setattr(worker.os, "_exit", exits.append)
+        loop = asyncio.get_running_loop()
+        previous = worker._install_signal_handlers(loop)
+        try:
+            handler = _signal.getsignal(_signal.SIGTERM)
+            handler(_signal.SIGTERM, None)   # first: handed to the loop, nothing else
+            assert exits == [] and not worker._shutdown.is_set()
+            handler(_signal.SIGTERM, None)   # second, before the loop ran: exits
+            assert exits == [1]
+            await asyncio.sleep(0)
+            assert worker._shutdown.is_set()
+        finally:
+            for sig, h in previous.items():
+                _signal.signal(sig, h)

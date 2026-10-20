@@ -51,8 +51,8 @@ ASTAP_FOV_HINT: float = float(_get("ASTAP_FOV_HINT", "0"))
 # cleanly but finds no match, retry once with a wide/effectively-blind search
 # radius before giving up. Worth having on by default: the header's own
 # RA/Dec estimate (e.g. mount pointing) can be off by several degrees while
-# the frame itself is perfectly solvable — see docs/ISSUES.md and the
-# 2026-08-12 IC3322A incident (mount pointing off by ~10° in Dec).
+# the frame itself is perfectly solvable — see the 2026-08-12 IC3322A
+# incident (mount pointing off by ~10° in Dec).
 ASTAP_RETRY_WIDE_SEARCH: bool = _get("ASTAP_RETRY_WIDE_SEARCH", "true").strip().lower() in ("true", "1", "yes")
 # Search radius (degrees) for that retry. 30° comfortably covers the ~10°
 # mount-pointing offset seen in the incident above with margin to spare,
@@ -94,7 +94,7 @@ QC_STARS_MIN: int = int(_get("QC_STARS_MIN", "10"))
 # Maximum acceptable median sky background (ADU). Frames exceeding this are
 # rejected as HIGH_BACKGROUND — twilight, moonlight, cloud, or stray light
 # raise the background without necessarily blurring FWHM or trailing stars,
-# so BLUR/TRAIL/LOW_STARS alone can miss it (see docs/ISSUES.md). Default is
+# so BLUR/TRAIL/LOW_STARS alone can miss it. Default is
 # a generic, generous ballpark relative to SATURATION_ADU — tune to your own
 # site's typical dark-sky background (log the actual qc_sky_background
 # values your setup reports on good frames, then set this a comfortable
@@ -663,8 +663,7 @@ FORCED_PHOTOMETRY_BLEND_FWHM: float = float(_get("FORCED_PHOTOMETRY_BLEND_FWHM",
 # and — just as importantly — catalog stars the blind extractor's own star
 # filter (elongation/FWHM/SNR bounds) or WCS residual happened to miss even
 # though they are bright enough to detect. See modules/forced_photometry.py's
-# own docstring for the full rationale ("forced photometry" / "precovery";
-# originally proposed as ROADMAP.md #1 — see git log for that history).
+# own docstring for the full rationale ("forced photometry" / "precovery").
 #
 # Set false to disable this pass entirely (it adds one aperture-photometry
 # measurement per eligible catalog star/MPC object, on top of the already-

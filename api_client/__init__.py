@@ -26,15 +26,15 @@ Full list:
   get_sources_near(ra, dec, radius_arcsec, before_time)     → list
   get_frames_covering(ra, dec, before_time)                 → list
   get_nearest_frame_before(object_name, before_time)        → dict | None
-  get_sources_near_batch(positions, radius_arcsec, before_time)  → dict
-  get_frames_covering_batch(positions, before_time)         → dict
+  get_sources_near_batch(positions, radius_arcsec, before_time)  → dict | None
+  get_frames_covering_batch(positions, before_time)         → dict | None
   get_source_track(source_id)                               → list
   get_source_tracks_batch(source_ids)                       → dict
   upload_source_chart(source_id, png_bytes, style, frame_count)  → bool
 
   get_frames(object_name, date_from, date_to, limit, offset) → list
   get_frame(frame_id)                                        → dict | None
-  get_frame_sources(frame_id)                                → list
+  get_frame_sources(frame_id)                                → list | None
 
   create_task(task_type, items, scope, parent_task_id)       → dict | None
   get_tasks(status, task_type, object_name, limit, order, claimable) → list
