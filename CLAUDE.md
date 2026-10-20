@@ -234,7 +234,9 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   `PENDING` (its unreported items are redone) instead of sitting at `RUNNING` forever.
 - **Known limitation:** no lease/heartbeat. A worker that dies mid-task without that chance (OOM
   kill, SIGKILL after the grace period) leaves it `RUNNING` forever — reset by hand with
-  `PATCH /tasks/{id} {"status": "PENDING"}`.
+  `PATCH /tasks/{id} {"status": "PENDING"}`. The item it was on stays `RUNNING` (the worker's
+  live-progress hint, `_mark_running()`); the worker treats `RUNNING` items like `PENDING` ones
+  (`_UNFINISHED_ITEM_STATUSES`), so the next claim redoes it.
 
 ---
 

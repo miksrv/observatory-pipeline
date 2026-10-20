@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0
+
+### Minor Changes
+
+- Tasks: pipeline reports an intermediate RUNNING status for a task item right before processing starts, so the operator UI can show which file is currently being worked on instead of only queued/done; an item left RUNNING is redone like a PENDING one (requires observatory-api 1.2.0)
+
 ## 1.2.0
 
 ### Minor Changes
