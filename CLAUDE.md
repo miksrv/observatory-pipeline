@@ -589,7 +589,8 @@ touches its input (CFA frames are converted in a throwaway copy).
 ### `api_client/`
 Package split by resource (`frames.py`, `sources.py`, `anomalies.py`, `tasks.py`, `settings.py`,
 shared `_shared.py`), all re-exported from `__init__.py`. `httpx` async + `tenacity` retries.
-Sends `X-API-Key`, JSON headers. Older single-position endpoints (`/sources/near`,
+Sends `X-API-Key`, JSON headers and `X-Pipeline-Version` (`version.py`, the top `CHANGELOG.md`
+heading; the API shows it on its dashboard). Older single-position endpoints (`/sources/near`,
 `/frames/covering`, `/sources/{id}/track`) are still exported but unused.
 
 `_to_wire_source()`: renames `_from_subtraction` → `from_subtraction` (only when truthy), strips

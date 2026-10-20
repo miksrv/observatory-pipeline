@@ -1,12 +1,16 @@
 # Changelog
 
-## 1.3.1
+## 1.4.0
+
+### Minor Changes
+
+- API: every request carries the pipeline's version (`X-Pipeline-Version`, from the top `CHANGELOG.md` heading), shown beside the pipeline's name on the API dashboard; the worker and watcher log it at startup (shown by observatory-api 1.3.0; older APIs ignore it)
 
 ### Patch Changes
 
 - Analysis: cross-catalog duplicate removal takes milliseconds instead of 3–8 minutes per frame (same result)
 - Subtraction: reference frames whose plate scale differs from the new frame's by more than `SUBTRACTION_REF_MAX_SCALE_DIFF` (default 5%) are no longer stacked — INDI writes the mount's name into `TELESCOP`, so two telescopes on one mount with the same camera used to be mixed
-- Anomalies: a source is "near a galaxy" only for Simbad's galaxy object types (exact list) — red giants (`RG*`), globular clusters, nebulae and other types merely containing the letter G no longer raise `SUPERNOVA_CANDIDATE`; Seyfert, LINER, radio and low-surface-brightness galaxies now do
+- Anomalies: a source is "near a galaxy" only for Simbad's galaxy object types (exact list) — red giants (`RG*`), globular clusters, nebulae and other types merely containing the letter G no longer raise `SUPERNOVA_CANDIDATE`; Seyfert, LINER, radio and low-surface-brightness galaxies now do; a fading `LSB`/`SBG` galaxy is no longer reported as `BINARY_STAR`
 
 ## 1.3.0
 

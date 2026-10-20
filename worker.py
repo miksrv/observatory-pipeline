@@ -82,6 +82,7 @@ import config
 from logging_setup import configure_logging
 import pipeline
 import api_client
+import version
 
 logger = logging.getLogger(__name__)
 
@@ -722,8 +723,8 @@ async def _poll_until_shutdown() -> None:
     interval = base_interval
 
     logger.info(
-        "Worker started — polling every %.0fs when idle (backs off up to %.0fs)",
-        base_interval, max_interval,
+        "Worker %s started — polling every %.0fs when idle (backs off up to %.0fs)",
+        version.VERSION or "(unknown version)", base_interval, max_interval,
     )
 
     while not _shutdown.is_set():

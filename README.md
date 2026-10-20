@@ -128,6 +128,7 @@ observatory-pipeline/
 ├── requirements.txt
 ├── config.py                  ← loads all settings from .env (+ remote settings)
 ├── logging_setup.py           ← stderr + rotated per-service log files
+├── version.py                 ← release from CHANGELOG.md, sent as X-Pipeline-Version
 ├── watcher.py                 ← monitors FITS_INCOMING, submits ANALYZE tasks
 ├── worker.py                  ← polls the API task queue, dispatches to pipeline.py
 ├── pipeline.py                ← the processing stages for one frame

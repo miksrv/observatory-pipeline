@@ -26,6 +26,7 @@ Every request must include the following headers:
 | `X-API-Key` | `<your-api-key>` | Pipeline authentication key |
 | `Content-Type` | `application/json` | Required for all POST requests |
 | `Accept` | `application/json` | Expected response format |
+| `X-Pipeline-Version` | `<X.Y.Z>` | Optional: this release (top heading of `CHANGELOG.md`, `version.py`); stored with the heartbeat and shown on the API dashboard (observatory-api 1.3.0+, ignored by older APIs) |
 
 The API key is configured via the `API_KEY` environment variable in `.env`. Every server has its
 own key (issued with `php spark pipeline:create <name>` on the API host); the key also tells the API
