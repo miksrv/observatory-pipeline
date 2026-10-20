@@ -126,6 +126,14 @@ class TestLocalFitsPath:
 
         assert result == str(tmp_path / "Vesta_A807_FA" / "frame1.fits")
 
+    def test_finds_the_frame_in_its_filter_directory(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
+        archived = tmp_path / "M51" / "Ha" / "frame1.fits"
+        archived.parent.mkdir(parents=True)
+        archived.write_bytes(b"x")
+
+        assert finder_chart._local_fits_path({"object": "M51", "filename": "frame1.fits"}) == str(archived)
+
     def test_missing_object_falls_back_to_unknown(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path))
         epoch = {"object": None, "filename": "frame1.fits"}

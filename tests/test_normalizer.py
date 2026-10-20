@@ -229,8 +229,11 @@ class TestGenerateNormalizedFilename:
             filter_name="L",  # Should be ignored for dark frames
             exptime=300.0,
             obs_time="2024-03-15T22:01:34",
+            camera="ZWO ASI1600MM Pro",
         )
-        assert filename == "M51_Dark_300_2024-03-15T22-01-34.fits"
+        # Calibration is named after the camera, not the object; the camera's
+        # spaces become hyphens so it stays one positional token.
+        assert filename == "ZWO-ASI1600MM-Pro_Dark_300_2024-03-15T22-01-34.fits"
 
     def test_bias_frame_no_filter(self):
         """Test that bias frames exclude filter from filename."""
@@ -477,14 +480,53 @@ class TestFlatFilenamesCarryTheFilter:
 
     @pytest.mark.parametrize("frame_type", ["Dark", "Bias"])
     def test_filter_independent_frames_keep_the_shorter_name(self, frame_type):
-        name = normalizer.generate_normalized_filename("M42", frame_type, "Ha", 300.0, "2024-03-15T18:02:10")
+        name = normalizer.generate_normalized_filename(
+            "M42", frame_type, "Ha", 300.0, "2024-03-15T18:02:10", camera="ASI1600MM",
+        )
 
-        assert name == f"M42_{frame_type}_300_2024-03-15T18-02-10.fits"
+        assert name == f"ASI1600MM_{frame_type}_300_2024-03-15T18-02-10.fits"
 
     def test_light_frames_are_unchanged(self):
         name = normalizer.generate_normalized_filename("M42", "Light", "L", 120.0, "2024-03-15T18:02:10")
 
         assert name == "M42_Light_L_120_2024-03-15T18-02-10.fits"
+
+    def test_flat_is_named_after_the_camera(self):
+        name = normalizer.generate_normalized_filename(
+            "M42", "Flat", "Ha", 3.0, "2024-03-15T18:02:10", camera="ASI1600MM",
+        )
+
+        assert name == "ASI1600MM_Flat_Ha_3_2024-03-15T18-02-10.fits"
+
+    def test_calibration_without_a_camera_is_unknown(self):
+        name = normalizer.generate_normalized_filename("M42", "Dark", None, 300.0, "2024-03-15T18:02:10")
+
+        assert name == "_UNKNOWN_Dark_300_2024-03-15T18-02-10.fits"
+
+    @pytest.mark.parametrize("frame_type", ["Light", "Flat"])
+    def test_missing_filter_is_written_as_none(self, frame_type):
+        name = normalizer.generate_normalized_filename(
+            "M42", frame_type, None, 3.0, "2024-03-15T18:02:10", camera="ASI1600MM",
+        )
+
+        assert f"_{frame_type}_NONE_3_" in name
+
+    def test_new_names_still_parse(self):
+        from modules.subtraction import _parse_normalized_filename
+
+        light = normalizer.generate_normalized_filename("M42", "Light", None, 120.0, "2024-03-15T18:02:10")
+        dark = normalizer.generate_normalized_filename(
+            "M42", "Dark", None, 300.0, "2024-03-15T18:02:10", camera="QHY 268M",
+        )
+
+        assert _parse_normalized_filename(light) == ("Light", "NONE")
+        assert _parse_normalized_filename(dark) == ("Dark", None)
+
+    def test_legacy_filterless_light_still_parses(self):
+        from modules.subtraction import _parse_normalized_filename
+
+        assert _parse_normalized_filename("M42_Light_120_2024-03-15T18-02-10.fits") == ("Light", None)
+        assert _parse_normalized_filename("M42_Dark_300_2024-03-15T18-02-10.fits") == ("Dark", None)
 
     def test_subtractions_parser_reads_the_new_flat_name(self):
         """

@@ -490,7 +490,7 @@ class TestNonFiniteHandling:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["a.fits", "b.fits", "c.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["a.fits", "b.fits", "c.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(
@@ -693,7 +693,7 @@ class TestDetectDiffSources:
 
 
 # ---------------------------------------------------------------------------
-# Streak masking on the difference image (docs/ISSUES.md-style real incident,
+# Streak masking on the difference image (real incident,
 # 2026-08-07, T_CrB test frames: a satellite trail present in the new frame
 # but absent from the reference stack fragmented into 42 separate
 # elongation>3 candidates on the diff image — each individually
@@ -1604,7 +1604,7 @@ class TestReferenceNormalizationInRun:
         for ref_path in ref_paths:
             data_by_path[ref_path] = frame(ref_exptime)
 
-        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None: ref_paths)
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None, **kw: ref_paths)
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (s, None))
 
@@ -1670,7 +1670,7 @@ class TestReferenceNormalizationInRun:
         for ref_path in ref_paths:
             data_by_path[ref_path] = ref_data
 
-        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None: ref_paths)
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None, **kw: ref_paths)
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: data_by_path[p].copy())
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (s, None))
         monkeypatch.setattr(subtraction, "_pixel_scale_arcsec", lambda path, wcs=None: 1.0)
@@ -1697,7 +1697,7 @@ class TestReferenceNormalizationInRun:
 class TestRun:
 
     async def test_skips_when_too_few_archive_frames(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None: ["a.fits", "b.fits"])
+        monkeypatch.setattr(subtraction, "_find_archive_frames", lambda d, f, pa=None, fwhm=None, **kw: ["a.fits", "b.fits"])
 
         result = await subtraction.run(str(tmp_path / "new.fits"), str(tmp_path), None)
 
@@ -1706,7 +1706,7 @@ class TestRun:
     async def test_skips_when_new_frame_unloadable(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["a.fits", "b.fits", "c.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["a.fits", "b.fits", "c.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: None)
 
@@ -1740,7 +1740,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", fake_load)
         monkeypatch.setattr(subtraction, "_align_frame", fake_align)
@@ -1755,7 +1755,7 @@ class TestRun:
     async def test_skips_when_alignment_fails_for_all_frames(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones((10, 10), dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: None)
@@ -1770,7 +1770,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.ones(shape, dtype=np.float32), None))
@@ -1809,7 +1809,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(
             subtraction, "_load_frame_data",
@@ -1839,7 +1839,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.full(shape, 100.0, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.full(shape, 100.0, dtype=np.float32), None))
@@ -1870,7 +1870,7 @@ class TestRun:
         shape = (10, 10)
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: ["ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: ["ref1.fits", "ref2.fits", "ref3.fits"],
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: np.ones(shape, dtype=np.float32))
         monkeypatch.setattr(subtraction, "_align_frame", lambda s, t: (np.ones(shape, dtype=np.float32), None))
@@ -1912,7 +1912,7 @@ class TestRun:
         new_path = str(tmp_path / "new.fits")
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: [new_path, "ref1.fits", "ref2.fits", "ref3.fits"],
+            lambda d, f, pa=None, fwhm=None, **kw: [new_path, "ref1.fits", "ref2.fits", "ref3.fits"],
         )
 
         loaded_paths: list[str] = []
@@ -1970,7 +1970,7 @@ class TestRun:
 
         monkeypatch.setattr(
             subtraction, "_find_archive_frames",
-            lambda d, f, pa=None, fwhm=None: list(wcs_by_path.keys()),
+            lambda d, f, pa=None, fwhm=None, **kw: list(wcs_by_path.keys()),
         )
         monkeypatch.setattr(subtraction, "_load_frame_data", lambda p: raw_ref_data.copy())
         monkeypatch.setattr(subtraction, "_open_wcs", lambda p: wcs_by_path.get(p))
@@ -2007,3 +2007,94 @@ class TestRun:
         # The 180-degree-flipped reference reaches _align_frame() already
         # pre-rotated - i.e. NOT the raw, still-flipped data.
         assert not np.array_equal(align_calls[1], raw_ref_data)
+
+
+# ---------------------------------------------------------------------------
+# Archive layout: per-filter directories and the same-instrument screen
+# ---------------------------------------------------------------------------
+
+def _write_instrument_frame(path, telescope=None, camera=None):
+    """A tiny FITS file carrying TELESCOP/INSTRUME."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdu = fits.PrimaryHDU(np.ones((8, 8), dtype=np.float32))
+    if telescope is not None:
+        hdu.header["TELESCOP"] = telescope
+    if camera is not None:
+        hdu.header["INSTRUME"] = camera
+    hdu.writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestArchiveLayoutReferences:
+
+    def test_the_filter_directory_decides_the_filter(self, tmp_path):
+        for i in range(3):
+            _write_instrument_frame(tmp_path / "Ha" / f"M51_Light_Ha_60_2024-03-1{i}T00-00-00.fits")
+        _write_instrument_frame(tmp_path / "R" / "M51_Light_R_60_2024-03-19T00-00-00.fits")
+
+        found = subtraction._find_archive_frames(str(tmp_path), "Ha")
+
+        assert len(found) == 3
+        assert all(os.path.basename(os.path.dirname(f)) == "Ha" for f in found)
+
+    def test_too_few_in_the_filter_directory_falls_back_to_every_filter(self, tmp_path):
+        _write_instrument_frame(tmp_path / "Ha" / "M51_Light_Ha_60_2024-03-10T00-00-00.fits")
+        for i in range(3):
+            _write_instrument_frame(tmp_path / "R" / f"M51_Light_R_60_2024-03-1{i + 1}T00-00-00.fits")
+
+        found = subtraction._find_archive_frames(str(tmp_path), "Ha")
+
+        assert len(found) == 4
+
+    def test_legacy_flat_files_are_still_found(self, tmp_path):
+        _write_instrument_frame(tmp_path / "M51_Light_L_60_2024-03-10T00-00-00.fits")
+        for i in range(2):
+            _write_instrument_frame(tmp_path / "L" / f"M51_Light_L_60_2024-03-1{i + 1}T00-00-00.fits")
+
+        found = subtraction._find_archive_frames(str(tmp_path), "L")
+
+        assert len(found) == 3
+
+    def test_the_new_frame_is_excluded_before_the_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(subtraction, "_MAX_FRAMES", 3)
+        paths = [
+            _write_instrument_frame(tmp_path / "L" / f"M51_Light_L_60_2024-03-1{i}T00-00-00.fits")
+            for i in range(4)
+        ]
+        os.utime(paths[0], (2e9, 2e9))  # the newest — would take a slot first
+
+        found = subtraction._find_archive_frames(str(tmp_path), "L", exclude_path=paths[0])
+
+        assert paths[0] not in found
+        assert len(found) == 3
+
+    def test_another_instrument_is_never_stacked(self, tmp_path):
+        same = [
+            _write_instrument_frame(tmp_path / f"s{i}.fits", "RC8", "ASI1600MM") for i in range(3)
+        ]
+        other = _write_instrument_frame(tmp_path / "o.fits", "Newton 200", "ASI1600MM")
+
+        kept = subtraction._screen_by_quality(same + [other], None, ("RC8", "ASI1600MM"))
+
+        assert set(kept) == set(same)
+
+    def test_the_instrument_screen_has_no_fallback(self, tmp_path):
+        """Unlike the seeing screen: another optics' frame makes a wrong diff, not a worse one."""
+        others = [
+            _write_instrument_frame(tmp_path / f"o{i}.fits", "Newton 200", "QHY268M") for i in range(4)
+        ]
+
+        assert subtraction._screen_by_quality(others, None, ("RC8", "ASI1600MM")) == []
+
+    def test_a_candidate_without_the_keywords_is_kept(self, tmp_path):
+        bare = _write_instrument_frame(tmp_path / "bare.fits")
+        camera_only = _write_instrument_frame(tmp_path / "cam.fits", camera="asi1600mm ")
+
+        kept = subtraction._screen_by_quality([bare, camera_only], None, ("RC8", "ASI1600MM"))
+
+        assert kept == [bare, camera_only]
+
+    def test_a_new_frame_without_the_keywords_screens_nothing(self, tmp_path):
+        paths = [_write_instrument_frame(tmp_path / f"o{i}.fits", "Newton 200", "QHY268M") for i in range(3)]
+
+        assert subtraction._screen_by_quality(paths, None, (None, None)) == paths

@@ -43,7 +43,7 @@ import logging
 import math
 import os
 import re
-from typing import Optional
+from typing import Any, Optional
 
 import astropy.units as u
 import numpy as np
@@ -53,6 +53,7 @@ from astropy.wcs import WCS
 import sep
 
 import config
+from modules import archive_layout
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,9 @@ def _parse_normalized_filename(basename: str) -> tuple[Optional[str], Optional[s
     (NORMALIZE_ENABLED=false, or a file placed in the archive by hand).
 
     ``filter_name`` is None for a calibration frame, and also for a Light
-    frame written without a filter field.
+    frame written without a filter field — a legacy name only: the normalizer
+    now writes ``NONE`` for a missing filter, so the filter-less branch below
+    reads nothing it produces any more.
     """
     tokens = os.path.splitext(basename)[0].split("_")
 
@@ -178,23 +181,38 @@ def _find_archive_frames(
     filter_name: Optional[str],
     new_position_angle_deg: Optional[float] = None,
     psf_fwhm_arcsec: Optional[float] = None,
+    *,
+    instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
+    exclude_path: Optional[str] = None,
 ) -> list[str]:
     """
     Return up to _MAX_FRAMES FITS paths from archive_dir, sorted newest-first.
 
-    Calibration frames (Dark/Flat/Bias, which pipeline.py archives into this
-    same per-object directory) are never eligible — see
+    archive_dir is the object's directory (modules/archive_layout.py): its
+    per-filter subdirectories are searched, and so are files lying directly
+    in it — the legacy flat layout of an archive not yet migrated.
+
+    Calibration frames (Dark/Flat/Bias, which pipeline.py used to archive into
+    this same per-object directory) are never eligible — see
     _parse_normalized_filename().
 
     When filter_name is provided and at least SUBTRACTION_MIN_FRAMES of the
-    remaining science frames carry that filter in their filename's own filter
-    FIELD, only those same-filter frames are returned.  Otherwise all science
+    remaining science frames carry that filter — by their filter directory,
+    or for a file in the flat legacy layout by its filename's own filter
+    FIELD — only those same-filter frames are returned.  Otherwise all science
     frames are returned, allowing cross-filter subtraction as a fallback.
 
     Parameters
     ----------
     archive_dir:
         Absolute path to the per-object archive directory.
+    instrument:
+        The new frame's own ``(TELESCOP, INSTRUME)`` — see
+        _screen_by_quality(). None skips the instrument screen.
+    exclude_path:
+        The new frame's own path. Re-analysing an archived frame passes a
+        file that sits in archive_dir itself; it is dropped here, before the
+        _MAX_FRAMES cap, so it never costs the stack a reference slot.
     filter_name:
         Normalized filter string (e.g. "Ha", "R", "L") or None.
     psf_fwhm_arcsec:
@@ -232,14 +250,21 @@ def _find_archive_frames(
     if not os.path.isdir(archive_dir):
         return []
 
+    root = glob.escape(archive_dir)
     all_files: list[str] = []
     for ext in ("*.fits", "*.fit", "*.FITS", "*.FIT"):
-        all_files.extend(glob.glob(os.path.join(archive_dir, ext)))
+        all_files.extend(glob.glob(os.path.join(root, ext)))
+        all_files.extend(glob.glob(os.path.join(root, "*", ext)))
+
+    if exclude_path is not None:
+        excluded = os.path.realpath(exclude_path)
+        all_files = [f for f in all_files if os.path.realpath(f) != excluded]
 
     all_files.sort(key=os.path.getmtime, reverse=True)
 
-    # Drop calibration frames before anything else. pipeline.py archives
-    # Dark/Flat/Bias into this same per-object directory, and a starless
+    # Drop calibration frames before anything else. pipeline.py used to
+    # archive Dark/Flat/Bias into this same per-object directory (an archive
+    # not yet migrated still has them here), and a starless
     # calibration frame is not a reference for anything — being recent, it
     # would also crowd genuine science frames out of the newest-first
     # _MAX_FRAMES selection below (audit 2026-08-18, finding C5). A file
@@ -247,6 +272,12 @@ def _find_archive_frames(
     # identified as calibration, and an archive normalized by hand or with
     # NORMALIZE_ENABLED=false must not lose subtraction over it.
     parsed = {f: _parse_normalized_filename(os.path.basename(f)) for f in all_files}
+    archive_real = os.path.realpath(archive_dir)
+    filter_dir = {
+        f: os.path.basename(os.path.dirname(f))
+        for f in all_files
+        if os.path.realpath(os.path.dirname(f)) != archive_real
+    }
     science_files = [f for f in all_files if parsed[f][0] not in _CALIBRATION_FRAME_TYPES]
     n_calibration = len(all_files) - len(science_files)
     if n_calibration:
@@ -255,13 +286,17 @@ def _find_archive_frames(
             n_calibration, archive_dir,
         )
 
-    science_files = _screen_by_quality(science_files, psf_fwhm_arcsec)
+    science_files = _screen_by_quality(science_files, psf_fwhm_arcsec, instrument)
 
     candidates = science_files
     if filter_name:
         token = f"_{filter_name.upper()}_"
+        wanted_dir = archive_layout.filter_token(filter_name).upper()
 
         def _same_filter(path: str) -> bool:
+            if path in filter_dir:
+                # The archive layout files Lights by filter directory.
+                return filter_dir[path].upper() == wanted_dir
             parsed_filter = parsed[path][1]
             if parsed[path][0] is not None:
                 # Positional match against the filename's own filter FIELD.
@@ -291,19 +326,57 @@ def _find_archive_frames(
     return candidates[:_MAX_FRAMES]
 
 
-def _read_qc_headers(path: str) -> tuple[Optional[str], Optional[float]]:
-    """
-    Read the QCFLAG/QCFWHM pair pipeline.py stamps into a frame's header at
-    archive time. Either or both are None for a frame archived before those
-    existed, or one placed in the directory by hand.
+def _header_text(header: Any, key: str) -> Optional[str]:
+    """A string header card, stripped and upper-cased; None when absent/blank."""
+    value = header.get(key)
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    return text or None
 
-    A header-only read: no pixel data is touched, so screening the whole
-    candidate list costs a handful of small reads.
-    """
+
+def _read_header(path: str) -> Optional[Any]:
+    """The primary header of *path* (header-only read), or None if unreadable."""
     try:
-        header = fits.getheader(path)
+        return fits.getheader(path)
     except Exception as exc:
-        logger.debug("Subtraction: could not read QC headers from %s: %s", path, exc)
+        logger.debug("Subtraction: could not read the header of %s: %s", path, exc)
+        return None
+
+
+def _instrument_of(header: Optional[Any]) -> Optional[tuple[Optional[str], Optional[str]]]:
+    """A header's ``(TELESCOP, INSTRUME)``, either None when absent; None without a header."""
+    if header is None:
+        return None
+    return _header_text(header, "TELESCOP"), _header_text(header, "INSTRUME")
+
+
+def _read_instrument(path: str) -> Optional[tuple[Optional[str], Optional[str]]]:
+    """The frame's ``(TELESCOP, INSTRUME)``, either None when absent; None if unreadable."""
+    return _instrument_of(_read_header(path))
+
+
+def _same_instrument(
+    candidate: Optional[tuple[Optional[str], Optional[str]]],
+    new: Optional[tuple[Optional[str], Optional[str]]],
+) -> bool:
+    """
+    False only when a keyword both frames carry differs. A frame missing a
+    keyword cannot be judged on it and is kept (same rule as for QCFLAG).
+    """
+    if candidate is None or new is None:
+        return True
+    return all(c is None or n is None or c == n for c, n in zip(candidate, new))
+
+
+def _qc_of(header: Optional[Any]) -> tuple[Optional[str], Optional[float]]:
+    """
+    The QCFLAG/QCFWHM pair pipeline.py stamps into a frame's header at
+    archive time. Either or both are None for a frame archived before those
+    existed, or one placed in the directory by hand (or an unreadable one,
+    *header* None).
+    """
+    if header is None:
         return None, None
 
     flag = header.get("QCFLAG")
@@ -325,11 +398,19 @@ def _read_qc_headers(path: str) -> tuple[Optional[str], Optional[float]]:
 def _screen_by_quality(
     paths: list[str],
     psf_fwhm_arcsec: Optional[float],
+    instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
 ) -> list[str]:
     """
     Drop reference candidates that would damage the difference image: frames
-    their own QC marked as failed, and frames whose seeing is far worse than
-    the new frame's.
+    taken with other optics or another camera, frames their own QC marked as
+    failed, and frames whose seeing is far worse than the new frame's.
+
+    The instrument screen compares TELESCOP and INSTRUME with the new frame's
+    *instrument*. The archive is filed by object and filter only, so this is
+    the one thing keeping two telescopes' frames of one object apart. It has
+    no fallback: a blurred reference degrades the difference image, another
+    instrument's frame (different PSF, scale, field distortion, bandpass)
+    makes a wrong one.
 
     Reference selection used to be recency (plus PA-closeness) alone and never
     looked at quality at all. That was harmless while QC-failed frames were
@@ -350,6 +431,22 @@ def _screen_by_quality(
     if not paths:
         return paths
 
+    # One header read per candidate serves both screens.
+    headers = {p: _read_header(p) for p in paths}
+
+    if instrument is not None:
+        same = [p for p in paths if _same_instrument(_instrument_of(headers[p]), instrument)]
+        if len(same) != len(paths):
+            logger.info(
+                "Subtraction: excluded %d of %d reference candidate(s) taken with "
+                "another telescope/camera than %s",
+                len(paths) - len(same), len(paths),
+                " / ".join(v or "?" for v in instrument),
+            )
+        paths = same
+        if not paths:
+            return paths
+
     limit = None
     if psf_fwhm_arcsec is not None and psf_fwhm_arcsec > 0:
         limit = psf_fwhm_arcsec * config.SUBTRACTION_REF_MAX_FWHM_RATIO
@@ -359,7 +456,7 @@ def _screen_by_quality(
     n_blurred = 0
 
     for path in paths:
-        flag, fwhm = _read_qc_headers(path)
+        flag, fwhm = _qc_of(headers[path])
         if flag is not None and flag != "OK":
             n_failed_qc += 1
             continue
@@ -1195,8 +1292,11 @@ def _pixel_scale_arcsec(fits_path: str, wcs: Optional[WCS] = None) -> Optional[f
     if wcs is None:
         return None
     try:
+        # Geometric mean of both axes — same as photometry._pixel_scale_from_wcs().
         ps_matrix = wcs.pixel_scale_matrix  # (2, 2), units deg/px
-        deg = math.sqrt(ps_matrix[0, 0] ** 2 + ps_matrix[1, 0] ** 2)
+        deg = math.sqrt(
+            math.hypot(ps_matrix[0, 0], ps_matrix[1, 0]) * math.hypot(ps_matrix[0, 1], ps_matrix[1, 1])
+        )
         return deg * 3600.0
     except Exception:
         return None
@@ -1569,14 +1669,16 @@ async def run(
 
     archive_files = _find_archive_frames(
         archive_dir, filter_name, new_position_angle_deg, psf_fwhm_arcsec,
+        instrument=_read_instrument(fits_path),
+        exclude_path=fits_path,
     )
     # Exclude the new frame's own file from its candidate reference stack —
     # re-analyzing an already-archived frame (see pipeline.py's
     # _resolve_bare_filename()) passes a fits_path that may already be
-    # sitting inside archive_dir itself, and _find_archive_frames() globs the
-    # whole directory with no idea which file is "the new one". Without this,
-    # a re-analyzed frame would subtract a resampled copy of itself as part
-    # of its own reference median.
+    # sitting inside archive_dir itself. _find_archive_frames() already drops
+    # it before its cap; this repeats the check for a replacement of it
+    # (tests patch it). Without this, a re-analyzed frame would subtract a
+    # resampled copy of itself as part of its own reference median.
     fits_path_real = os.path.realpath(fits_path)
     archive_files = [f for f in archive_files if os.path.realpath(f) != fits_path_real]
     if len(archive_files) < config.SUBTRACTION_MIN_FRAMES:

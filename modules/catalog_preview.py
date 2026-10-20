@@ -60,8 +60,8 @@ from astropy.io import fits
 from astropy.visualization import AsinhStretch, ImageNormalize, ZScaleInterval
 
 import config
-from modules import astrometry, catalog_matcher, cfa, qc, subtraction
-from modules.fits_header import sanitize_object_name
+from modules import archive_layout, astrometry, catalog_matcher, cfa, normalizer, qc, subtraction
+from modules.fits_header import extract_headers
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +125,20 @@ async def _render(fits_path: str) -> dict:
 
     with fits.open(fits_path) as hdul:
         header = hdul[0].header
-        object_name = sanitize_object_name(header.get("OBJECT"))
-        filter_name = header.get("FILTER") or header.get("FILTNAM") or header.get("FILTERID")
         obs_time = header.get("DATE-OBS", "")
+
+    # Object and filter exactly as analyze_frame() files the frame
+    # (normalized, e.g. "M 51" → "M51", "Luminance" → "L"), so subtraction
+    # looks for references in the directory and filter they are archived
+    # under.
+    frame_header = extract_headers(fits_path)
+    if config.NORMALIZE_ENABLED:
+        frame_header = normalizer.normalize_headers(frame_header)
+    object_name = frame_header.get("object_name") or archive_layout.UNKNOWN
+    if object_name == archive_layout.UNKNOWN:
+        # analyze_frame()'s own fallback for a frame without OBJECT.
+        object_name = normalizer.extract_object_from_filename(filename)
+    filter_name = (frame_header.get("observation") or {}).get("filter")
 
     # move_on_reject=False: this module must never touch the input frame —
     # qc.analyze() otherwise moves a non-OK frame to FITS_REJECTED itself,
@@ -222,7 +233,7 @@ async def _render(fits_path: str) -> dict:
 
         sources = list(astro["sources_all"])  # loose filter, same list catalog_matcher/anomaly_detector use
 
-        archive_dir = os.path.join(config.FITS_ARCHIVE, object_name)
+        archive_dir = archive_layout.object_dir(object_name)
         try:
             sub_result = await subtraction.run(fits_path, archive_dir, filter_name)
             logger.info(

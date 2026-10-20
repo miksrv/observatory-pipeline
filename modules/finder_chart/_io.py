@@ -36,18 +36,27 @@ from astropy.wcs import WCS
 from PIL import Image
 
 import config
+from modules import archive_layout
 
 logger = logging.getLogger(__name__)
 
 
 def _local_fits_path(epoch: dict) -> str:
     """
-    Resolve an epoch dict (from GET /sources/{id}/track) to its local path
-    in the FITS archive. Frames are archived under FITS_ARCHIVE/{object}/
-    (see pipeline.py Step 10) — "object" here is that same normalized
-    directory name, as recorded on the `frames` row.
+    Resolve an epoch dict (from POST /sources/tracks/batch) to its local path
+    in the FITS archive — see archive_layout.find_archived(). "object" is the
+    normalized object name recorded on the `frames` row, which narrows the
+    search to that object's directory first.
+
+    A frame not found locally still gets a path (where it would be filed with
+    no filter known), so the caller's ordinary "cannot load" logging names
+    something meaningful.
     """
-    return os.path.join(config.FITS_ARCHIVE, epoch.get("object") or "_UNKNOWN", epoch["filename"])
+    object_name = epoch.get("object") or archive_layout.UNKNOWN
+    found = archive_layout.find_archived(epoch["filename"], object_name)
+    if found is not None:
+        return found
+    return os.path.join(archive_layout.object_dir(object_name), epoch["filename"])
 
 
 def _load_frame(fits_path: str) -> Optional[tuple[np.ndarray, WCS]]:

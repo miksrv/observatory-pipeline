@@ -226,7 +226,7 @@ async def test_qc_ok_all_steps_called(mock_modules, tmp_path):
 
     # File must have been archived with normalized filename
     archive_path = os.path.join(
-        config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME
+        config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME
     )
     assert os.path.exists(archive_path), f"Expected archived file at {archive_path}"
 
@@ -431,7 +431,7 @@ async def test_qc_rejected_registers_frame_with_empty_sources_and_archives(mock_
 
     # The file is still archived — no separate "rejected" move for a QC
     # failure anymore.
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     assert os.path.exists(archive_path), f"Expected archived file at {archive_path}"
 
 
@@ -449,7 +449,7 @@ async def test_reanalysis_downgrade_retracts_sources_without_move_crash(mock_mod
     # First pass: QC passes, frame is archived normally.
     first_result = await pipeline.analyze_frame(fits_path)
     assert first_result["quality_flag"] == "OK"
-    archived_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archived_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     assert os.path.exists(archived_path)
 
     # Reset call counters so the second pass's assertions are unambiguous.
@@ -566,7 +566,7 @@ async def test_archive_move_correct_path(mock_modules, tmp_path):
     await pipeline.run(fits_path)
 
     # File is archived with normalized filename, not original
-    expected = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    expected = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     assert os.path.exists(expected), f"Expected archived file at {expected}"
 
 
@@ -604,7 +604,7 @@ async def test_archived_file_gets_solved_wcs(mock_modules, tmp_path):
 
     await pipeline.run(str(fits_path))
 
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     assert os.path.exists(archive_path), f"Expected archived file at {archive_path}"
 
     with fits.open(archive_path) as hdul:
@@ -773,7 +773,7 @@ async def test_archived_file_carries_only_one_wcs_representation(mock_modules, t
 
     await pipeline.run(str(fits_path))
 
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     with fits.open(archive_path) as hdul:
         header = hdul[0].header
         has_cd = any(k.startswith("CD1_") or k.startswith("CD2_") for k in header)
@@ -831,7 +831,7 @@ async def test_archived_file_gets_qc_headers(mock_modules, tmp_path):
 
     await pipeline.run(str(fits_path))
 
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     with fits.open(archive_path) as hdul:
         assert hdul[0].header["QCFLAG"] == "OK"
         assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
@@ -861,7 +861,7 @@ async def test_qc_fwhm_header_comes_from_the_solved_scale(mock_modules, tmp_path
 
     await pipeline.run(str(fits_path))
 
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     with fits.open(archive_path) as hdul:
         assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
 
@@ -888,7 +888,7 @@ async def test_qc_fwhm_header_written_even_when_headers_had_no_plate_scale(
 
     await pipeline.run(str(fits_path))
 
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     with fits.open(archive_path) as hdul:
         assert hdul[0].header["QCFWHM"] == pytest.approx(3.2)
 
@@ -915,7 +915,7 @@ async def test_qc_fwhm_header_omitted_when_nothing_can_supply_a_scale(
 
     await pipeline.run(str(fits_path))
 
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     with fits.open(archive_path) as hdul:
         assert hdul[0].header["QCFLAG"] == "OK"
         assert "QCFWHM" not in hdul[0].header
@@ -959,7 +959,7 @@ async def test_finder_chart_runs_after_archive_move(mock_modules, monkeypatch):
         return_value=[{"anomaly_type": "UNKNOWN", "source_id": "src-1"}]
     )
 
-    expected_archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    expected_archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     archive_existed_at_chart_time = {}
 
     async def fake_update_charts_for_sources(anomaly_types_by_source_id, designation_by_source_id=None):
@@ -1141,7 +1141,7 @@ async def test_post_frame_failure_aborts(mock_modules):
     pipeline.api_client.post_sources.assert_not_called()
 
     archive_path = os.path.join(
-        config.FITS_ARCHIVE, "M51", os.path.basename(fits_path)
+        config.FITS_ARCHIVE, "M51", "V", os.path.basename(fits_path)
     )
     assert not os.path.exists(archive_path)
 
@@ -1182,7 +1182,7 @@ async def test_optional_modules_absent(monkeypatch, fits_file, tmp_path):
 
     # When normalizer is None, file is archived with original name
     archive_path = os.path.join(
-        config.FITS_ARCHIVE, "M51", fits_file.name
+        config.FITS_ARCHIVE, "M51", "V", fits_file.name
     )
     assert os.path.exists(archive_path)
 
@@ -1213,7 +1213,7 @@ async def test_api_client_none_skips_api_steps(mock_modules, monkeypatch):
 
     # No archive file should exist — pipeline returned before archive step
     archive_path = os.path.join(
-        config.FITS_ARCHIVE, "M51", os.path.basename(str(mock_modules))
+        config.FITS_ARCHIVE, "M51", "V", os.path.basename(str(mock_modules))
     )
     assert not os.path.exists(archive_path)
 
@@ -1248,7 +1248,7 @@ async def test_anomaly_detection_exception_continues(mock_modules):
     await pipeline.run(str(mock_modules))
 
     # The frame is still archived — detection failing is not fatal.
-    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME)
+    archive_path = os.path.join(config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME)
     assert os.path.exists(archive_path)
 
 
@@ -1293,7 +1293,7 @@ async def test_post_anomalies_exception_continues(mock_modules):
 
     # Archive move must still have happened (with normalized filename)
     archive_path = os.path.join(
-        config.FITS_ARCHIVE, "M51", _NORMALIZED_FILENAME
+        config.FITS_ARCHIVE, "M51", "V", _NORMALIZED_FILENAME
     )
     assert os.path.exists(archive_path)
 
@@ -1358,7 +1358,7 @@ async def test_subtraction_candidates_merged_without_crashing(mock_modules):
 
 
 # ---------------------------------------------------------------------------
-# Step 5.6 — forced photometry / reverse matching (originally proposed as ROADMAP.md #1)
+# Step 5.6 — forced photometry / reverse matching
 # ---------------------------------------------------------------------------
 
 
@@ -1553,7 +1553,7 @@ async def test_source_id_absent_when_post_sources_returns_none(mock_modules):
 @pytest.mark.asyncio
 async def test_mag_field_is_none_when_uncalibrated(mock_modules):
     """
-    Regression test for docs/ISSUES.md #2: when photometry could not
+    Regression test (extreme -15 "magnitudes" once stored): when photometry could not
     calibrate a source (fewer than 3 Gaia DR3 references in the frame),
     "mag" must be None — it must NEVER fall back to the raw uncalibrated
     mag_instrumental. mag_instrumental has no absolute zero-point; falling
@@ -1770,7 +1770,7 @@ class TestDedupeByCatalogIdentity:
 #
 # Regression coverage for the C_2020_R4_ATLAS incident (2026-08-11): an
 # uncatalogued object (MPC/SkyBot carries no ephemeris data for this comet at
-# all — see docs/ISSUES.md) has no catalog identity for
+# all) has no catalog identity for
 # _dedupe_by_catalog_identity() to key on, so its normal sep detection and its
 # own image-subtraction candidate both survived as separate `sources` entries
 # — inflating observation_count and producing two MOVING_UNKNOWN anomalies
@@ -2937,8 +2937,167 @@ async def test_cfa_frame_end_to_end_archives_mono_and_keeps_raw(mock_modules, ra
     # extract_headers is mocked to report M51 — both archives follow it.
     raw_copy = raw_archive / "M51" / frame.name
     assert _sha(raw_copy) == original_sha
-    archived = tmp_path / "archive" / "M51" / _NORMALIZED_FILENAME
+    archived = tmp_path / "archive" / "M51" / "V" / _NORMALIZED_FILENAME
     with fits.open(archived) as hdul:
         assert hdul[0].header["CFACONV"] is True
         assert hdul[0].data.shape == (20, 30)
     assert not frame.exists()
+
+
+# ---------------------------------------------------------------------------
+# Archive layout (modules/archive_layout.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_calibration_frame_goes_to_the_calibration_night(mock_modules, monkeypatch):
+    """The frame type decides, not OBJECT: a Dark tagged M51 lands under _calibration."""
+    header = copy.deepcopy(_GOOD_HEADER)
+    header["observation"]["frame_type"] = "Dark"
+    header["obs_time"] = "2024-03-16T02:10:41"
+    header["instrument"] = {"camera": "ASI1600MM"}
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: header)
+    seen = {}
+
+    def _name(**kwargs):
+        seen.update(kwargs)
+        return "ASI1600MM_Dark_120_2024-03-16T02-10-41.fits"
+
+    pipeline.normalizer.generate_normalized_filename = _name
+
+    assert await pipeline.analyze_frame(str(mock_modules)) is None
+
+    assert seen["camera"] == "ASI1600MM"
+    assert os.path.exists(os.path.join(
+        config.FITS_ARCHIVE, "_calibration", "2024-03-15", "Dark",
+        "ASI1600MM_Dark_120_2024-03-16T02-10-41.fits",
+    ))
+    pipeline.api_client.post_frame.assert_not_called()
+
+
+def test_resolve_bare_filename_finds_the_filter_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path / "archive"))
+    archived = tmp_path / "archive" / "M51" / "Ha" / "frame.fits"
+    archived.parent.mkdir(parents=True)
+    archived.write_bytes(b"x")
+
+    assert pipeline._resolve_bare_filename("frame.fits") == str(archived)
+
+
+def test_move_archived_file_to_rejected_finds_the_new_layout(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "FITS_ARCHIVE", str(tmp_path / "archive"))
+    monkeypatch.setattr(config, "FITS_REJECTED", str(tmp_path / "rejected"))
+    archived = tmp_path / "archive" / "M51" / "L" / "frame.fits"
+    archived.parent.mkdir(parents=True)
+    archived.write_bytes(b"x")
+
+    dest = pipeline.move_archived_file_to_rejected("frame.fits", "M51")
+
+    assert dest == str(tmp_path / "rejected" / "M51" / "frame.fits")
+    assert not archived.exists()
+
+
+# ---------------------------------------------------------------------------
+# An API outage must never replace a frame's stored anomalies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_source_fetch_fails_the_item_without_posting(monkeypatch):
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(return_value={"filename": "f.fits", "obs_time": "2024-03-15T22:00:00"})
+    api_mock.get_frame_sources = AsyncMock(return_value=None)
+    api_mock.post_anomalies = AsyncMock(return_value=True)
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+
+    with pytest.raises(RuntimeError, match="could not fetch"):
+        await pipeline.detect_anomalies_for_frame_id("frame-123")
+
+    api_mock.post_anomalies.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_history_outage_posts_nothing_and_requeues_detection(monkeypatch):
+    from modules.anomaly_detector import HistoryUnavailable
+
+    api_mock = MagicMock()
+    api_mock.post_anomalies = AsyncMock(return_value=True)
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+    anom_mock = MagicMock()
+    anom_mock.detect = AsyncMock(side_effect=HistoryUnavailable("coverage"))
+    monkeypatch.setattr("pipeline.anomaly_detector", anom_mock)
+    queued = AsyncMock()
+    monkeypatch.setattr(pipeline, "_queue_recovery_task", queued)
+
+    result = await pipeline.detect_anomalies_for_frame_data(
+        "frame-123", [{"ra": 1.0, "dec": 2.0}], {"filename": "f.fits"}, post_filename="f.fits",
+    )
+
+    assert result == []
+    api_mock.post_anomalies.assert_not_called()
+    assert queued.call_args.args[0] == "DETECT_ANOMALIES"
+    assert queued.call_args.args[1] == {"frame_id": "frame-123"}
+
+
+def test_catalog_offset_is_carried_into_the_solved_wcs():
+    """
+    catalog_matcher shifts source positions by the Gaia-measured offset; the
+    WCS used afterwards (photometry apertures, forced photometry, archived
+    header) must map pixels onto those corrected positions.
+    """
+    from astropy.wcs import WCS
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.crval = [359.99, 10.0]
+    wcs.wcs.crpix = [500.0, 500.0]
+    wcs.wcs.cdelt = [-1.0 / 3600.0, 1.0 / 3600.0]
+    d_ra, d_dec = 20.0 / 3600.0, -30.0 / 3600.0
+    ra0, dec0 = (float(v) for v in wcs.all_pix2world([[100.0, 800.0]], 0)[0])
+    astro = {"wcs": wcs, "ra_center": 359.99, "dec_center": 10.0}
+    sources = [{"ra": ra0 + d_ra, "dec": dec0 + d_dec, "_wcs_offset_ra": d_ra, "_wcs_offset_dec": d_dec}]
+
+    pipeline._apply_wcs_offset_to_solution(astro, sources, {})
+
+    x, y = astro["wcs"].all_world2pix([[(ra0 + d_ra) % 360.0, dec0 + d_dec]], 0)[0]
+    assert abs(x - 100.0) < 0.05 and abs(y - 800.0) < 0.05
+    assert astro["ra_center"] == pytest.approx((359.99 + d_ra) % 360.0)
+    assert wcs.wcs.crval[0] == pytest.approx(359.99)  # the original is not mutated
+
+
+def test_no_offset_leaves_the_wcs_alone():
+    sentinel = object()
+    astro = {"wcs": sentinel}
+    pipeline._apply_wcs_offset_to_solution(astro, [{"ra": 1.0, "dec": 2.0}], {})
+    assert astro["wcs"] is sentinel
+
+
+@pytest.mark.asyncio
+async def test_watcher_restart_does_not_resubmit_already_queued_files(monkeypatch, tmp_path):
+    import watcher
+
+    queued = tmp_path / "queued.fits"
+    queued.write_bytes(b"x")
+    fresh = tmp_path / "fresh.fits"
+    fresh.write_bytes(b"x")
+    watcher._in_flight_realpaths.clear()
+
+    async def _get_tasks(status=None, **kwargs):
+        return [{"id": "t1"}] if status == "PENDING" else []
+
+    monkeypatch.setattr(watcher.api_client, "get_tasks", AsyncMock(side_effect=_get_tasks))
+    monkeypatch.setattr(watcher.api_client, "get_task", AsyncMock(return_value={
+        "task": {"id": "t1"},
+        "items": [
+            {"id": "i1", "status": "PENDING", "filename": str(queued)},
+            {"id": "i2", "status": "DONE", "filename": str(tmp_path / "gone.fits")},
+        ],
+    }))
+
+    try:
+        assert await watcher._mark_already_queued() == 1
+        monkeypatch.setattr(watcher.config, "WATCHER_MAX_BATCH_SIZE", 100)
+        watcher.process_existing_files(str(tmp_path))
+        assert watcher._pending_paths == [str(fresh)]
+    finally:
+        watcher._in_flight_realpaths.clear()
