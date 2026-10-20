@@ -6,6 +6,7 @@
 
 - Analysis: cross-catalog duplicate removal takes milliseconds instead of 3–8 minutes per frame (same result)
 - Subtraction: reference frames whose plate scale differs from the new frame's by more than `SUBTRACTION_REF_MAX_SCALE_DIFF` (default 5%) are no longer stacked — INDI writes the mount's name into `TELESCOP`, so two telescopes on one mount with the same camera used to be mixed
+- Anomalies: a source is "near a galaxy" only for Simbad's galaxy object types (exact list) — red giants (`RG*`), globular clusters, nebulae and other types merely containing the letter G no longer raise `SUPERNOVA_CANDIDATE`; Seyfert, LINER, radio and low-surface-brightness galaxies now do
 
 ## 1.3.0
 

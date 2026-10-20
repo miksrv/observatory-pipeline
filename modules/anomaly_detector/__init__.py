@@ -20,7 +20,7 @@ preventing server overload when processing frames with hundreds of detected sour
 Split into files by concern — see docs/anomaly-detector.md for the full mechanics:
 
   types.py                  AnomalyType enum + the alert-worthy subset
-  _otypes.py                Simbad OTYPE substring classifiers (variable/binary/galaxy)
+  _otypes.py                Simbad OTYPE classifiers (variable/binary/galaxy)
   _geometry.py              haversine separation, sky tiling, radius filtering
   _history.py               historical-magnitude extraction and same-filter restriction
   _movement.py              "has this source actually moved?" evidence

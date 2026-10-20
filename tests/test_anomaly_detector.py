@@ -193,33 +193,34 @@ class TestObjectTypeClassifiers:
             assert ad._is_binary_star(otype) is True, f"Expected True for '{otype}'"
 
     def test_is_galaxy_matches(self):
-        for otype in ("G", "AGN", "SFG", "GiG"):
+        for otype in ("G", "G?", "AGN", "GiG", "EmG", "SBG", "H2G", "ClG", "IG"):
             assert ad._is_galaxy(otype) is True, f"Expected True for '{otype}'"
 
     def test_is_galaxy_none(self):
         assert ad._is_galaxy(None) is False
 
-    def test_is_galaxy_matches_the_g_suffix_family(self):
-        """
-        Audit 2026-08-18, finding L2: the docstring used to promise a
-        word-boundary-aware check, under which a token had to stand alone as
-        a word. Simbad puts "G" at the END of a whole family of genuine
-        galaxy codes, so that rule would have rejected every one of these —
-        the substring test is the right shape here, and this pins it.
-        """
-        for otype in ("EmG", "RadioG", "SBG", "H2G", "LSB_G"):
+    def test_is_galaxy_matches_galaxy_codes_without_a_g(self):
+        """The substring test used to miss these Simbad galaxy codes."""
+        for otype in ("LIN", "Sy1", "Sy2", "rG", "LSB"):
             assert ad._is_galaxy(otype) is True, f"Expected True for '{otype}'"
 
-    def test_is_galaxy_is_known_to_overmatch_a_globular_cluster(self):
+    def test_is_galaxy_matches_long_labels(self):
+        for otype in ("Galaxy", "RadioG", "Seyfert2", "LowSurfBrghtG"):
+            assert ad._is_galaxy(otype) is True, f"Expected True for '{otype}'"
+
+    def test_is_galaxy_rejects_non_galaxies_carrying_a_g(self):
         """
-        The documented cost of that substring test, pinned so it is a choice
-        rather than a surprise: a bare "G" also matches OTYPEs that merely
-        contain the letter. `GlC` is a globular cluster, not a galaxy, and a
-        new point source projected near one is reported
-        SUPERNOVA_CANDIDATE rather than UNKNOWN — a misnamed alert, not a
-        lost one. See _is_galaxy()'s docstring.
+        Regression, 2026-10-20 lookatstars NGC 7129 run: a red giant (`RG*`)
+        undetected in one frame was posted as SUPERNOVA_CANDIDATE "near
+        galaxy". Every one of these contains the letter G and none is a galaxy.
         """
-        assert ad._is_galaxy("GlC") is True
+        for otype in ("RG*", "GlC", "Gl?", "GNe", "CGb", "MGr", "GWE"):
+            assert ad._is_galaxy(otype) is False, f"Expected False for '{otype}'"
+
+    def test_is_galaxy_leaves_out_point_like_agn(self):
+        """A quasar's or blazar's own variability is not a supernova."""
+        for otype in ("QSO", "Q?", "Bla", "BLL"):
+            assert ad._is_galaxy(otype) is False, f"Expected False for '{otype}'"
 
     def test_is_galaxy_rejects_an_otype_with_no_token_at_all(self):
         for otype in ("Star", "**", "PN", "HII"):

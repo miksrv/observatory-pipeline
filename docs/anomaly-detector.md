@@ -313,13 +313,13 @@ one condition matches, the function returns and no further checks run:
    variable seeing) from alerting every night: a large `delta_mag` is unremarkable against
    a large scatter. `DELTA_MAG_ALERT` still applies on top as an absolute floor.
 
-Table of Simbad OTYPE substrings used by the classifiers:
+Simbad OTYPE tests used by the classifiers:
 
-| Function | OTYPE substrings |
-|---|---|
-| `_is_variable_star` | `V*`, `RR`, `Cep`, `BY`, `RS`, `Ell`, `bL` |
-| `_is_binary_star` | `**`, `EB`, `SB` |
-| `_is_galaxy` | `G`, `SFG`, `AGN`, `GiG` |
+| Function | Match | OTYPEs |
+|---|---|---|
+| `_is_variable_star` | substring | `V*`, `RR`, `Cep`, `BY`, `RS`, `Ell`, `bL` |
+| `_is_binary_star` | substring | `**`, `EB`, `SB` |
+| `_is_galaxy` | exact (`_GALAXY_OTYPES`) | Simbad's `G` branch without the QSO/blazar subtree, plus `ClG`, `GrG`, `CGG`, `IG`, `PaG`, `PoG` and their candidates; short codes and long labels |
 
 ---
 
