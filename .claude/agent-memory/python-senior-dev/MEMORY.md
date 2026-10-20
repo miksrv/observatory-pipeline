@@ -4,12 +4,12 @@
 - [user_profile.md](user_profile.md) — Role and collaboration context for the observatory-pipeline project
 
 ## Project
-- [project_test_infrastructure.md](project_test_infrastructure.md) — Test setup: conftest, venv, asyncio mode, pre-existing failures
+- [project_test_infrastructure.md](project_test_infrastructure.md) — Test setup: conftest, venv, asyncio mode, run under .env and .env.test
 
 ## Feedback
 - [feedback_mock_patterns.md](feedback_mock_patterns.md) — How to correctly mock sep, astropy, and astroscrappy in qc tests
 - [feedback_logging_extra_keys.md](feedback_logging_extra_keys.md) — Reserved LogRecord keys that must not appear in extra= dicts (e.g. "filename")
 - [feedback_api_client_patterns.md](feedback_api_client_patterns.md) — httpx.AsyncClient mock pattern and inner/outer retry design for api_client tests
-- [feedback_catalog_matcher_patterns.md](feedback_catalog_matcher_patterns.md) — Simbad sexagesimal format, MPC instability, Simbad class-mock pattern, UTC datetime for cache
+- [feedback_catalog_matcher_patterns.md](feedback_catalog_matcher_patterns.md) — Simbad sexagesimal format, SkyBot soft failure, Simbad class-mock pattern, UTC datetime for cache
 - [feedback_ephemeris_patterns.md](feedback_ephemeris_patterns.md) — Horizons mock chain, numpy.ma.masked for masked columns, KeyError injection, elevation unit (m→km)
 - [feedback_module_to_package_split.md](feedback_module_to_package_split.md) — Five compatibility rules (attribute-chain patches, bare-name patches, direct-call re-exports, orchestrator-needs-qualified-access, single-site bare class) for splitting a modules/*.py file into a package without breaking tests, plus when a monolithic-procedure module (astrometry.py) needs new function boundaries instead of pure relocation

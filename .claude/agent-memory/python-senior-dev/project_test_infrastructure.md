@@ -24,17 +24,4 @@ being in requirements.txt.
 
 **How to apply:** Run `.venv/bin/python -m pytest tests/ -q` to verify the full suite.
 
-**Known pre-existing failures (confirmed present on a clean `git stash`/HEAD, unrelated to
-whatever feature you're currently testing — don't try to fix these unless that IS the task):**
-as of 2026-08-12 (commit `ee52125`), 6 tests fail out of the box:
-  - `tests/test_normalizer.py::TestGenerateNormalizedFilename` — 4 tests (`test_full_light_frame`,
-    `test_dark_frame_no_filter`, `test_bias_frame_no_filter`, `test_fractional_exptime`) expect
-    single-letter frame-type codes in the generated filename (`M51_L_Ha_300_...`) but
-    `modules/normalizer.py`'s current `generate_normalized_filename()` emits the full frame_type
-    word instead (`M51_Light_Ha_300_...`) — production code and CLAUDE.md's own documented
-    filename convention have drifted from this test file's expectations.
-  - `tests/test_astrometry.py::TestNearEdgeFlag::test_margin_scales_with_frame_size`
-  - `tests/test_api_client.py::TestGetSourceTracksBatch::test_returns_empty_dict_when_results_not_a_dict`
-Before reporting a full pytest run's pass/fail counts to the user, diff against this list (or
-re-check via `git stash`) so a pre-existing failure isn't misattributed to whatever you just
-changed.
+The whole suite passes on a clean tree; CI runs it with `.env.test` copied over `.env`, so check both.
