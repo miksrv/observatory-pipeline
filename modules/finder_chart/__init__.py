@@ -142,6 +142,7 @@ they take effect regardless of which submodule (here, `_style_before_after.py` f
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Optional
 
 import api_client
@@ -196,8 +197,53 @@ logger = logging.getLogger(__name__)
 __all__ = ["update_charts_for_sources"]
 
 
+def _epoch_timestamp(epoch: dict[str, Any]) -> Optional[float]:
+    """`obs_time` as POSIX seconds, or None if missing/unparseable."""
+    obs_time = epoch.get("obs_time")
+    if not isinstance(obs_time, str) or not obs_time.strip():
+        return None
+    try:
+        return datetime.fromisoformat(obs_time.strip().replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _select_epochs_evenly(epochs: list[dict[str, Any]], max_epochs: int) -> list[dict[str, Any]]:
+    """
+    Pick at most `max_epochs` of the chronologically ordered `epochs`, spread
+    evenly in time over the whole history, first and last always included.
+
+    Keeping only the newest N lost the earliest epochs — on a field revisited
+    years later (M82: 75 epochs in 2020, 7 in 2022) the chart showed almost
+    only the last night, without the "nothing was here before" evidence.
+
+    For each of the N equally spaced target times the nearest epoch is taken,
+    constrained to stay after the previous pick and to leave room for the
+    picks still to come, so the result is N distinct epochs in order. Any
+    unparseable `obs_time` makes the whole selection fall back to equal
+    spacing by index.
+    """
+    n = len(epochs)
+    if n <= max_epochs:
+        return list(epochs)
+    if max_epochs == 1:
+        return [epochs[-1]]
+
+    stamps = [_epoch_timestamp(e) for e in epochs]
+    times = [float(i) for i in range(n)] if None in stamps else [t for t in stamps if t is not None]
+    t_first, t_last = times[0], times[-1]
+
+    picked: list[int] = []
+    for k in range(max_epochs):
+        target = t_first + (t_last - t_first) * k / (max_epochs - 1)
+        lo = picked[-1] + 1 if picked else 0
+        hi = n - (max_epochs - k)  # leave one epoch for every later pick
+        picked.append(min(range(lo, hi + 1), key=lambda i: abs(times[i] - target)))
+    return [epochs[i] for i in picked]
+
+
 # ---------------------------------------------------------------------------
-# Rendering (local — no API calls). Caps to CHART_MAX_EPOCHS, loads whatever
+# Rendering (local — no API calls). Thins to CHART_MAX_EPOCHS, loads whatever
 # epochs are still present in the local archive, and renders the PNG.
 # Failure at any step logs and returns None rather than raising, so a single
 # source_id's rendering trouble never affects any other source_id in the
@@ -244,15 +290,16 @@ async def _render_charts_for_source(
     read/written when this source ends up needing the "before_after" style
     (exactly one loaded epoch); unused (and safe to omit) otherwise.
     """
-    # Epochs come back chronologically ordered (oldest first) — keep the
-    # most recent CHART_MAX_EPOCHS so the image size and the number of local
-    # FITS files opened stay bounded for a source with a very long history.
+    # Epochs come back chronologically ordered (oldest first) — keep
+    # CHART_MAX_EPOCHS of them, evenly spread over the whole history, so the
+    # image size and the number of local FITS files opened stay bounded for
+    # a source with a very long history.
     if len(epochs) > config.CHART_MAX_EPOCHS:
         logger.info(
-            "finder_chart: source_id=%s has %d epochs — keeping the most recent %d",
+            "finder_chart: source_id=%s has %d epochs — keeping %d evenly spaced in time",
             source_id, len(epochs), config.CHART_MAX_EPOCHS,
         )
-        epochs = epochs[-config.CHART_MAX_EPOCHS:]
+        epochs = _select_epochs_evenly(epochs, config.CHART_MAX_EPOCHS)
 
     loaded: list[dict[str, Any]] = []
     for epoch in epochs:

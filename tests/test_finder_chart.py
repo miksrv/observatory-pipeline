@@ -992,12 +992,22 @@ class TestUpdateChartsForSources:
 
         monkeypatch.setattr(finder_chart.api_client, "upload_source_chart", fake_upload_chart)
 
+        loaded_paths = []
+        real_load_frame = finder_chart._load_frame
+
+        def spy_load_frame(path):
+            loaded_paths.append(str(path))
+            return real_load_frame(path)
+
+        monkeypatch.setattr(finder_chart, "_load_frame", spy_load_frame)
+
         result = await finder_chart.update_charts_for_sources({"src1": ["ASTEROID"]})
 
         assert result == {"src1": {"ASTEROID": True}}
-        # Only the most recent CHART_MAX_EPOCHS=2 epochs (e2, e3) should have
-        # been loaded and included — e0/e1 dropped as the oldest.
+        # CHART_MAX_EPOCHS=2 epochs spread over the whole history: the first
+        # and the last (e0, e3) — not the two newest.
         assert upload_calls == [2]
+        assert [p.rsplit("/", 1)[-1] for p in loaded_paths] == ["e0.fits", "e3.fits"]
 
     async def test_upload_failure_propagates_false(self, monkeypatch, tmp_path):
         monkeypatch.setattr(config, "CHART_ENABLED", True)
@@ -1478,3 +1488,40 @@ class TestUpdateChartsForSourcesGif:
 async def _async_return(value):
     """Helper: an awaitable that resolves to `value` — for lambda-based async monkeypatches."""
     return value
+
+
+class TestSelectEpochsEvenly:
+    @staticmethod
+    def _epochs(times: list[str]) -> list[dict]:
+        return [{"filename": f"e{i}.fits", "obs_time": t} for i, t in enumerate(times)]
+
+    def test_short_history_kept_whole(self):
+        epochs = self._epochs(["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"])
+        assert finder_chart._select_epochs_evenly(epochs, 12) == epochs
+
+    def test_spread_over_two_campaigns(self):
+        # 75 epochs on one night in 2020, 7 on one night in 2022 (the M82
+        # shape): the selection must reach back into 2020, not only 2022.
+        times = [f"2020-03-01T{20 + i // 60:02d}:{i % 60:02d}:00Z" for i in range(75)]
+        times += [f"2022-04-01T21:{i:02d}:00Z" for i in range(7)]
+        picked = finder_chart._select_epochs_evenly(self._epochs(times), 12)
+
+        names = [e["filename"] for e in picked]
+        assert len(names) == 12
+        assert len(set(names)) == 12
+        assert names[0] == "e0.fits" and names[-1] == "e81.fits"
+        assert names == sorted(names, key=lambda n: int(n[1:-5]))
+        assert any(e["obs_time"].startswith("2020") for e in picked[1:-1])
+
+    def test_even_in_time_not_in_index(self):
+        # Dense cluster at the start, sparse tail: equal time steps pick the
+        # tail epochs, equal index steps would not.
+        times = [f"2024-01-01T00:{i:02d}:00Z" for i in range(10)]
+        times += ["2024-01-11T00:00:00Z", "2024-01-21T00:00:00Z"]
+        picked = finder_chart._select_epochs_evenly(self._epochs(times), 3)
+        assert [e["filename"] for e in picked] == ["e0.fits", "e10.fits", "e11.fits"]
+
+    def test_unparseable_time_falls_back_to_index_spacing(self):
+        times = ["2024-01-01T00:00:00Z", "bogus", *[f"2024-01-0{d}T00:00:00Z" for d in range(2, 9)]]
+        picked = finder_chart._select_epochs_evenly(self._epochs(times), 3)
+        assert [e["filename"] for e in picked] == ["e0.fits", "e4.fits", "e8.fits"]

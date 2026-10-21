@@ -567,7 +567,8 @@ namespace.
 | `before_after` | a single detected epoch (any type) | before/after pair |
 | `track_gif`, `stamp_strip_gif` | companions to the two above (`CHART_GIF_ENABLED`) | independent renderers: fixed canvas, each frame from that epoch's own pixels |
 
-- Flow: `POST /sources/tracks/batch` → cap at `CHART_MAX_EPOCHS` → load each epoch from
+- Flow: `POST /sources/tracks/batch` → thin to `CHART_MAX_EPOCHS`, evenly spaced in time with the
+  first and last kept (`_select_epochs_evenly()`) → load each epoch from
   `archive_layout.find_archived(filename, object)` (missing files skipped) → render each distinct style the
   source's anomaly types imply (`_group_types_by_style()`) → upload. API side stores
   `UNIQUE(source_id, style)`.

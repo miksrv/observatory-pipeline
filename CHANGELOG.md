@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1
+
+### Patch Changes
+
+- Finder charts: a source with more than `CHART_MAX_EPOCHS` epochs shows that many spread evenly in time over its whole history (first and last always included), instead of only the most recent ones
 ## 1.4.0
 
 ### Minor Changes

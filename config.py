@@ -744,8 +744,8 @@ CHART_ENABLED: bool = _get("CHART_ENABLED", "true").lower() in ("true", "1", "ye
 # (stationary anomalies), in arcseconds. Converted to pixels per-frame using
 # that frame's own WCS plate scale.
 CHART_STAMP_SIZE_ARCSEC: float = float(_get("CHART_STAMP_SIZE_ARCSEC", "60.0"))
-# Cap on the number of epochs drawn on one chart (oldest dropped first if a
-# source's track is longer than this) — keeps the rendered image size, and
+# Cap on the number of epochs drawn on one chart (a longer track is thinned
+# to this many, evenly spaced in time, first and last kept) — keeps the rendered image size, and
 # the number of local archive FITS files opened per chart, bounded for
 # sources with a very long observation history.
 CHART_MAX_EPOCHS: int = int(_get("CHART_MAX_EPOCHS", "12"))
