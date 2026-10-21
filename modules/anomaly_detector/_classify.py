@@ -387,6 +387,24 @@ def _classify_source_sync(
         }
 
     # ------------------------------------------------------------------
+    # A subtraction candidate beside a catalogued star of the same
+    # brightness is that star's residual, whatever shape it has — checked
+    # before every branch below, not only the UNKNOWN ones it was written
+    # for. Misregistration at a wide field's edges leaves such residuals by
+    # the hundred, and they reached SPACE_DEBRIS (a dipole is elongated),
+    # MOVING_UNKNOWN and, through the star's own history, VARIABLE_STAR
+    # (M51 L 2025-04: every one of the 47-49 VARIABLE_STARs per frame).
+    # ------------------------------------------------------------------
+    if from_subtraction and _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
+        logger.debug(
+            "Suppressed: subtraction candidate ra=%.4f dec=%.4f mag=%s sits beside "
+            "a catalogued star of the same brightness — its residual, not a change",
+            ra, dec, mag,
+            extra=extra,
+        )
+        return None
+
+    # ------------------------------------------------------------------
     # Priority 2 — Position-shifted unmatched moving objects
     # ------------------------------------------------------------------
 
@@ -614,15 +632,6 @@ def _classify_source_sync(
                 extra=extra,
             )
             return None
-        if _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
-            logger.debug(
-                "Suppressed UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f "
-                "mag=%s sits beside a catalogued star of the same brightness — "
-                "its residual, not a transient",
-                ra, dec, mag,
-                extra=extra,
-            )
-            return None
         logger.info(
             "UNKNOWN (subtraction, new area): ra=%.4f dec=%.4f mag=%s",
             ra, dec, mag,
@@ -646,7 +655,12 @@ def _classify_source_sync(
     # --- Area has prior coverage from here on ---
 
     # --- SUPERNOVA_CANDIDATE: new source in/near a galaxy ---
-    if n_history == 0 and _is_galaxy(object_type):
+    # Only a subtraction candidate: `object_type` is this source's OWN
+    # catalog identity, so an ordinary detection carrying a galaxy type IS
+    # the galaxy — a faint one detected tonight and not on shallower frames
+    # before, which is KNOWN_CATALOG_NEW below, not a supernova. A
+    # subtraction candidate matched to the galaxy is a pixel-level change on it.
+    if n_history == 0 and _is_galaxy(object_type) and from_subtraction:
         logger.warning(
             "ALERT — SUPERNOVA_CANDIDATE: new source near galaxy object_type=%s "
             "ra=%.4f dec=%.4f mag=%s",
@@ -702,16 +716,6 @@ def _classify_source_sync(
             )
             return None
 
-        if _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
-            logger.debug(
-                "Suppressed UNKNOWN: subtraction candidate ra=%.4f dec=%.4f "
-                "mag=%s sits beside a catalogued star of the same brightness — "
-                "its residual, not a transient",
-                ra, dec, mag,
-                extra=extra,
-            )
-            return None
-
         logger.warning(
             "ALERT — UNKNOWN: new uncatalogued source ra=%.4f dec=%.4f mag=%s "
             "covered_by=%d frames",
@@ -745,6 +749,22 @@ def _classify_source_sync(
         return None  # Known object newly above threshold — not an anomaly
 
     # --- Source HAS prior history from here ---
+
+    # A subtraction candidate is not compared against history by magnitude.
+    # Its `mag` is aperture photometry at the residual's centroid, and the
+    # history in the cone around it is usually a neighbouring star's (the
+    # dedup passes keep the normal detection of a source over its own
+    # candidate). Measured against that star's light curve, a residual 4"
+    # from a 13.5 mag star read as the star fading by 0.7 mag. A real change
+    # of a known source is judged on that source's own normal detection.
+    if from_subtraction:
+        logger.debug(
+            "Not Δmag-classified: subtraction candidate ra=%.4f dec=%.4f mag=%s "
+            "on a position with %d prior detection(s)",
+            ra, dec, mag, n_history,
+            extra=extra,
+        )
+        return None
 
     # Magnitude comparison uses only same-filter history — see
     # _same_filter_history()'s docstring. `history` itself (the existence

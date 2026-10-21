@@ -533,13 +533,14 @@ class TestDetectStationaryClassifications:
         assert result == []
 
     async def test_detect_supernova_candidate_new_source(self):
-        """Covered, no history at all, galaxy object_type → SUPERNOVA_CANDIDATE.
+        """Covered, no history at all, a subtraction candidate on a galaxy →
+        SUPERNOVA_CANDIDATE.
 
         This is the "new point source with no prior detection" variant
         (n_history == 0). See test_detect_supernova_candidate_brightening
         below for the "already-known host, got brighter" variant.
         """
-        source = _make_source(catalog_name="Simbad", object_type="G")
+        source = _make_source(catalog_name="Simbad", object_type="G", from_subtraction=True)
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
@@ -554,6 +555,22 @@ class TestDetectStationaryClassifications:
         assert result[0]["anomaly_type"] == "SUPERNOVA_CANDIDATE"
         assert result[0]["ephemeris"] is None
         assert result[0]["mpc_designation"] is None
+
+    async def test_a_galaxy_detected_for_the_first_time_is_not_a_supernova(self):
+        """An ordinary detection whose own identity is a galaxy IS the galaxy —
+        a faint one first detected tonight, not a new source near it."""
+        source = _make_source(catalog_name="Simbad", object_type="G")
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": []}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+
+            result = await ad.detect(_FRAME_ID, [source], [source], _FRAME_META)
+
+        assert result == []
 
     async def test_detect_supernova_candidate_brightening(self):
         """
@@ -829,6 +846,21 @@ class TestDetectLightCurveVariability:
         assert result[0]["anomaly_type"] == "VARIABLE_STAR"
         assert result[0]["delta_mag"] == pytest.approx(12.0 - 14.505, abs=0.02)
         assert "own light curve" in result[0]["notes"]
+
+    async def test_a_subtraction_candidate_is_not_judged_on_the_cone_history(self):
+        """
+        M51 L 2025-04: a residual 4" from a 13.5 mag star, photometered at
+        14.2, was compared with the star's light curve and reported as the
+        star fading by 0.7 mag. The same magnitudes on a normal detection
+        are a genuine VARIABLE_STAR (control).
+        """
+        hist = [_make_hist_source(mag=m) for m in (13.50, 13.52, 13.48, 13.51)]
+
+        normal = _make_source(mag=14.2, catalog_name=None)
+        assert [a["anomaly_type"] for a in await self._run(normal, hist)] == ["VARIABLE_STAR"]
+
+        candidate = _make_source(mag=14.2, catalog_name=None, from_subtraction=True)
+        assert await self._run(candidate, hist) == []
 
     async def test_an_extended_object_is_not_a_light_curve_variable(self):
         """
@@ -2089,3 +2121,40 @@ class TestChangeConfirmation:
         stable = [15.0, 15.02, 14.98, 15.01, 14.99, 15.0]
         result = await self._classify(self._star(14.2), self._history(stable))
         assert [a["anomaly_type"] for a in result] == ["VARIABLE_STAR"]
+
+
+class TestSubtractionResidualSuppressedInEveryBranch:
+    """
+    A subtraction candidate beside a catalogued star of the same brightness
+    is that star's residual — also when its shape or the absence of history
+    would send it to SPACE_DEBRIS or UNKNOWN.
+    """
+
+    async def _run(self, sources: list[dict]) -> list[dict]:
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {str(i): [] for i in range(len(sources))}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            return await ad.detect(_FRAME_ID, sources, sources, _FRAME_META)
+
+    async def test_elongated_residual_beside_a_star_is_not_space_debris(self):
+        star = _make_source(mag=14.0, catalog_name="Gaia DR3", catalog_id="G1", object_type="STAR")
+        dipole = _make_source(
+            ra=_RA + 6.0 / 3600.0, mag=14.3, fwhm=3.0, elongation=8.0, from_subtraction=True,
+        )
+
+        result = await self._run([star, dipole])
+
+        assert [a["anomaly_type"] for a in result] == []
+
+    async def test_elongated_candidate_far_from_any_star_is_still_reported(self):
+        star = _make_source(mag=14.0, catalog_name="Gaia DR3", catalog_id="G1", object_type="STAR")
+        trail = _make_source(
+            ra=_RA + 120.0 / 3600.0, mag=14.3, fwhm=3.0, elongation=8.0, from_subtraction=True,
+        )
+
+        result = await self._run([star, trail])
+
+        assert [a["anomaly_type"] for a in result] == ["SPACE_DEBRIS"]
