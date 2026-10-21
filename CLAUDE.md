@@ -597,6 +597,12 @@ Sends `X-API-Key`, JSON headers and `X-Pipeline-Version` (`version.py`, the top 
 heading; the API shows it on its dashboard). Older single-position endpoints (`/sources/near`,
 `/frames/covering`, `/sources/{id}/track`) are still exported but unused.
 
+Sized for shared hosting: every call has a 30 s timeout except `POST /frames/{id}/sources`
+(`API_SOURCES_TIMEOUT_SEC` — a timed-out POST used to be retried while the first was still
+running server-side); `get_sources_near_batch()` sends `HISTORY_BATCH_MAX_POSITIONS` positions per
+request, grouped by declination, one request after another (one request per frame ran the API's
+PHP out of memory).
+
 `_to_wire_source()`: renames `_from_subtraction` → `from_subtraction` (only when truthy), strips
 every other leading-underscore key. **Convention: a leading underscore means "internal, not for
 the wire".** The API is treated as a black box — only endpoint contracts matter.

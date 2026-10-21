@@ -7,6 +7,8 @@
 - Finder charts: a source with more than `CHART_MAX_EPOCHS` epochs shows that many spread evenly in time over its whole history (first and last always included), instead of only the most recent ones
 - Subtraction: an unsolved (QC-failed) archived frame is screened by its header plate scale (`XPIXSZ` + `FOCALLEN`) — it used to count as "scale unknown", so the QC fallback could stack another telescope's frames into the reference
 - 8-bit frames (`BITPIX=8`): saturation is detected at the file's own ceiling (255) instead of `SATURATION_ADU`, photometry stays uncalibrated (a stretched export's magnitudes put faint stars ~1 mag too bright), and subtraction never mixes 8-bit and raw frames in one reference stack — re-analyze existing 8-bit frames (and re-run anomaly detection on their objects) after deploying
+- API: anomaly-detection history is fetched in chunks of `HISTORY_BATCH_MAX_POSITIONS` (default 100) positions grouped by declination, so a frame of a field observed hundreds of times no longer makes the API run out of memory (HTTP 500 → the detection re-queued as a task per frame)
+- API: posting a frame's sources waits up to `API_SOURCES_TIMEOUT_SEC` (default 180 s) instead of 30 s — a timed-out post was retried while the first one was still being saved, and the two collided (HTTP 500 → the frame re-analyzed as a separate task); works best with observatory-api 1.3.1, which also makes such a collision harmless
 ## 1.4.0
 
 ### Minor Changes

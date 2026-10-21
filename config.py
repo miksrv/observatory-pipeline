@@ -271,6 +271,19 @@ ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MA
 # otherwise re-queue itself forever. 0 disables recovery entirely.
 API_RECOVERY_MAX_ATTEMPTS: int = int(_get("API_RECOVERY_MAX_ATTEMPTS", "2"))
 
+# Read timeout (s) for POST /frames/{id}/sources. Saving several hundred
+# sources takes the API well over the 30 s every other call gets; a client
+# timeout there retried the POST while the first one was still running on
+# the server, and the two collided on its unique keys (HTTP 500, M51 run).
+API_SOURCES_TIMEOUT_SEC: float = float(_get("API_SOURCES_TIMEOUT_SEC", "180"))
+
+# Positions per POST /sources/near/batch request. A frame's history query is
+# split into chunks of neighbouring declinations, so each request's bounding
+# box — and the API's memory for it — covers a strip of the field, not all
+# of it (a ~700-source frame over a 300-frame field exhausted the hosting's
+# 256 MB PHP limit).
+HISTORY_BATCH_MAX_POSITIONS: int = int(_get("HISTORY_BATCH_MAX_POSITIONS", "100"))
+
 # ---------------------------------------------------------------------------
 # Cross-matching
 # ---------------------------------------------------------------------------
@@ -926,6 +939,8 @@ _OVERRIDABLE: dict[str, type] = {
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
     "API_RECOVERY_MAX_ATTEMPTS": int,
+    "API_SOURCES_TIMEOUT_SEC": float,
+    "HISTORY_BATCH_MAX_POSITIONS": int,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "MOVING_RATE_ARCSEC_PER_MIN": float,
