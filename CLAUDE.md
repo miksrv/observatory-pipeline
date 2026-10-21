@@ -418,9 +418,10 @@ frames of the same object. `performed=False` with fewer than `SUBTRACTION_MIN_FR
    files); same filter preferred (fallback: any), the new frame's own file excluded. Never
    Dark/Flat/Bias (parsed positionally from the filename — a defence for un-migrated archives).
    `_screen_by_quality()` first drops any candidate whose `TELESCOP`/`INSTRUME` differs from the
-   new frame's, or whose archived solve's plate scale is off the new frame's by more than
-   `SUBTRACTION_REF_MAX_SCALE_DIFF` (INDI's `TELESCOP` is the mount's name, so the scale is what
-   separates two telescopes on one mount) — **no fallback**: another optics' frame makes a wrong
+   new frame's, or whose archived solve's plate scale (header `XPIXSZ`+`FOCALLEN` for an unsolved,
+   QC-failed frame) is off the new frame's by more than `SUBTRACTION_REF_MAX_SCALE_DIFF` (INDI's
+   `TELESCOP` is the mount's name, so the scale is what separates two telescopes on one mount) —
+   **no fallback**: another optics' frame makes a wrong
    difference image, not a degraded one. It then excludes `QCFLAG != OK` and `QCFWHM` worse than
    `SUBTRACTION_REF_MAX_FWHM_RATIO` × the new frame's; if that leaves too few, the
    same-instrument unscreened set is used. Frames without a keyword are kept on that keyword.

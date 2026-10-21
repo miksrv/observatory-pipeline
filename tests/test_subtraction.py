@@ -2100,12 +2100,24 @@ class TestArchiveLayoutReferences:
         assert subtraction._screen_by_quality(paths, None, (None, None)) == paths
 
 
-def _write_scaled_frame(path, scale_arcsec=None, telescope="EQMOD MOUNT", camera="ASI1600MM"):
-    """A tiny FITS file carrying a celestial WCS at the given plate scale (″/px)."""
+def _write_scaled_frame(
+    path, scale_arcsec=None, telescope="EQMOD MOUNT", camera="ASI1600MM",
+    *, pixel_um=None, focal_mm=None, qcflag=None,
+):
+    """
+    A tiny FITS file carrying a celestial WCS at the given plate scale (″/px),
+    and optionally the optics keywords (XPIXSZ/FOCALLEN) and a QCFLAG.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     hdu = fits.PrimaryHDU(np.ones((8, 8), dtype=np.float32))
     hdu.header["TELESCOP"] = telescope
     hdu.header["INSTRUME"] = camera
+    if pixel_um is not None:
+        hdu.header["XPIXSZ"] = pixel_um
+    if focal_mm is not None:
+        hdu.header["FOCALLEN"] = focal_mm
+    if qcflag is not None:
+        hdu.header["QCFLAG"] = qcflag
     if scale_arcsec is not None:
         w = AstropyWCS(naxis=2)
         w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
@@ -2148,10 +2160,41 @@ class TestPlateScaleScreen:
 
         assert subtraction._screen_by_quality(others, None, pixel_scale_arcsec=0.777) == []
 
-    def test_a_candidate_without_a_wcs_is_kept(self, tmp_path):
+    def test_a_candidate_without_a_wcs_or_optics_keywords_is_kept(self, tmp_path):
         bare = _write_scaled_frame(tmp_path / "bare.fits")
 
         assert subtraction._screen_by_quality([bare], None, pixel_scale_arcsec=0.777) == [bare]
+
+    def test_a_candidate_without_a_wcs_is_judged_by_its_header_scale(self, tmp_path):
+        # 3.8 µm / 1000 mm = 0.784″/px; 7.6 µm (bin 2) / 1580 mm = 0.992″/px.
+        same_optics = _write_scaled_frame(tmp_path / "s.fits", pixel_um=3.8, focal_mm=1000.0)
+        other_optics = _write_scaled_frame(tmp_path / "o.fits", pixel_um=7.6, focal_mm=1580.0)
+
+        kept = subtraction._screen_by_quality([same_optics, other_optics], None, pixel_scale_arcsec=0.780)
+
+        assert kept == [same_optics]
+
+    def test_qc_fallback_does_not_readmit_unsolved_frames_of_other_optics(self, tmp_path, monkeypatch):
+        """
+        The M82 case (1.4.0): QC-failed frames are archived unsolved; with too
+        few good references the QC screen falls back to the unscreened set,
+        which used to bring the other telescope's unsolved frames back in.
+        """
+        monkeypatch.setattr(config, "SUBTRACTION_MIN_FRAMES", 3)
+        good = [_write_scaled_frame(tmp_path / f"g{i}.fits", 0.99, qcflag="OK") for i in range(2)]
+        failed_same = _write_scaled_frame(
+            tmp_path / "fs.fits", pixel_um=7.6, focal_mm=1580.0, qcflag="LOW_STARS",
+        )
+        failed_other = [
+            _write_scaled_frame(tmp_path / f"fo{i}.fits", pixel_um=3.8, focal_mm=1000.0, qcflag="LOW_STARS")
+            for i in range(8)
+        ]
+
+        kept = subtraction._screen_by_quality(
+            good + [failed_same] + failed_other, None, pixel_scale_arcsec=0.987,
+        )
+
+        assert set(kept) == set(good + [failed_same])
 
     def test_no_new_frame_scale_screens_nothing(self, tmp_path):
         paths = [_write_scaled_frame(tmp_path / f"o{i}.fits", 1.55) for i in range(3)]

@@ -5,6 +5,7 @@
 ### Patch Changes
 
 - Finder charts: a source with more than `CHART_MAX_EPOCHS` epochs shows that many spread evenly in time over its whole history (first and last always included), instead of only the most recent ones
+- Subtraction: an unsolved (QC-failed) archived frame is screened by its header plate scale (`XPIXSZ` + `FOCALLEN`) — it used to count as "scale unknown", so the QC fallback could stack another telescope's frames into the reference
 ## 1.4.0
 
 ### Minor Changes

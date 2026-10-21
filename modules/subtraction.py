@@ -54,7 +54,7 @@ from astropy.wcs import WCS
 import sep
 
 import config
-from modules import archive_layout
+from modules import archive_layout, fits_header
 
 logger = logging.getLogger(__name__)
 
@@ -378,24 +378,29 @@ def _same_instrument(
 
 def _scale_of(header: Optional[Any]) -> Optional[float]:
     """
-    The plate scale (arcsec/px) of a header's celestial WCS — for an archived
-    frame, the astap solve pipeline.py wrote into it. None without one.
+    The plate scale (arcsec/px) of an archived frame: its celestial WCS — the
+    astap solve pipeline.py wrote into it — or, without one, the nominal scale
+    of its optics from the headers (`fits_header.resolve_pixel_scale_arcsec()`,
+    XPIXSZ + FOCALLEN). None when neither is there.
 
-    A frame archived without a solve still carries whatever WCS the capture
-    software wrote, possibly at nominal optics; such frames are QC-failed in
-    practice, and the QCFLAG screen drops those anyway.
+    The header fallback matters for QC-failed frames: astrometry is skipped
+    for them, so they are archived with no WCS at all. Kept as "unknown
+    scale", they slipped past this screen, and when too few good references
+    were left the QC screen's unscreened fallback stacked them — 0.78"/px
+    frames from one telescope into references for a 0.99"/px one (M82, 1.4.0).
     """
     if header is None:
         return None
+    wcs = None
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             wcs = WCS(header)
     except Exception:
-        return None
-    if not wcs.has_celestial:
-        return None
-    return _pixel_scale_arcsec("", wcs=wcs.celestial)
+        pass
+    if wcs is not None and wcs.has_celestial:
+        return _pixel_scale_arcsec("", wcs=wcs.celestial)
+    return fits_header.resolve_pixel_scale_arcsec(header)
 
 
 def _same_scale(candidate: Optional[float], new: Optional[float]) -> bool:
@@ -459,7 +464,8 @@ def _screen_by_quality(
     the new frame's solved *pixel_scale_arcsec* against each candidate's
     archived solve, within SUBTRACTION_REF_MAX_SCALE_DIFF (it also separates
     binning modes and a reducer fitted or removed). Same rule as the keyword
-    screen: no fallback, and a candidate without a WCS is kept.
+    screen: no fallback. A candidate without a WCS is judged by its header
+    plate scale (see `_scale_of()`), and kept only when it has neither.
 
     Reference selection used to be recency (plus PA-closeness) alone and never
     looked at quality at all. That was harmless while QC-failed frames were
