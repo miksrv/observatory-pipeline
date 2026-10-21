@@ -2,6 +2,7 @@
 tests/test_normalizer.py — Unit tests for the normalizer module.
 """
 
+import numpy as np
 import pytest
 from modules import normalizer
 
@@ -569,3 +570,38 @@ class TestOneShotColour:
         from modules import subtraction
         assert subtraction._parse_normalized_filename(
             "NGC7331_Light_OSC_60_2026-09-21T16-56-14.fits") == ("Light", "OSC")
+
+
+class TestFilterFromPath:
+    @pytest.mark.parametrize("path, expected", [
+        ("/in/M_51/Light/L/M_51_Light_L_300_secs_2022-05-02T00-00-09_001.fits", "L"),
+        ("/in/M_51/Light/R/M_51_Light_2x2_R_300_secs_2025-04-02T02-45-10_001.fits", "R"),
+        ("/in/M63/M63_Light_Luminance_300_secs_2021-03-14T22-27-12_001.fits", "L"),
+        ("/in/Flats/ASI1600_Flat_OIII_1_2024-01-01T00-00-00.fits", "OIII"),
+        # no filter token in the name → the directory
+        ("/in/NGC7129/Ha/NGC7129_Light_300_secs_2021-03-25.fits", "Ha"),
+        # neither is a known filter → nothing guessed
+        ("/in/M51/M51_Light_Foo_300_secs.fits", None),
+        ("/in/M51/M51_Light_300_secs.fits", None),
+    ])
+    def test_extract_filter_from_path(self, path, expected):
+        assert normalizer.extract_filter_from_path(path) == expected
+
+    def test_known_filter_accepts_aliases_and_canonical_names_only(self):
+        assert normalizer.known_filter("Red") == "R"
+        assert normalizer.known_filter("LeNhance") == "LeNhance"
+        assert normalizer.known_filter("300") is None
+        assert normalizer.known_filter("Light") is None
+        assert normalizer.known_filter(None) is None
+
+    def test_update_fits_filter_header(self, tmp_path):
+        from astropy.io import fits
+
+        path = tmp_path / "f.fits"
+        fits.PrimaryHDU(np.zeros((2, 2), dtype=np.float32)).writeto(path)
+
+        normalizer.update_fits_filter_header(str(path), "R")
+
+        hdr = fits.getheader(path)
+        assert hdr["FILTER"] == "R"
+        assert "file name" in hdr.comments["FILTER"]

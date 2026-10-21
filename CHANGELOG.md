@@ -9,6 +9,7 @@
 - Subtraction: when both frames carry SIP terms, a reference is resampled through the two plate solves instead of astroalign's affine fit (`SUBTRACTION_ALIGN_BY_WCS`, default on) — a wide field's distortion is not affine, and references from another night left residuals across its edges
 - Anomalies: a subtraction candidate beside a catalogued star of the same brightness is suppressed as that star's residual in every branch (it reached `SPACE_DEBRIS`, `MOVING_UNKNOWN` and `VARIABLE_STAR`), and is never compared by magnitude with the history around it — that history is the neighbouring star's (324 of the 572 `VARIABLE_STAR` on the M51/M63/M82 run were such residuals)
 - Anomalies: `SUPERNOVA_CANDIDATE` for a new source needs a subtraction candidate on the galaxy — an ordinary detection matched to a galaxy is the galaxy itself, first detected on a deeper frame
+- Analysis: a Light or Flat frame without a `FILTER` header takes its filter from the file name (`…_Light_R_300_secs_…`) or its directory (`Light/R/`), when that is a known filter, and records it in the frame's `FILTER` card — such frames used to be archived under `NONE` and left out of every same-filter comparison and reference stack (177 M51 frames of 2022)
 - After deploying: re-run `ANALYZE` on all frames (archived headers get SIP; a frame's WCS resampling applies to the references already re-analyzed), then `DETECT_ANOMALIES` on all of them — each run replaces that frame's anomalies
 
 ### Patch Changes

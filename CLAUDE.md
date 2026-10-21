@@ -275,6 +275,11 @@ Normalizes object names (`M 51`→`M51`, `Sh2 101`→`SH2-101`, `Abell 39`/`A39`
 and frame types (`Light`/`Dark`/`Flat`/`Bias`). Full mapping tables are in the code.
 `is_narrowband()` uses `config.NARROWBAND_FILTERS`.
 
+A Light/Flat with no FILTER card takes the filter from its path (`extract_filter_from_path()`:
+the token after `Light`/`Flat` in the filename, a `2x2` binning token skipped, else the parent
+directory), only if `known_filter()` recognises it; it is written into the frame's `FILTER` card,
+marked as taken from the file name.
+
 Filenames (`NORMALIZE_ENABLED=true`):
 ```
 Light:     {Object}_Light_{Filter}_{Exptime}_{DateTime}[_{Seq}].fits

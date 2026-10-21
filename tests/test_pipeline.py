@@ -269,6 +269,57 @@ def test_is_8bit_file_reads_bitpix(tmp_path):
     assert pipeline._is_8bit_file(str(tmp_path / "missing.fits")) is False
 
 
+def _use_real_path_filter_helpers(monkeypatch):
+    """The fixture's normalizer is a mock; these tests need the real path parsing."""
+    from modules import normalizer as real_normalizer
+
+    monkeypatch.setattr("pipeline.normalizer.normalize_frame_type", real_normalizer.normalize_frame_type)
+    monkeypatch.setattr("pipeline.normalizer.extract_filter_from_path", real_normalizer.extract_filter_from_path)
+
+
+@pytest.mark.asyncio
+async def test_missing_filter_header_is_taken_from_the_path(monkeypatch, mock_modules, tmp_path):
+    """No FILTER card (M51 2022-05): the filter in the capture program's file
+    name is used and written into the frame's header."""
+    light_dir = tmp_path / "M_51" / "Light" / "R"
+    light_dir.mkdir(parents=True)
+    path = light_dir / "M_51_Light_R_300_secs_2022-05-02T00-00-09_001.fits"
+    fits.PrimaryHDU(np.zeros((4, 4), dtype=np.float32)).writeto(path)
+    header = copy.deepcopy(_GOOD_HEADER)
+    header["observation"]["filter"] = None
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: header)
+    _use_real_path_filter_helpers(monkeypatch)
+    written = {}
+    monkeypatch.setattr(
+        "pipeline.normalizer.update_fits_filter_header",
+        lambda p, f: written.setdefault("filter", f),
+    )
+
+    await pipeline.run(str(path))
+
+    _, kwargs = pipeline.photometry.measure.call_args
+    assert kwargs.get("filter_name") == "R"
+    assert written == {"filter": "R"}
+
+
+@pytest.mark.asyncio
+async def test_dark_frame_never_gets_a_filter_from_its_path(monkeypatch, mock_modules, tmp_path):
+    dark_dir = tmp_path / "R"
+    dark_dir.mkdir()
+    path = dark_dir / "Cam_Dark_300_2022-05-02T00-00-09.fits"
+    fits.PrimaryHDU(np.zeros((4, 4), dtype=np.float32)).writeto(path)
+    header = copy.deepcopy(_GOOD_HEADER)
+    header["observation"].update(filter=None, frame_type="Dark")
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: header)
+    _use_real_path_filter_helpers(monkeypatch)
+    called = []
+    monkeypatch.setattr("pipeline.normalizer.update_fits_filter_header", lambda p, f: called.append(f))
+
+    await pipeline.run(str(path))
+
+    assert called == []
+
+
 @pytest.mark.asyncio
 async def test_narrowband_filter_skips_calibration(monkeypatch, mock_modules):
     """A narrowband (Hα) frame must call photometry.measure(skip_calibration=True)."""

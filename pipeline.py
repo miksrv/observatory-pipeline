@@ -340,6 +340,21 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # ------------------------------------------------------------------
     header: dict = fits_header.extract_headers(fits_path)
 
+    # No FILTER card: take the filter the capture program put in the path
+    # (normalizer.extract_filter_from_path()) — Lights and Flats only, the
+    # frame types a filter belongs to.
+    observation = header.get("observation")
+    if normalizer is not None and isinstance(observation, dict) and not observation.get("filter"):
+        frame_type, _ = normalizer.normalize_frame_type(observation.get("frame_type"))
+        path_filter = normalizer.extract_filter_from_path(fits_path) if frame_type in ("Light", "Flat") else None
+        if path_filter is not None:
+            observation["filter"] = path_filter
+            normalizer.update_fits_filter_header(fits_path, path_filter)
+            logger.info(
+                "No FILTER header — using %r from the file name/directory", path_filter,
+                extra=extra,
+            )
+
     # Apply normalization if enabled in config
     if config.NORMALIZE_ENABLED and normalizer is not None:
         header = normalizer.normalize_headers(header)
