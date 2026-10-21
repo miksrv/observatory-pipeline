@@ -882,3 +882,22 @@ class TestSaturationAdu:
         assert fits_header.is_8bit(self._hdr(BITPIX=8))
         assert not fits_header.is_8bit(self._hdr(BITPIX=16))
         assert not fits_header.is_8bit(self._hdr())
+
+
+class TestCfaDepthIsKept:
+    def test_converted_raw8_frame_is_still_8bit(self):
+        h = fits.Header()
+        h["BITPIX"] = -32
+        h["CFABITPX"] = 8
+        h["CFASATLV"] = 255.0
+        assert fits_header.is_8bit(h)
+        assert fits_header.saturation_adu(h) == 255.0
+
+    def test_converted_16bit_frame_keeps_the_configured_threshold(self, monkeypatch):
+        monkeypatch.setattr(fits_header.config, "SATURATION_ADU", 60000.0)
+        h = fits.Header()
+        h["BITPIX"] = -32
+        h["CFABITPX"] = 16
+        h["CFASATLV"] = 65535.0
+        assert not fits_header.is_8bit(h)
+        assert fits_header.saturation_adu(h) == 60000.0

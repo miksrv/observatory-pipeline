@@ -224,7 +224,7 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   targeted at itself. Shared: history, coverage, anomalies and remote settings.
 - **Shutdown:** SIGTERM/SIGINT is checked only *between* items (an item cut halfway could register
   a frame without its sources). The item in progress finishes, nothing new starts, and a task
-  with unstarted items is `PATCH`ed back to `PENDING`; compose's `stop_grace_period: 5m` covers a
+  with unstarted items is `PATCH`ed back to `PENDING`; compose's `stop_grace_period: 10m` covers a
   long ANALYZE item. A second signal exits at once — the handler is `signal.signal()`, not the
   loop's, because CPU-bound steps hold the loop for minutes. astap runs in its own session, so a
   terminal Ctrl+C does not kill it mid-solve. The watcher maps SIGTERM onto its Ctrl+C path

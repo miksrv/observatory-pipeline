@@ -2153,7 +2153,7 @@ class TestBitDepthScreen:
         raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
         exports = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(5)]
 
-        kept = subtraction._screen_by_quality(raw + exports, None, bitpix=16)
+        kept = subtraction._screen_by_quality(raw + exports, None, eight_bit=False)
 
         assert kept == raw
 
@@ -2161,7 +2161,13 @@ class TestBitDepthScreen:
         raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
         exports = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(3)]
 
-        assert subtraction._screen_by_quality(raw + exports, None, bitpix=8) == exports
+        assert subtraction._screen_by_quality(raw + exports, None, eight_bit=True) == exports
+
+    def test_16_bit_and_float_frames_of_one_camera_still_stack(self, tmp_path):
+        raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
+        floats = [_write_bitpix_frame(tmp_path / f"f{i}.fits", -32) for i in range(2)]
+
+        assert subtraction._screen_by_quality(raw + floats, None, eight_bit=False) == raw + floats
 
     def test_no_new_frame_bitpix_screens_nothing(self, tmp_path):
         paths = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(2)]
@@ -2349,3 +2355,23 @@ class TestPhotometricScale:
         footprint = np.ones(new.shape, dtype=bool)   # the reference covers nothing
 
         assert subtraction._photometric_scale(new, ref, footprint, stars) is None
+
+
+class TestRegistrationOffset:
+    def test_exact_and_shifted_alignment_are_told_apart(self):
+        shape = (160, 200)
+        rng = np.random.default_rng(5)
+        stars = [(202.47 + dx, 47.2 + dy) for dx, dy in rng.uniform(-0.03, 0.03, size=(60, 2))]
+        target_wcs = _sip_wcs(shape=shape)
+        target = _render_stars(target_wcs, shape, stars) + rng.normal(0, 3, shape).astype(np.float32)
+        # A reference whose solve is off by ~2 px (3"), as before the catalog
+        # offset correction.
+        wrong_wcs = _sip_wcs(crval1=202.47 + 3.0 / 3600.0 / math.cos(math.radians(47.2)), shape=shape)
+        ref = _render_stars(target_wcs, shape, stars)
+        found = subtraction._scale_stars(target, 60000.0)
+
+        good, good_fp = subtraction._align_by_wcs(ref, target_wcs, target_wcs, shape)
+        bad, bad_fp = subtraction._align_by_wcs(ref, wrong_wcs, target_wcs, shape)
+
+        assert subtraction._registration_offset_px(target, good, good_fp, found) < 0.1
+        assert subtraction._registration_offset_px(target, bad, bad_fp, found) > 1.5

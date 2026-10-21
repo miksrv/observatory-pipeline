@@ -234,7 +234,7 @@ def _survives_edge_zone(source: dict) -> bool:
 
 def _is_residual_of_catalogued_star(
     source: dict,
-    catalogued_frame_sources: list[tuple[float, float, float]],
+    catalogued_frame_sources: list[tuple],
 ) -> bool:
     """
     Whether an uncatalogued subtraction candidate is a catalogued star's own
@@ -260,6 +260,10 @@ def _is_residual_of_catalogued_star(
     measured magnitude is then essentially the star's; that is the accepted
     cost. No magnitude on the candidate, or the check disabled, decides
     nothing.
+
+    On a frame without calibrated magnitudes (narrowband, 8-bit) the
+    brightness comparison falls back to the flux ratio, as a magnitude
+    difference; entries are ``(ra, dec, mag, flux)`` (a 3-tuple is mag-only).
     """
     factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
     if factor <= 0 or not catalogued_frame_sources:
@@ -267,10 +271,14 @@ def _is_residual_of_catalogued_star(
     if not source.get("_from_subtraction") or source.get("catalog_name") is not None:
         return False
     try:
-        ra, dec, mag = float(source["ra"]), float(source["dec"]), float(source["mag"])
+        ra, dec = float(source["ra"]), float(source["dec"])
     except (KeyError, TypeError, ValueError):
         return False
-    if not (math.isfinite(ra) and math.isfinite(dec) and math.isfinite(mag)):
+    if not (math.isfinite(ra) and math.isfinite(dec)):
+        return False
+    mag = _finite(source.get("mag"))
+    flux = _finite(source.get("flux"))
+    if mag is None and (flux is None or flux <= 0):
         return False
 
     try:
@@ -280,15 +288,28 @@ def _is_residual_of_catalogued_star(
     radius = factor * fwhm if fwhm > 0 else 2.0 * config.MATCH_CONE_ARCSEC
     radius = max(radius, config.MATCH_CONE_ARCSEC)
 
-    for c_ra, c_dec, c_mag in catalogued_frame_sources:
+    for entry in catalogued_frame_sources:
+        c_ra, c_dec, c_mag = entry[0], entry[1], entry[2]
+        c_flux = entry[3] if len(entry) > 3 else None
         if abs(c_dec - dec) * 3600.0 > radius:
             continue
-        if (
-            abs(c_mag - mag) <= config.SUBTRACTION_RESIDUAL_MAX_DMAG
-            and _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius
-        ):
+        if mag is not None and c_mag is not None:
+            dmag = abs(c_mag - mag)
+        elif flux is not None and flux > 0 and c_flux is not None and c_flux > 0:
+            dmag = abs(2.5 * math.log10(c_flux / flux))
+        else:
+            continue
+        if dmag <= config.SUBTRACTION_RESIDUAL_MAX_DMAG and _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius:
             return True
     return False
+
+
+def _finite(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _classify_source_sync(
@@ -300,7 +321,7 @@ def _classify_source_sync(
     coverage_by_tile: dict[tuple, list],
     current_frame_positions: list[tuple[float, float]],
     obs_time: str = "",
-    catalogued_frame_sources: list[tuple[float, float, float]] | None = None,
+    catalogued_frame_sources: list[tuple] | None = None,
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).

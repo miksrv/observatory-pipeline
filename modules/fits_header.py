@@ -604,8 +604,14 @@ def integer_ceiling_adu(hdr: fits.Header) -> float | None:
 
     Read it from a header taken before the data is accessed: astropy rewrites
     BITPIX/BZERO in the in-memory header once it scales the data.
+
+    A one-shot-colour frame converted by modules/cfa.py is float data whose
+    original ceiling is kept in `CFASATLV` — an 8-bit (RAW8) capture still
+    clips at 255 after its 2x2 mean.
     """
     try:
+        if "CFASATLV" in hdr and int(hdr.get("BITPIX", 0)) < 0:
+            return float(hdr["CFASATLV"])
         bitpix = int(hdr.get("BITPIX", 0))
         bzero = float(hdr.get("BZERO", 0.0))
         bscale = float(hdr.get("BSCALE", 1.0))
@@ -641,7 +647,9 @@ def is_8bit(hdr: fits.Header) -> bool:
     like a raw frame's.
     """
     try:
-        return int(hdr.get("BITPIX", 0)) == 8
+        # CFABITPX: the depth of a one-shot-colour frame before modules/cfa.py
+        # turned it into float superpixels.
+        return int(hdr.get("BITPIX", 0)) == 8 or int(hdr.get("CFABITPX", 0)) == 8
     except (TypeError, ValueError):
         return False
 

@@ -294,7 +294,7 @@ async def _render_charts_for_source(
     # CHART_MAX_EPOCHS of them, evenly spread over the whole history, so the
     # image size and the number of local FITS files opened stay bounded for
     # a source with a very long history.
-    if len(epochs) > config.CHART_MAX_EPOCHS:
+    if 0 < config.CHART_MAX_EPOCHS < len(epochs):  # 0 = no cap
         logger.info(
             "finder_chart: source_id=%s has %d epochs — keeping %d evenly spaced in time",
             source_id, len(epochs), config.CHART_MAX_EPOCHS,

@@ -7,6 +7,7 @@ worth of sources.
 from __future__ import annotations
 
 import logging
+import math
 
 from ._classify import _classify_source_sync
 from ._ephemeris_resolution import _resolve_ephemerides
@@ -14,6 +15,14 @@ from ._prefetch import _prefetch_history_data
 from .types import _ALERT_TYPES
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_or_none(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 # ---------------------------------------------------------------------------
@@ -105,17 +114,22 @@ async def detect(
         except (TypeError, ValueError):
             continue
 
-    # Catalogued sources with a measured magnitude, for telling a subtraction
+    # Catalogued sources with a measured magnitude or flux, for telling a subtraction
     # candidate that is merely a star's own residual from a transient — see
     # _classify._is_residual_of_catalogued_star().
-    catalogued_frame_sources: list[tuple[float, float, float]] = []
+    catalogued_frame_sources: list[tuple[float, float, float | None, float | None]] = []
     for s in sources:
         if s.get("catalog_name") is None:
             continue
         try:
-            catalogued_frame_sources.append((float(s["ra"]), float(s["dec"]), float(s["mag"])))
+            ra_, dec_ = float(s["ra"]), float(s["dec"])
         except (KeyError, TypeError, ValueError):
             continue
+        mag_, flux_ = _finite_or_none(s.get("mag")), _finite_or_none(s.get("flux"))
+        if mag_ is not None or flux_ is not None:
+            # (ra, dec, mag, flux) — the flux stands in for brightness on a
+            # frame without calibrated magnitudes (narrowband, 8-bit).
+            catalogued_frame_sources.append((ra_, dec_, mag_, flux_))
 
     anomalies: list[dict] = []
 

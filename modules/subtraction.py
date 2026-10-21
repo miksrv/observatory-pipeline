@@ -184,7 +184,7 @@ def _find_archive_frames(
     psf_fwhm_arcsec: Optional[float] = None,
     *,
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
-    bitpix: Optional[int] = None,
+    eight_bit: Optional[bool] = None,
     pixel_scale_arcsec: Optional[float] = None,
     exclude_path: Optional[str] = None,
 ) -> list[str]:
@@ -212,9 +212,9 @@ def _find_archive_frames(
     instrument:
         The new frame's own ``(TELESCOP, INSTRUME)`` — see
         _screen_by_quality(). None skips the instrument screen.
-    bitpix:
-        The new frame's BITPIX — see _screen_by_quality(). None skips that
-        screen.
+    eight_bit:
+        Whether the new frame is 8-bit (fits_header.is_8bit()) — see
+        _screen_by_quality(). None skips that screen.
     pixel_scale_arcsec:
         The new frame's own solved plate scale — see _screen_by_quality().
         None skips the plate-scale screen.
@@ -297,7 +297,7 @@ def _find_archive_frames(
 
     science_files = _screen_by_quality(
         science_files, psf_fwhm_arcsec, instrument,
-        bitpix=bitpix, pixel_scale_arcsec=pixel_scale_arcsec,
+        eight_bit=eight_bit, pixel_scale_arcsec=pixel_scale_arcsec,
     )
 
     candidates = science_files
@@ -459,7 +459,7 @@ def _screen_by_quality(
     psf_fwhm_arcsec: Optional[float],
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
     *,
-    bitpix: Optional[int] = None,
+    eight_bit: Optional[bool] = None,
     pixel_scale_arcsec: Optional[float] = None,
 ) -> list[str]:
     """
@@ -482,8 +482,8 @@ def _screen_by_quality(
     archived solve, within SUBTRACTION_REF_MAX_SCALE_DIFF (it also separates
     binning modes and a reducer fitted or removed).
 
-    *bitpix* keeps 8-bit exports and raw camera frames apart, also with no
-    fallback: an 8-bit frame is a stretched, quantized copy whose ADU are
+    *eight_bit* keeps 8-bit frames and deeper ones apart, also with no
+    fallback (16-bit and float frames of one camera still stack together): an 8-bit frame is a stretched, quantized copy whose ADU are
     nowhere near the raw frame's (the flux scale knows exposure and gain, not
     a ×256 stretch), so stacking one leaves every star in the difference image
     (M63 2021-04-12 R: 139–237 candidates per frame against 8-bit references). Same rule as the keyword
@@ -525,13 +525,17 @@ def _screen_by_quality(
         if not paths:
             return paths
 
-    if bitpix is not None:
-        same = [p for p in paths if _bitpix_of(headers[p]) in (None, bitpix)]
+    if eight_bit is not None:
+        same = [
+            p for p in paths
+            if headers[p] is None or _bitpix_of(headers[p]) is None
+            or fits_header.is_8bit(headers[p]) == eight_bit
+        ]
         if len(same) != len(paths):
             logger.info(
-                "Subtraction: excluded %d of %d reference candidate(s) whose BITPIX "
-                "differs from this frame's %d",
-                len(paths) - len(same), len(paths), bitpix,
+                "Subtraction: excluded %d of %d reference candidate(s) of another bit "
+                "depth (this frame is %s8-bit)",
+                len(paths) - len(same), len(paths), "" if eight_bit else "not ",
             )
         paths = same
         if not paths:
@@ -884,6 +888,44 @@ _WCS_ALIGN_BLOCK_ROWS = 512
 # Below this fraction of the new frame covered by the reference, the WCS
 # mapping is treated as a failure (wrong or unrelated solve).
 _WCS_ALIGN_MIN_COVERAGE = 0.2
+# A WCS-resampled reference whose shared stars sit further than this (px,
+# median) from the new frame's is not used — astroalign registers it instead.
+# The two solves' errors add up, and the new frame's solve has not had the
+# catalog offset correction its archived references carry.
+_WCS_ALIGN_MAX_OFFSET_PX = 0.5
+
+
+def _registration_offset_px(
+    new_data: np.ndarray,
+    aligned_ref: np.ndarray,
+    footprint: Optional[np.ndarray],
+    stars: Optional[tuple[np.ndarray, np.ndarray, float]],
+) -> Optional[float]:
+    """
+    Median offset (px) between the windowed centroids of the new frame's
+    bright stars and the same stars in an aligned reference; None when too
+    few stars can be measured in both.
+    """
+    if stars is None:
+        return None
+    x, y, fwhm = stars
+    sig = max(fwhm / 2.3548, 0.5)
+    try:
+        new_c = np.ascontiguousarray(np.nan_to_num(new_data, nan=0.0), dtype=np.float32)
+        ref_c = np.ascontiguousarray(np.nan_to_num(aligned_ref, nan=0.0), dtype=np.float32)
+        xn, yn, fn = sep.winpos(new_c, x, y, sig)
+        xr, yr, fr = sep.winpos(ref_c, x, y, sig)
+    except Exception as exc:
+        logger.debug("Subtraction: registration check failed: %s", exc)
+        return None
+    ok = (fn == 0) & (fr == 0)
+    if footprint is not None:
+        ix = np.clip(np.round(x).astype(int), 0, footprint.shape[1] - 1)
+        iy = np.clip(np.round(y).astype(int), 0, footprint.shape[0] - 1)
+        ok &= ~footprint[iy, ix]
+    if int(ok.sum()) < _PHOT_SCALE_MIN_STARS:
+        return None
+    return float(np.hypot(np.median(xr[ok] - xn[ok]), np.median(yr[ok] - yn[ok])))
 
 
 def _sip_wcs_of(header: Optional[Any]) -> Optional[WCS]:
@@ -938,13 +980,15 @@ def _align_by_wcs(
             return None
 
         from scipy.interpolate import RectBivariateSpline
-        from scipy.ndimage import map_coordinates
+        from scipy.ndimage import map_coordinates, spline_filter
 
         spline_x = RectBivariateSpline(gy, gx, px, kx=3, ky=3)
         spline_y = RectBivariateSpline(gy, gx, py, kx=3, ky=3)
 
         valid = np.isfinite(source)
         filled = np.where(valid, source, 0.0).astype(np.float32)
+        # The cubic prefilter once for the whole frame, not per block.
+        coeffs = spline_filter(filled, order=3, output=np.float32)
         invalid = None if valid.all() else (~valid).astype(np.float32)
 
         aligned = np.empty((ny, nx), dtype=np.float32)
@@ -955,7 +999,7 @@ def _align_by_wcs(
             bx = spline_x(rows, cols)
             by = spline_y(rows, cols)
             coords = np.stack([by, bx])
-            aligned[y0:y0 + len(rows)] = map_coordinates(filled, coords, order=3, cval=0.0)
+            aligned[y0:y0 + len(rows)] = map_coordinates(coeffs, coords, order=3, cval=0.0, prefilter=False)
             outside = (bx < 0) | (bx > sx - 1) | (by < 0) | (by > sy - 1)
             if invalid is not None:
                 outside |= map_coordinates(invalid, coords, order=1, cval=1.0) > 0.01
@@ -1950,7 +1994,7 @@ async def run(
     archive_files = _find_archive_frames(
         archive_dir, filter_name, new_position_angle_deg, psf_fwhm_arcsec,
         instrument=_instrument_of(new_header),
-        bitpix=_bitpix_of(new_header),
+        eight_bit=fits_header.is_8bit(new_header) if new_header is not None else None,
         pixel_scale_arcsec=_pixel_scale_arcsec(fits_path, wcs=wcs) if wcs is not None else None,
         exclude_path=fits_path,
     )
@@ -2022,6 +2066,15 @@ async def run(
         ref_sip_wcs = _sip_wcs_of(_read_header(ref_path)) if new_sip_wcs is not None else None
         if ref_sip_wcs is not None:
             result = _align_by_wcs(ref_data, ref_sip_wcs, new_sip_wcs, new_data.shape)
+            if result is not None:
+                offset = _registration_offset_px(new_data, result[0], result[1], scale_stars)
+                if offset is not None and offset > _WCS_ALIGN_MAX_OFFSET_PX:
+                    logger.debug(
+                        "Subtraction: %s resampled through the plate solves lands %.2f px "
+                        "off — registering it with astroalign instead",
+                        os.path.basename(ref_path), offset,
+                    )
+                    result = None
             if result is not None:
                 n_wcs_aligned += 1
                 aligned.append(result[0])

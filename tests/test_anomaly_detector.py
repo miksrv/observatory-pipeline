@@ -2158,3 +2158,18 @@ class TestSubtractionResidualSuppressedInEveryBranch:
         result = await self._run([star, trail])
 
         assert [a["anomaly_type"] for a in result] == ["SPACE_DEBRIS"]
+
+
+class TestResidualCheckWithoutMagnitudes:
+    """Narrowband and 8-bit frames carry no calibrated mag — the flux decides."""
+
+    def test_flux_ratio_identifies_the_residual(self):
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        cand = _make_source(mag=None, flux=9_000.0, fwhm=3.0, from_subtraction=True)
+        cand["mag"] = None
+        star_same = [(_RA, _DEC + 6.0 / 3600.0, None, 10_000.0)]
+        star_much_brighter = [(_RA, _DEC + 6.0 / 3600.0, None, 1_000_000.0)]
+
+        assert _is_residual_of_catalogued_star(cand, star_same) is True
+        assert _is_residual_of_catalogued_star(cand, star_much_brighter) is False
