@@ -340,6 +340,25 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # ------------------------------------------------------------------
     header: dict = fits_header.extract_headers(fits_path)
 
+    # No FILTER card: take the filter the capture program put in the path
+    # (normalizer.extract_filter_from_path()) — Lights (also a frame with no
+    # type at all, which is processed as one) and Flats, the frame types a
+    # filter belongs to.
+    observation = header.get("observation")
+    if normalizer is not None and isinstance(observation, dict) and not observation.get("filter"):
+        frame_type, _ = normalizer.normalize_frame_type(observation.get("frame_type"))
+        # None: no IMAGETYP — such a frame is processed as a Light.
+        path_filter = (
+            normalizer.extract_filter_from_path(fits_path) if frame_type in ("Light", "Flat", None) else None
+        )
+        if path_filter is not None:
+            observation["filter"] = path_filter
+            normalizer.update_fits_filter_header(fits_path, path_filter)
+            logger.info(
+                "No FILTER header — using %r from the file name/directory", path_filter,
+                extra=extra,
+            )
+
     # Apply normalization if enabled in config
     if config.NORMALIZE_ENABLED and normalizer is not None:
         header = normalizer.normalize_headers(header)
@@ -708,6 +727,15 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 normalizer is not None
                 and normalizer.is_narrowband(header.get("observation", {}).get("filter"))
             )
+            # An 8-bit frame is a stretched, quantized export, not linear ADU
+            # (fits_header.is_8bit()) — its zero point would put faint stars
+            # ~1 mag too bright and poison every later Δmag comparison.
+            if not skip_calibration and _is_8bit_file(fits_path):
+                logger.warning(
+                    "8-bit frame (BITPIX=8) — photometry stays uncalibrated",
+                    extra=extra,
+                )
+                skip_calibration = True
             # The solved WCS, not the file's own header: that is only
             # corrected at archive time (step 12.5) and may still hold the
             # mount-pointing estimate — see photometry.measure()'s `wcs`.
@@ -1656,6 +1684,16 @@ def _object_dir_name(fits_path: str) -> str:
     return frame_header.get("object_name") or "_UNKNOWN"
 
 
+def _is_8bit_file(fits_path: str) -> bool:
+    """`fits_header.is_8bit()` of the file's primary header; False if unreadable."""
+    from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+    try:
+        return fits_header.is_8bit(astropy_fits.getheader(fits_path))
+    except Exception:
+        return False
+
+
 def _reject_unsupported_frame(fits_path: str, extra: dict) -> bool:
     """
     Move a file that is not a single 2-D exposure to
@@ -2252,7 +2290,10 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
         with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
             header = hdul[0].header
             _strip_wcs_representation(header)
-            header.update(wcs.to_header())
+            # relax=True: SIP distortion terms are "non-standard" to astropy
+            # and silently dropped otherwise — the archived header would
+            # carry only the linear part of a wide-field solve.
+            header.update(wcs.to_header(relax=True))
         return True
     except Exception as exc:
         logger.warning("Could not write solved WCS into %s: %s", fits_path, exc)
@@ -2271,6 +2312,9 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
 _WCS_LINEAR_CARD_RE = re.compile(
     r"^(?:CD|PC)\d+_\d+[A-Z]?$|^(?:CDELT|CROTA)\d+[A-Z]?$"
 )
+# SIP distortion terms (`A_ORDER`, `B_2_1`, `AP_0_3`, `A_DMAX`, …): a stale
+# set left beside a fresh solve would bend it with the old solve's distortion.
+_WCS_SIP_CARD_RE = re.compile(r"^(?:A|B|AP|BP)_(?:ORDER|DMAX|\d+_\d+)$")
 
 
 def _strip_wcs_representation(header) -> None:
@@ -2295,11 +2339,12 @@ def _strip_wcs_representation(header) -> None:
 
     CROTA1/2 goes too: it is the pre-CD rotation convention, and a stale copy
     of it alongside a fresh CD matrix is the same ambiguity in older clothes.
+    So do SIP distortion terms, which belong to the solve they came with.
     """
     for key in list(header.keys()):
         if not key:
             continue
-        if _WCS_LINEAR_CARD_RE.match(key.upper()):
+        if _WCS_LINEAR_CARD_RE.match(key.upper()) or _WCS_SIP_CARD_RE.match(key.upper()):
             try:
                 del header[key]
             except KeyError:

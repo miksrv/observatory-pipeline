@@ -92,7 +92,7 @@ def _normalize_batch_results(resp_json: object, keys: list[str] | None = None) -
     return {}
 
 
-def _make_client() -> httpx.AsyncClient:
+def _make_client(timeout: float = 30.0) -> httpx.AsyncClient:
     """Return a configured AsyncClient for the observatory API."""
     headers = {
         "X-API-Key": config.API_KEY,
@@ -102,7 +102,7 @@ def _make_client() -> httpx.AsyncClient:
     if version.VERSION is not None:
         # Recorded with the heartbeat and shown on the API's dashboard.
         headers["X-Pipeline-Version"] = version.VERSION
-    return httpx.AsyncClient(base_url=config.API_BASE_URL, headers=headers, timeout=30.0)
+    return httpx.AsyncClient(base_url=config.API_BASE_URL, headers=headers, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------

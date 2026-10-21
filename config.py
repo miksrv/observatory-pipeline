@@ -47,6 +47,13 @@ ASTAP_BINARY: str = _get("ASTAP_BINARY", "/usr/local/bin/astap")
 ASTAP_CATALOGS: str = _get("ASTAP_CATALOGS", "/astap/catalogs")
 # Optional FOV hint in degrees (0 = auto-detect from FITS headers)
 ASTAP_FOV_HINT: float = float(_get("ASTAP_FOV_HINT", "0"))
+# Ask astap for SIP distortion coefficients (`-sip y`) on top of the linear
+# TAN solution. A wide field is not a plane: on a 2° frame (M51, ASI6200 at
+# 1000 mm) the linear solve put stars 14-28" off Gaia in the outer third of
+# the field — no catalog match, so every one became UNKNOWN/MOVING_UNKNOWN —
+# while the SIP solve kept them within 1.4". Harmless on a narrow field,
+# where the coefficients come out near zero.
+ASTAP_SIP_ENABLED: bool = _get("ASTAP_SIP_ENABLED", "true").strip().lower() in ("true", "1", "yes")
 # When the first attempt (narrow, header-based search window) completes
 # cleanly but finds no match, retry once with a wide/effectively-blind search
 # radius before giving up. Worth having on by default: the header's own
@@ -227,7 +234,9 @@ STREAK_MASK_DILATE_ARCSEC: float = float(_get("STREAK_MASK_DILATE_ARCSEC", "3.0"
 # ---------------------------------------------------------------------------
 # Sensor pixel value (ADU) at/above which a pixel is considered saturated.
 # Default assumes a 16-bit sensor with some headroom below the hard 65535
-# ceiling for non-linearity near full well — tune per camera.
+# ceiling for non-linearity near full well — tune per camera. Each file is
+# also capped at the largest value its integer BITPIX can store (255 for an
+# 8-bit export) — modules/fits_header.saturation_adu().
 SATURATION_ADU: float = float(_get("SATURATION_ADU", "60000"))
 # Radius (arcsec) around a saturated pixel that modules/subtraction.py
 # excludes from difference-image source detection, to suppress astroalign
@@ -268,6 +277,19 @@ ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MA
 # failure (a 4xx the retry decorator deliberately doesn't retry) would
 # otherwise re-queue itself forever. 0 disables recovery entirely.
 API_RECOVERY_MAX_ATTEMPTS: int = int(_get("API_RECOVERY_MAX_ATTEMPTS", "2"))
+
+# Read timeout (s) for POST /frames/{id}/sources. Saving several hundred
+# sources takes the API well over the 30 s every other call gets; a client
+# timeout there retried the POST while the first one was still running on
+# the server, and the two collided on its unique keys (HTTP 500, M51 run).
+API_SOURCES_TIMEOUT_SEC: float = float(_get("API_SOURCES_TIMEOUT_SEC", "180"))
+
+# Positions per POST /sources/near/batch request. A frame's history query is
+# split into chunks of neighbouring declinations, so each request's bounding
+# box — and the API's memory for it — covers a strip of the field, not all
+# of it (a ~700-source frame over a 300-frame field exhausted the hosting's
+# 256 MB PHP limit).
+HISTORY_BATCH_MAX_POSITIONS: int = int(_get("HISTORY_BATCH_MAX_POSITIONS", "100"))
 
 # ---------------------------------------------------------------------------
 # Cross-matching
@@ -418,6 +440,12 @@ SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 # absorbs a small residual angle, and rotating (interpolating) the reference
 # array for a fraction of a degree only adds blur for no real benefit.
 SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG", "2.0"))
+# Resample a reference onto the new frame through both frames' plate solves
+# when both carry SIP distortion terms, instead of astroalign's single affine
+# transform. A wide field's distortion is not affine: references from another
+# night (slightly different pointing) left star residuals across the outer
+# third of 2° M51 frames. Frames without SIP keep astroalign.
+SUBTRACTION_ALIGN_BY_WCS: bool = _get("SUBTRACTION_ALIGN_BY_WCS", "true").strip().lower() in ("true", "1", "yes")
 # Worst reference seeing worth stacking, as a multiple of the NEW frame's own
 # measured FWHM. Differencing a sharp frame against a blurred reference leaves
 # the classic ring-shaped residual at every star in the field — a mismatched
@@ -744,8 +772,8 @@ CHART_ENABLED: bool = _get("CHART_ENABLED", "true").lower() in ("true", "1", "ye
 # (stationary anomalies), in arcseconds. Converted to pixels per-frame using
 # that frame's own WCS plate scale.
 CHART_STAMP_SIZE_ARCSEC: float = float(_get("CHART_STAMP_SIZE_ARCSEC", "60.0"))
-# Cap on the number of epochs drawn on one chart (oldest dropped first if a
-# source's track is longer than this) — keeps the rendered image size, and
+# Cap on the number of epochs drawn on one chart (a longer track is thinned
+# to this many, evenly spaced in time, first and last kept) — keeps the rendered image size, and
 # the number of local archive FITS files opened per chart, bounded for
 # sources with a very long observation history.
 CHART_MAX_EPOCHS: int = int(_get("CHART_MAX_EPOCHS", "12"))
@@ -924,6 +952,8 @@ _OVERRIDABLE: dict[str, type] = {
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
     "API_RECOVERY_MAX_ATTEMPTS": int,
+    "API_SOURCES_TIMEOUT_SEC": float,
+    "HISTORY_BATCH_MAX_POSITIONS": int,
     "MATCH_CONE_ARCSEC": float,
     "MOVING_CONE_ARCSEC": float,
     "MOVING_RATE_ARCSEC_PER_MIN": float,

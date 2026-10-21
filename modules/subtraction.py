@@ -54,7 +54,7 @@ from astropy.wcs import WCS
 import sep
 
 import config
-from modules import archive_layout
+from modules import archive_layout, fits_header
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,7 @@ def _find_archive_frames(
     psf_fwhm_arcsec: Optional[float] = None,
     *,
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
+    eight_bit: Optional[bool] = None,
     pixel_scale_arcsec: Optional[float] = None,
     exclude_path: Optional[str] = None,
 ) -> list[str]:
@@ -211,6 +212,9 @@ def _find_archive_frames(
     instrument:
         The new frame's own ``(TELESCOP, INSTRUME)`` — see
         _screen_by_quality(). None skips the instrument screen.
+    eight_bit:
+        Whether the new frame is 8-bit (fits_header.is_8bit()) — see
+        _screen_by_quality(). None skips that screen.
     pixel_scale_arcsec:
         The new frame's own solved plate scale — see _screen_by_quality().
         None skips the plate-scale screen.
@@ -292,7 +296,8 @@ def _find_archive_frames(
         )
 
     science_files = _screen_by_quality(
-        science_files, psf_fwhm_arcsec, instrument, pixel_scale_arcsec=pixel_scale_arcsec,
+        science_files, psf_fwhm_arcsec, instrument,
+        eight_bit=eight_bit, pixel_scale_arcsec=pixel_scale_arcsec,
     )
 
     candidates = science_files
@@ -363,6 +368,16 @@ def _read_instrument(path: str) -> Optional[tuple[Optional[str], Optional[str]]]
     return _instrument_of(_read_header(path))
 
 
+def _bitpix_of(header: Optional[Any]) -> Optional[int]:
+    """A header's BITPIX; None without a header or a usable value."""
+    if header is None:
+        return None
+    try:
+        return int(header.get("BITPIX"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _same_instrument(
     candidate: Optional[tuple[Optional[str], Optional[str]]],
     new: Optional[tuple[Optional[str], Optional[str]]],
@@ -378,24 +393,29 @@ def _same_instrument(
 
 def _scale_of(header: Optional[Any]) -> Optional[float]:
     """
-    The plate scale (arcsec/px) of a header's celestial WCS — for an archived
-    frame, the astap solve pipeline.py wrote into it. None without one.
+    The plate scale (arcsec/px) of an archived frame: its celestial WCS — the
+    astap solve pipeline.py wrote into it — or, without one, the nominal scale
+    of its optics from the headers (`fits_header.resolve_pixel_scale_arcsec()`,
+    XPIXSZ + FOCALLEN). None when neither is there.
 
-    A frame archived without a solve still carries whatever WCS the capture
-    software wrote, possibly at nominal optics; such frames are QC-failed in
-    practice, and the QCFLAG screen drops those anyway.
+    The header fallback matters for QC-failed frames: astrometry is skipped
+    for them, so they are archived with no WCS at all. Kept as "unknown
+    scale", they slipped past this screen, and when too few good references
+    were left the QC screen's unscreened fallback stacked them — 0.78"/px
+    frames from one telescope into references for a 0.99"/px one (M82, 1.4.0).
     """
     if header is None:
         return None
+    wcs = None
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             wcs = WCS(header)
     except Exception:
-        return None
-    if not wcs.has_celestial:
-        return None
-    return _pixel_scale_arcsec("", wcs=wcs.celestial)
+        pass
+    if wcs is not None and wcs.has_celestial:
+        return _pixel_scale_arcsec("", wcs=wcs.celestial)
+    return fits_header.resolve_pixel_scale_arcsec(header)
 
 
 def _same_scale(candidate: Optional[float], new: Optional[float]) -> bool:
@@ -439,12 +459,14 @@ def _screen_by_quality(
     psf_fwhm_arcsec: Optional[float],
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
     *,
+    eight_bit: Optional[bool] = None,
     pixel_scale_arcsec: Optional[float] = None,
 ) -> list[str]:
     """
     Drop reference candidates that would damage the difference image: frames
-    taken with other optics or another camera, frames their own QC marked as
-    failed, and frames whose seeing is far worse than the new frame's.
+    taken with other optics or another camera, frames of another bit depth,
+    frames their own QC marked as failed, and frames whose seeing is far
+    worse than the new frame's.
 
     The instrument screen compares TELESCOP and INSTRUME with the new frame's
     *instrument*. The archive is filed by object and filter only, so this is
@@ -458,8 +480,15 @@ def _screen_by_quality(
     same camera look identical to it. The plate scale does tell them apart —
     the new frame's solved *pixel_scale_arcsec* against each candidate's
     archived solve, within SUBTRACTION_REF_MAX_SCALE_DIFF (it also separates
-    binning modes and a reducer fitted or removed). Same rule as the keyword
-    screen: no fallback, and a candidate without a WCS is kept.
+    binning modes and a reducer fitted or removed).
+
+    *eight_bit* keeps 8-bit frames and deeper ones apart, also with no
+    fallback (16-bit and float frames of one camera still stack together): an 8-bit frame is a stretched, quantized copy whose ADU are
+    nowhere near the raw frame's (the flux scale knows exposure and gain, not
+    a ×256 stretch), so stacking one leaves every star in the difference image
+    (M63 2021-04-12 R: 139–237 candidates per frame against 8-bit references). Same rule as the keyword
+    screen: no fallback. A candidate without a WCS is judged by its header
+    plate scale (see `_scale_of()`), and kept only when it has neither.
 
     Reference selection used to be recency (plus PA-closeness) alone and never
     looked at quality at all. That was harmless while QC-failed frames were
@@ -491,6 +520,22 @@ def _screen_by_quality(
                 "another telescope/camera than %s",
                 len(paths) - len(same), len(paths),
                 " / ".join(v or "?" for v in instrument),
+            )
+        paths = same
+        if not paths:
+            return paths
+
+    if eight_bit is not None:
+        same = [
+            p for p in paths
+            if headers[p] is None or _bitpix_of(headers[p]) is None
+            or fits_header.is_8bit(headers[p]) == eight_bit
+        ]
+        if len(same) != len(paths):
+            logger.info(
+                "Subtraction: excluded %d of %d reference candidate(s) of another bit "
+                "depth (this frame is %s8-bit)",
+                len(paths) - len(same), len(paths), "" if eight_bit else "not ",
             )
         paths = same
         if not paths:
@@ -713,6 +758,79 @@ def _read_flux_scale_keys(fits_path: str) -> tuple[Optional[float], Optional[flo
     return exptime, gain
 
 
+# Stars used to measure a reference's photometric scale (_photometric_scale):
+# detection threshold (sigma), minimum count for a trusted ratio, aperture
+# radius and local-sky annulus in units of the stars' median FWHM.
+_PHOT_SCALE_DETECT_SIGMA = 10.0
+_PHOT_SCALE_MIN_STARS = 20
+_PHOT_SCALE_APERTURE_FWHM = 3.0
+_PHOT_SCALE_ANNULUS_FWHM = (4.0, 6.0)
+
+
+def _scale_stars(
+    new_data: np.ndarray, saturation_adu: float,
+) -> Optional[tuple[np.ndarray, np.ndarray, float]]:
+    """
+    Bright, unsaturated, unflagged stars of the new frame — ``(x, y,
+    median_fwhm_px)`` — for _photometric_scale(); None when too few.
+    """
+    try:
+        data = np.ascontiguousarray(np.nan_to_num(new_data, nan=0.0), dtype=np.float32)
+        bkg = sep.Background(data)
+        objs = sep.extract(data - bkg, _PHOT_SCALE_DETECT_SIGMA, err=bkg.globalrms, minarea=10)
+    except Exception as exc:
+        logger.debug("Subtraction: no stars for photometric scaling: %s", exc)
+        return None
+    keep = (objs["flag"] == 0) & (objs["peak"] + bkg.globalback < saturation_adu)
+    objs = objs[keep]
+    if len(objs) < _PHOT_SCALE_MIN_STARS:
+        return None
+    fwhm = float(np.median(2.0 * np.sqrt(np.log(2.0) * (objs["a"] ** 2 + objs["b"] ** 2))))
+    return objs["x"].astype(np.float64), objs["y"].astype(np.float64), fwhm
+
+
+def _photometric_scale(
+    new_data: np.ndarray,
+    aligned_ref: np.ndarray,
+    footprint: Optional[np.ndarray],
+    stars: Optional[tuple[np.ndarray, np.ndarray, float]],
+) -> Optional[float]:
+    """
+    Multiplier bringing an aligned reference onto the new frame's flux scale,
+    measured on the stars both share: the median ratio of their aperture
+    fluxes (local sky from an annulus). None when too few stars qualify.
+
+    The header factor (_flux_scale_factor()) knows exposure time and gain,
+    not the sky: between two nights of M51 the same stars were 0.17 mag
+    brighter on one, so every one of them stayed in the difference image as
+    a 17 % residual. Measuring the ratio covers transparency, airmass and
+    the header factor at once.
+    """
+    if stars is None:
+        return None
+    x, y, fwhm = stars
+    r = _PHOT_SCALE_APERTURE_FWHM * fwhm
+    ann = (_PHOT_SCALE_ANNULUS_FWHM[0] * fwhm, _PHOT_SCALE_ANNULUS_FWHM[1] * fwhm)
+    try:
+        new_c = np.ascontiguousarray(np.nan_to_num(new_data, nan=0.0), dtype=np.float32)
+        ref_c = np.ascontiguousarray(np.nan_to_num(aligned_ref, nan=0.0), dtype=np.float32)
+        mask = None if footprint is None else np.ascontiguousarray(footprint, dtype=bool)
+        f_new, _, flag_new = sep.sum_circle(new_c, x, y, r, bkgann=ann)
+        f_ref, _, flag_ref = sep.sum_circle(ref_c, x, y, r, bkgann=ann, mask=mask)
+    except Exception as exc:
+        logger.debug("Subtraction: photometric scale measurement failed: %s", exc)
+        return None
+    ok = (
+        (f_new > 0) & (f_ref > 0)
+        & ((flag_ref & sep.APER_HASMASKED) == 0)
+        & ((flag_new | flag_ref) & sep.APER_TRUNC == 0)
+    )
+    if int(ok.sum()) < _PHOT_SCALE_MIN_STARS:
+        return None
+    ratio = float(np.median(f_new[ok] / f_ref[ok]))
+    return ratio if math.isfinite(ratio) and ratio > 0 else None
+
+
 def _flux_scale_factor(
     ref_path: str,
     new_exptime: Optional[float],
@@ -758,6 +876,142 @@ def _flux_scale_factor(
 # ---------------------------------------------------------------------------
 # Image alignment
 # ---------------------------------------------------------------------------
+
+# Spacing (px) of the grid on which _align_by_wcs() evaluates the exact
+# pixel mapping; a bicubic spline fills in between. The mapping is smooth
+# (TAN + low-order SIP), so a coarse grid loses nothing measurable and
+# saves evaluating an iterative world→pixel inverse at every pixel.
+_WCS_ALIGN_GRID_STEP_PX = 32
+# Rows resampled per block — bounds the memory of the full-size coordinate
+# maps on a 60-Mpx frame.
+_WCS_ALIGN_BLOCK_ROWS = 512
+# Below this fraction of the new frame covered by the reference, the WCS
+# mapping is treated as a failure (wrong or unrelated solve).
+_WCS_ALIGN_MIN_COVERAGE = 0.2
+# A WCS-resampled reference whose shared stars sit further than this (px,
+# median) from the new frame's is not used — astroalign registers it instead.
+# The two solves' errors add up, and the new frame's solve has not had the
+# catalog offset correction its archived references carry.
+_WCS_ALIGN_MAX_OFFSET_PX = 0.5
+
+
+def _registration_offset_px(
+    new_data: np.ndarray,
+    aligned_ref: np.ndarray,
+    footprint: Optional[np.ndarray],
+    stars: Optional[tuple[np.ndarray, np.ndarray, float]],
+) -> Optional[float]:
+    """
+    Median offset (px) between the windowed centroids of the new frame's
+    bright stars and the same stars in an aligned reference; None when too
+    few stars can be measured in both.
+    """
+    if stars is None:
+        return None
+    x, y, fwhm = stars
+    sig = max(fwhm / 2.3548, 0.5)
+    try:
+        new_c = np.ascontiguousarray(np.nan_to_num(new_data, nan=0.0), dtype=np.float32)
+        ref_c = np.ascontiguousarray(np.nan_to_num(aligned_ref, nan=0.0), dtype=np.float32)
+        xn, yn, fn = sep.winpos(new_c, x, y, sig)
+        xr, yr, fr = sep.winpos(ref_c, x, y, sig)
+    except Exception as exc:
+        logger.debug("Subtraction: registration check failed: %s", exc)
+        return None
+    ok = (fn == 0) & (fr == 0)
+    if footprint is not None:
+        ix = np.clip(np.round(x).astype(int), 0, footprint.shape[1] - 1)
+        iy = np.clip(np.round(y).astype(int), 0, footprint.shape[0] - 1)
+        ok &= ~footprint[iy, ix]
+    if int(ok.sum()) < _PHOT_SCALE_MIN_STARS:
+        return None
+    return float(np.hypot(np.median(xr[ok] - xn[ok]), np.median(yr[ok] - yn[ok])))
+
+
+def _sip_wcs_of(header: Optional[Any]) -> Optional[WCS]:
+    """A header's celestial WCS when it carries SIP distortion terms, else None."""
+    if header is None:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wcs = WCS(header)
+    except Exception:
+        return None
+    if not wcs.has_celestial or wcs.sip is None:
+        return None
+    return wcs
+
+
+def _align_by_wcs(
+    source: np.ndarray,
+    source_wcs: WCS,
+    target_wcs: WCS,
+    target_shape: tuple[int, int],
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """
+    Resample *source* onto the target pixel grid through the two plate
+    solves: target pixel → sky (target_wcs) → source pixel (source_wcs),
+    bicubic. Returns ``(aligned, footprint)`` like _align_frame() — footprint
+    True where the source has no data — or None when the mapping fails or
+    covers too little of the target.
+
+    astroalign fits one affine transform between the two star patterns. Over
+    a wide field the optics' distortion is not affine, and two frames whose
+    pointing differs (another night) need different corrections across the
+    field — the fit absorbs the centre and leaves every star in the outer
+    third as a residual pair. Both frames' SIP solves already describe that
+    distortion, so mapping through them is exact up to the solve accuracy
+    (0.2-1.4" on 2° M51 frames). Rotation needs no pre-rotation here.
+    """
+    try:
+        ny, nx = target_shape
+        sy, sx = source.shape
+        gx = np.linspace(0.0, nx - 1.0, max(2, nx // _WCS_ALIGN_GRID_STEP_PX + 2))
+        gy = np.linspace(0.0, ny - 1.0, max(2, ny // _WCS_ALIGN_GRID_STEP_PX + 2))
+        mx, my = np.meshgrid(gx, gy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ra, dec = target_wcs.all_pix2world(mx.ravel(), my.ravel(), 0)
+            px, py = source_wcs.all_world2pix(ra, dec, 0, quiet=True)
+        px = np.asarray(px, dtype=np.float64).reshape(mx.shape)
+        py = np.asarray(py, dtype=np.float64).reshape(mx.shape)
+        if not (np.all(np.isfinite(px)) and np.all(np.isfinite(py))):
+            return None
+
+        from scipy.interpolate import RectBivariateSpline
+        from scipy.ndimage import map_coordinates, spline_filter
+
+        spline_x = RectBivariateSpline(gy, gx, px, kx=3, ky=3)
+        spline_y = RectBivariateSpline(gy, gx, py, kx=3, ky=3)
+
+        valid = np.isfinite(source)
+        filled = np.where(valid, source, 0.0).astype(np.float32)
+        # The cubic prefilter once for the whole frame, not per block.
+        coeffs = spline_filter(filled, order=3, output=np.float32)
+        invalid = None if valid.all() else (~valid).astype(np.float32)
+
+        aligned = np.empty((ny, nx), dtype=np.float32)
+        footprint = np.empty((ny, nx), dtype=bool)
+        cols = np.arange(nx, dtype=np.float64)
+        for y0 in range(0, ny, _WCS_ALIGN_BLOCK_ROWS):
+            rows = np.arange(y0, min(ny, y0 + _WCS_ALIGN_BLOCK_ROWS), dtype=np.float64)
+            bx = spline_x(rows, cols)
+            by = spline_y(rows, cols)
+            coords = np.stack([by, bx])
+            aligned[y0:y0 + len(rows)] = map_coordinates(coeffs, coords, order=3, cval=0.0, prefilter=False)
+            outside = (bx < 0) | (bx > sx - 1) | (by < 0) | (by > sy - 1)
+            if invalid is not None:
+                outside |= map_coordinates(invalid, coords, order=1, cval=1.0) > 0.01
+            footprint[y0:y0 + len(rows)] = outside
+
+        if 1.0 - float(footprint.mean()) < _WCS_ALIGN_MIN_COVERAGE:
+            return None
+        return aligned, footprint
+    except Exception as exc:
+        logger.debug("Subtraction: WCS-based alignment failed: %s", exc)
+        return None
+
 
 def _align_frame(
     source: np.ndarray,
@@ -1581,6 +1835,7 @@ def _build_saturation_mask(
     new_data: np.ndarray,
     aligned_refs: list[np.ndarray],
     radius_px: int,
+    saturation_adu: Optional[float] = None,
 ) -> Optional[np.ndarray]:
     """
     Flag pixels near saturation in the new frame or any aligned reference
@@ -1606,6 +1861,9 @@ def _build_saturation_mask(
     radius_px:
         Dilation radius in pixels. 0 (or a failed dilation, e.g. missing
         scipy) falls back to the un-dilated saturation mask itself.
+    saturation_adu:
+        The new frame's threshold (`fits_header.saturation_adu()` — 255 for
+        an 8-bit frame); None → config.SATURATION_ADU.
 
     Returns
     -------
@@ -1614,10 +1872,12 @@ def _build_saturation_mask(
         new frame or any reference frame is saturated (the common case) —
         callers can skip masking work entirely in that case.
     """
-    saturated = new_data >= config.SATURATION_ADU
+    if saturation_adu is None:
+        saturation_adu = config.SATURATION_ADU
+    saturated = new_data >= saturation_adu
     for ref in aligned_refs:
         if ref.shape == new_data.shape:
-            saturated |= (ref >= config.SATURATION_ADU)
+            saturated |= (ref >= saturation_adu)
 
     if not saturated.any():
         return None
@@ -1729,10 +1989,12 @@ async def run(
     # (no wcs, or its own PA round-trip failed) degrades gracefully: recency-
     # only selection and no pre-rotation, exactly like before this feature.
     new_position_angle_deg = _position_angle_deg(wcs) if wcs is not None else None
+    new_header = _read_header(fits_path)
 
     archive_files = _find_archive_frames(
         archive_dir, filter_name, new_position_angle_deg, psf_fwhm_arcsec,
-        instrument=_read_instrument(fits_path),
+        instrument=_instrument_of(new_header),
+        eight_bit=fits_header.is_8bit(new_header) if new_header is not None else None,
         pixel_scale_arcsec=_pixel_scale_arcsec(fits_path, wcs=wcs) if wcs is not None else None,
         exclude_path=fits_path,
     )
@@ -1777,10 +2039,48 @@ async def run(
     aligned: list[np.ndarray] = []
     footprints: list[Optional[np.ndarray]] = []
     scales: list[float] = []
+    # Through the plate solves when this frame's carries SIP terms — see
+    # _align_by_wcs(); a reference archived without them takes astroalign.
+    new_sip_wcs = wcs if (
+        config.SUBTRACTION_ALIGN_BY_WCS and wcs is not None and getattr(wcs, "sip", None) is not None
+    ) else None
+    n_wcs_aligned = 0
+    n_photometric = 0
+    scale_stars = _scale_stars(
+        new_data,
+        fits_header.saturation_adu(new_header) if new_header is not None else config.SATURATION_ADU,
+    )
+
+    def _reference_scale(ref_aligned: np.ndarray, ref_footprint: Optional[np.ndarray], ref_path: str) -> float:
+        nonlocal n_photometric
+        measured = _photometric_scale(new_data, ref_aligned, ref_footprint, scale_stars)
+        if measured is not None:
+            n_photometric += 1
+            return measured
+        return _flux_scale_factor(ref_path, new_exptime, new_gain)
+
     for ref_path in archive_files:
         ref_data = _load_frame_data(ref_path)
         if ref_data is None:
             continue
+        ref_sip_wcs = _sip_wcs_of(_read_header(ref_path)) if new_sip_wcs is not None else None
+        if ref_sip_wcs is not None:
+            result = _align_by_wcs(ref_data, ref_sip_wcs, new_sip_wcs, new_data.shape)
+            if result is not None:
+                offset = _registration_offset_px(new_data, result[0], result[1], scale_stars)
+                if offset is not None and offset > _WCS_ALIGN_MAX_OFFSET_PX:
+                    logger.debug(
+                        "Subtraction: %s resampled through the plate solves lands %.2f px "
+                        "off — registering it with astroalign instead",
+                        os.path.basename(ref_path), offset,
+                    )
+                    result = None
+            if result is not None:
+                n_wcs_aligned += 1
+                aligned.append(result[0])
+                footprints.append(result[1])
+                scales.append(_reference_scale(result[0], result[1], ref_path))
+                continue
         # Coarse-correct for a known camera/rotator orientation difference
         # (e.g. a meridian flip) BEFORE astroalign's own fine, star-matching
         # registration — see _prerotate_reference()'s docstring. A no-op
@@ -1807,12 +2107,25 @@ async def run(
             # _build_saturation_mask() below compares the aligned references
             # against SATURATION_ADU, and a scaled-down reference's saturated
             # core would drop below that threshold and escape masking.
-            scales.append(_flux_scale_factor(ref_path, new_exptime, new_gain))
+            scales.append(_reference_scale(result_frame, footprint, ref_path))
         else:
             logger.debug(
                 "Subtraction: skipping %s (alignment failed)",
                 os.path.basename(ref_path),
             )
+
+    if aligned and n_photometric < len(aligned):
+        logger.info(
+            "Subtraction: %d of %d reference frame(s) scaled by EXPTIME/GAIN only — too "
+            "few shared stars to measure their flux ratio",
+            len(aligned) - n_photometric, len(aligned),
+        )
+    if n_wcs_aligned:
+        logger.info(
+            "Subtraction: %d of %d reference frame(s) resampled through their SIP plate "
+            "solves, the rest by astroalign",
+            n_wcs_aligned, len(aligned),
+        )
 
     if len(aligned) < config.SUBTRACTION_MIN_FRAMES:
         logger.warning(
@@ -1856,7 +2169,12 @@ async def run(
     if pixel_scale_arcsec and pixel_scale_arcsec > 0:
         radius_px = max(1, int(round(config.SATURATION_MASK_RADIUS_ARCSEC / pixel_scale_arcsec)))
 
-    sat_mask = _build_saturation_mask(new_data, aligned, radius_px)
+    # One threshold for the new frame and its references: the BITPIX screen
+    # in _screen_by_quality() only stacks references of the same bit depth.
+    sat_mask = _build_saturation_mask(
+        new_data, aligned, radius_px,
+        saturation_adu=fits_header.saturation_adu(new_header) if new_header is not None else None,
+    )
     if sat_mask is not None:
         logger.info(
             "Subtraction: masking %d saturated-vicinity pixel(s) (radius=%dpx) "

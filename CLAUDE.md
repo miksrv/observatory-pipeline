@@ -224,7 +224,7 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   targeted at itself. Shared: history, coverage, anomalies and remote settings.
 - **Shutdown:** SIGTERM/SIGINT is checked only *between* items (an item cut halfway could register
   a frame without its sources). The item in progress finishes, nothing new starts, and a task
-  with unstarted items is `PATCH`ed back to `PENDING`; compose's `stop_grace_period: 5m` covers a
+  with unstarted items is `PATCH`ed back to `PENDING`; compose's `stop_grace_period: 10m` covers a
   long ANALYZE item. A second signal exits at once — the handler is `signal.signal()`, not the
   loop's, because CPU-bound steps hold the loop for minutes. astap runs in its own session, so a
   terminal Ctrl+C does not kill it mid-solve. The watcher maps SIGTERM onto its Ctrl+C path
@@ -274,6 +274,11 @@ Normalizes object names (`M 51`→`M51`, `Sh2 101`→`SH2-101`, `Abell 39`/`A39`
 `OSC`/`RGB`/`Color`→`OSC`, `H-Alpha`→`Ha`, `L-eNhance`→`LeNhance`, Johnson/SDSS passed through, …)
 and frame types (`Light`/`Dark`/`Flat`/`Bias`). Full mapping tables are in the code.
 `is_narrowband()` uses `config.NARROWBAND_FILTERS`.
+
+A Light/Flat with no FILTER card takes the filter from its path (`extract_filter_from_path()`:
+the token after `Light`/`Flat` in the filename, a `2x2` binning token skipped, else the parent
+directory), only if `known_filter()` recognises it; it is written into the frame's `FILTER` card,
+marked as taken from the file name.
 
 Filenames (`NORMALIZE_ENABLED=true`):
 ```
@@ -353,6 +358,10 @@ Package: `_astap.py` (runs astap), `_wcs.py` (read/validate WCS), `_frame_geomet
 
 - **astap** runs via `xvfb-run` without `-update` (never writes into the FITS; only `.wcs`/`.ini`/
   `.log` side files), on a worker thread (`asyncio.to_thread`) with `subprocess.run(timeout=)`.
+- **SIP distortion** (`-sip y`, `ASTAP_SIP_ENABLED`): a linear TAN solve put stars 14-28" off
+  Gaia in the outer third of a 2° frame (no catalog match → UNKNOWN/MOVING_UNKNOWN); with SIP
+  ≤ 1.4". Every consumer uses `all_pix2world`/`pixel_to_world`, which apply it; the archived
+  header keeps it (`to_header(relax=True)`, stale SIP cards stripped first).
 - The fresh `.wcs` side file is **preferred over any WCS already in the header** — capture
   software writes mount-pointing WCS that looks valid but can be arcminutes off. Header WCS is only
   a fallback.
@@ -376,7 +385,8 @@ Package: `_astap.py` (runs astap), `_wcs.py` (read/validate WCS), `_frame_geomet
   - `sources` — strict star filter; `sources_all` — loose, elongation ceiling
     `SOURCES_ALL_ELONGATION_MAX` (must stay above `SPACE_DEBRIS_EDGE_ELONGATION_MIN`, warned
     otherwise).
-  - `saturated` — peak raw ADU ≥ `SATURATION_ADU`; `near_edge` — within `EDGE_MARGIN_FRAC` of an
+  - `saturated` — peak raw ADU ≥ `fits_header.saturation_adu()` (`SATURATION_ADU`, capped at the
+    file's integer `BITPIX` ceiling — 255 for an 8-bit export); `near_edge` — within `EDGE_MARGIN_FRAC` of an
     edge. Both are wire fields (persisted, so standalone re-runs can use them).
   - `position_angle_deg` — 0° = North up, clockwise toward +X, via pixel↔world round trip.
     Diagnostic only.
@@ -397,7 +407,8 @@ still hold a mount estimate), falling back to header then `.wcs` file.
   transformed identically). The per-frame fit is only **logged**, as calibration data for that
   setting. No configured `k` → plain median. Sources with unknown colour use `zp` bare with
   `mag_err` widened by `|k| × color_scatter`.
-- **Narrowband** (`skip_calibration=True`): aperture photometry runs, calibration never does.
+- **Narrowband and 8-bit frames** (`skip_calibration=True`): aperture photometry runs, calibration
+  never does. An 8-bit (`BITPIX=8`) frame is a stretched, quantized export, not linear ADU.
 - **Noise:** `flux_err = sqrt(|net|/gain + area × sky_sigma²)`; gain from `_resolve_gain()`:
   argument → `PHOTOMETRY_GAIN_E_PER_ADU` → header `EGAIN` before `GAIN` (`GAIN` is often a vendor
   setting); implausible → 1.0 with a warning. `snr = flux/flux_err`, overwriting any provisional
@@ -418,20 +429,26 @@ frames of the same object. `performed=False` with fewer than `SUBTRACTION_MIN_FR
    files); same filter preferred (fallback: any), the new frame's own file excluded. Never
    Dark/Flat/Bias (parsed positionally from the filename — a defence for un-migrated archives).
    `_screen_by_quality()` first drops any candidate whose `TELESCOP`/`INSTRUME` differs from the
-   new frame's, or whose archived solve's plate scale is off the new frame's by more than
-   `SUBTRACTION_REF_MAX_SCALE_DIFF` (INDI's `TELESCOP` is the mount's name, so the scale is what
-   separates two telescopes on one mount) — **no fallback**: another optics' frame makes a wrong
-   difference image, not a degraded one. It then excludes `QCFLAG != OK` and `QCFWHM` worse than
-   `SUBTRACTION_REF_MAX_FWHM_RATIO` × the new frame's; if that leaves too few, the
-   same-instrument unscreened set is used. Frames without a keyword are kept on that keyword.
+   new frame's, or whose archived solve's plate scale (header `XPIXSZ`+`FOCALLEN` for an unsolved,
+   QC-failed frame) is off the new frame's by more than `SUBTRACTION_REF_MAX_SCALE_DIFF` (INDI's
+   `TELESCOP` is the mount's name, so the scale is what separates two telescopes on one mount) —
+   **no fallback**: another optics' frame makes a wrong difference image, not a degraded one. A
+   candidate of another `BITPIX` (8-bit export vs raw camera frame) is dropped the same way. It
+   then excludes `QCFLAG != OK` and `QCFWHM` worse than `SUBTRACTION_REF_MAX_FWHM_RATIO` × the new
+   frame's; if that leaves too few, the same-instrument unscreened set is used. Frames without a keyword are kept on that keyword.
    Position-angle closeness ranks the whole candidate list as a soft tiebreaker.
 2. **Pre-rotation** (`_prerotate_reference()`) by the known PA difference above
    `SUBTRACTION_PREROTATE_MIN_DEG`, growing the canvas (`reshape=True`) and marking fill as invalid.
    Never excludes a reference for rotation — astroalign handles even 180°.
-3. **Alignment** with `astroalign` (shape mismatches are fine; it resamples onto the new grid).
-4. **Flux scaling** of the stack by `(t_new/t_ref) × (g_ref/g_new)` (`_flux_scale_factor()`; each
-   factor → 1.0 if a keyword is missing). Applied to the stack only, so saturation masking still
-   sees raw reference ADU.
+3. **Alignment:** through both plate solves (`_align_by_wcs()`: target pixel → sky → reference
+   pixel, bicubic) when both carry SIP terms (`SUBTRACTION_ALIGN_BY_WCS`) — a wide field's
+   distortion is not affine; otherwise `astroalign` (shape mismatches are fine; it resamples
+   onto the new grid).
+4. **Flux scaling** of each reference by the median flux ratio of the stars both frames share
+   (`_photometric_scale()` — covers transparency, which differed by 0.17 mag between two M51
+   nights), falling back to `(t_new/t_ref) × (g_ref/g_new)` (`_flux_scale_factor()`; each
+   factor → 1.0 if a keyword is missing) with too few stars. Applied to the stack only, so
+   saturation masking still sees raw reference ADU.
 5. **Median stack** honouring each reference's astroalign footprint and excluding non-finite
    pixels; uncovered pixels take the new frame's value (difference = 0).
 6. **Masks:** vicinity of saturated pixels in the new frame or any reference
@@ -522,13 +539,14 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Unmatched + `near_edge` | suppressed, unless a subtraction candidate passing `_survives_edge_zone()` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC`, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (`…_EDGE_…` near the edge) | `SPACE_DEBRIS` — recorded, not an alert; no "vacated position" proof needed |
 | Unmatched, shifted (see below), not near edge | `MOVING_UNKNOWN` → alert |
-| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star within `SUBTRACTION_RESIDUAL_MAX_DMAG` | suppressed (that star's residual) |
+| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star within `SUBTRACTION_RESIDUAL_MAX_DMAG` | suppressed (that star's residual) — checked before every branch below |
 | No coverage, normal detection | `FIRST_OBSERVATION` — logged only, not posted |
 | No coverage, subtraction candidate, catalogued | suppressed (registration residual) |
 | No coverage, subtraction candidate, uncatalogued | `UNKNOWN` → alert |
-| Covered, no history, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → alert |
+| Covered, no history, subtraction candidate on a Simbad galaxy | `SUPERNOVA_CANDIDATE` → alert (a normal detection of the galaxy itself → `KNOWN_CATALOG_NEW`) |
 | Covered, no history, catalogued | `KNOWN_CATALOG_NEW` — logged only, not posted |
 | Covered, no history, uncatalogued | `UNKNOWN` → alert |
+| History, subtraction candidate | nothing — no Δmag against a neighbour's light curve |
 | History, significant brightening, near galaxy | `SUPERNOVA_CANDIDATE` → alert |
 | History, significant Δmag, Simbad binary / variable | `BINARY_STAR` / `VARIABLE_STAR` |
 | History, significant Δmag beyond `VARIABILITY_SIGMA` × own same-filter scatter over ≥ `VARIABILITY_MIN_EPOCHS`, not a galaxy/cluster | `VARIABLE_STAR` (light-curve based; stated in `notes`) |
@@ -567,7 +585,8 @@ namespace.
 | `before_after` | a single detected epoch (any type) | before/after pair |
 | `track_gif`, `stamp_strip_gif` | companions to the two above (`CHART_GIF_ENABLED`) | independent renderers: fixed canvas, each frame from that epoch's own pixels |
 
-- Flow: `POST /sources/tracks/batch` → cap at `CHART_MAX_EPOCHS` → load each epoch from
+- Flow: `POST /sources/tracks/batch` → thin to `CHART_MAX_EPOCHS`, evenly spaced in time with the
+  first and last kept (`_select_epochs_evenly()`) → load each epoch from
   `archive_layout.find_archived(filename, object)` (missing files skipped) → render each distinct style the
   source's anomaly types imply (`_group_types_by_style()`) → upload. API side stores
   `UNIQUE(source_id, style)`.
@@ -592,6 +611,12 @@ shared `_shared.py`), all re-exported from `__init__.py`. `httpx` async + `tenac
 Sends `X-API-Key`, JSON headers and `X-Pipeline-Version` (`version.py`, the top `CHANGELOG.md`
 heading; the API shows it on its dashboard). Older single-position endpoints (`/sources/near`,
 `/frames/covering`, `/sources/{id}/track`) are still exported but unused.
+
+Sized for shared hosting: every call has a 30 s timeout except `POST /frames/{id}/sources`
+(`API_SOURCES_TIMEOUT_SEC` — a timed-out POST used to be retried while the first was still
+running server-side); `get_sources_near_batch()` sends `HISTORY_BATCH_MAX_POSITIONS` positions per
+request, grouped by declination, one request after another (one request per frame ran the API's
+PHP out of memory).
 
 `_to_wire_source()`: renames `_from_subtraction` → `from_subtraction` (only when truthy), strips
 every other leading-underscore key. **Convention: a leading underscore means "internal, not for

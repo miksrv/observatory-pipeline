@@ -559,6 +559,14 @@ class TestMeasureAtPixel:
         result = fp._measure_at_pixel(data_sub, image, 200.0, 200.0, ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0)
         assert result is None
 
+    def test_returns_none_above_the_files_own_saturation_level(self):
+        """An 8-bit file clips at 255 — far below SATURATION_ADU."""
+        image = _make_image()
+        data_sub = image - 1000.0
+        kwargs = dict(ap_radius=6.0, annulus_inner=12.0, annulus_outer=18.0, sky_sigma=5.0)
+        assert fp._measure_at_pixel(data_sub, image, 100.0, 100.0, **kwargs) is not None
+        assert fp._measure_at_pixel(data_sub, image, 100.0, 100.0, saturation_adu=255.0, **kwargs) is None
+
     def test_a_saturated_pixel_outside_the_aperture_is_tolerated(self):
         """
         Audit 2026-08-18, finding M7: the check scanned the square bounding

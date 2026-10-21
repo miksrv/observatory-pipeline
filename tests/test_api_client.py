@@ -32,6 +32,7 @@ from api_client import (
     post_sources,
     upload_source_chart,
 )
+import config
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +869,51 @@ class TestGetSourcesNearBatch:
         _, call_kwargs = mock_client.post.call_args
         assert call_kwargs["json"]["uncatalogued_only"] is True
         assert call_kwargs["json"]["radius_arcsec"] == 600.0
+
+    async def test_positions_are_sent_in_dec_sorted_chunks_and_reassembled(self, monkeypatch):
+        monkeypatch.setattr(config, "HISTORY_BATCH_MAX_POSITIONS", 2)
+        positions = [{"ra": 10.0, "dec": d} for d in (5.0, 1.0, 4.0, 2.0, 3.0)]
+        sent: list[list[float]] = []
+
+        async def fake_batch(chunk, radius_arcsec, before_time, uncatalogued_only=False):
+            sent.append([p["dec"] for p in chunk])
+            # Echo each position's dec back as its only "observation".
+            return {str(j): [{"dec": p["dec"]}] for j, p in enumerate(chunk)}
+
+        monkeypatch.setattr(_sources_module, "_get_sources_near_batch_with_retry", fake_batch)
+
+        results = await api_client_module.get_sources_near_batch(positions, 5.0, "t")
+
+        assert sent == [[1.0, 2.0], [3.0, 4.0], [5.0]]
+        assert {k: v[0]["dec"] for k, v in results.items()} == {
+            str(i): p["dec"] for i, p in enumerate(positions)
+        }
+
+    async def test_one_failed_chunk_fails_the_whole_query(self, monkeypatch):
+        monkeypatch.setattr(config, "HISTORY_BATCH_MAX_POSITIONS", 1)
+        calls = AsyncMock(side_effect=[{"0": []}, httpx.ConnectError("down")])
+        monkeypatch.setattr(_sources_module, "_get_sources_near_batch_with_retry", calls)
+
+        assert await api_client_module.get_sources_near_batch(
+            [{"ra": 1.0, "dec": 1.0}, {"ra": 1.0, "dec": 2.0}], 5.0, "t") is None
+
+
+class TestPostSourcesTimeout:
+    async def test_post_sources_uses_its_own_read_timeout(self, monkeypatch):
+        monkeypatch.setattr(config, "API_SOURCES_TIMEOUT_SEC", 123.0)
+        resp = _mock_response(status_code=201, json_data={"source_ids": []})
+        seen = {}
+        real_make_client = _sources_module._make_client
+
+        def spy(timeout=30.0):
+            seen["timeout"] = timeout
+            return real_make_client(timeout=timeout)
+
+        monkeypatch.setattr(_sources_module, "_make_client", spy)
+        with _patch_client(post_response=resp):
+            await api_client_module.post_sources("f1", "x.fits", [])
+
+        assert seen["timeout"] == 123.0
 
 
 

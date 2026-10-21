@@ -338,6 +338,72 @@ def normalize_filter_name(raw_filter: Any) -> tuple[str | None, str | None]:
     return (raw_str, raw_str)
 
 
+# Tokens after which a capture program's filename names the filter
+# (`M_51_Light_R_300_secs_…`, `…_Flat_Ha_…`), and the binning token some put
+# in between (`M_51_Light_2x2_R_…`).
+_FILENAME_FILTER_ANCHORS: frozenset[str] = frozenset({"light", "flat"})
+_BINNING_TOKEN_RE = re.compile(r"^\d+x\d+$", re.IGNORECASE)
+
+
+def known_filter(token: Any) -> str | None:
+    """
+    The canonical filter name for *token* if it is one FILTER_MAP knows
+    (an alias or a canonical name itself), else None — never the raw token,
+    unlike normalize_filter_name(): a guess from a filename must be a filter.
+    """
+    if token is None:
+        return None
+    text = str(token).strip()
+    if not text:
+        return None
+    if text.lower() in FILTER_MAP:
+        return FILTER_MAP[text.lower()]
+    return text if text in set(FILTER_MAP.values()) else None
+
+
+def extract_filter_from_path(fits_path: str) -> str | None:
+    """
+    The filter a capture program recorded in the file's name or directory
+    when it left the FILTER header empty — the fallback for such frames.
+
+    Some setups write the filter only into the path: 177 M51 frames of
+    2022-05 arrived as `M_51/Light/L/M_51_Light_L_300_secs_….fits` with no
+    FILTER card, were archived under `NONE` and so never took part in a
+    same-filter magnitude comparison or reference stack.
+
+    Order: the token after `Light`/`Flat` in the filename (a binning token
+    such as `2x2` skipped), then the name of the directory the file sits in.
+    Only a name FILTER_MAP knows is accepted (known_filter()); otherwise None.
+    """
+    import os  # noqa: PLC0415
+
+    stem = re.sub(r"\.(fits|fit|fts)$", "", os.path.basename(fits_path), flags=re.IGNORECASE)
+    parts = stem.split("_")
+    for i, part in enumerate(parts):
+        if part.lower() not in _FILENAME_FILTER_ANCHORS:
+            continue
+        rest = [p for p in parts[i + 1:] if not _BINNING_TOKEN_RE.match(p)]
+        if rest and (found := known_filter(rest[0])) is not None:
+            return found
+        break
+    return known_filter(os.path.basename(os.path.dirname(fits_path)))
+
+
+def update_fits_filter_header(fits_path: str, filter_name: str) -> None:
+    """
+    Record a filter taken from the file's path in its FILTER card, marked as
+    such, so every later reader of the archived file sees it. All I/O
+    exceptions are caught and logged.
+    """
+    try:
+        from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+        with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
+            hdul[0].header["FILTER"] = (filter_name, "from the file name; header had none")
+    except Exception as exc:
+        logger.warning("Could not write FILTER header in %s: %s", fits_path, exc)
+
+
 def is_narrowband(raw_filter: Any) -> bool:
     """
     Return True if a (possibly raw, un-normalized) filter value is one of

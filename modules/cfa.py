@@ -47,6 +47,7 @@ import astropy.io.fits as fits
 import numpy as np
 
 import config
+from modules import fits_header
 
 logger = logging.getLogger(__name__)
 
@@ -159,10 +160,21 @@ def to_superpixel(src_path: str, dest_path: str) -> dict[str, Any]:
         if not is_cfa(header):
             raise ValueError(f"not an unconverted CFA frame: {src_path}")
         pattern = _pattern(header)
+        # The file's own ceiling, read before the data is scaled — an 8-bit
+        # capture clips at 255, far below SATURATION_ADU.
+        saturation = fits_header.saturation_adu(header)
+        ceiling = fits_header.integer_ceiling_adu(header)
+        bitpix = header.get("BITPIX")
         data = np.asarray(hdul[0].data)
         native_shape = data.shape
-        mono, n_saturated = _superpixel(data, config.SATURATION_ADU)
+        mono, n_saturated = _superpixel(data, saturation)
         new_header = _converted_header(header, pattern, os.path.basename(src_path), mono.shape)
+        # Kept for fits_header.saturation_adu()/is_8bit(): the float output
+        # no longer says what the camera's integer data could hold.
+        if bitpix is not None:
+            new_header["CFABITPX"] = (int(bitpix), "BITPIX of the original CFA frame")
+        if ceiling is not None:
+            new_header["CFASATLV"] = (ceiling, "largest value the original data could hold")
 
     fits.PrimaryHDU(data=mono, header=new_header).writeto(dest_path, overwrite=False)
     return {

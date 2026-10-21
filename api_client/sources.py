@@ -108,7 +108,7 @@ async def _post_sources_with_retry(
 
     wire_sources = [_to_wire_source(s) for s in sources]
 
-    async with _make_client() as client:
+    async with _make_client(timeout=config.API_SOURCES_TIMEOUT_SEC) as client:
         response = await client.post(
             f"/frames/{frame_id}/sources",
             json={"filename": filename, "sources": wire_sources},
@@ -324,29 +324,46 @@ async def get_sources_near_batch(
     dict
         Dictionary mapping position index (as string) to list of source dicts.
         Example: {"0": [source1, source2], "1": [], "2": [source3]}
-        ``{}`` for an empty *positions*; ``None`` when the request failed, so
+        ``{}`` for an empty *positions*; ``None`` when any request failed, so
         the anomaly detector can tell an outage from "no history here".
+
+    The positions go out in chunks of HISTORY_BATCH_MAX_POSITIONS, grouped by
+    declination: the API selects every observation in one bounding box around
+    a request's positions, so a whole frame's worth spans the whole field and
+    its history (a ~700-source M51 frame ran the API out of memory). Chunks
+    are sent one after another — the API is shared hosting.
     """
     if not positions:
         return {}
 
+    chunk_size = max(1, config.HISTORY_BATCH_MAX_POSITIONS)
+    order = sorted(range(len(positions)), key=lambda i: float(positions[i]["dec"]))
+    chunks = [order[k:k + chunk_size] for k in range(0, len(order), chunk_size)]
+
     logger.debug(
-        "POST /sources/near/batch positions=%d radius=%.1f",
+        "POST /sources/near/batch positions=%d radius=%.1f requests=%d",
         len(positions),
         radius_arcsec,
+        len(chunks),
         extra={"frame_id": None, "fits_filename": None},
     )
-    try:
-        return await _get_sources_near_batch_with_retry(
-            positions, radius_arcsec, before_time, uncatalogued_only
-        )
-    except Exception as exc:
-        logger.error(
-            "Error querying /sources/near/batch: %s",
-            exc,
-            extra={"frame_id": None, "fits_filename": None},
-        )
-        return None
+    results: dict = {}
+    for chunk in chunks:
+        try:
+            chunk_results = await _get_sources_near_batch_with_retry(
+                [positions[i] for i in chunk], radius_arcsec, before_time, uncatalogued_only
+            )
+        except Exception as exc:
+            logger.error(
+                "Error querying /sources/near/batch: %s",
+                exc,
+                extra={"frame_id": None, "fits_filename": None},
+            )
+            return None
+        for local, original in enumerate(chunk):
+            if str(local) in chunk_results:
+                results[str(original)] = chunk_results[str(local)]
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,7 @@ from astropy.wcs import WCS
 from photutils.aperture import ApertureStats, CircularAnnulus, CircularAperture, aperture_photometry
 
 import config
+from modules import fits_header
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +272,7 @@ def _measure_at_pixel(
     annulus_outer: float,
     sky_sigma: float,
     gain_e_per_adu: float = 1.0,
+    saturation_adu: float | None = None,
 ) -> tuple[float, float] | None:
     """
     Aperture-photometer a single fixed position. Mirrors modules/photometry.py's
@@ -280,7 +282,8 @@ def _measure_at_pixel(
 
     Returns (net_flux, flux_err), or None if the annulus falls even partially
     outside data_sub's bounds, or any pixel under the aperture is at/above
-    SATURATION_ADU — a forced measurement on a saturated core is exactly as
+    *saturation_adu* (the file's own threshold, `fits_header.saturation_adu()`;
+    None → SATURATION_ADU) — a forced measurement on a saturated core is exactly as
     physically meaningless as it is for a blindly-detected source (see
     photometry.py's own saturated-source handling).
     """
@@ -301,7 +304,9 @@ def _measure_at_pixel(
     # is deliberately not included either: a saturated pixel in the sky ring
     # biases the background estimate but does not clip the source's own core,
     # and the sigma clip on the annulus stats (H7) already handles it.
-    if _aperture_max(raw_data, x_px, y_px, ap_radius) >= config.SATURATION_ADU:
+    if saturation_adu is None:
+        saturation_adu = config.SATURATION_ADU
+    if _aperture_max(raw_data, x_px, y_px, ap_radius) >= saturation_adu:
         return None
 
     position = (x_px, y_px)
@@ -543,8 +548,10 @@ async def run(
 
     try:
         with fits.open(fits_path, mode="readonly", ignore_missing_simple=True) as hdul:
-            raw_data = hdul[0].data
             hdr = hdul[0].header
+            # Before the data is touched — see fits_header.integer_ceiling_adu().
+            saturation_adu = fits_header.saturation_adu(hdr)
+            raw_data = hdul[0].data
     except Exception as exc:
         logger.warning("forced_photometry: failed to open %s: %s", fits_path, exc)
         return []
@@ -638,7 +645,7 @@ async def run(
             return None
         measured = _measure_at_pixel(
             data_sub, data, x_px, y_px, ap_radius, annulus_inner, annulus_outer, sky_sigma,
-            gain_e_per_adu,
+            gain_e_per_adu, saturation_adu=saturation_adu,
         )
         if measured is None:
             return None

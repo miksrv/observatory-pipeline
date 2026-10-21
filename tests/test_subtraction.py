@@ -987,6 +987,15 @@ class TestDegenerateMinorAxis:
 
 class TestBuildSaturationMask:
 
+    def test_explicit_threshold_is_used(self):
+        """An 8-bit frame's threshold (255) flags what SATURATION_ADU would not."""
+        new_data = np.full((20, 20), 16.0, dtype=np.float32)
+        new_data[3, 4] = 255.0
+
+        assert subtraction._build_saturation_mask(new_data, [], radius_px=0) is None
+        mask = subtraction._build_saturation_mask(new_data, [], radius_px=0, saturation_adu=255.0)
+        assert mask is not None and int(mask.sum()) == 1 and bool(mask[3, 4])
+
     def test_no_saturation_returns_none(self):
         new_data = np.full((20, 20), 100.0, dtype=np.float32)
         refs = [np.full((20, 20), 100.0, dtype=np.float32)]
@@ -2100,12 +2109,24 @@ class TestArchiveLayoutReferences:
         assert subtraction._screen_by_quality(paths, None, (None, None)) == paths
 
 
-def _write_scaled_frame(path, scale_arcsec=None, telescope="EQMOD MOUNT", camera="ASI1600MM"):
-    """A tiny FITS file carrying a celestial WCS at the given plate scale (″/px)."""
+def _write_scaled_frame(
+    path, scale_arcsec=None, telescope="EQMOD MOUNT", camera="ASI1600MM",
+    *, pixel_um=None, focal_mm=None, qcflag=None,
+):
+    """
+    A tiny FITS file carrying a celestial WCS at the given plate scale (″/px),
+    and optionally the optics keywords (XPIXSZ/FOCALLEN) and a QCFLAG.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     hdu = fits.PrimaryHDU(np.ones((8, 8), dtype=np.float32))
     hdu.header["TELESCOP"] = telescope
     hdu.header["INSTRUME"] = camera
+    if pixel_um is not None:
+        hdu.header["XPIXSZ"] = pixel_um
+    if focal_mm is not None:
+        hdu.header["FOCALLEN"] = focal_mm
+    if qcflag is not None:
+        hdu.header["QCFLAG"] = qcflag
     if scale_arcsec is not None:
         w = AstropyWCS(naxis=2)
         w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
@@ -2115,6 +2136,43 @@ def _write_scaled_frame(path, scale_arcsec=None, telescope="EQMOD MOUNT", camera
         hdu.header.update(w.to_header())
     hdu.writeto(str(path), overwrite=True)
     return str(path)
+
+
+def _write_bitpix_frame(path, bitpix):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dtype = {8: np.uint8, 16: np.int16, -32: np.float32}[bitpix]
+    fits.PrimaryHDU(np.ones((8, 8), dtype=dtype)).writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestBitDepthScreen:
+    """8-bit exports and raw camera frames never share a reference stack."""
+
+    def test_other_bit_depth_is_excluded_without_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "SUBTRACTION_MIN_FRAMES", 3)
+        raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
+        exports = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(5)]
+
+        kept = subtraction._screen_by_quality(raw + exports, None, eight_bit=False)
+
+        assert kept == raw
+
+    def test_8bit_frame_keeps_8bit_references(self, tmp_path):
+        raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
+        exports = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(3)]
+
+        assert subtraction._screen_by_quality(raw + exports, None, eight_bit=True) == exports
+
+    def test_16_bit_and_float_frames_of_one_camera_still_stack(self, tmp_path):
+        raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
+        floats = [_write_bitpix_frame(tmp_path / f"f{i}.fits", -32) for i in range(2)]
+
+        assert subtraction._screen_by_quality(raw + floats, None, eight_bit=False) == raw + floats
+
+    def test_no_new_frame_bitpix_screens_nothing(self, tmp_path):
+        paths = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(2)]
+
+        assert subtraction._screen_by_quality(paths, None) == paths
 
 
 class TestPlateScaleScreen:
@@ -2148,10 +2206,41 @@ class TestPlateScaleScreen:
 
         assert subtraction._screen_by_quality(others, None, pixel_scale_arcsec=0.777) == []
 
-    def test_a_candidate_without_a_wcs_is_kept(self, tmp_path):
+    def test_a_candidate_without_a_wcs_or_optics_keywords_is_kept(self, tmp_path):
         bare = _write_scaled_frame(tmp_path / "bare.fits")
 
         assert subtraction._screen_by_quality([bare], None, pixel_scale_arcsec=0.777) == [bare]
+
+    def test_a_candidate_without_a_wcs_is_judged_by_its_header_scale(self, tmp_path):
+        # 3.8 µm / 1000 mm = 0.784″/px; 7.6 µm (bin 2) / 1580 mm = 0.992″/px.
+        same_optics = _write_scaled_frame(tmp_path / "s.fits", pixel_um=3.8, focal_mm=1000.0)
+        other_optics = _write_scaled_frame(tmp_path / "o.fits", pixel_um=7.6, focal_mm=1580.0)
+
+        kept = subtraction._screen_by_quality([same_optics, other_optics], None, pixel_scale_arcsec=0.780)
+
+        assert kept == [same_optics]
+
+    def test_qc_fallback_does_not_readmit_unsolved_frames_of_other_optics(self, tmp_path, monkeypatch):
+        """
+        The M82 case (1.4.0): QC-failed frames are archived unsolved; with too
+        few good references the QC screen falls back to the unscreened set,
+        which used to bring the other telescope's unsolved frames back in.
+        """
+        monkeypatch.setattr(config, "SUBTRACTION_MIN_FRAMES", 3)
+        good = [_write_scaled_frame(tmp_path / f"g{i}.fits", 0.99, qcflag="OK") for i in range(2)]
+        failed_same = _write_scaled_frame(
+            tmp_path / "fs.fits", pixel_um=7.6, focal_mm=1580.0, qcflag="LOW_STARS",
+        )
+        failed_other = [
+            _write_scaled_frame(tmp_path / f"fo{i}.fits", pixel_um=3.8, focal_mm=1000.0, qcflag="LOW_STARS")
+            for i in range(8)
+        ]
+
+        kept = subtraction._screen_by_quality(
+            good + [failed_same] + failed_other, None, pixel_scale_arcsec=0.987,
+        )
+
+        assert set(kept) == set(good + [failed_same])
 
     def test_no_new_frame_scale_screens_nothing(self, tmp_path):
         paths = [_write_scaled_frame(tmp_path / f"o{i}.fits", 1.55) for i in range(3)]
@@ -2167,3 +2256,122 @@ class TestPlateScaleScreen:
 
         assert len(found) == 3
         assert not any("03-19" in f for f in found)
+
+
+def _sip_wcs(crval1=202.47, crval2=47.2, rot_deg=0.0, a20=2e-6, shape=(120, 160)):
+    """A TAN-SIP WCS with a mild quadratic distortion."""
+    h = fits.Header()
+    c, s = math.cos(math.radians(rot_deg)), math.sin(math.radians(rot_deg))
+    scale = 1.5 / 3600.0
+    for k, v in dict(NAXIS=2, NAXIS1=shape[1], NAXIS2=shape[0],
+                     CTYPE1="RA---TAN-SIP", CTYPE2="DEC--TAN-SIP", CRVAL1=crval1, CRVAL2=crval2,
+                     CRPIX1=shape[1] / 2, CRPIX2=shape[0] / 2,
+                     CD1_1=-scale * c, CD1_2=scale * s, CD2_1=scale * s, CD2_2=scale * c,
+                     A_ORDER=2, B_ORDER=2, A_2_0=a20, B_0_2=a20).items():
+        h[k] = v
+    return AstropyWCS(h)
+
+
+def _render_stars(wcs, shape, stars, sigma=1.5):
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+    img = np.full(shape, 100.0, dtype=np.float32)
+    for ra, dec in stars:
+        x, y = wcs.all_world2pix([[ra, dec]], 0)[0]
+        img += 1000.0 * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2))
+    return img
+
+
+class TestAlignByWcs:
+    """Resampling through two SIP solves reproduces the target frame."""
+
+    def test_rotated_shifted_reference_lands_on_the_target_grid(self):
+        shape = (120, 160)
+        target_wcs = _sip_wcs()
+        source_wcs = _sip_wcs(crval1=202.47 + 20 / 3600.0, crval2=47.2 - 15 / 3600.0, rot_deg=7.0)
+        rng = np.random.default_rng(1)
+        stars = [(202.47 + dx, 47.2 + dy) for dx, dy in rng.uniform(-0.02, 0.02, size=(25, 2))]
+        target = _render_stars(target_wcs, shape, stars)
+        source = _render_stars(source_wcs, shape, stars)
+
+        result = subtraction._align_by_wcs(source, source_wcs, target_wcs, shape)
+
+        assert result is not None
+        aligned, footprint = result
+        inside = ~footprint
+        assert inside.mean() > 0.8
+        residual = np.abs(aligned - target)[inside]
+        assert np.percentile(residual, 99) < 20.0   # stars peak at 1000
+
+    def test_no_overlap_is_a_failure(self):
+        shape = (120, 160)
+        far = _sip_wcs(crval1=10.0, crval2=-30.0)
+        img = np.ones(shape, dtype=np.float32)
+
+        assert subtraction._align_by_wcs(img, far, _sip_wcs(), shape) is None
+
+    def test_sip_wcs_of_requires_distortion_terms(self):
+        sip_header = _sip_wcs().to_header(relax=True)
+        linear = AstropyWCS(naxis=2)
+        linear.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        linear.wcs.crval = [202.47, 47.2]
+        linear.wcs.cdelt = [-4e-4, 4e-4]
+
+        assert subtraction._sip_wcs_of(sip_header) is not None
+        assert subtraction._sip_wcs_of(linear.to_header()) is None
+        assert subtraction._sip_wcs_of(None) is None
+
+
+class TestPhotometricScale:
+    """References are put on the new frame's flux scale by their shared stars."""
+
+    @staticmethod
+    def _field(gain_factor=1.0, n=40, shape=(200, 200), seed=3):
+        rng = np.random.default_rng(seed)
+        yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+        img = np.full(shape, 200.0)
+        pos = rng.uniform(15, shape[0] - 15, size=(n, 2))
+        for (x, y), amp in zip(pos, rng.uniform(800, 5000, size=n)):
+            img += amp * gain_factor * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * 1.5 ** 2))
+        img += rng.normal(0, 3.0, size=shape)
+        return img.astype(np.float32)
+
+    def test_transparency_difference_is_measured(self):
+        new = self._field(1.0)
+        ref = self._field(1.0 / 1.17)   # the same stars 0.17 mag fainter
+        stars = subtraction._scale_stars(new, 60000.0)
+
+        scale = subtraction._photometric_scale(new, ref, None, stars)
+
+        assert scale == pytest.approx(1.17, rel=0.02)
+
+    def test_too_few_stars_gives_none(self):
+        new = self._field(1.0, n=5)
+        assert subtraction._photometric_scale(new, new, None, subtraction._scale_stars(new, 60000.0)) is None
+
+    def test_masked_stars_are_not_used(self):
+        new = self._field(1.0)
+        ref = self._field(1.0 / 1.17)
+        stars = subtraction._scale_stars(new, 60000.0)
+        footprint = np.ones(new.shape, dtype=bool)   # the reference covers nothing
+
+        assert subtraction._photometric_scale(new, ref, footprint, stars) is None
+
+
+class TestRegistrationOffset:
+    def test_exact_and_shifted_alignment_are_told_apart(self):
+        shape = (160, 200)
+        rng = np.random.default_rng(5)
+        stars = [(202.47 + dx, 47.2 + dy) for dx, dy in rng.uniform(-0.03, 0.03, size=(60, 2))]
+        target_wcs = _sip_wcs(shape=shape)
+        target = _render_stars(target_wcs, shape, stars) + rng.normal(0, 3, shape).astype(np.float32)
+        # A reference whose solve is off by ~2 px (3"), as before the catalog
+        # offset correction.
+        wrong_wcs = _sip_wcs(crval1=202.47 + 3.0 / 3600.0 / math.cos(math.radians(47.2)), shape=shape)
+        ref = _render_stars(target_wcs, shape, stars)
+        found = subtraction._scale_stars(target, 60000.0)
+
+        good, good_fp = subtraction._align_by_wcs(ref, target_wcs, target_wcs, shape)
+        bad, bad_fp = subtraction._align_by_wcs(ref, wrong_wcs, target_wcs, shape)
+
+        assert subtraction._registration_offset_px(target, good, good_fp, found) < 0.1
+        assert subtraction._registration_offset_px(target, bad, bad_fp, found) > 1.5

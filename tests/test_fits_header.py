@@ -848,3 +848,56 @@ class TestObsTimeResolution:
             _cleanup(path)
 
         assert result["obs_time_mid"].startswith("2024-03-15T22:02:34")
+
+
+class TestSaturationAdu:
+    @staticmethod
+    def _hdr(**cards) -> fits.Header:
+        h = fits.Header()
+        for k, v in cards.items():
+            h[k] = v
+        return h
+
+    def test_8bit_frame_saturates_at_255(self):
+        assert fits_header.saturation_adu(self._hdr(BITPIX=8)) == 255.0
+
+    def test_bscale_raises_the_ceiling(self):
+        assert fits_header.integer_ceiling_adu(self._hdr(BITPIX=8, BSCALE=2.0)) == 510.0
+
+    def test_uint16_frame_keeps_the_configured_threshold(self, monkeypatch):
+        monkeypatch.setattr(fits_header.config, "SATURATION_ADU", 60000.0)
+        hdr = self._hdr(BITPIX=16, BZERO=32768)
+        assert fits_header.integer_ceiling_adu(hdr) == 65535.0
+        assert fits_header.saturation_adu(hdr) == 60000.0
+
+    def test_signed_int16_frame_is_capped_at_32767(self, monkeypatch):
+        monkeypatch.setattr(fits_header.config, "SATURATION_ADU", 60000.0)
+        assert fits_header.saturation_adu(self._hdr(BITPIX=16)) == 32767.0
+
+    def test_float_frame_keeps_the_configured_threshold(self, monkeypatch):
+        monkeypatch.setattr(fits_header.config, "SATURATION_ADU", 60000.0)
+        assert fits_header.saturation_adu(self._hdr(BITPIX=-32)) == 60000.0
+
+    def test_is_8bit(self):
+        assert fits_header.is_8bit(self._hdr(BITPIX=8))
+        assert not fits_header.is_8bit(self._hdr(BITPIX=16))
+        assert not fits_header.is_8bit(self._hdr())
+
+
+class TestCfaDepthIsKept:
+    def test_converted_raw8_frame_is_still_8bit(self):
+        h = fits.Header()
+        h["BITPIX"] = -32
+        h["CFABITPX"] = 8
+        h["CFASATLV"] = 255.0
+        assert fits_header.is_8bit(h)
+        assert fits_header.saturation_adu(h) == 255.0
+
+    def test_converted_16bit_frame_keeps_the_configured_threshold(self, monkeypatch):
+        monkeypatch.setattr(fits_header.config, "SATURATION_ADU", 60000.0)
+        h = fits.Header()
+        h["BITPIX"] = -32
+        h["CFABITPX"] = 16
+        h["CFASATLV"] = 65535.0
+        assert not fits_header.is_8bit(h)
+        assert fits_header.saturation_adu(h) == 60000.0

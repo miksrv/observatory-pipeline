@@ -21,6 +21,8 @@ import astropy.io.fits as fits
 from astropy.coordinates import Angle
 import astropy.units as u
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -591,6 +593,65 @@ def resolve_pixel_scale_arcsec(hdr: fits.Header) -> float | None:
         return value
 
     return None
+
+
+def integer_ceiling_adu(hdr: fits.Header) -> float | None:
+    """
+    The largest physical value the file's integer BITPIX can store
+    (BZERO + BSCALE x the raw maximum), or None for floating-point data or an
+    unusable header. BITPIX 8 is unsigned (0..255); 16/32/64 are signed, so a
+    uint16 camera frame (BITPIX 16, BZERO 32768) tops out at 65535.
+
+    Read it from a header taken before the data is accessed: astropy rewrites
+    BITPIX/BZERO in the in-memory header once it scales the data.
+
+    A one-shot-colour frame converted by modules/cfa.py is float data whose
+    original ceiling is kept in `CFASATLV` — an 8-bit (RAW8) capture still
+    clips at 255 after its 2x2 mean.
+    """
+    try:
+        if "CFASATLV" in hdr and int(hdr.get("BITPIX", 0)) < 0:
+            return float(hdr["CFASATLV"])
+        bitpix = int(hdr.get("BITPIX", 0))
+        bzero = float(hdr.get("BZERO", 0.0))
+        bscale = float(hdr.get("BSCALE", 1.0))
+    except (TypeError, ValueError):
+        return None
+    if bitpix not in (8, 16, 32, 64) or bscale <= 0:
+        return None
+    raw_max = 255 if bitpix == 8 else 2 ** (bitpix - 1) - 1
+    return bzero + bscale * raw_max
+
+
+def saturation_adu(hdr: fits.Header) -> float:
+    """
+    The saturation threshold for this file: `config.SATURATION_ADU`, lowered to
+    the file's own integer ceiling when that is smaller.
+
+    An 8-bit frame clips its bright stars at 255, far below any 16-bit-camera
+    SATURATION_ADU, so with the configured value alone none of them was ever
+    flagged — clipped stars anchored the zero point and entered reference
+    stacks unmasked (M63 R frames of 2020-05-04).
+    """
+    ceiling = integer_ceiling_adu(hdr)
+    if ceiling is None:
+        return config.SATURATION_ADU
+    return min(config.SATURATION_ADU, ceiling)
+
+
+def is_8bit(hdr: fits.Header) -> bool:
+    """
+    True for BITPIX 8 data. Such a frame is a stretched, quantized export, not
+    linear camera ADU: its sky sits in a handful of levels and faint stars
+    come out too bright, so its magnitudes cannot be calibrated against Gaia
+    like a raw frame's.
+    """
+    try:
+        # CFABITPX: the depth of a one-shot-colour frame before modules/cfa.py
+        # turned it into float superpixels.
+        return int(hdr.get("BITPIX", 0)) == 8 or int(hdr.get("CFABITPX", 0)) == 8
+    except (TypeError, ValueError):
+        return False
 
 
 def _extract_sensor(hdr: fits.Header) -> dict:

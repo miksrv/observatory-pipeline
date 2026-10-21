@@ -61,8 +61,9 @@ services:
     # On SIGTERM the worker finishes the item in progress before exiting (an
     # ANALYZE item takes a minute or more), then puts any unstarted items back
     # on the queue. Docker's default 10 s would SIGKILL it mid-item and leave
-    # the task stuck RUNNING.
-    stop_grace_period: 5m
+    # the task stuck RUNNING. 10 min: POST /sources alone may take 3 × 180 s
+    # (API_SOURCES_TIMEOUT_SEC with the client's retries).
+    stop_grace_period: 10m
     volumes:
       - .:/app
       - ${HOST_DATA_DIR:-~/Developer/data}/fits/incoming:/fits/incoming

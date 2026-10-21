@@ -246,6 +246,81 @@ async def test_broadband_filter_does_not_skip_calibration(mock_modules):
 
 
 @pytest.mark.asyncio
+async def test_8bit_frame_skips_calibration(monkeypatch, mock_modules):
+    """A BITPIX=8 export is quantized, not linear ADU — never Gaia-calibrated."""
+    monkeypatch.setattr(pipeline, "_is_8bit_file", lambda path: True)
+
+    await pipeline.run(str(mock_modules))
+
+    _, kwargs = pipeline.photometry.measure.call_args
+    assert kwargs.get("skip_calibration") is True
+
+
+def test_is_8bit_file_reads_bitpix(tmp_path):
+    from astropy.io import fits as astropy_fits
+
+    eight = tmp_path / "e.fits"
+    sixteen = tmp_path / "s.fits"
+    astropy_fits.PrimaryHDU(np.ones((4, 4), dtype=np.uint8)).writeto(eight)
+    astropy_fits.PrimaryHDU(np.ones((4, 4), dtype=np.int16)).writeto(sixteen)
+
+    assert pipeline._is_8bit_file(str(eight)) is True
+    assert pipeline._is_8bit_file(str(sixteen)) is False
+    assert pipeline._is_8bit_file(str(tmp_path / "missing.fits")) is False
+
+
+def _use_real_path_filter_helpers(monkeypatch):
+    """The fixture's normalizer is a mock; these tests need the real path parsing."""
+    from modules import normalizer as real_normalizer
+
+    monkeypatch.setattr("pipeline.normalizer.normalize_frame_type", real_normalizer.normalize_frame_type)
+    monkeypatch.setattr("pipeline.normalizer.extract_filter_from_path", real_normalizer.extract_filter_from_path)
+
+
+@pytest.mark.asyncio
+async def test_missing_filter_header_is_taken_from_the_path(monkeypatch, mock_modules, tmp_path):
+    """No FILTER card (M51 2022-05): the filter in the capture program's file
+    name is used and written into the frame's header."""
+    light_dir = tmp_path / "M_51" / "Light" / "R"
+    light_dir.mkdir(parents=True)
+    path = light_dir / "M_51_Light_R_300_secs_2022-05-02T00-00-09_001.fits"
+    fits.PrimaryHDU(np.zeros((4, 4), dtype=np.float32)).writeto(path)
+    header = copy.deepcopy(_GOOD_HEADER)
+    header["observation"]["filter"] = None
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: header)
+    _use_real_path_filter_helpers(monkeypatch)
+    written = {}
+    monkeypatch.setattr(
+        "pipeline.normalizer.update_fits_filter_header",
+        lambda p, f: written.setdefault("filter", f),
+    )
+
+    await pipeline.run(str(path))
+
+    _, kwargs = pipeline.photometry.measure.call_args
+    assert kwargs.get("filter_name") == "R"
+    assert written == {"filter": "R"}
+
+
+@pytest.mark.asyncio
+async def test_dark_frame_never_gets_a_filter_from_its_path(monkeypatch, mock_modules, tmp_path):
+    dark_dir = tmp_path / "R"
+    dark_dir.mkdir()
+    path = dark_dir / "Cam_Dark_300_2022-05-02T00-00-09.fits"
+    fits.PrimaryHDU(np.zeros((4, 4), dtype=np.float32)).writeto(path)
+    header = copy.deepcopy(_GOOD_HEADER)
+    header["observation"].update(filter=None, frame_type="Dark")
+    monkeypatch.setattr("pipeline.fits_header.extract_headers", lambda p: header)
+    _use_real_path_filter_helpers(monkeypatch)
+    called = []
+    monkeypatch.setattr("pipeline.normalizer.update_fits_filter_header", lambda p, f: called.append(f))
+
+    await pipeline.run(str(path))
+
+    assert called == []
+
+
+@pytest.mark.asyncio
 async def test_narrowband_filter_skips_calibration(monkeypatch, mock_modules):
     """A narrowband (Hα) frame must call photometry.measure(skip_calibration=True)."""
     narrowband_header = copy.deepcopy(_GOOD_HEADER)
@@ -811,6 +886,41 @@ def test_stripping_the_wcs_leaves_non_wcs_cards_alone():
     assert header["PCOUNT"] == 0
     assert header["GCOUNT"] == 1
     assert header["CCDTEMP"] == pytest.approx(-10.0)
+
+
+def test_strip_wcs_representation_removes_stale_sip_terms():
+    header = fits.Header()
+    for key, value in (("A_ORDER", 3), ("B_ORDER", 3), ("A_2_1", 1e-7), ("B_0_3", 2e-9),
+                       ("AP_1_1", 1e-7), ("BP_ORDER", 3), ("A_DMAX", 1.2), ("AIRMASS", 1.1)):
+        header[key] = value
+
+    pipeline._strip_wcs_representation(header)
+
+    assert [k for k in header.keys()] == ["AIRMASS"]
+
+
+def test_write_solved_wcs_keeps_sip_distortion(tmp_path):
+    """to_header() drops SIP unless relax=True — the archive kept only the
+    linear part of a wide-field solve."""
+    path = tmp_path / "f.fits"
+    hdu = fits.PrimaryHDU(np.zeros((10, 10), dtype=np.float32))
+    hdu.header["A_ORDER"] = 2          # a stale solve's distortion
+    hdu.header["A_1_1"] = 9.0
+    hdu.writeto(path)
+
+    solved = fits.Header()
+    for key, value in dict(CTYPE1="RA---TAN-SIP", CTYPE2="DEC--TAN-SIP", CRVAL1=202.47, CRVAL2=47.2,
+                           CRPIX1=5.0, CRPIX2=5.0, CD1_1=-4e-4, CD1_2=0.0, CD2_1=0.0, CD2_2=4e-4,
+                           A_ORDER=2, B_ORDER=2, A_2_0=3e-6, B_0_2=4e-6).items():
+        solved[key] = value
+    assert pipeline._write_solved_wcs(str(path), AstropyWCS(solved)) is True
+
+    with fits.open(path) as hdul:
+        h = hdul[0].header
+        assert h["CTYPE1"] == "RA---TAN-SIP"
+        assert h["A_2_0"] == pytest.approx(3e-6)
+        assert "A_1_1" not in h
+        assert AstropyWCS(h).sip is not None
 
 
 @pytest.mark.asyncio

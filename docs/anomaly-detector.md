@@ -96,7 +96,9 @@ flowchart TD
     Loop --> P1{"catalog_name\n== 'MPC'?"}
     P1 -- yes --> Asteroid["ASTEROID / COMET\n(by object_type)\n⚑ _needs_ephemeris=True"]
 
-    P1 -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
+    P1 -- no --> Residual{"subtraction candidate beside a\ncatalogued star of the same mag?\n(_is_residual_of_catalogued_star)"}
+    Residual -- yes --> Suppressed
+    Residual -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
     Sat -- yes --> NewBright{"_could_be_a_new_bright_object()?\n(round, not near_edge, area covered,\nno history at all here)"}
     NewBright -- no --> Suppressed(["suppressed — return None\n(bright-star/subtraction artifact,\nnot a real transient)"])
     NewBright -- "yes (possible nova —\nclassified, magnitude unmeasurable)" --> NoHist
@@ -118,7 +120,7 @@ flowchart TD
 
     Coverage -- no, area\nwas covered --> History{"n_history == 0?\n(no prior detection\nwithin MATCH_CONE_ARCSEC)"}
 
-    History -- yes --> Galaxy{"near a Simbad galaxy?\n(_is_galaxy)"}
+    History -- yes --> Galaxy{"subtraction candidate\non a Simbad galaxy?\n(_is_galaxy AND _from_subtraction)"}
     Galaxy -- yes --> SNnew["🔔 SUPERNOVA_CANDIDATE\n(new point source,\nno baseline to compare)"]
     Galaxy -- no --> InCatalog{"catalog_name\nis not None?"}
     InCatalog -- no --> CovEdge{"near_edge AND NOT\n_survives_edge_zone()?"}
@@ -126,7 +128,9 @@ flowchart TD
     CovEdge -- no --> UnkNoCat["🔔 UNKNOWN\n(not found in\nany catalog)"]
     InCatalog -- yes --> KnownNew["KNOWN_CATALOG_NEW\n(known object, was simply\nbelow detection threshold\nbefore; not an anomaly)"]
 
-    History -- no, has\nhistory --> DeltaMag["delta_mag = mag − median(\n_same_filter_history(history).mag)\n(only same-filter epochs — see below)"]
+    History -- no, has\nhistory --> HistSub{"_from_subtraction?"}
+    HistSub -- yes --> NoAnomaly
+    HistSub -- no --> DeltaMag["delta_mag = mag − median(\n_same_filter_history(history).mag)\n(only same-filter epochs — see below)"]
     DeltaMag --> Changed{"_is_significant_delta():\nabs(delta_mag) > DELTA_MAG_ALERT\nAND > VARIABILITY_SIGMA x noise\n(mag_err ⊕ same-filter scatter)?"}
     Changed -- no --> NoAnomaly(["no anomaly"])
     Changed -- yes --> Bright{"delta_mag < 0\n(got brighter)\nAND near a galaxy?"}
@@ -266,7 +270,10 @@ one condition matches, the function returns and no further checks run:
      than a real transient (real incident, 2026-08-14, source_id
      `6a7cfbae64e706.89320404`, a Gaia DR3 star; see CLAUDE.md's "camera rotation"
      discussion);
-   - covered, no history, near a galaxy (Simbad OTYPE) → `SUPERNOVA_CANDIDATE`;
+   - covered, no history, a **subtraction candidate** matched to a galaxy (Simbad OTYPE) →
+     `SUPERNOVA_CANDIDATE`. An ordinary detection matched to a galaxy *is* the galaxy — a
+     faint one detected tonight and not on shallower frames — and falls through to
+     `KNOWN_CATALOG_NEW`;
    - covered, no history, not in any catalog → `UNKNOWN` — **suppressed** instead when
      `near_edge` (coma shifts the centroid off the star's catalog position so matching
      misses it), unless `_survives_edge_zone()` holds: a subtraction candidate that is
@@ -276,6 +283,10 @@ one condition matches, the function returns and no further checks run:
      `near_edge` otherwise (audit 2026-08-18, finding H11). An ordinary (non-subtraction)
      near-edge detection never qualifies;
    - covered, no history, in a catalog (not a galaxy) → `KNOWN_CATALOG_NEW` (not an anomaly);
+   - has history, subtraction candidate → nothing: its magnitude is aperture photometry at
+     a residual's centroid, and the cone's history is usually a neighbouring star's (M51 L
+     2025-04: a residual 4" from a 13.5 mag star read as the star fading by 0.7 mag, ~50
+     times per frame). A known source's change is judged on its own normal detection;
    - has history → compare `delta_mag = mag − median(same_filter_history.mag)` — only
      history entries observed through the same filter as this source, via
      `_same_filter_history()` — via `_is_significant_delta()`: the change must exceed

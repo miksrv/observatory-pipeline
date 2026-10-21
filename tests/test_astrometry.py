@@ -276,6 +276,7 @@ def _patch_astrometry(
     sep_background_raises: bool = False,
     naxis1: int = _IMAGE_SHAPE[1],
     naxis2: int = _IMAGE_SHAPE[0],
+    header_extra: dict[str, Any] | None = None,
 ):
     """
     Patch every external dependency of astrometry.py in one shot.
@@ -296,13 +297,15 @@ def _patch_astrometry(
         If True, sep.Background raises RuntimeError.
     naxis1, naxis2:
         Image dimensions embedded in the fake FITS header.
+    header_extra:
+        Further cards for the fake FITS header (e.g. BITPIX).
     """
     if wcs is None:
         wcs = _make_wcs()
     if sources is None:
         sources = _make_sources()
 
-    header = {"NAXIS1": naxis1, "NAXIS2": naxis2}
+    header = {"NAXIS1": naxis1, "NAXIS2": naxis2, **(header_extra or {})}
     image  = np.ones((naxis2, naxis1), dtype=np.float64)
     hdul   = _make_hdul(image, header)
 
@@ -737,6 +740,14 @@ class TestSaturationFlag:
         assert result["sources_all"]
         assert all(src["saturated"] is True for src in result["sources_all"])
 
+    async def test_8bit_frame_saturates_at_its_own_ceiling(self):
+        """A peak far below SATURATION_ADU is clipped in an 8-bit file (255)."""
+        with _patch_astrometry(header_extra={"BITPIX": 8}):  # peak 1000 + 800 sky
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"]
+        assert all(src["saturated"] is True for src in result["sources"])
+
 
 # ---------------------------------------------------------------------------
 # Test 2.6 — Near-edge geometry flag (coma false-positive fix, 2026-08-07)
@@ -854,6 +865,26 @@ class TestAstapFailures:
 # ---------------------------------------------------------------------------
 
 from modules.astrometry._astap import _run_astap, _run_astap_attempt  # noqa: E402
+
+
+class TestAstapSip:
+    """Wide fields need SIP distortion terms (2° M51 frames: 14-28" edge errors)."""
+
+    @staticmethod
+    async def _cmd(monkeypatch, enabled: bool) -> list[str]:
+        monkeypatch.setattr(config, "ASTAP_SIP_ENABLED", enabled)
+        run_mock = MagicMock(return_value=MagicMock(returncode=0, stdout="Solution found", stderr=""))
+        with patch("modules.astrometry.subprocess.run", run_mock):
+            await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
+        return list(run_mock.call_args.args[0])
+
+    async def test_sip_is_requested_by_default(self, monkeypatch):
+        cmd = await self._cmd(monkeypatch, True)
+        i = cmd.index("-sip")
+        assert cmd[i + 1] == "y"
+
+    async def test_sip_can_be_switched_off(self, monkeypatch):
+        assert "-sip" not in await self._cmd(monkeypatch, False)
 
 
 class TestAstapTimeoutBudgets:
