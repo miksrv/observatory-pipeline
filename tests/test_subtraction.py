@@ -2250,3 +2250,102 @@ class TestPlateScaleScreen:
 
         assert len(found) == 3
         assert not any("03-19" in f for f in found)
+
+
+def _sip_wcs(crval1=202.47, crval2=47.2, rot_deg=0.0, a20=2e-6, shape=(120, 160)):
+    """A TAN-SIP WCS with a mild quadratic distortion."""
+    h = fits.Header()
+    c, s = math.cos(math.radians(rot_deg)), math.sin(math.radians(rot_deg))
+    scale = 1.5 / 3600.0
+    for k, v in dict(NAXIS=2, NAXIS1=shape[1], NAXIS2=shape[0],
+                     CTYPE1="RA---TAN-SIP", CTYPE2="DEC--TAN-SIP", CRVAL1=crval1, CRVAL2=crval2,
+                     CRPIX1=shape[1] / 2, CRPIX2=shape[0] / 2,
+                     CD1_1=-scale * c, CD1_2=scale * s, CD2_1=scale * s, CD2_2=scale * c,
+                     A_ORDER=2, B_ORDER=2, A_2_0=a20, B_0_2=a20).items():
+        h[k] = v
+    return AstropyWCS(h)
+
+
+def _render_stars(wcs, shape, stars, sigma=1.5):
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+    img = np.full(shape, 100.0, dtype=np.float32)
+    for ra, dec in stars:
+        x, y = wcs.all_world2pix([[ra, dec]], 0)[0]
+        img += 1000.0 * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma ** 2))
+    return img
+
+
+class TestAlignByWcs:
+    """Resampling through two SIP solves reproduces the target frame."""
+
+    def test_rotated_shifted_reference_lands_on_the_target_grid(self):
+        shape = (120, 160)
+        target_wcs = _sip_wcs()
+        source_wcs = _sip_wcs(crval1=202.47 + 20 / 3600.0, crval2=47.2 - 15 / 3600.0, rot_deg=7.0)
+        rng = np.random.default_rng(1)
+        stars = [(202.47 + dx, 47.2 + dy) for dx, dy in rng.uniform(-0.02, 0.02, size=(25, 2))]
+        target = _render_stars(target_wcs, shape, stars)
+        source = _render_stars(source_wcs, shape, stars)
+
+        result = subtraction._align_by_wcs(source, source_wcs, target_wcs, shape)
+
+        assert result is not None
+        aligned, footprint = result
+        inside = ~footprint
+        assert inside.mean() > 0.8
+        residual = np.abs(aligned - target)[inside]
+        assert np.percentile(residual, 99) < 20.0   # stars peak at 1000
+
+    def test_no_overlap_is_a_failure(self):
+        shape = (120, 160)
+        far = _sip_wcs(crval1=10.0, crval2=-30.0)
+        img = np.ones(shape, dtype=np.float32)
+
+        assert subtraction._align_by_wcs(img, far, _sip_wcs(), shape) is None
+
+    def test_sip_wcs_of_requires_distortion_terms(self):
+        sip_header = _sip_wcs().to_header(relax=True)
+        linear = AstropyWCS(naxis=2)
+        linear.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        linear.wcs.crval = [202.47, 47.2]
+        linear.wcs.cdelt = [-4e-4, 4e-4]
+
+        assert subtraction._sip_wcs_of(sip_header) is not None
+        assert subtraction._sip_wcs_of(linear.to_header()) is None
+        assert subtraction._sip_wcs_of(None) is None
+
+
+class TestPhotometricScale:
+    """References are put on the new frame's flux scale by their shared stars."""
+
+    @staticmethod
+    def _field(gain_factor=1.0, n=40, shape=(200, 200), seed=3):
+        rng = np.random.default_rng(seed)
+        yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+        img = np.full(shape, 200.0)
+        pos = rng.uniform(15, shape[0] - 15, size=(n, 2))
+        for (x, y), amp in zip(pos, rng.uniform(800, 5000, size=n)):
+            img += amp * gain_factor * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * 1.5 ** 2))
+        img += rng.normal(0, 3.0, size=shape)
+        return img.astype(np.float32)
+
+    def test_transparency_difference_is_measured(self):
+        new = self._field(1.0)
+        ref = self._field(1.0 / 1.17)   # the same stars 0.17 mag fainter
+        stars = subtraction._scale_stars(new, 60000.0)
+
+        scale = subtraction._photometric_scale(new, ref, None, stars)
+
+        assert scale == pytest.approx(1.17, rel=0.02)
+
+    def test_too_few_stars_gives_none(self):
+        new = self._field(1.0, n=5)
+        assert subtraction._photometric_scale(new, new, None, subtraction._scale_stars(new, 60000.0)) is None
+
+    def test_masked_stars_are_not_used(self):
+        new = self._field(1.0)
+        ref = self._field(1.0 / 1.17)
+        stars = subtraction._scale_stars(new, 60000.0)
+        footprint = np.ones(new.shape, dtype=bool)   # the reference covers nothing
+
+        assert subtraction._photometric_scale(new, ref, footprint, stars) is None

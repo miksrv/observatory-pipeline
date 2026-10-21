@@ -129,6 +129,9 @@ async def _run_astap_attempt(
                           # itself is never opened for writing by astap)
     ]
 
+    if config.ASTAP_SIP_ENABLED:
+        cmd.extend(["-sip", "y"])  # distortion terms — see config.ASTAP_SIP_ENABLED
+
     if output_base:
         cmd.extend(["-o", output_base])  # redirect .ini/.wcs/.log only
 

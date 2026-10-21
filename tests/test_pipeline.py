@@ -837,6 +837,41 @@ def test_stripping_the_wcs_leaves_non_wcs_cards_alone():
     assert header["CCDTEMP"] == pytest.approx(-10.0)
 
 
+def test_strip_wcs_representation_removes_stale_sip_terms():
+    header = fits.Header()
+    for key, value in (("A_ORDER", 3), ("B_ORDER", 3), ("A_2_1", 1e-7), ("B_0_3", 2e-9),
+                       ("AP_1_1", 1e-7), ("BP_ORDER", 3), ("A_DMAX", 1.2), ("AIRMASS", 1.1)):
+        header[key] = value
+
+    pipeline._strip_wcs_representation(header)
+
+    assert [k for k in header.keys()] == ["AIRMASS"]
+
+
+def test_write_solved_wcs_keeps_sip_distortion(tmp_path):
+    """to_header() drops SIP unless relax=True — the archive kept only the
+    linear part of a wide-field solve."""
+    path = tmp_path / "f.fits"
+    hdu = fits.PrimaryHDU(np.zeros((10, 10), dtype=np.float32))
+    hdu.header["A_ORDER"] = 2          # a stale solve's distortion
+    hdu.header["A_1_1"] = 9.0
+    hdu.writeto(path)
+
+    solved = fits.Header()
+    for key, value in dict(CTYPE1="RA---TAN-SIP", CTYPE2="DEC--TAN-SIP", CRVAL1=202.47, CRVAL2=47.2,
+                           CRPIX1=5.0, CRPIX2=5.0, CD1_1=-4e-4, CD1_2=0.0, CD2_1=0.0, CD2_2=4e-4,
+                           A_ORDER=2, B_ORDER=2, A_2_0=3e-6, B_0_2=4e-6).items():
+        solved[key] = value
+    assert pipeline._write_solved_wcs(str(path), AstropyWCS(solved)) is True
+
+    with fits.open(path) as hdul:
+        h = hdul[0].header
+        assert h["CTYPE1"] == "RA---TAN-SIP"
+        assert h["A_2_0"] == pytest.approx(3e-6)
+        assert "A_1_1" not in h
+        assert AstropyWCS(h).sip is not None
+
+
 @pytest.mark.asyncio
 async def test_archived_file_gets_qc_headers(mock_modules, tmp_path):
     """

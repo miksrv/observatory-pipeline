@@ -2271,7 +2271,10 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
         with astropy_fits.open(fits_path, mode="update", output_verify="silentfix") as hdul:
             header = hdul[0].header
             _strip_wcs_representation(header)
-            header.update(wcs.to_header())
+            # relax=True: SIP distortion terms are "non-standard" to astropy
+            # and silently dropped otherwise — the archived header would
+            # carry only the linear part of a wide-field solve.
+            header.update(wcs.to_header(relax=True))
         return True
     except Exception as exc:
         logger.warning("Could not write solved WCS into %s: %s", fits_path, exc)
@@ -2290,6 +2293,9 @@ def _write_solved_wcs(fits_path: str, wcs) -> bool:
 _WCS_LINEAR_CARD_RE = re.compile(
     r"^(?:CD|PC)\d+_\d+[A-Z]?$|^(?:CDELT|CROTA)\d+[A-Z]?$"
 )
+# SIP distortion terms (`A_ORDER`, `B_2_1`, `AP_0_3`, `A_DMAX`, …): a stale
+# set left beside a fresh solve would bend it with the old solve's distortion.
+_WCS_SIP_CARD_RE = re.compile(r"^(?:A|B|AP|BP)_(?:ORDER|DMAX|\d+_\d+)$")
 
 
 def _strip_wcs_representation(header) -> None:
@@ -2314,11 +2320,12 @@ def _strip_wcs_representation(header) -> None:
 
     CROTA1/2 goes too: it is the pre-CD rotation convention, and a stale copy
     of it alongside a fresh CD matrix is the same ambiguity in older clothes.
+    So do SIP distortion terms, which belong to the solve they came with.
     """
     for key in list(header.keys()):
         if not key:
             continue
-        if _WCS_LINEAR_CARD_RE.match(key.upper()):
+        if _WCS_LINEAR_CARD_RE.match(key.upper()) or _WCS_SIP_CARD_RE.match(key.upper()):
             try:
                 del header[key]
             except KeyError:

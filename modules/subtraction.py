@@ -754,6 +754,79 @@ def _read_flux_scale_keys(fits_path: str) -> tuple[Optional[float], Optional[flo
     return exptime, gain
 
 
+# Stars used to measure a reference's photometric scale (_photometric_scale):
+# detection threshold (sigma), minimum count for a trusted ratio, aperture
+# radius and local-sky annulus in units of the stars' median FWHM.
+_PHOT_SCALE_DETECT_SIGMA = 10.0
+_PHOT_SCALE_MIN_STARS = 20
+_PHOT_SCALE_APERTURE_FWHM = 3.0
+_PHOT_SCALE_ANNULUS_FWHM = (4.0, 6.0)
+
+
+def _scale_stars(
+    new_data: np.ndarray, saturation_adu: float,
+) -> Optional[tuple[np.ndarray, np.ndarray, float]]:
+    """
+    Bright, unsaturated, unflagged stars of the new frame — ``(x, y,
+    median_fwhm_px)`` — for _photometric_scale(); None when too few.
+    """
+    try:
+        data = np.ascontiguousarray(np.nan_to_num(new_data, nan=0.0), dtype=np.float32)
+        bkg = sep.Background(data)
+        objs = sep.extract(data - bkg, _PHOT_SCALE_DETECT_SIGMA, err=bkg.globalrms, minarea=10)
+    except Exception as exc:
+        logger.debug("Subtraction: no stars for photometric scaling: %s", exc)
+        return None
+    keep = (objs["flag"] == 0) & (objs["peak"] + bkg.globalback < saturation_adu)
+    objs = objs[keep]
+    if len(objs) < _PHOT_SCALE_MIN_STARS:
+        return None
+    fwhm = float(np.median(2.0 * np.sqrt(np.log(2.0) * (objs["a"] ** 2 + objs["b"] ** 2))))
+    return objs["x"].astype(np.float64), objs["y"].astype(np.float64), fwhm
+
+
+def _photometric_scale(
+    new_data: np.ndarray,
+    aligned_ref: np.ndarray,
+    footprint: Optional[np.ndarray],
+    stars: Optional[tuple[np.ndarray, np.ndarray, float]],
+) -> Optional[float]:
+    """
+    Multiplier bringing an aligned reference onto the new frame's flux scale,
+    measured on the stars both share: the median ratio of their aperture
+    fluxes (local sky from an annulus). None when too few stars qualify.
+
+    The header factor (_flux_scale_factor()) knows exposure time and gain,
+    not the sky: between two nights of M51 the same stars were 0.17 mag
+    brighter on one, so every one of them stayed in the difference image as
+    a 17 % residual. Measuring the ratio covers transparency, airmass and
+    the header factor at once.
+    """
+    if stars is None:
+        return None
+    x, y, fwhm = stars
+    r = _PHOT_SCALE_APERTURE_FWHM * fwhm
+    ann = (_PHOT_SCALE_ANNULUS_FWHM[0] * fwhm, _PHOT_SCALE_ANNULUS_FWHM[1] * fwhm)
+    try:
+        new_c = np.ascontiguousarray(np.nan_to_num(new_data, nan=0.0), dtype=np.float32)
+        ref_c = np.ascontiguousarray(np.nan_to_num(aligned_ref, nan=0.0), dtype=np.float32)
+        mask = None if footprint is None else np.ascontiguousarray(footprint, dtype=bool)
+        f_new, _, flag_new = sep.sum_circle(new_c, x, y, r, bkgann=ann)
+        f_ref, _, flag_ref = sep.sum_circle(ref_c, x, y, r, bkgann=ann, mask=mask)
+    except Exception as exc:
+        logger.debug("Subtraction: photometric scale measurement failed: %s", exc)
+        return None
+    ok = (
+        (f_new > 0) & (f_ref > 0)
+        & ((flag_ref & sep.APER_HASMASKED) == 0)
+        & ((flag_new | flag_ref) & sep.APER_TRUNC == 0)
+    )
+    if int(ok.sum()) < _PHOT_SCALE_MIN_STARS:
+        return None
+    ratio = float(np.median(f_new[ok] / f_ref[ok]))
+    return ratio if math.isfinite(ratio) and ratio > 0 else None
+
+
 def _flux_scale_factor(
     ref_path: str,
     new_exptime: Optional[float],
@@ -799,6 +872,102 @@ def _flux_scale_factor(
 # ---------------------------------------------------------------------------
 # Image alignment
 # ---------------------------------------------------------------------------
+
+# Spacing (px) of the grid on which _align_by_wcs() evaluates the exact
+# pixel mapping; a bicubic spline fills in between. The mapping is smooth
+# (TAN + low-order SIP), so a coarse grid loses nothing measurable and
+# saves evaluating an iterative world→pixel inverse at every pixel.
+_WCS_ALIGN_GRID_STEP_PX = 32
+# Rows resampled per block — bounds the memory of the full-size coordinate
+# maps on a 60-Mpx frame.
+_WCS_ALIGN_BLOCK_ROWS = 512
+# Below this fraction of the new frame covered by the reference, the WCS
+# mapping is treated as a failure (wrong or unrelated solve).
+_WCS_ALIGN_MIN_COVERAGE = 0.2
+
+
+def _sip_wcs_of(header: Optional[Any]) -> Optional[WCS]:
+    """A header's celestial WCS when it carries SIP distortion terms, else None."""
+    if header is None:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wcs = WCS(header)
+    except Exception:
+        return None
+    if not wcs.has_celestial or wcs.sip is None:
+        return None
+    return wcs
+
+
+def _align_by_wcs(
+    source: np.ndarray,
+    source_wcs: WCS,
+    target_wcs: WCS,
+    target_shape: tuple[int, int],
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """
+    Resample *source* onto the target pixel grid through the two plate
+    solves: target pixel → sky (target_wcs) → source pixel (source_wcs),
+    bicubic. Returns ``(aligned, footprint)`` like _align_frame() — footprint
+    True where the source has no data — or None when the mapping fails or
+    covers too little of the target.
+
+    astroalign fits one affine transform between the two star patterns. Over
+    a wide field the optics' distortion is not affine, and two frames whose
+    pointing differs (another night) need different corrections across the
+    field — the fit absorbs the centre and leaves every star in the outer
+    third as a residual pair. Both frames' SIP solves already describe that
+    distortion, so mapping through them is exact up to the solve accuracy
+    (0.2-1.4" on 2° M51 frames). Rotation needs no pre-rotation here.
+    """
+    try:
+        ny, nx = target_shape
+        sy, sx = source.shape
+        gx = np.linspace(0.0, nx - 1.0, max(2, nx // _WCS_ALIGN_GRID_STEP_PX + 2))
+        gy = np.linspace(0.0, ny - 1.0, max(2, ny // _WCS_ALIGN_GRID_STEP_PX + 2))
+        mx, my = np.meshgrid(gx, gy)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ra, dec = target_wcs.all_pix2world(mx.ravel(), my.ravel(), 0)
+            px, py = source_wcs.all_world2pix(ra, dec, 0, quiet=True)
+        px = np.asarray(px, dtype=np.float64).reshape(mx.shape)
+        py = np.asarray(py, dtype=np.float64).reshape(mx.shape)
+        if not (np.all(np.isfinite(px)) and np.all(np.isfinite(py))):
+            return None
+
+        from scipy.interpolate import RectBivariateSpline
+        from scipy.ndimage import map_coordinates
+
+        spline_x = RectBivariateSpline(gy, gx, px, kx=3, ky=3)
+        spline_y = RectBivariateSpline(gy, gx, py, kx=3, ky=3)
+
+        valid = np.isfinite(source)
+        filled = np.where(valid, source, 0.0).astype(np.float32)
+        invalid = None if valid.all() else (~valid).astype(np.float32)
+
+        aligned = np.empty((ny, nx), dtype=np.float32)
+        footprint = np.empty((ny, nx), dtype=bool)
+        cols = np.arange(nx, dtype=np.float64)
+        for y0 in range(0, ny, _WCS_ALIGN_BLOCK_ROWS):
+            rows = np.arange(y0, min(ny, y0 + _WCS_ALIGN_BLOCK_ROWS), dtype=np.float64)
+            bx = spline_x(rows, cols)
+            by = spline_y(rows, cols)
+            coords = np.stack([by, bx])
+            aligned[y0:y0 + len(rows)] = map_coordinates(filled, coords, order=3, cval=0.0)
+            outside = (bx < 0) | (bx > sx - 1) | (by < 0) | (by > sy - 1)
+            if invalid is not None:
+                outside |= map_coordinates(invalid, coords, order=1, cval=1.0) > 0.01
+            footprint[y0:y0 + len(rows)] = outside
+
+        if 1.0 - float(footprint.mean()) < _WCS_ALIGN_MIN_COVERAGE:
+            return None
+        return aligned, footprint
+    except Exception as exc:
+        logger.debug("Subtraction: WCS-based alignment failed: %s", exc)
+        return None
+
 
 def _align_frame(
     source: np.ndarray,
@@ -1826,10 +1995,39 @@ async def run(
     aligned: list[np.ndarray] = []
     footprints: list[Optional[np.ndarray]] = []
     scales: list[float] = []
+    # Through the plate solves when this frame's carries SIP terms — see
+    # _align_by_wcs(); a reference archived without them takes astroalign.
+    new_sip_wcs = wcs if (
+        config.SUBTRACTION_ALIGN_BY_WCS and wcs is not None and getattr(wcs, "sip", None) is not None
+    ) else None
+    n_wcs_aligned = 0
+    n_photometric = 0
+    scale_stars = _scale_stars(
+        new_data,
+        fits_header.saturation_adu(new_header) if new_header is not None else config.SATURATION_ADU,
+    )
+
+    def _reference_scale(ref_aligned: np.ndarray, ref_footprint: Optional[np.ndarray], ref_path: str) -> float:
+        nonlocal n_photometric
+        measured = _photometric_scale(new_data, ref_aligned, ref_footprint, scale_stars)
+        if measured is not None:
+            n_photometric += 1
+            return measured
+        return _flux_scale_factor(ref_path, new_exptime, new_gain)
+
     for ref_path in archive_files:
         ref_data = _load_frame_data(ref_path)
         if ref_data is None:
             continue
+        ref_sip_wcs = _sip_wcs_of(_read_header(ref_path)) if new_sip_wcs is not None else None
+        if ref_sip_wcs is not None:
+            result = _align_by_wcs(ref_data, ref_sip_wcs, new_sip_wcs, new_data.shape)
+            if result is not None:
+                n_wcs_aligned += 1
+                aligned.append(result[0])
+                footprints.append(result[1])
+                scales.append(_reference_scale(result[0], result[1], ref_path))
+                continue
         # Coarse-correct for a known camera/rotator orientation difference
         # (e.g. a meridian flip) BEFORE astroalign's own fine, star-matching
         # registration — see _prerotate_reference()'s docstring. A no-op
@@ -1856,12 +2054,25 @@ async def run(
             # _build_saturation_mask() below compares the aligned references
             # against SATURATION_ADU, and a scaled-down reference's saturated
             # core would drop below that threshold and escape masking.
-            scales.append(_flux_scale_factor(ref_path, new_exptime, new_gain))
+            scales.append(_reference_scale(result_frame, footprint, ref_path))
         else:
             logger.debug(
                 "Subtraction: skipping %s (alignment failed)",
                 os.path.basename(ref_path),
             )
+
+    if aligned and n_photometric < len(aligned):
+        logger.info(
+            "Subtraction: %d of %d reference frame(s) scaled by EXPTIME/GAIN only — too "
+            "few shared stars to measure their flux ratio",
+            len(aligned) - n_photometric, len(aligned),
+        )
+    if n_wcs_aligned:
+        logger.info(
+            "Subtraction: %d of %d reference frame(s) resampled through their SIP plate "
+            "solves, the rest by astroalign",
+            n_wcs_aligned, len(aligned),
+        )
 
     if len(aligned) < config.SUBTRACTION_MIN_FRAMES:
         logger.warning(

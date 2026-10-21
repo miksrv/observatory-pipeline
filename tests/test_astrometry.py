@@ -867,6 +867,26 @@ class TestAstapFailures:
 from modules.astrometry._astap import _run_astap, _run_astap_attempt  # noqa: E402
 
 
+class TestAstapSip:
+    """Wide fields need SIP distortion terms (2° M51 frames: 14-28" edge errors)."""
+
+    @staticmethod
+    async def _cmd(monkeypatch, enabled: bool) -> list[str]:
+        monkeypatch.setattr(config, "ASTAP_SIP_ENABLED", enabled)
+        run_mock = MagicMock(return_value=MagicMock(returncode=0, stdout="Solution found", stderr=""))
+        with patch("modules.astrometry.subprocess.run", run_mock):
+            await _run_astap_attempt(_FITS_PATH, None, wide_radius_deg=None)
+        return list(run_mock.call_args.args[0])
+
+    async def test_sip_is_requested_by_default(self, monkeypatch):
+        cmd = await self._cmd(monkeypatch, True)
+        i = cmd.index("-sip")
+        assert cmd[i + 1] == "y"
+
+    async def test_sip_can_be_switched_off(self, monkeypatch):
+        assert "-sip" not in await self._cmd(monkeypatch, False)
+
+
 class TestAstapTimeoutBudgets:
 
     async def test_narrow_attempt_uses_astap_timeout_sec(self, monkeypatch):

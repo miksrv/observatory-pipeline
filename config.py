@@ -47,6 +47,13 @@ ASTAP_BINARY: str = _get("ASTAP_BINARY", "/usr/local/bin/astap")
 ASTAP_CATALOGS: str = _get("ASTAP_CATALOGS", "/astap/catalogs")
 # Optional FOV hint in degrees (0 = auto-detect from FITS headers)
 ASTAP_FOV_HINT: float = float(_get("ASTAP_FOV_HINT", "0"))
+# Ask astap for SIP distortion coefficients (`-sip y`) on top of the linear
+# TAN solution. A wide field is not a plane: on a 2° frame (M51, ASI6200 at
+# 1000 mm) the linear solve put stars 14-28" off Gaia in the outer third of
+# the field — no catalog match, so every one became UNKNOWN/MOVING_UNKNOWN —
+# while the SIP solve kept them within 1.4". Harmless on a narrow field,
+# where the coefficients come out near zero.
+ASTAP_SIP_ENABLED: bool = _get("ASTAP_SIP_ENABLED", "true").strip().lower() in ("true", "1", "yes")
 # When the first attempt (narrow, header-based search window) completes
 # cleanly but finds no match, retry once with a wide/effectively-blind search
 # radius before giving up. Worth having on by default: the header's own
@@ -433,6 +440,12 @@ SUBTRACTION_DETECT_SIGMA: float = float(_get("SUBTRACTION_DETECT_SIGMA", "5.0"))
 # absorbs a small residual angle, and rotating (interpolating) the reference
 # array for a fraction of a degree only adds blur for no real benefit.
 SUBTRACTION_PREROTATE_MIN_DEG: float = float(_get("SUBTRACTION_PREROTATE_MIN_DEG", "2.0"))
+# Resample a reference onto the new frame through both frames' plate solves
+# when both carry SIP distortion terms, instead of astroalign's single affine
+# transform. A wide field's distortion is not affine: references from another
+# night (slightly different pointing) left star residuals across the outer
+# third of 2° M51 frames. Frames without SIP keep astroalign.
+SUBTRACTION_ALIGN_BY_WCS: bool = _get("SUBTRACTION_ALIGN_BY_WCS", "true").strip().lower() in ("true", "1", "yes")
 # Worst reference seeing worth stacking, as a multiple of the NEW frame's own
 # measured FWHM. Differencing a sharp frame against a blurred reference leaves
 # the classic ring-shaped residual at every star in the field — a mismatched
