@@ -16,6 +16,7 @@ import sep
 from astropy.wcs import WCS
 
 import config
+from modules import fits_header
 
 from ._streak import _build_streak_mask
 
@@ -71,6 +72,9 @@ def _extract_sources(
         for the field shape of each source dict.
     """
     with fits.open(fits_path) as hdul:
+        # Before the data is touched — astropy rewrites BITPIX/BZERO once it
+        # scales it (see fits_header.integer_ceiling_adu()).
+        saturation_adu = fits_header.saturation_adu(hdul[0].header)
         data: np.ndarray = np.ascontiguousarray(
             hdul[0].data.astype(np.float64)
         )
@@ -176,13 +180,13 @@ def _extract_sources(
         # measurement.
         # ---------------------------------------------------------
         raw_peak: np.ndarray = _raw_peak_adu(objects, data, bkg)
-        saturated_mask: np.ndarray = raw_peak >= config.SATURATION_ADU
+        saturated_mask: np.ndarray = raw_peak >= saturation_adu
         n_saturated = int(np.sum(saturated_mask))
         if n_saturated:
             logger.info(
                 "Saturation check: %d/%d raw detection(s) at/above "
-                "SATURATION_ADU=%.0f  file=%s",
-                n_saturated, len(objects), config.SATURATION_ADU,
+                "%.0f ADU  file=%s",
+                n_saturated, len(objects), saturation_adu,
                 fits_filename,
             )
 
@@ -408,7 +412,10 @@ def _extract_sources(
     # being elongated.
     if streak_features:
         sources_all.extend(
-            _streak_sources(streak_features, wcs, pixel_scale_arcsec, naxis1, naxis2, bkg)
+            _streak_sources(
+                streak_features, wcs, pixel_scale_arcsec, naxis1, naxis2, bkg,
+                saturation_adu=saturation_adu,
+            )
         )
         logger.info(
             "Streak masking: re-emitted %d masked streak(s) as detection(s) "
@@ -451,6 +458,7 @@ def _streak_sources(
     naxis1: int,
     naxis2: int,
     bkg,
+    saturation_adu: float | None = None,
 ) -> list[dict[str, float]]:
     """
     Turn the coarse pre-pass's masked streaks into ordinary source dicts, one
@@ -495,7 +503,7 @@ def _streak_sources(
             "elongation": feature["elongation"],
             "saturated":  bool(
                 feature["peak"] + _local_background(bkg, back, feature["x"], feature["y"])
-                >= config.SATURATION_ADU
+                >= (config.SATURATION_ADU if saturation_adu is None else saturation_adu)
             ),
             "near_edge":  bool(
                 feature["x"] < margin_x or feature["x"] > naxis1 - margin_x

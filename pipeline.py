@@ -708,6 +708,15 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 normalizer is not None
                 and normalizer.is_narrowband(header.get("observation", {}).get("filter"))
             )
+            # An 8-bit frame is a stretched, quantized export, not linear ADU
+            # (fits_header.is_8bit()) — its zero point would put faint stars
+            # ~1 mag too bright and poison every later Δmag comparison.
+            if not skip_calibration and _is_8bit_file(fits_path):
+                logger.warning(
+                    "8-bit frame (BITPIX=8) — photometry stays uncalibrated",
+                    extra=extra,
+                )
+                skip_calibration = True
             # The solved WCS, not the file's own header: that is only
             # corrected at archive time (step 12.5) and may still hold the
             # mount-pointing estimate — see photometry.measure()'s `wcs`.
@@ -1654,6 +1663,16 @@ def _object_dir_name(fits_path: str) -> str:
     if config.NORMALIZE_ENABLED and normalizer is not None:
         frame_header = normalizer.normalize_headers(frame_header)
     return frame_header.get("object_name") or "_UNKNOWN"
+
+
+def _is_8bit_file(fits_path: str) -> bool:
+    """`fits_header.is_8bit()` of the file's primary header; False if unreadable."""
+    from astropy.io import fits as astropy_fits  # noqa: PLC0415
+
+    try:
+        return fits_header.is_8bit(astropy_fits.getheader(fits_path))
+    except Exception:
+        return False
 
 
 def _reject_unsupported_frame(fits_path: str, extra: dict) -> bool:

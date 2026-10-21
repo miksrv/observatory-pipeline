@@ -376,7 +376,8 @@ Package: `_astap.py` (runs astap), `_wcs.py` (read/validate WCS), `_frame_geomet
   - `sources` — strict star filter; `sources_all` — loose, elongation ceiling
     `SOURCES_ALL_ELONGATION_MAX` (must stay above `SPACE_DEBRIS_EDGE_ELONGATION_MIN`, warned
     otherwise).
-  - `saturated` — peak raw ADU ≥ `SATURATION_ADU`; `near_edge` — within `EDGE_MARGIN_FRAC` of an
+  - `saturated` — peak raw ADU ≥ `fits_header.saturation_adu()` (`SATURATION_ADU`, capped at the
+    file's integer `BITPIX` ceiling — 255 for an 8-bit export); `near_edge` — within `EDGE_MARGIN_FRAC` of an
     edge. Both are wire fields (persisted, so standalone re-runs can use them).
   - `position_angle_deg` — 0° = North up, clockwise toward +X, via pixel↔world round trip.
     Diagnostic only.
@@ -397,7 +398,8 @@ still hold a mount estimate), falling back to header then `.wcs` file.
   transformed identically). The per-frame fit is only **logged**, as calibration data for that
   setting. No configured `k` → plain median. Sources with unknown colour use `zp` bare with
   `mag_err` widened by `|k| × color_scatter`.
-- **Narrowband** (`skip_calibration=True`): aperture photometry runs, calibration never does.
+- **Narrowband and 8-bit frames** (`skip_calibration=True`): aperture photometry runs, calibration
+  never does. An 8-bit (`BITPIX=8`) frame is a stretched, quantized export, not linear ADU.
 - **Noise:** `flux_err = sqrt(|net|/gain + area × sky_sigma²)`; gain from `_resolve_gain()`:
   argument → `PHOTOMETRY_GAIN_E_PER_ADU` → header `EGAIN` before `GAIN` (`GAIN` is often a vendor
   setting); implausible → 1.0 with a warning. `snr = flux/flux_err`, overwriting any provisional
@@ -421,10 +423,10 @@ frames of the same object. `performed=False` with fewer than `SUBTRACTION_MIN_FR
    new frame's, or whose archived solve's plate scale (header `XPIXSZ`+`FOCALLEN` for an unsolved,
    QC-failed frame) is off the new frame's by more than `SUBTRACTION_REF_MAX_SCALE_DIFF` (INDI's
    `TELESCOP` is the mount's name, so the scale is what separates two telescopes on one mount) —
-   **no fallback**: another optics' frame makes a wrong
-   difference image, not a degraded one. It then excludes `QCFLAG != OK` and `QCFWHM` worse than
-   `SUBTRACTION_REF_MAX_FWHM_RATIO` × the new frame's; if that leaves too few, the
-   same-instrument unscreened set is used. Frames without a keyword are kept on that keyword.
+   **no fallback**: another optics' frame makes a wrong difference image, not a degraded one. A
+   candidate of another `BITPIX` (8-bit export vs raw camera frame) is dropped the same way. It
+   then excludes `QCFLAG != OK` and `QCFWHM` worse than `SUBTRACTION_REF_MAX_FWHM_RATIO` × the new
+   frame's; if that leaves too few, the same-instrument unscreened set is used. Frames without a keyword are kept on that keyword.
    Position-angle closeness ranks the whole candidate list as a soft tiebreaker.
 2. **Pre-rotation** (`_prerotate_reference()`) by the known PA difference above
    `SUBTRACTION_PREROTATE_MIN_DEG`, growing the canvas (`reshape=True`) and marking fill as invalid.

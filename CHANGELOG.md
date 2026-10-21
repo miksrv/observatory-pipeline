@@ -6,6 +6,7 @@
 
 - Finder charts: a source with more than `CHART_MAX_EPOCHS` epochs shows that many spread evenly in time over its whole history (first and last always included), instead of only the most recent ones
 - Subtraction: an unsolved (QC-failed) archived frame is screened by its header plate scale (`XPIXSZ` + `FOCALLEN`) — it used to count as "scale unknown", so the QC fallback could stack another telescope's frames into the reference
+- 8-bit frames (`BITPIX=8`): saturation is detected at the file's own ceiling (255) instead of `SATURATION_ADU`, photometry stays uncalibrated (a stretched export's magnitudes put faint stars ~1 mag too bright), and subtraction never mixes 8-bit and raw frames in one reference stack — re-analyze existing 8-bit frames (and re-run anomaly detection on their objects) after deploying
 ## 1.4.0
 
 ### Minor Changes

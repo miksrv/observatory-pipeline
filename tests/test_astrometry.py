@@ -276,6 +276,7 @@ def _patch_astrometry(
     sep_background_raises: bool = False,
     naxis1: int = _IMAGE_SHAPE[1],
     naxis2: int = _IMAGE_SHAPE[0],
+    header_extra: dict[str, Any] | None = None,
 ):
     """
     Patch every external dependency of astrometry.py in one shot.
@@ -296,13 +297,15 @@ def _patch_astrometry(
         If True, sep.Background raises RuntimeError.
     naxis1, naxis2:
         Image dimensions embedded in the fake FITS header.
+    header_extra:
+        Further cards for the fake FITS header (e.g. BITPIX).
     """
     if wcs is None:
         wcs = _make_wcs()
     if sources is None:
         sources = _make_sources()
 
-    header = {"NAXIS1": naxis1, "NAXIS2": naxis2}
+    header = {"NAXIS1": naxis1, "NAXIS2": naxis2, **(header_extra or {})}
     image  = np.ones((naxis2, naxis1), dtype=np.float64)
     hdul   = _make_hdul(image, header)
 
@@ -736,6 +739,14 @@ class TestSaturationFlag:
 
         assert result["sources_all"]
         assert all(src["saturated"] is True for src in result["sources_all"])
+
+    async def test_8bit_frame_saturates_at_its_own_ceiling(self):
+        """A peak far below SATURATION_ADU is clipped in an 8-bit file (255)."""
+        with _patch_astrometry(header_extra={"BITPIX": 8}):  # peak 1000 + 800 sky
+            result = await astrometry.solve(_FITS_PATH)
+
+        assert result["sources"]
+        assert all(src["saturated"] is True for src in result["sources"])
 
 
 # ---------------------------------------------------------------------------

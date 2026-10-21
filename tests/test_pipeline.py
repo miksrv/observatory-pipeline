@@ -246,6 +246,30 @@ async def test_broadband_filter_does_not_skip_calibration(mock_modules):
 
 
 @pytest.mark.asyncio
+async def test_8bit_frame_skips_calibration(monkeypatch, mock_modules):
+    """A BITPIX=8 export is quantized, not linear ADU — never Gaia-calibrated."""
+    monkeypatch.setattr(pipeline, "_is_8bit_file", lambda path: True)
+
+    await pipeline.run(str(mock_modules))
+
+    _, kwargs = pipeline.photometry.measure.call_args
+    assert kwargs.get("skip_calibration") is True
+
+
+def test_is_8bit_file_reads_bitpix(tmp_path):
+    from astropy.io import fits as astropy_fits
+
+    eight = tmp_path / "e.fits"
+    sixteen = tmp_path / "s.fits"
+    astropy_fits.PrimaryHDU(np.ones((4, 4), dtype=np.uint8)).writeto(eight)
+    astropy_fits.PrimaryHDU(np.ones((4, 4), dtype=np.int16)).writeto(sixteen)
+
+    assert pipeline._is_8bit_file(str(eight)) is True
+    assert pipeline._is_8bit_file(str(sixteen)) is False
+    assert pipeline._is_8bit_file(str(tmp_path / "missing.fits")) is False
+
+
+@pytest.mark.asyncio
 async def test_narrowband_filter_skips_calibration(monkeypatch, mock_modules):
     """A narrowband (Hα) frame must call photometry.measure(skip_calibration=True)."""
     narrowband_header = copy.deepcopy(_GOOD_HEADER)

@@ -987,6 +987,15 @@ class TestDegenerateMinorAxis:
 
 class TestBuildSaturationMask:
 
+    def test_explicit_threshold_is_used(self):
+        """An 8-bit frame's threshold (255) flags what SATURATION_ADU would not."""
+        new_data = np.full((20, 20), 16.0, dtype=np.float32)
+        new_data[3, 4] = 255.0
+
+        assert subtraction._build_saturation_mask(new_data, [], radius_px=0) is None
+        mask = subtraction._build_saturation_mask(new_data, [], radius_px=0, saturation_adu=255.0)
+        assert mask is not None and int(mask.sum()) == 1 and bool(mask[3, 4])
+
     def test_no_saturation_returns_none(self):
         new_data = np.full((20, 20), 100.0, dtype=np.float32)
         refs = [np.full((20, 20), 100.0, dtype=np.float32)]
@@ -2127,6 +2136,37 @@ def _write_scaled_frame(
         hdu.header.update(w.to_header())
     hdu.writeto(str(path), overwrite=True)
     return str(path)
+
+
+def _write_bitpix_frame(path, bitpix):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dtype = {8: np.uint8, 16: np.int16, -32: np.float32}[bitpix]
+    fits.PrimaryHDU(np.ones((8, 8), dtype=dtype)).writeto(str(path), overwrite=True)
+    return str(path)
+
+
+class TestBitDepthScreen:
+    """8-bit exports and raw camera frames never share a reference stack."""
+
+    def test_other_bit_depth_is_excluded_without_fallback(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "SUBTRACTION_MIN_FRAMES", 3)
+        raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
+        exports = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(5)]
+
+        kept = subtraction._screen_by_quality(raw + exports, None, bitpix=16)
+
+        assert kept == raw
+
+    def test_8bit_frame_keeps_8bit_references(self, tmp_path):
+        raw = [_write_bitpix_frame(tmp_path / f"r{i}.fits", 16) for i in range(2)]
+        exports = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(3)]
+
+        assert subtraction._screen_by_quality(raw + exports, None, bitpix=8) == exports
+
+    def test_no_new_frame_bitpix_screens_nothing(self, tmp_path):
+        paths = [_write_bitpix_frame(tmp_path / f"e{i}.fits", 8) for i in range(2)]
+
+        assert subtraction._screen_by_quality(paths, None) == paths
 
 
 class TestPlateScaleScreen:

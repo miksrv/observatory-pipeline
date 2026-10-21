@@ -184,6 +184,7 @@ def _find_archive_frames(
     psf_fwhm_arcsec: Optional[float] = None,
     *,
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
+    bitpix: Optional[int] = None,
     pixel_scale_arcsec: Optional[float] = None,
     exclude_path: Optional[str] = None,
 ) -> list[str]:
@@ -211,6 +212,9 @@ def _find_archive_frames(
     instrument:
         The new frame's own ``(TELESCOP, INSTRUME)`` — see
         _screen_by_quality(). None skips the instrument screen.
+    bitpix:
+        The new frame's BITPIX — see _screen_by_quality(). None skips that
+        screen.
     pixel_scale_arcsec:
         The new frame's own solved plate scale — see _screen_by_quality().
         None skips the plate-scale screen.
@@ -292,7 +296,8 @@ def _find_archive_frames(
         )
 
     science_files = _screen_by_quality(
-        science_files, psf_fwhm_arcsec, instrument, pixel_scale_arcsec=pixel_scale_arcsec,
+        science_files, psf_fwhm_arcsec, instrument,
+        bitpix=bitpix, pixel_scale_arcsec=pixel_scale_arcsec,
     )
 
     candidates = science_files
@@ -361,6 +366,16 @@ def _instrument_of(header: Optional[Any]) -> Optional[tuple[Optional[str], Optio
 def _read_instrument(path: str) -> Optional[tuple[Optional[str], Optional[str]]]:
     """The frame's ``(TELESCOP, INSTRUME)``, either None when absent; None if unreadable."""
     return _instrument_of(_read_header(path))
+
+
+def _bitpix_of(header: Optional[Any]) -> Optional[int]:
+    """A header's BITPIX; None without a header or a usable value."""
+    if header is None:
+        return None
+    try:
+        return int(header.get("BITPIX"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _same_instrument(
@@ -444,12 +459,14 @@ def _screen_by_quality(
     psf_fwhm_arcsec: Optional[float],
     instrument: Optional[tuple[Optional[str], Optional[str]]] = None,
     *,
+    bitpix: Optional[int] = None,
     pixel_scale_arcsec: Optional[float] = None,
 ) -> list[str]:
     """
     Drop reference candidates that would damage the difference image: frames
-    taken with other optics or another camera, frames their own QC marked as
-    failed, and frames whose seeing is far worse than the new frame's.
+    taken with other optics or another camera, frames of another bit depth,
+    frames their own QC marked as failed, and frames whose seeing is far
+    worse than the new frame's.
 
     The instrument screen compares TELESCOP and INSTRUME with the new frame's
     *instrument*. The archive is filed by object and filter only, so this is
@@ -463,7 +480,13 @@ def _screen_by_quality(
     same camera look identical to it. The plate scale does tell them apart —
     the new frame's solved *pixel_scale_arcsec* against each candidate's
     archived solve, within SUBTRACTION_REF_MAX_SCALE_DIFF (it also separates
-    binning modes and a reducer fitted or removed). Same rule as the keyword
+    binning modes and a reducer fitted or removed).
+
+    *bitpix* keeps 8-bit exports and raw camera frames apart, also with no
+    fallback: an 8-bit frame is a stretched, quantized copy whose ADU are
+    nowhere near the raw frame's (the flux scale knows exposure and gain, not
+    a ×256 stretch), so stacking one leaves every star in the difference image
+    (M63 2021-04-12 R: 139–237 candidates per frame against 8-bit references). Same rule as the keyword
     screen: no fallback. A candidate without a WCS is judged by its header
     plate scale (see `_scale_of()`), and kept only when it has neither.
 
@@ -497,6 +520,18 @@ def _screen_by_quality(
                 "another telescope/camera than %s",
                 len(paths) - len(same), len(paths),
                 " / ".join(v or "?" for v in instrument),
+            )
+        paths = same
+        if not paths:
+            return paths
+
+    if bitpix is not None:
+        same = [p for p in paths if _bitpix_of(headers[p]) in (None, bitpix)]
+        if len(same) != len(paths):
+            logger.info(
+                "Subtraction: excluded %d of %d reference candidate(s) whose BITPIX "
+                "differs from this frame's %d",
+                len(paths) - len(same), len(paths), bitpix,
             )
         paths = same
         if not paths:
@@ -1587,6 +1622,7 @@ def _build_saturation_mask(
     new_data: np.ndarray,
     aligned_refs: list[np.ndarray],
     radius_px: int,
+    saturation_adu: Optional[float] = None,
 ) -> Optional[np.ndarray]:
     """
     Flag pixels near saturation in the new frame or any aligned reference
@@ -1612,6 +1648,9 @@ def _build_saturation_mask(
     radius_px:
         Dilation radius in pixels. 0 (or a failed dilation, e.g. missing
         scipy) falls back to the un-dilated saturation mask itself.
+    saturation_adu:
+        The new frame's threshold (`fits_header.saturation_adu()` — 255 for
+        an 8-bit frame); None → config.SATURATION_ADU.
 
     Returns
     -------
@@ -1620,10 +1659,12 @@ def _build_saturation_mask(
         new frame or any reference frame is saturated (the common case) —
         callers can skip masking work entirely in that case.
     """
-    saturated = new_data >= config.SATURATION_ADU
+    if saturation_adu is None:
+        saturation_adu = config.SATURATION_ADU
+    saturated = new_data >= saturation_adu
     for ref in aligned_refs:
         if ref.shape == new_data.shape:
-            saturated |= (ref >= config.SATURATION_ADU)
+            saturated |= (ref >= saturation_adu)
 
     if not saturated.any():
         return None
@@ -1735,10 +1776,12 @@ async def run(
     # (no wcs, or its own PA round-trip failed) degrades gracefully: recency-
     # only selection and no pre-rotation, exactly like before this feature.
     new_position_angle_deg = _position_angle_deg(wcs) if wcs is not None else None
+    new_header = _read_header(fits_path)
 
     archive_files = _find_archive_frames(
         archive_dir, filter_name, new_position_angle_deg, psf_fwhm_arcsec,
-        instrument=_read_instrument(fits_path),
+        instrument=_instrument_of(new_header),
+        bitpix=_bitpix_of(new_header),
         pixel_scale_arcsec=_pixel_scale_arcsec(fits_path, wcs=wcs) if wcs is not None else None,
         exclude_path=fits_path,
     )
@@ -1862,7 +1905,12 @@ async def run(
     if pixel_scale_arcsec and pixel_scale_arcsec > 0:
         radius_px = max(1, int(round(config.SATURATION_MASK_RADIUS_ARCSEC / pixel_scale_arcsec)))
 
-    sat_mask = _build_saturation_mask(new_data, aligned, radius_px)
+    # One threshold for the new frame and its references: the BITPIX screen
+    # in _screen_by_quality() only stacks references of the same bit depth.
+    sat_mask = _build_saturation_mask(
+        new_data, aligned, radius_px,
+        saturation_adu=fits_header.saturation_adu(new_header) if new_header is not None else None,
+    )
     if sat_mask is not None:
         logger.info(
             "Subtraction: masking %d saturated-vicinity pixel(s) (radius=%dpx) "

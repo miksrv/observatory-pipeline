@@ -227,7 +227,9 @@ STREAK_MASK_DILATE_ARCSEC: float = float(_get("STREAK_MASK_DILATE_ARCSEC", "3.0"
 # ---------------------------------------------------------------------------
 # Sensor pixel value (ADU) at/above which a pixel is considered saturated.
 # Default assumes a 16-bit sensor with some headroom below the hard 65535
-# ceiling for non-linearity near full well — tune per camera.
+# ceiling for non-linearity near full well — tune per camera. Each file is
+# also capped at the largest value its integer BITPIX can store (255 for an
+# 8-bit export) — modules/fits_header.saturation_adu().
 SATURATION_ADU: float = float(_get("SATURATION_ADU", "60000"))
 # Radius (arcsec) around a saturated pixel that modules/subtraction.py
 # excludes from difference-image source detection, to suppress astroalign
