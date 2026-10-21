@@ -353,6 +353,10 @@ Package: `_astap.py` (runs astap), `_wcs.py` (read/validate WCS), `_frame_geomet
 
 - **astap** runs via `xvfb-run` without `-update` (never writes into the FITS; only `.wcs`/`.ini`/
   `.log` side files), on a worker thread (`asyncio.to_thread`) with `subprocess.run(timeout=)`.
+- **SIP distortion** (`-sip y`, `ASTAP_SIP_ENABLED`): a linear TAN solve put stars 14-28" off
+  Gaia in the outer third of a 2° frame (no catalog match → UNKNOWN/MOVING_UNKNOWN); with SIP
+  ≤ 1.4". Every consumer uses `all_pix2world`/`pixel_to_world`, which apply it; the archived
+  header keeps it (`to_header(relax=True)`, stale SIP cards stripped first).
 - The fresh `.wcs` side file is **preferred over any WCS already in the header** — capture
   software writes mount-pointing WCS that looks valid but can be arcminutes off. Header WCS is only
   a fallback.
@@ -431,10 +435,15 @@ frames of the same object. `performed=False` with fewer than `SUBTRACTION_MIN_FR
 2. **Pre-rotation** (`_prerotate_reference()`) by the known PA difference above
    `SUBTRACTION_PREROTATE_MIN_DEG`, growing the canvas (`reshape=True`) and marking fill as invalid.
    Never excludes a reference for rotation — astroalign handles even 180°.
-3. **Alignment** with `astroalign` (shape mismatches are fine; it resamples onto the new grid).
-4. **Flux scaling** of the stack by `(t_new/t_ref) × (g_ref/g_new)` (`_flux_scale_factor()`; each
-   factor → 1.0 if a keyword is missing). Applied to the stack only, so saturation masking still
-   sees raw reference ADU.
+3. **Alignment:** through both plate solves (`_align_by_wcs()`: target pixel → sky → reference
+   pixel, bicubic) when both carry SIP terms (`SUBTRACTION_ALIGN_BY_WCS`) — a wide field's
+   distortion is not affine; otherwise `astroalign` (shape mismatches are fine; it resamples
+   onto the new grid).
+4. **Flux scaling** of each reference by the median flux ratio of the stars both frames share
+   (`_photometric_scale()` — covers transparency, which differed by 0.17 mag between two M51
+   nights), falling back to `(t_new/t_ref) × (g_ref/g_new)` (`_flux_scale_factor()`; each
+   factor → 1.0 if a keyword is missing) with too few stars. Applied to the stack only, so
+   saturation masking still sees raw reference ADU.
 5. **Median stack** honouring each reference's astroalign footprint and excluding non-finite
    pixels; uncovered pixels take the new frame's value (difference = 0).
 6. **Masks:** vicinity of saturated pixels in the new frame or any reference
@@ -525,13 +534,14 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Unmatched + `near_edge` | suppressed, unless a subtraction candidate passing `_survives_edge_zone()` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC`, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (`…_EDGE_…` near the edge) | `SPACE_DEBRIS` — recorded, not an alert; no "vacated position" proof needed |
 | Unmatched, shifted (see below), not near edge | `MOVING_UNKNOWN` → alert |
-| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star within `SUBTRACTION_RESIDUAL_MAX_DMAG` | suppressed (that star's residual) |
+| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star within `SUBTRACTION_RESIDUAL_MAX_DMAG` | suppressed (that star's residual) — checked before every branch below |
 | No coverage, normal detection | `FIRST_OBSERVATION` — logged only, not posted |
 | No coverage, subtraction candidate, catalogued | suppressed (registration residual) |
 | No coverage, subtraction candidate, uncatalogued | `UNKNOWN` → alert |
-| Covered, no history, near a Simbad galaxy | `SUPERNOVA_CANDIDATE` → alert |
+| Covered, no history, subtraction candidate on a Simbad galaxy | `SUPERNOVA_CANDIDATE` → alert (a normal detection of the galaxy itself → `KNOWN_CATALOG_NEW`) |
 | Covered, no history, catalogued | `KNOWN_CATALOG_NEW` — logged only, not posted |
 | Covered, no history, uncatalogued | `UNKNOWN` → alert |
+| History, subtraction candidate | nothing — no Δmag against a neighbour's light curve |
 | History, significant brightening, near galaxy | `SUPERNOVA_CANDIDATE` → alert |
 | History, significant Δmag, Simbad binary / variable | `BINARY_STAR` / `VARIABLE_STAR` |
 | History, significant Δmag beyond `VARIABILITY_SIGMA` × own same-filter scatter over ≥ `VARIABILITY_MIN_EPOCHS`, not a galaxy/cluster | `VARIABLE_STAR` (light-curve based; stated in `notes`) |

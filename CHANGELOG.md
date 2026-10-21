@@ -1,6 +1,15 @@
 # Changelog
 
-## 1.4.1
+## 1.5.0
+
+### Minor Changes
+
+- Astrometry: plate solves include SIP distortion terms (`ASTAP_SIP_ENABLED`, default on) and the archived header keeps them — on a 2° field the linear solve put stars 14–28″ off their catalog positions in the outer third of the frame, so they went unmatched and became `UNKNOWN`/`MOVING_UNKNOWN`; re-analyze wide-field frames after deploying
+- Subtraction: references are put on the new frame's flux scale by the stars both share, not only by exposure time and gain — transparency differing between nights (0.17 mag on M51) left every star in the difference image
+- Subtraction: when both frames carry SIP terms, a reference is resampled through the two plate solves instead of astroalign's affine fit (`SUBTRACTION_ALIGN_BY_WCS`, default on) — a wide field's distortion is not affine, and references from another night left residuals across its edges
+- Anomalies: a subtraction candidate beside a catalogued star of the same brightness is suppressed as that star's residual in every branch (it reached `SPACE_DEBRIS`, `MOVING_UNKNOWN` and `VARIABLE_STAR`), and is never compared by magnitude with the history around it — that history is the neighbouring star's (324 of the 572 `VARIABLE_STAR` on the M51/M63/M82 run were such residuals)
+- Anomalies: `SUPERNOVA_CANDIDATE` for a new source needs a subtraction candidate on the galaxy — an ordinary detection matched to a galaxy is the galaxy itself, first detected on a deeper frame
+- After deploying: re-run `ANALYZE` on all frames (archived headers get SIP; a frame's WCS resampling applies to the references already re-analyzed), then `DETECT_ANOMALIES` on all of them — each run replaces that frame's anomalies
 
 ### Patch Changes
 
@@ -9,6 +18,7 @@
 - 8-bit frames (`BITPIX=8`): saturation is detected at the file's own ceiling (255) instead of `SATURATION_ADU`, photometry stays uncalibrated (a stretched export's magnitudes put faint stars ~1 mag too bright), and subtraction never mixes 8-bit and raw frames in one reference stack — re-analyze existing 8-bit frames (and re-run anomaly detection on their objects) after deploying
 - API: anomaly-detection history is fetched in chunks of `HISTORY_BATCH_MAX_POSITIONS` (default 100) positions grouped by declination, so a frame of a field observed hundreds of times no longer makes the API run out of memory (HTTP 500 → the detection re-queued as a task per frame)
 - API: posting a frame's sources waits up to `API_SOURCES_TIMEOUT_SEC` (default 180 s) instead of 30 s — a timed-out post was retried while the first one was still being saved, and the two collided (HTTP 500 → the frame re-analyzed as a separate task); works best with observatory-api 1.3.1, which also makes such a collision harmless
+
 ## 1.4.0
 
 ### Minor Changes
