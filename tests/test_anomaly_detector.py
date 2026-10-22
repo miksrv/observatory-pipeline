@@ -2570,3 +2570,105 @@ class TestStationaryAlertConfirmation:
         assert await self._run(source, [], [], frames, records) == []
         kept = await self._run(source, [self._det(5, 0.0, "f+5")], [], frames, records)
         assert [a["anomaly_type"] for a in kept] == ["SUPERNOVA_CANDIDATE"]
+
+
+class TestSuspectFrame:
+    """
+    M82 G 2020-08-21T22-34-31 (23 uncatalogued 10-13 mag "stars", 32 alerts)
+    and M63 L 2021-03-16 (ghost copies after a mount jump): Gaia is complete
+    far below 15 mag, so several bright uncatalogued star-like sources in one
+    frame are copies of real stars. There only a confirmed alert stands.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    @staticmethod
+    def _sources(n_ghosts: int) -> list[dict]:
+        return [
+            _make_source(ra=_RA + i * 0.01, mag=12.0, catalog_name=None, fwhm=3.0, elongation=1.1)
+            for i in range(n_ghosts)
+        ]
+
+    async def _run(self, sources, here=None):
+        current = _frame_record(_FRAME_ID, fwhm=3.0)
+
+        async def near(positions, radius, before_time, uncatalogued_only=False):
+            if before_time == _OBS_TIME or uncatalogued_only:
+                return {}
+            return {"0": here or []}
+
+        async def covering(positions, before_time):
+            return {str(i): [_make_coverage_frame()] for i in range(len(positions))} if before_time == _OBS_TIME else {}
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", side_effect=covering),
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = [current, TestMovingUnknownTrackConfirmation._frame("f+5", 5)]
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, sources, sources, {**_FRAME_META, "frame": current})
+
+    async def test_unconfirmed_alerts_of_a_suspect_frame_are_withdrawn(self, caplog):
+        with caplog.at_level("WARNING"):
+            assert await self._run(self._sources(3)) == []
+        assert "Suspect frame: 3 uncatalogued star-like sources" in caplog.text
+
+    async def test_a_confirmed_alert_of_a_suspect_frame_stands(self):
+        seen = [TestMovingUnknownTrackConfirmation._det(5, 0.0, "f+5")]
+        result = await self._run(self._sources(3), here=seen)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]  # only the first is seen again
+        assert "Seen again" in result[0]["notes"]
+
+    async def test_two_bright_uncatalogued_sources_do_not_make_a_frame_suspect(self):
+        result = await self._run(self._sources(2))
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN", "UNKNOWN"]
+
+    @pytest.mark.parametrize("change", [
+        {"mag": 15.5}, {"elongation": 2.5}, {"fwhm": 6.0}, {"saturated": True}, {"mag": None},
+    ])
+    async def test_only_bright_star_like_sources_count(self, change):
+        sources = [{**s, **change} for s in self._sources(3)]
+        assert ad._detect._ghost_sources(sources, 3.0) == []
+
+
+class TestDiffuseSubtractionCandidate:
+    """
+    2026-10-22 run: 60 alerts were subtraction candidates 3-20 × the PSF wide
+    over pure noise in the frame — uncancelled background. Such a candidate
+    stands only when the frames around it confirm it; a new comet would be.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    _run = TestStationaryAlertConfirmation._run
+
+    @staticmethod
+    def _blob(fwhm=12.0):
+        return _make_source(mag=15.0, catalog_name=None, fwhm=fwhm, from_subtraction=True)
+
+    async def test_an_unconfirmed_diffuse_candidate_is_withdrawn(self):
+        assert await self._run(self._blob(), [], [], [], []) == []
+
+    async def test_a_diffuse_candidate_seen_again_stands(self):
+        seen = [TestMovingUnknownTrackConfirmation._det(5, 0.0, "f+5")]
+        frames = [{"id": "f+5", "obs_time": _at(5)}]
+        result = await self._run(self._blob(), seen, [], frames,
+                                 [TestMovingUnknownTrackConfirmation._frame("f+5", 5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+
+    async def test_a_point_like_candidate_is_not_affected(self):
+        result = await self._run(self._blob(fwhm=4.0), [], [], [], [])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Not confirmed yet" in result[0]["notes"]

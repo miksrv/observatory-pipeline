@@ -419,8 +419,23 @@ subtraction residual does not.
   here is why it is new.
 - Otherwise (no such frame yet) → kept, "not confirmed yet" in `notes`.
 
+**Suspect frame.** `detect()` first counts the frame's ghost sources (`_ghost_sources()`):
+uncatalogued, round (`STAR_ELONGATION_MAX`), PSF-sized (≤ 1.5 × the frame's PSF),
+unsaturated, not from subtraction, brighter than `SUSPECT_FRAME_MAG` (15). Gaia is complete
+far below that, so `SUSPECT_FRAME_MIN_SOURCES` (3) or more of them are copies of real stars
+— a mount jump, a double exposure, a drifting frame. In such a frame (logged at WARNING)
+every alert the check above leaves "not confirmed yet" is withdrawn instead; a confirmed one
+stands. On the 2026-10-22 run three frames had 4–23 ghost sources and the other 519 at most
+one (M82 G 2020-08-21T22-34-31 alone posted 32 alerts).
+
+**Diffuse subtraction candidate.** A subtraction candidate wider than
+`SUBTRACTION_DIFFUSE_FWHM_RATIO` (2.5) × the frame's PSF is held to the same rule: it stands
+only when confirmed (`_needs_confirmation()`). On the 2026-10-22 run 60 alerts were such
+blobs, 3–20 × the PSF, over pure noise in the frame itself. A new comet is diffuse too, but
+still there in the next frames; a known one is matched through MPC first.
+
 So an alert from a sequence's last frame, or from detection run before the next frames
-were ingested, stands as before; running `DETECT_ANOMALIES` once a night's frames are all
+were ingested, stands as before (unless its frame is suspect or it is diffuse); running `DETECT_ANOMALIES` once a night's frames are all
 in gives the check its evidence.
 
 ---

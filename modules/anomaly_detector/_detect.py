@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 import math
 
+import config
+
 from ._classify import _classify_source_sync
 from ._confirm import _confirm_alerts
 from ._ephemeris_resolution import _resolve_ephemerides
@@ -25,6 +27,33 @@ def _finite_or_none(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _ghost_sources(sources: list[dict], frame_psf_arcsec: float | None) -> list[dict]:
+    """
+    Detections that look like ordinary stars — round (`STAR_ELONGATION_MAX`),
+    no wider than 1.5 × the frame's PSF when that is known, unsaturated, not
+    a subtraction candidate — brighter than `SUSPECT_FRAME_MAG`, and in no
+    catalog. Gaia is complete far below that magnitude, so several of them in
+    one frame are copies of real stars (a mount jump, a double exposure)
+    rather than new objects. Uncalibrated frames have no magnitudes and
+    never count any.
+    """
+    ghosts = []
+    for s in sources:
+        if s.get("catalog_name") is not None or s.get("_from_subtraction") or s.get("saturated"):
+            continue
+        mag = _finite_or_none(s.get("mag"))
+        if mag is None or mag > config.SUSPECT_FRAME_MAG:
+            continue
+        elongation = _finite_or_none(s.get("elongation"))
+        if elongation is None or elongation > config.STAR_ELONGATION_MAX:
+            continue
+        fwhm = _finite_or_none(s.get("fwhm"))
+        if frame_psf_arcsec and fwhm is not None and fwhm > 1.5 * frame_psf_arcsec:
+            continue
+        ghosts.append(s)
+    return ghosts
 
 
 async def _mark_history_optics(
@@ -210,8 +239,25 @@ async def detect(
             )
 
     # Check the alerts against the frames around this one — see _confirm.py.
+    # A frame full of bright uncatalogued "stars" is holding ghost copies of
+    # real ones; there only a confirmed alert stands.
+    ghosts = _ghost_sources(sources, frame_psf_arcsec)
+    suspect = None
+    if len(ghosts) >= max(1, config.SUSPECT_FRAME_MIN_SOURCES):
+        suspect = (
+            f"{len(ghosts)} uncatalogued star-like sources brighter than "
+            f"{config.SUSPECT_FRAME_MAG:g} mag in a suspect frame — ghost images "
+            f"(mount jump, double exposure)?"
+        )
+        logger.warning(
+            "Suspect frame: %s — its alerts stand only if the frames around it "
+            "confirm them",
+            suspect,
+            extra=extra,
+        )
     anomalies = await _confirm_alerts(
-        anomalies, frame_id, obs_time, frame_meta, current_frame_positions, extra
+        anomalies, frame_id, obs_time, frame_meta, current_frame_positions, extra,
+        suspect=suspect, frame_psf_arcsec=frame_psf_arcsec,
     )
     for anomaly in anomalies:
         anomaly.pop("_source", None)

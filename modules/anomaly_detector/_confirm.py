@@ -214,11 +214,19 @@ async def _confirm_alerts(
     frame_meta: dict,
     current_frame_positions: list[tuple[float, float]],
     extra: dict,
+    suspect: str | None = None,
+    frame_psf_arcsec: float | None = None,
 ) -> list[dict]:
     """
     Check the alerts in `anomalies` against the frames around this one and
     return the list with the outcome applied (see the module docstring).
     Needs each anomaly's `_source`, and a MOVING_UNKNOWN's `_fallback`.
+
+    `suspect` is why this frame cannot be trusted on its own (detect()'s
+    ghost-source count), or None. `frame_psf_arcsec` is the frame's seeing,
+    for `_needs_confirmation()`. In a suspect frame, and for a diffuse
+    subtraction candidate anywhere, an alert the frames
+    around it cannot confirm is withdrawn instead of kept.
 
     Three batch requests for the whole frame — detections at each alert's own
     position, the uncatalogued detections around it, and the covering frames,
@@ -352,6 +360,10 @@ async def _confirm_alerts(
             state, note = _track(anomaly, k)
             if state == "unpaired":
                 state = "untested"
+            distrust = suspect or _needs_confirmation(anomaly, frame_psf_arcsec)
+            if state == "untested" and distrust:
+                state, note = "refuted", f"unconfirmed ({distrust})"
+                anomaly["_fallback"] = None
             counts[f"MOVING_UNKNOWN {state}"] = counts.get(f"MOVING_UNKNOWN {state}", 0) + 1
             if state == "refuted":
                 fallback = anomaly.get("_fallback")
@@ -379,6 +391,9 @@ async def _confirm_alerts(
                 continue
 
         state, note = _stationary(anomaly, k)
+        distrust = suspect or _needs_confirmation(anomaly, frame_psf_arcsec)
+        if state == "untested" and distrust:
+            state, note = "refuted", f"unconfirmed ({distrust})"
         label = str(getattr(anomaly["anomaly_type"], "value", anomaly["anomaly_type"]))
         counts[f"{label} {state}"] = counts.get(f"{label} {state}", 0) + 1
         if state == "refuted":
@@ -421,3 +436,29 @@ def _is_checked(anomaly: dict) -> bool:
     if anomaly_type in (AnomalyType.MOVING_UNKNOWN, AnomalyType.UNKNOWN):
         return True
     return anomaly_type == AnomalyType.SUPERNOVA_CANDIDATE and anomaly.get("delta_mag") is None
+
+
+def _needs_confirmation(anomaly: dict, frame_psf_arcsec: float | None) -> str | None:
+    """
+    Why this alert stands only if the frames around it confirm it, or None.
+
+    A subtraction candidate wider than `SUBTRACTION_DIFFUSE_FWHM_RATIO` ×
+    the frame's PSF is not a point source appearing: on the 2026-10-22
+    M51/M63/M82 run 60 alerts were such blobs, 3-20 × the PSF, and the frames
+    themselves show only noise there — a stretch of the difference image's
+    background left uncancelled (a narrowband frame against broadband
+    references, a gradient). A new comet would be diffuse too; it is still
+    there in the next frames, so it is kept once they confirm it, and a
+    known one is matched through MPC before any of this.
+    """
+    source = anomaly.get("_source") or {}
+    if not source.get("_from_subtraction") or not frame_psf_arcsec:
+        return None
+    try:
+        fwhm = float(source.get("fwhm"))
+    except (TypeError, ValueError):
+        return None
+    ratio = config.SUBTRACTION_DIFFUSE_FWHM_RATIO
+    if ratio <= 0 or not math.isfinite(fwhm) or fwhm <= ratio * frame_psf_arcsec:
+        return None
+    return f"diffuse subtraction candidate, FWHM {fwhm:.1f}\" > {ratio:g} × PSF {frame_psf_arcsec:.1f}\""

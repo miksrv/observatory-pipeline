@@ -340,6 +340,22 @@ MOVING_EXTEND_MAX_GAP_MIN: float = float(_get("MOVING_EXTEND_MAX_GAP_MIN", "30.0
 # With no such frame — a sequence's last frame, or detection run as soon as a
 # frame arrives — the alert stands as before. 0 disables the check.
 ALERT_CONFIRM_WINDOW_MIN: float = float(_get("ALERT_CONFIRM_WINDOW_MIN", "180.0"))
+# A frame showing at least SUSPECT_FRAME_MIN_SOURCES uncatalogued, star-like
+# (round, PSF-sized, unsaturated, not from subtraction) sources brighter than
+# SUSPECT_FRAME_MAG is not to be trusted on its own: Gaia is complete far
+# below that, so they are ghost copies of real stars — a mount jump or
+# double exposure (M63 L 2021-03-16) or a drifting, half-failed frame (M82 G
+# 2020-08-21, 23 of them). On the 2026-10-22 run three frames had 4-23 such
+# sources and the other 519 at most one. In such a frame an alert stands
+# only when the frames around it confirm it (ALERT_CONFIRM_WINDOW_MIN).
+SUSPECT_FRAME_MAG: float = float(_get("SUSPECT_FRAME_MAG", "15.0"))
+SUSPECT_FRAME_MIN_SOURCES: int = int(_get("SUSPECT_FRAME_MIN_SOURCES", "3"))
+# A subtraction candidate wider than this many times the frame's PSF stands
+# as an alert only when the frames around it confirm it: on the 2026-10-22
+# run 60 alerts were such blobs (3-20 × PSF) over pure noise in the frame
+# itself — uncancelled background in the difference image. A new comet is
+# diffuse too, but still there in the next frames. 0 disables.
+SUBTRACTION_DIFFUSE_FWHM_RATIO: float = float(_get("SUBTRACTION_DIFFUSE_FWHM_RATIO", "2.5"))
 
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
 
@@ -983,6 +999,9 @@ _OVERRIDABLE: dict[str, type] = {
     "MOVING_CONE_MAX_ARCSEC": float,
     "MOVING_EXTEND_MAX_GAP_MIN": float,
     "ALERT_CONFIRM_WINDOW_MIN": float,
+    "SUSPECT_FRAME_MAG": float,
+    "SUSPECT_FRAME_MIN_SOURCES": int,
+    "SUBTRACTION_DIFFUSE_FWHM_RATIO": float,
     "DELTA_MAG_ALERT": float,
     "VARIABILITY_MIN_EPOCHS": int,
     "VARIABILITY_SIGMA": float,
