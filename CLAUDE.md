@@ -539,7 +539,7 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Unmatched + `near_edge` | suppressed, unless a subtraction candidate passing `_survives_edge_zone()` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC`, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (`…_EDGE_…` near the edge) | `SPACE_DEBRIS` — recorded, not an alert; no "vacated position" proof needed |
 | Unmatched, shifted (see below), not near edge | `MOVING_UNKNOWN` → alert |
-| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star within `SUBTRACTION_RESIDUAL_MAX_DMAG` | suppressed (that star's residual) — checked before every branch below |
+| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star at most `SUBTRACTION_RESIDUAL_MAX_DMAG` brighter or `SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG` fainter | suppressed (that star's residual) — checked before every branch below |
 | No coverage, normal detection | `FIRST_OBSERVATION` — logged only, not posted |
 | No coverage, subtraction candidate, catalogued | suppressed (registration residual) |
 | No coverage, subtraction candidate, uncatalogued | `UNKNOWN` → alert |
@@ -549,17 +549,37 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | History, subtraction candidate | nothing — no Δmag against a neighbour's light curve |
 | History, significant brightening, near galaxy | `SUPERNOVA_CANDIDATE` → alert |
 | History, significant Δmag, Simbad binary / variable | `BINARY_STAR` / `VARIABLE_STAR` |
-| History, significant Δmag beyond `VARIABILITY_SIGMA` × own same-filter scatter over ≥ `VARIABILITY_MIN_EPOCHS`, not a galaxy/cluster | `VARIABLE_STAR` (light-curve based; stated in `notes`) |
+| History, significant Δmag beyond `VARIABILITY_SIGMA` × own same-filter, same-optics scatter over ≥ `VARIABILITY_MIN_EPOCHS`; a well-measured point source (not a galaxy/cluster/nebula, FWHM ≤ `VARIABILITY_MAX_FWHM_RATIO` × PSF, `mag_err` ≤ `VARIABILITY_MAX_MAG_ERR`, not near the edge) | `VARIABLE_STAR` (light-curve based; stated in `notes`) |
 
 - **"Shifted"** needs both: no history within `MATCH_CONE_ARCSEC` of the current position, **and**
   a historical detection in the wide cone whose position is now empty. The wide radius is
   per-candidate: `MOVING_CONE_ARCSEC` floor, extended to `MOVING_RATE_ARCSEC_PER_MIN × gap` for
   gaps ≤ `MOVING_EXTEND_MAX_GAP_MIN`, capped at `MOVING_CONE_MAX_ARCSEC`.
+- **Alert confirmation** (`_confirm.py`, after classification): a `MOVING_UNKNOWN` is checked
+  against the field's frames within `ALERT_CONFIRM_WINDOW_MIN`. Kept when a third detection lies
+  on its straight track, or when no frame can test the track; withdrawn (to what the source is
+  without the motion, usually `UNKNOWN`) when it moves exactly as the telescope pointing (a hot
+  pixel under dithering) or every frame that should show it — QC `OK`, plate-solved, same filter,
+  covering the predicted position — does not (a catalogued detection on the predicted track
+  leaves it untested: the mover may have been matched to a star it passed). An `UNKNOWN` must be
+  detected again in a later frame: absent from every later same-filter frame that covers it →
+  withdrawn, on a track through the later frames → `MOVING_UNKNOWN`, a catalogued detection there
+  or no later frame → kept. `SUPERNOVA_CANDIDATE` is not checked (the host galaxy is detected in
+  every later frame). Earlier frames never withdraw an alert. A failed request withdraws nothing. In a
+  **suspect frame** — `SUSPECT_FRAME_MIN_SOURCES`+ uncatalogued star-like sources brighter than
+  `SUSPECT_FRAME_MAG`, i.e. ghost copies of stars (mount jump, double exposure) — only a
+  confirmed alert stands; likewise for a subtraction candidate wider than
+  `SUBTRACTION_DIFFUSE_FWHM_RATIO` × PSF (uncancelled background — a new comet is confirmed by
+  the next frames).
 - **Significant Δmag** = above `DELTA_MAG_ALERT` **and** above `VARIABILITY_SIGMA` × (`mag_err` ⊕
   historical scatter), **and confirmed** by the previous `VARIABILITY_CONFIRM_EPOCHS − 1`
   same-filter epochs (one deviant epoch is usually a cosmic ray). Uses the calibrated `mag` only.
 - Δmag history is restricted to the **same filter** (`_same_filter_history()`, current filter in
   `_filter`, historical `filter` joined by the API). The existence check stays filter-agnostic.
+  The star branches (binary/variable) also drop epochs from **other optics**
+  (`_same_optics_history()`: another camera, or plate scale off by more than
+  `SUBTRACTION_REF_MAX_SCALE_DIFF`, read from the stored frame records — `_frames.py`); the
+  brightening `SUPERNOVA_CANDIDATE` keeps every same-filter epoch.
 - `object_type` comes only from Simbad; Gaia/2MASS/Pan-STARRS set a generic `"STAR"`.
 - Ephemerides: `ephemeris.py` per designation, gathered with `return_exceptions=True` so one
   failure costs only that anomaly its ephemeris.

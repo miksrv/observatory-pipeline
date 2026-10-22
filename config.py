@@ -329,6 +329,35 @@ MOVING_CONE_MAX_ARCSEC: float = float(_get("MOVING_CONE_MAX_ARCSEC", "600.0"))
 # "something left A" with "something appeared at B" carries little weight.
 MOVING_EXTEND_MAX_GAP_MIN: float = float(_get("MOVING_EXTEND_MAX_GAP_MIN", "30.0"))
 
+# --- Confirming an alert with the frames around it -------------------------
+# An alert is checked against the other frames of the same field taken within
+# this many minutes of it, before and after (modules/anomaly_detector/
+# _confirm.py). A MOVING_UNKNOWN must line up with detections in them on a
+# straight track and must not move with the telescope (a hot pixel follows
+# the dither); it is dropped only when a frame that should show the track
+# shows nothing there. An UNKNOWN must be detected again in a later frame of
+# its position through the same filter.
+# With no such frame — a sequence's last frame, or detection run as soon as a
+# frame arrives — the alert stands as before. 0 disables the check.
+ALERT_CONFIRM_WINDOW_MIN: float = float(_get("ALERT_CONFIRM_WINDOW_MIN", "180.0"))
+# A frame showing at least SUSPECT_FRAME_MIN_SOURCES uncatalogued, star-like
+# (round, PSF-sized, unsaturated, not from subtraction) sources brighter than
+# SUSPECT_FRAME_MAG is not to be trusted on its own: Gaia is complete far
+# below that, so they are ghost copies of real stars — a mount jump or
+# double exposure (M63 L 2021-03-16) or a drifting, half-failed frame (M82 G
+# 2020-08-21, 23 of them). On the 2026-10-22 run three frames had 4-23 such
+# sources and the other 519 at most one. In such a frame an alert stands
+# only when the frames around it confirm it (ALERT_CONFIRM_WINDOW_MIN).
+# SUSPECT_FRAME_MIN_SOURCES = 0 disables the check.
+SUSPECT_FRAME_MAG: float = float(_get("SUSPECT_FRAME_MAG", "15.0"))
+SUSPECT_FRAME_MIN_SOURCES: int = int(_get("SUSPECT_FRAME_MIN_SOURCES", "3"))
+# A subtraction candidate wider than this many times the frame's PSF stands
+# as an alert only when the frames around it confirm it: on the 2026-10-22
+# run 60 alerts were such blobs (3-20 × PSF) over pure noise in the frame
+# itself — uncancelled background in the difference image. A new comet is
+# diffuse too, but still there in the next frames. 0 disables.
+SUBTRACTION_DIFFUSE_FWHM_RATIO: float = float(_get("SUBTRACTION_DIFFUSE_FWHM_RATIO", "2.5"))
+
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
 
 # --- Statistical variability detection (modules/anomaly_detector/) ---------
@@ -369,6 +398,17 @@ VARIABILITY_SIGMA: float = float(_get("VARIABILITY_SIGMA", "3.0"))
 # brighter, and back to normal on the next (2026-09-23). A real change that
 # persists fires one epoch later. 1 disables the confirmation.
 VARIABILITY_CONFIRM_EPOCHS: int = int(_get("VARIABILITY_CONFIRM_EPOCHS", "2"))
+# The light-curve VARIABLE_STAR (no catalog says the source varies) is judged
+# only on a measurement worth judging: a magnitude error at most
+# VARIABILITY_MAX_MAG_ERR, and a FWHM at most VARIABILITY_MAX_FWHM_RATIO times
+# the frame's own PSF. A source at the detection limit — forced photometry
+# keeps only the epochs that noise pushed above its SNR threshold — reads
+# about 1 mag "brighter" with mag_err 0.2-0.3; an extended knot's aperture
+# magnitude follows the seeing. Together they were 220 of the 287
+# VARIABLE_STARs on the 2026-10-22 M51/M63/M82 run. Catalogued variables
+# (Simbad V*, RR, ...) are not gated.
+VARIABILITY_MAX_MAG_ERR: float = float(_get("VARIABILITY_MAX_MAG_ERR", "0.1"))
+VARIABILITY_MAX_FWHM_RATIO: float = float(_get("VARIABILITY_MAX_FWHM_RATIO", "2.0"))
 
 # Faintest predicted visual magnitude (V) for an MPC/SkyBot object to be
 # eligible for source matching. Objects fainter than this are almost certainly
@@ -508,6 +548,13 @@ SUBTRACTION_EDGE_SNR_MIN: float = float(_get("SUBTRACTION_EDGE_SNR_MIN", "10.0")
 # measured magnitude is the star's). 0 disables the check.
 SUBTRACTION_RESIDUAL_RADIUS_FWHM: float = float(_get("SUBTRACTION_RESIDUAL_RADIUS_FWHM", "2.5"))
 SUBTRACTION_RESIDUAL_MAX_DMAG: float = float(_get("SUBTRACTION_RESIDUAL_MAX_DMAG", "1.0"))
+# How much FAINTER than the star a residual may measure. A residual is part
+# of the star's light, so it is never much brighter than the star but often
+# fainter: on the 2026-10-22 M51 run (1.53″/px, 2° field) 65 UNKNOWN /
+# MOVING_UNKNOWN alerts were candidates 5-7″ from a star and 1.0-1.9 mag
+# fainter than it. SUBTRACTION_RESIDUAL_MAX_DMAG stays the bound on the
+# brighter side, so a transient outshining its neighbour is never suppressed.
+SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG: float = float(_get("SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG", "2.0"))
 
 # --- Correlated noise in the difference image ------------------------------
 # A candidate's significance was computed as flux / (rms * sqrt(npix)), which
@@ -959,10 +1006,16 @@ _OVERRIDABLE: dict[str, type] = {
     "MOVING_RATE_ARCSEC_PER_MIN": float,
     "MOVING_CONE_MAX_ARCSEC": float,
     "MOVING_EXTEND_MAX_GAP_MIN": float,
+    "ALERT_CONFIRM_WINDOW_MIN": float,
+    "SUSPECT_FRAME_MAG": float,
+    "SUSPECT_FRAME_MIN_SOURCES": int,
+    "SUBTRACTION_DIFFUSE_FWHM_RATIO": float,
     "DELTA_MAG_ALERT": float,
     "VARIABILITY_MIN_EPOCHS": int,
     "VARIABILITY_SIGMA": float,
     "VARIABILITY_CONFIRM_EPOCHS": int,
+    "VARIABILITY_MAX_MAG_ERR": float,
+    "VARIABILITY_MAX_FWHM_RATIO": float,
     "MPC_MAG_LIMIT": float,
     # Edge geometry
     "EDGE_MARGIN_FRAC": float,
@@ -978,6 +1031,7 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_EDGE_SNR_MIN": float,
     "SUBTRACTION_RESIDUAL_RADIUS_FWHM": float,
     "SUBTRACTION_RESIDUAL_MAX_DMAG": float,
+    "SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG": float,
     "SUBTRACTION_NOISE_CORR_MAX": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string

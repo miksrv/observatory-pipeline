@@ -1225,6 +1225,13 @@ def _from_wire_source(api_source: dict, frame_filter: str | None = None) -> dict
         "catalog_id": api_source.get("catalog_id"),
         "object_type": api_source.get("object_type"),
         "elongation": api_source.get("elongation") or 0.0,
+        # Size and brightness as measured: the residual check sizes its radius
+        # from the FWHM and falls back to the flux on a frame without
+        # calibrated magnitudes; the light-curve VARIABLE_STAR test reads the
+        # FWHM against the frame's PSF. Without them a standalone run fell
+        # back to a fixed radius and skipped the flux comparison.
+        "fwhm": api_source.get("fwhm"),
+        "flux": api_source.get("flux"),
         # Photometric quality, carried so that a standalone DETECT_ANOMALIES
         # re-run judges a source on the same terms an in-process run does:
         # mag_err feeds the Δmag significance test (audit 2026-08-18, finding
@@ -1308,6 +1315,9 @@ async def detect_anomalies_for_frame_id(frame_id: str, recovery_attempt: int = 0
             frame.get("obs_time"),
             _frame_exptime(frame),
         ),
+        # The stored record itself: which optics took the frame and its QC
+        # seeing (see anomaly_detector.detect()).
+        "frame": frame,
     }
 
     anomalies = await detect_anomalies_for_frame_data(

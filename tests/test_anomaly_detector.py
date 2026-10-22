@@ -1520,6 +1520,18 @@ class TestSubtractionResidualOfCatalogedStar:
 
         assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
 
+    async def test_a_residual_up_to_two_magnitudes_fainter_than_its_star_is_suppressed(self):
+        """M51 L 2025-04: 65 alerts 5-7" from a star and 1.0-1.9 mag fainter than it."""
+        result = await self._detect([self._candidate(mag=15.5), self._star(mag=14.0)])
+
+        assert [a for a in result if a["source_id"] == "src-resid-001"] == []
+
+    async def test_a_transient_brighter_than_its_neighbour_survives(self):
+        """A residual is part of the star's light — it cannot outshine it."""
+        result = await self._detect([self._candidate(mag=14.0), self._star(mag=15.5)])
+
+        assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
+
     async def test_a_candidate_far_from_any_star_survives(self):
         far = _make_source(
             dec=_DEC + 60.0 / 3600.0, mag=15.5, catalog_name="Gaia DR3",
@@ -2173,3 +2185,577 @@ class TestResidualCheckWithoutMagnitudes:
 
         assert _is_residual_of_catalogued_star(cand, star_same) is True
         assert _is_residual_of_catalogued_star(cand, star_much_brighter) is False
+
+
+# ===========================================================================
+# Light-curve VARIABLE_STAR: only a well-measured point source, judged
+# against epochs from the same optics (2026-10-22 M51/M63/M82 run)
+# ===========================================================================
+
+def _frame_record(frame_id: str, camera: str = "ZWO ASI1600MM", fov_deg: float = 0.5,
+                  width_px: int = 3600, height_px: int = 2700, fwhm: float = 3.0, **extra) -> dict:
+    record = {
+        "id": frame_id, "object": "M51", "camera": camera, "fov_deg": fov_deg,
+        "width_px": width_px, "height_px": height_px, "qc_fwhm_median": fwhm,
+        "quality_flag": "OK", "position_angle_deg": 10.0, "filter": "L",
+        "ra_center": _RA, "dec_center": _DEC, "obs_time": _OBS_TIME,
+    }
+    record.update(extra)
+    return record
+
+
+class TestLightCurveMeasurementQuality:
+    """
+    On the 2026-10-22 run 287 VARIABLE_STARs were posted and practically none
+    was real: 210 were knots inside M51's disc (Simbad Cl*/MoC/HII, FWHM up to
+    11 × the PSF), about 60 were faint Gaia stars measured by forced
+    photometry with mag_err 0.2-0.3, the rest edge stars. The light-curve
+    branch now asks for a measurement worth judging.
+    """
+
+    _HIST = [{"ra": _RA, "dec": _DEC, "mag": m, "filter": "L"} for m in (14.50, 14.52, 14.48, 14.51)]
+
+    async def _run(self, source: dict, frame_meta: dict | None = None) -> list[dict]:
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [dict(h) for h in self._HIST]}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            return await ad.detect(_FRAME_ID, [source], [source], frame_meta or _FRAME_META)
+
+    async def test_a_well_measured_star_is_still_reported(self):
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        source["mag_err"] = 0.02
+        meta = {**_FRAME_META, "frame": _frame_record(_FRAME_ID)}
+        assert [a["anomaly_type"] for a in await self._run(source, meta)] == ["VARIABLE_STAR"]
+
+    @pytest.mark.parametrize("otype", ["Cl*", "MoC", "HII", "SFR", "GlC"])
+    async def test_a_cluster_or_nebula_is_not_a_light_curve_variable(self, otype):
+        source = _make_source(mag=13.5, catalog_name="Simbad", object_type=otype)
+        assert await self._run(source) == []
+
+    async def test_an_extended_source_is_not_judged(self):
+        meta = {**_FRAME_META, "frame": _frame_record(_FRAME_ID, fwhm=3.0)}
+        extended = _make_source(mag=13.5, catalog_name="Simbad", object_type="*", fwhm=12.0)
+        assert await self._run(extended, meta) == []
+        compact = _make_source(mag=13.5, catalog_name="Simbad", object_type="*", fwhm=4.0)
+        assert [a["anomaly_type"] for a in await self._run(compact, meta)] == ["VARIABLE_STAR"]
+
+    async def test_without_the_frame_psf_the_fwhm_decides_nothing(self):
+        extended = _make_source(mag=13.5, catalog_name="Simbad", object_type="*", fwhm=12.0)
+        assert [a["anomaly_type"] for a in await self._run(extended)] == ["VARIABLE_STAR"]
+
+    async def test_a_noisy_measurement_is_not_judged(self):
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        source["mag_err"] = 0.25
+        assert await self._run(source) == []
+
+    async def test_a_near_edge_source_is_not_judged(self):
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR", near_edge=True)
+        assert await self._run(source) == []
+
+    async def test_a_catalogued_variable_is_not_gated(self):
+        """Simbad already says it varies — a noisy epoch of it is still a change."""
+        source = _make_source(mag=13.5, catalog_name="Simbad", object_type="V*", near_edge=True)
+        source["mag_err"] = 0.25
+        assert [a["anomaly_type"] for a in await self._run(source)] == ["VARIABLE_STAR"]
+
+
+class TestSameOpticsHistory:
+    """
+    M51 L 2025-04 (BK2001P, 1.53″/px) against the 2022 history (TAL250K,
+    0.50″/px): 115 knots read brighter. The star branches compare a source
+    with epochs from the same optics only; the brightening SUPERNOVA branch
+    keeps the whole same-filter history, so no alert is lost to it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self):
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    async def _run(self, source, hist, records):
+        current = _frame_record(_FRAME_ID, fov_deg=0.5, width_px=3600)  # 0.50″/px
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            mock_frames.return_value = records
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, [source], [source], {**_FRAME_META, "frame": current})
+
+    @staticmethod
+    def _epochs(mags, frame_ids):
+        return [{"ra": _RA, "dec": _DEC, "mag": m, "filter": "L", "frame_id": f} for m, f in zip(mags, frame_ids)]
+
+    async def test_a_change_seen_only_against_other_optics_is_not_a_variable(self):
+        records = [_frame_record(f"old-{i}", fov_deg=1.53, width_px=3600) for i in range(4)]  # 1.53″/px
+        records += [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"old-{i}" for i in range(4)])
+        hist += self._epochs((13.50, 13.52, 13.48, 13.51), [f"same-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert await self._run(source, hist, records) == []
+
+    async def test_another_camera_is_other_optics(self):
+        records = [_frame_record(f"old-{i}", camera="QHY268M") for i in range(4)]
+        records += [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"old-{i}" for i in range(4)])
+        hist += self._epochs((13.50, 13.52, 13.48, 13.51), [f"same-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert await self._run(source, hist, records) == []
+
+    async def test_a_change_within_the_same_optics_is_still_reported(self):
+        records = [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"same-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert [a["anomaly_type"] for a in await self._run(source, hist, records)] == ["VARIABLE_STAR"]
+
+    async def test_an_epoch_of_unknown_optics_is_kept(self):
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), ["gone-1", "gone-2", "gone-3", "gone-4"])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert [a["anomaly_type"] for a in await self._run(source, hist, [])] == ["VARIABLE_STAR"]
+
+    async def test_galaxy_brightening_is_judged_across_optics(self):
+        records = [_frame_record(f"old-{i}", fov_deg=1.53, width_px=3600) for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"old-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Simbad", object_type="Sy2")
+        assert [a["anomaly_type"] for a in await self._run(source, hist, records)] == ["SUPERNOVA_CANDIDATE"]
+
+    async def test_frame_records_come_from_one_listing_per_object(self):
+        records = [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"same-{i}" for i in range(4)])
+        with (
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = records
+            mock_frame.return_value = None
+            got = await ad._frames._frame_records([f"same-{i}" for i in range(4)] + ["elsewhere"], "M51")
+            assert set(got) == {f"same-{i}" for i in range(4)}
+            await ad._frames._frame_records(["same-0", "elsewhere"], "M51")
+        mock_frames.assert_awaited_once()
+        # A failed lookup is not cached: the next detection asks again.
+        assert mock_frame.await_count == 2
+
+
+# ===========================================================================
+# MOVING_UNKNOWN checked against the frames around it (_confirm.py)
+# ===========================================================================
+
+def _shift(ra: float, dec: float, east: float, north: float = 0.0) -> tuple[float, float]:
+    return ra + east / 3600.0 / math.cos(math.radians(dec)), dec + north / 3600.0
+
+
+def _at(minutes: float) -> str:
+    import datetime as _dt
+    t0 = _dt.datetime(2024, 3, 15, 22, 1, 34)
+    return (t0 + _dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fake_api(rows: list[dict], frames: list[dict], fail_after_obs: bool = False):
+    """
+    A small stand-in for the two batch endpoints: answers by position, cone,
+    `before_time` and `uncatalogued_only` from `rows` (detections; a row with
+    "catalogued": True is left out of an uncatalogued_only answer) and
+    `frames` (covering frames, plus the phase-1 coverage frame).
+    """
+    from modules.anomaly_detector._movement import _parse_obs_time
+
+    def before(value, limit):
+        return _parse_obs_time(value) < _parse_obs_time(limit)
+
+    async def near(positions, radius, before_time, uncatalogued_only=False):
+        if fail_after_obs and before_time != _OBS_TIME:
+            return None
+        return {
+            str(i): [
+                r for r in rows
+                if before(r["obs_time"], before_time)
+                and ad._haversine_arcsec(p["ra"], p["dec"], r["ra"], r["dec"]) <= radius
+                and not (uncatalogued_only and r.get("catalogued"))
+            ]
+            for i, p in enumerate(positions)
+        }
+
+    async def covering(positions, before_time):
+        if fail_after_obs and before_time != _OBS_TIME:
+            return None
+        found = [f for f in frames if before(f["obs_time"], before_time)]
+        if before_time == _OBS_TIME:
+            found = [_make_coverage_frame(), *found]
+        return {str(i): found for i in range(len(positions))}
+
+    return near, covering
+
+
+class TestMovingUnknownTrackConfirmation:
+    """
+    2026-10-22 run: most of the 120 MOVING_UNKNOWNs were a hot pixel or a
+    cosmic ray paired with another — a dithered sequence puts a hot pixel at
+    a new sky position in every frame. A real mover is on a straight track
+    in the neighbouring frames; a hot pixel moves exactly as the pointing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    async def _run(self, earlier, pool, frames, records, pool_fails=False, filter_name="L"):
+        """
+        earlier: the phase-1 wide-cone history (the vacated detection);
+        pool: uncatalogued detections in the window; frames: covering frames
+        in the window; records: stored frame records.
+        """
+        source = _make_source(mag=16.0, catalog_name=None, filter=filter_name)
+        current = _frame_record(_FRAME_ID)
+        rows = list({id(r): r for r in [*earlier, *pool]}.values())
+        near, covering = _fake_api(rows, frames, fail_after_obs=pool_fails)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", side_effect=covering),
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = [current, *records]
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, [source], [source], {**_FRAME_META, "frame": current})
+
+    @staticmethod
+    def _det(minutes, east, frame_id, catalogued=False):
+        ra, dec = _shift(_RA, _DEC, east)
+        return {"ra": ra, "dec": dec, "mag": 16.0, "filter": "L", "obs_time": _at(minutes),
+                "frame_id": frame_id, "catalogued": catalogued}
+
+    @staticmethod
+    def _frame(frame_id, minutes, east=0.0, **extra):
+        ra, dec = _shift(_RA, _DEC, east)
+        return _frame_record(frame_id, ra_center=ra, dec_center=dec, obs_time=_at(minutes), **extra)
+
+    async def test_a_third_detection_on_the_track_confirms_it(self):
+        before = self._det(-5, 30.0, "f-5")
+        after = self._det(+5, -30.0, "f+5")
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        result = await self._run([before], [before, after], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "Track confirmed" in result[0]["notes"]
+
+    async def test_a_track_shorter_than_two_cones_confirms_nothing(self):
+        """M63 2020-05-08: a 13.9 mag "mover" at 0.4"/min — 6" in 15 min, centroid scatter."""
+        before = self._det(-5, 8.0, "f-5")
+        after = self._det(+5, -8.0, "f+5")
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        result = await self._run([before], [before, after], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "too little to tell motion from centroid scatter" in result[0]["notes"]
+
+    async def test_a_detection_that_moves_with_the_pointing_is_a_hot_pixel(self):
+        """The earlier frame pointed 30" east: so did the 'object'."""
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5, east=30.0)]
+        result = await self._run([before], [before], [], records)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "withdrawn" in result[0]["notes"]
+        assert "telescope pointing" in result[0]["notes"]
+
+    async def test_a_frame_that_should_show_the_track_and_does_not_withdraws_it(self, caplog):
+        """Withdrawn to UNKNOWN — which the same later frame then refutes too."""
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        with caplog.at_level("INFO", logger="modules.anomaly_detector._confirm"):
+            result = await self._run([before], [before], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert result == []
+        assert "no detection on its track" in caplog.text
+        assert "UNKNOWN withdrawn" in caplog.text
+
+    @pytest.mark.parametrize("change", [
+        {"filter": "Ha"},               # shallower, another band
+        {"quality_flag": "BLUR"},       # QC failed: no sources
+        {"position_angle_deg": None},   # QC passed but never plate-solved
+        {"ra_center": _RA + 1.0},       # does not image the predicted position
+    ])
+    async def test_only_a_usable_frame_can_withdraw_it(self, change):
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5), {**self._frame("f+5", +5), **change}]
+        result = await self._run([before], [before], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "not confirmed yet" in result[0]["notes"]
+
+    async def test_a_mover_matched_to_a_star_on_its_track_is_not_withdrawn(self):
+        """It passed a star in the next frame and took the star's catalog id."""
+        before = self._det(-5, 30.0, "f-5")
+        on_star = self._det(+5, -30.0, "f+5", catalogued=True)
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        result = await self._run([before], [before, on_star], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "a catalogued source lies on its predicted track" in result[0]["notes"]
+
+    async def test_the_pointing_of_an_unsolved_frame_is_not_compared(self):
+        """Its centre is the mount's guess, so a 'move with the pointing' proves nothing."""
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5, east=30.0, position_angle_deg=None)]
+        result = await self._run([before], [before], [], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+
+    async def test_a_short_noise_pairing_does_not_save_a_hot_pixel(self):
+        before = self._det(-5, 30.0, "f-5")
+        noise = self._det(-10, 8.0, "f-10")
+        records = [self._frame("f-5", -5, east=30.0), self._frame("f-10", -10)]
+        result = await self._run([before, noise], [before, noise], [], records)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "telescope pointing" in result[0]["notes"]
+
+    async def test_a_failing_fallback_keeps_the_mover(self):
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5, east=30.0)]
+        real = ad._detect._classify_source_sync
+
+        def flaky(source, allow_moving=True, **kwargs):
+            if not allow_moving:
+                raise ValueError("boom")
+            return real(source, allow_moving=allow_moving, **kwargs)
+
+        with patch("modules.anomaly_detector._detect._classify_source_sync", side_effect=flaky):
+            result = await self._run([before], [before], [], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+
+    async def test_with_no_frame_after_it_the_alert_stands(self):
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [before], [], [self._frame("f-5", -5)])
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "not confirmed yet" in result[0]["notes"]
+
+    async def test_a_failed_request_never_withdraws_an_alert(self):
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [], [], [], pool_fails=True)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+
+    async def test_disabled_check_makes_no_requests(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 0.0)
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [], [], [], pool_fails=True)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "Track" not in result[0]["notes"]
+
+    async def test_internal_keys_never_reach_the_wire(self):
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [before], [], [self._frame("f-5", -5)])
+        assert not [k for a in result for k in a if k.startswith("_")]
+
+
+class TestStationaryAlertConfirmation:
+    """
+    2026-10-22 run: most UNKNOWN alerts were cosmic rays, hot pixels and
+    subtraction residuals present in one frame only. A supernova or nova is
+    still there five minutes later; an alert absent from every later frame
+    that images its position through the same filter is withdrawn. A mover
+    first seen in this frame becomes MOVING_UNKNOWN instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    async def _run(self, source, here, pool, frames, records):
+        current = _frame_record(_FRAME_ID)
+        near, covering = _fake_api([*here, *pool], frames)
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", side_effect=covering),
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = [current, *records]
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, [source], [source], {**_FRAME_META, "frame": current})
+
+    _det = staticmethod(TestMovingUnknownTrackConfirmation._det)
+    _frame = staticmethod(TestMovingUnknownTrackConfirmation._frame)
+
+    @staticmethod
+    def _unknown():
+        return _make_source(mag=16.0, catalog_name=None)
+
+    async def test_seen_again_later_is_confirmed(self):
+        result = await self._run(self._unknown(), [self._det(5, 0.0, "f+5")], [],
+                                 [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Seen again in 1 later frame" in result[0]["notes"]
+
+    async def test_absent_from_a_later_frame_that_covers_it_is_withdrawn(self):
+        result = await self._run(self._unknown(), [], [],
+                                 [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)])
+        assert result == []
+
+    async def test_an_earlier_frame_never_withdraws_it(self):
+        """Earlier frames that show nothing here are the reason it is new."""
+        result = await self._run(self._unknown(), [], [],
+                                 [{"id": "f-5", "obs_time": _at(-5)}], [self._frame("f-5", -5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Not confirmed yet" in result[0]["notes"]
+
+    @pytest.mark.parametrize("change", [
+        {"filter": "Ha"}, {"quality_flag": "LOW_STARS"}, {"position_angle_deg": None},
+        {"ra_center": _RA + 1.0},
+    ])
+    async def test_only_a_usable_later_frame_withdraws_it(self, change):
+        record = {**self._frame("f+5", 5), **change}
+        result = await self._run(self._unknown(), [], [], [{"id": "f+5", "obs_time": _at(5)}], [record])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+
+    async def test_a_new_mover_on_a_track_becomes_moving_unknown(self):
+        """First seen here: no earlier detection to pair with, but the next two frames show it moving."""
+        pool = [self._det(5, -30.0, "f+5"), self._det(10, -60.0, "f+10")]
+        frames = [{"id": "f+5", "obs_time": _at(5)}, {"id": "f+10", "obs_time": _at(10)}]
+        records = [self._frame("f+5", 5), self._frame("f+10", 10)]
+        result = await self._run(self._unknown(), [], pool, frames, records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "First seen in this frame, then moved" in result[0]["notes"]
+
+    async def test_a_possible_mover_that_cannot_be_tested_is_kept(self):
+        """Gone from here, one detection nearby in the next frame, nothing to test the line with."""
+        pool = [self._det(5, -30.0, "f+5")]
+        result = await self._run(self._unknown(), [], pool, [{"id": "f+5", "obs_time": _at(5)}],
+                                 [self._frame("f+5", 5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Not confirmed yet" in result[0]["notes"]
+
+    async def test_a_supernova_candidate_is_not_checked(self):
+        """
+        A new one is a subtraction candidate matched to its host: every later
+        frame detects the galaxy there, and nothing on the wire tells the two
+        apart. It stands as before, absent from the later frame or not.
+        """
+        source = _make_source(mag=16.0, catalog_name="Simbad", object_type="Sy2", from_subtraction=True)
+        frames, records = [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)]
+        result = await self._run(source, [], [], frames, records)
+        assert [a["anomaly_type"] for a in result] == ["SUPERNOVA_CANDIDATE"]
+
+    async def test_a_catalogued_detection_there_later_neither_confirms_nor_withdraws(self):
+        frames, records = [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)]
+        star = self._det(5, 0.0, "f+5", catalogued=True)
+        result = await self._run(self._unknown(), [star], [], frames, records)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "a catalogued source is detected here" in result[0]["notes"]
+
+
+class TestSuspectFrame:
+    """
+    M82 G 2020-08-21T22-34-31 (23 uncatalogued 10-13 mag "stars", 32 alerts)
+    and M63 L 2021-03-16 (ghost copies after a mount jump): Gaia is complete
+    far below 15 mag, so several bright uncatalogued star-like sources in one
+    frame are copies of real stars. There only a confirmed alert stands.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    @staticmethod
+    def _sources(n_ghosts: int) -> list[dict]:
+        return [
+            _make_source(ra=_RA + i * 0.01, mag=12.0, catalog_name=None, fwhm=3.0, elongation=1.1)
+            for i in range(n_ghosts)
+        ]
+
+    async def _run(self, sources, here=None):
+        current = _frame_record(_FRAME_ID, fwhm=3.0)
+        near, covering = _fake_api(here or [], [])
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", side_effect=covering),
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = [current, TestMovingUnknownTrackConfirmation._frame("f+5", 5)]
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, sources, sources, {**_FRAME_META, "frame": current})
+
+    async def test_unconfirmed_alerts_of_a_suspect_frame_are_withdrawn(self, caplog):
+        with caplog.at_level("WARNING"):
+            assert await self._run(self._sources(3)) == []
+        assert "Suspect frame: 3 uncatalogued star-like sources" in caplog.text
+
+    async def test_a_confirmed_alert_of_a_suspect_frame_stands(self):
+        seen = [TestMovingUnknownTrackConfirmation._det(5, 0.0, "f+5")]
+        result = await self._run(self._sources(3), here=seen)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]  # only the first is seen again
+        assert "Seen again" in result[0]["notes"]
+
+    async def test_zero_disables_the_check(self, monkeypatch):
+        monkeypatch.setattr(config, "SUSPECT_FRAME_MIN_SOURCES", 0)
+        result = await self._run(self._sources(3))
+        assert len(result) == 3
+
+    async def test_two_bright_uncatalogued_sources_do_not_make_a_frame_suspect(self):
+        result = await self._run(self._sources(2))
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN", "UNKNOWN"]
+
+    @pytest.mark.parametrize("change", [
+        {"mag": 15.5}, {"elongation": 2.5}, {"fwhm": 6.0}, {"saturated": True}, {"mag": None},
+    ])
+    async def test_only_bright_star_like_sources_count(self, change):
+        sources = [{**s, **change} for s in self._sources(3)]
+        assert ad._detect._ghost_sources(sources, 3.0) == []
+
+
+class TestDiffuseSubtractionCandidate:
+    """
+    2026-10-22 run: 60 alerts were subtraction candidates 3-20 × the PSF wide
+    over pure noise in the frame — uncancelled background. Such a candidate
+    stands only when the frames around it confirm it; a new comet would be.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    _run = TestStationaryAlertConfirmation._run
+
+    @staticmethod
+    def _blob(fwhm=12.0):
+        return _make_source(mag=15.0, catalog_name=None, fwhm=fwhm, from_subtraction=True)
+
+    async def test_an_unconfirmed_diffuse_candidate_is_withdrawn(self):
+        assert await self._run(self._blob(), [], [], [], []) == []
+
+    async def test_a_diffuse_candidate_seen_again_stands(self):
+        seen = [TestMovingUnknownTrackConfirmation._det(5, 0.0, "f+5")]
+        frames = [{"id": "f+5", "obs_time": _at(5)}]
+        result = await self._run(self._blob(), seen, [], frames,
+                                 [TestMovingUnknownTrackConfirmation._frame("f+5", 5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+
+    async def test_a_point_like_candidate_is_not_affected(self):
+        result = await self._run(self._blob(fwhm=4.0), [], [], [], [])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Not confirmed yet" in result[0]["notes"]
+
+    async def test_a_diffuse_candidate_is_not_taken_for_a_stars_residual(self):
+        """A new comet beside a star: its 30" FWHM must not stretch the residual radius over the star."""
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        comet = self._blob(fwhm=30.0)
+        star = [(_RA, _DEC + 40.0 / 3600.0, 14.0)]
+        assert _is_residual_of_catalogued_star(comet, star, frame_psf_arcsec=3.0) is False
+        assert _is_residual_of_catalogued_star(comet, star) is True  # no PSF: as before

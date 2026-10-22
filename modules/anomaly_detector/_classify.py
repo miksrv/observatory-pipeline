@@ -22,7 +22,7 @@ from ._history import (
     _same_filter_history,
 )
 from ._movement import _find_wide_history, _is_position_shifted
-from ._otypes import _is_binary_star, _is_galaxy, _is_variable_star
+from ._otypes import _is_binary_star, _is_galaxy, _is_non_stellar, _is_variable_star
 from .types import AnomalyType
 
 logger = logging.getLogger(__name__)
@@ -235,6 +235,7 @@ def _survives_edge_zone(source: dict) -> bool:
 def _is_residual_of_catalogued_star(
     source: dict,
     catalogued_frame_sources: list[tuple],
+    frame_psf_arcsec: float | None = None,
 ) -> bool:
     """
     Whether an uncatalogued subtraction candidate is a catalogued star's own
@@ -255,15 +256,24 @@ def _is_residual_of_catalogued_star(
     the same positions across sessions.
 
     The magnitude condition is what keeps the finding-C6 case alive — a
-    transient flaring beside a star of clearly different brightness. A
-    transient much FAINTER than a neighbour this close is lost, since its
-    measured magnitude is then essentially the star's; that is the accepted
-    cost. No magnitude on the candidate, or the check disabled, decides
-    nothing.
+    transient flaring beside a star of clearly different brightness. It is
+    asymmetric: a residual is part of the star's light, so it may measure up
+    to SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG fainter than the star (M51
+    2025-04: 65 alerts 5-7" from a star and 1.0-1.9 mag fainter) but only
+    SUBTRACTION_RESIDUAL_MAX_DMAG brighter — a transient outshining its
+    neighbour is never taken for its residual. A transient up to 2 mag
+    FAINTER than a neighbour this close is lost; that is the accepted cost.
+    No magnitude on the candidate, or the check disabled, decides nothing.
 
     On a frame without calibrated magnitudes (narrowband, 8-bit) the
     brightness comparison falls back to the flux ratio, as a magnitude
     difference; entries are ``(ra, dec, mag, flux)`` (a 3-tuple is mag-only).
+
+    Not for a diffuse candidate — wider than SUBTRACTION_DIFFUSE_FWHM_RATIO ×
+    the frame's PSF (`frame_psf_arcsec`): its FWHM would stretch the radius
+    over any star within a minute of arc, and a new comet beside one would be
+    dropped. Such a candidate is held to the alert confirmation instead
+    (`_confirm._needs_confirmation()`).
     """
     factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
     if factor <= 0 or not catalogued_frame_sources:
@@ -285,6 +295,9 @@ def _is_residual_of_catalogued_star(
         fwhm = float(source.get("fwhm") or 0.0)
     except (TypeError, ValueError):
         fwhm = 0.0
+    diffuse_ratio = config.SUBTRACTION_DIFFUSE_FWHM_RATIO
+    if frame_psf_arcsec and diffuse_ratio > 0 and fwhm > diffuse_ratio * frame_psf_arcsec:
+        return False
     radius = factor * fwhm if fwhm > 0 else 2.0 * config.MATCH_CONE_ARCSEC
     radius = max(radius, config.MATCH_CONE_ARCSEC)
 
@@ -293,13 +306,18 @@ def _is_residual_of_catalogued_star(
         c_flux = entry[3] if len(entry) > 3 else None
         if abs(c_dec - dec) * 3600.0 > radius:
             continue
+        # Positive when the candidate is fainter than the star.
         if mag is not None and c_mag is not None:
-            dmag = abs(c_mag - mag)
+            fainter_by = mag - c_mag
         elif flux is not None and flux > 0 and c_flux is not None and c_flux > 0:
-            dmag = abs(2.5 * math.log10(c_flux / flux))
+            fainter_by = 2.5 * math.log10(c_flux / flux)
         else:
             continue
-        if dmag <= config.SUBTRACTION_RESIDUAL_MAX_DMAG and _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius:
+        if not -config.SUBTRACTION_RESIDUAL_MAX_DMAG <= fainter_by <= max(
+            config.SUBTRACTION_RESIDUAL_MAX_DMAG, config.SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG
+        ):
+            continue
+        if _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius:
             return True
     return False
 
@@ -312,6 +330,89 @@ def _finite(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _assess_change(
+    source: dict,
+    history: list[dict],
+    extra: dict,
+) -> tuple[float | None, bool]:
+    """
+    The source's magnitude change against `history`, and whether it counts:
+    significant (`_is_significant_delta()`, audit 2026-08-18 finding M3) and
+    shown by the previous epochs too (`_change_is_confirmed()` — a single
+    deviant epoch is what a cosmic ray or hot pixel in the aperture makes).
+    """
+    mag = source.get("mag")
+    median_hist_mag = _history_median_mag(history)
+    if mag is None or median_hist_mag is None:
+        return None, False
+
+    delta_mag = mag - median_hist_mag  # negative = brighter than history
+    if not _is_significant_delta(delta_mag, source, history):
+        return delta_mag, False
+    if not _change_is_confirmed(delta_mag, history):
+        logger.debug(
+            "Unconfirmed magnitude change at ra=%s dec=%s delta_mag=%.3f — "
+            "the previous %d same-filter epoch(s) do not show it; waiting for "
+            "the next epoch before classifying",
+            source.get("ra"), source.get("dec"), delta_mag,
+            config.VARIABILITY_CONFIRM_EPOCHS - 1,
+            extra=extra,
+        )
+        return delta_mag, False
+    return delta_mag, True
+
+
+def _same_optics_history(history: list[dict]) -> list[dict]:
+    """
+    The epochs not known to come from other optics. `detect()` marks each
+    history row `_same_optics` from the stored record of the frame behind it
+    (`_frames._same_optics()`); a row it could not judge carries None and is
+    kept, so a missing frame record never shortens a light curve.
+    """
+    return [src for src in history if src.get("_same_optics") is not False]
+
+
+def _light_curve_unmeasurable(source: dict, frame_psf_arcsec: float | None) -> str | None:
+    """
+    Why this source's own light curve cannot carry a VARIABLE_STAR claim, or
+    None when it can. Only for the catalog-independent branch — a catalogued
+    variable is expected to vary, this is for a source nobody says varies.
+
+    * Simbad calls it a cluster or interstellar matter (`_is_non_stellar()`)
+      — not one star, and in a nearby galaxy a knot whose magnitude follows
+      the seeing.
+    * It is extended: FWHM over `VARIABILITY_MAX_FWHM_RATIO` × the frame's
+      PSF. Same reason, for a knot Simbad does not type.
+    * Its magnitude error exceeds `VARIABILITY_MAX_MAG_ERR`. Near the
+      detection limit the epochs that survive a SNR cut are the ones noise
+      pushed up — forced photometry of faint Gaia stars read about a
+      magnitude "brighter" this way, epoch after epoch.
+    * It is near the frame edge, where vignetting, coma and a clipped
+      aperture move the magnitude with the pointing.
+
+    A missing value decides nothing: rows written before a field existed
+    keep the previous behaviour.
+    """
+    object_type = source.get("object_type")
+    if _is_non_stellar(object_type):
+        return f"Simbad object_type={object_type} is not a single star"
+
+    fwhm = _finite(source.get("fwhm"))
+    if fwhm is not None and frame_psf_arcsec and fwhm > config.VARIABILITY_MAX_FWHM_RATIO * frame_psf_arcsec:
+        return (
+            f"extended (FWHM {fwhm:.1f}\" > {config.VARIABILITY_MAX_FWHM_RATIO:g} × "
+            f"PSF {frame_psf_arcsec:.1f}\")"
+        )
+
+    mag_err = _finite(source.get("mag_err"))
+    if mag_err is not None and mag_err > config.VARIABILITY_MAX_MAG_ERR:
+        return f"mag_err {mag_err:.3f} > {config.VARIABILITY_MAX_MAG_ERR:g}"
+
+    if source.get("near_edge"):
+        return "near the frame edge"
+    return None
+
+
 def _classify_source_sync(
     source: dict,
     frame_id: str,
@@ -322,6 +423,8 @@ def _classify_source_sync(
     current_frame_positions: list[tuple[float, float]],
     obs_time: str = "",
     catalogued_frame_sources: list[tuple] | None = None,
+    frame_psf_arcsec: float | None = None,
+    allow_moving: bool = True,
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).
@@ -330,7 +433,10 @@ def _classify_source_sync(
     (`_prefetch._prefetch_history_data()`): ``narrow_history`` is this
     source's own narrow-cone history, ``wide_pool`` its uncatalogued
     wide-cone candidates (empty for a catalogued source, which never uses
-    them).
+    them). ``frame_psf_arcsec`` is the frame's own seeing (QC's median
+    FWHM), or None when unknown. ``allow_moving=False`` skips the
+    MOVING_UNKNOWN branch — what the source is without the motion evidence,
+    which detect() keeps as the fallback should `_confirm` withdraw it.
 
     Returns an anomaly dict, or None if no reportable anomaly is found.
     """
@@ -416,7 +522,9 @@ def _classify_source_sync(
     # MOVING_UNKNOWN and, through the star's own history, VARIABLE_STAR
     # (M51 L 2025-04: every one of the 47-49 VARIABLE_STARs per frame).
     # ------------------------------------------------------------------
-    if from_subtraction and _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
+    if from_subtraction and _is_residual_of_catalogued_star(
+        source, catalogued_frame_sources or [], frame_psf_arcsec
+    ):
         logger.debug(
             "Suppressed: subtraction candidate ra=%.4f dec=%.4f mag=%s sits beside "
             "a catalogued star of the same brightness — its residual, not a change",
@@ -550,7 +658,7 @@ def _classify_source_sync(
                 ),
             }
 
-        if _is_position_shifted(history, wide_history, current_frame_positions):
+        if allow_moving and _is_position_shifted(history, wide_history, current_frame_positions):
             # Near-edge sources get their centroid shifted by coma between
             # frames (rotation, guiding) — this looks like "position shifted"
             # but is purely optical. All 7 MOVING_UNKNOWN near_edge=1 in the
@@ -791,63 +899,50 @@ def _classify_source_sync(
     # _same_filter_history()'s docstring. `history` itself (the existence
     # check above, n_history) stays filter-agnostic on purpose.
     same_filter_history = _same_filter_history(history, source_filter)
-    median_hist_mag = _history_median_mag(same_filter_history)
-    delta_mag: float | None = None
+    delta_mag, mag_changed = _assess_change(source, same_filter_history, extra)
 
-    if mag is not None and median_hist_mag is not None:
-        delta_mag = mag - median_hist_mag  # negative = brighter than history
-
-    # Not a flat threshold any more: past DELTA_MAG_ALERT *and* past what
-    # this source's own measurement error and historical scatter would
-    # produce — see _is_significant_delta() (audit 2026-08-18, finding M3).
-    mag_changed = (
-        delta_mag is not None
-        and _is_significant_delta(delta_mag, source, same_filter_history)
-    )
-
-    # ...and not in this epoch alone: a single deviant epoch is what a cosmic
-    # ray or hot pixel in the aperture produces — see _change_is_confirmed().
-    if mag_changed and not _change_is_confirmed(delta_mag, same_filter_history):
-        logger.debug(
-            "Unconfirmed magnitude change at ra=%.4f dec=%.4f delta_mag=%.3f — "
-            "the previous %d same-filter epoch(s) do not show it; waiting for "
-            "the next epoch before classifying",
-            ra, dec, delta_mag, config.VARIABILITY_CONFIRM_EPOCHS - 1,
+    # --- SUPERNOVA_CANDIDATE — brightening in/near an already-known galaxy.
+    # Checked first, before BINARY_STAR/VARIABLE_STAR: a genuine supernova
+    # should take priority; the binary branch below excludes galaxies itself,
+    # since its substring test matches LSB and SBG. Only "brightening"
+    # (delta_mag negative — mag = mag - median_hist_mag, so lower mag means
+    # brighter) counts here; a host galaxy's own foreground star simply
+    # fading is not a supernova signature. Judged on the whole same-filter
+    # history, whatever optics took it: an alert is never given up because
+    # the earlier epochs came from another telescope. ---
+    if mag_changed and delta_mag is not None and delta_mag < -config.DELTA_MAG_ALERT and _is_galaxy(object_type):
+        logger.warning(
+            "ALERT — SUPERNOVA_CANDIDATE: brightening near galaxy object_type=%s "
+            "ra=%.4f dec=%.4f delta_mag=%.3f",
+            object_type, ra, dec, delta_mag,
             extra=extra,
         )
-        mag_changed = False
+        return {
+            "anomaly_type":    AnomalyType.SUPERNOVA_CANDIDATE,
+            "source_id":       source_id,
+            "ra":              ra,
+            "dec":             dec,
+            "magnitude":       mag,
+            "delta_mag":       delta_mag,
+            "mpc_designation": None,
+            "ephemeris":       None,
+            "notes": (
+                f"Brightness increase near known galaxy "
+                f"(object_type='{object_type}') delta_mag={delta_mag:.3f} "
+                f"(threshold {config.DELTA_MAG_ALERT:.2f})."
+            ),
+        }
+
+    # The star branches below compare the source with epochs from the same
+    # optics only. A magnitude through another telescope's plate scale and
+    # aperture is not the same measurement: on M51 the 2025 frames (1.53″/px)
+    # read the galaxy's knots up to a magnitude brighter than the 2022 history
+    # (0.50″/px) did. An epoch whose optics are unknown is kept.
+    star_history = _same_optics_history(same_filter_history)
+    if len(star_history) != len(same_filter_history):
+        delta_mag, mag_changed = _assess_change(source, star_history, extra)
 
     if mag_changed:
-        # --- SUPERNOVA_CANDIDATE — brightening in/near an already-known
-        # galaxy. Checked first, before BINARY_STAR/VARIABLE_STAR: a genuine
-        # supernova should take priority; the binary branch below excludes
-        # galaxies itself, since its substring test matches LSB and SBG. Only "brightening"
-        # (delta_mag negative — mag = mag - median_hist_mag, so lower mag
-        # means brighter) counts here; a host galaxy's own foreground star
-        # simply fading is not a supernova signature. ---
-        if delta_mag is not None and delta_mag < -config.DELTA_MAG_ALERT and _is_galaxy(object_type):
-            logger.warning(
-                "ALERT — SUPERNOVA_CANDIDATE: brightening near galaxy object_type=%s "
-                "ra=%.4f dec=%.4f delta_mag=%.3f",
-                object_type, ra, dec, delta_mag,
-                extra=extra,
-            )
-            return {
-                "anomaly_type":    AnomalyType.SUPERNOVA_CANDIDATE,
-                "source_id":       source_id,
-                "ra":              ra,
-                "dec":             dec,
-                "magnitude":       mag,
-                "delta_mag":       delta_mag,
-                "mpc_designation": None,
-                "ephemeris":       None,
-                "notes": (
-                    f"Brightness increase near known galaxy "
-                    f"(object_type='{object_type}') delta_mag={delta_mag:.3f} "
-                    f"(threshold {config.DELTA_MAG_ALERT:.2f})."
-                ),
-            }
-
         # --- BINARY_STAR — check before VARIABLE_STAR (more specific match).
         # Not for a galaxy: the binary substring test also matches LSB and
         # SBG, and a galaxy's "fading" is measurement (see the extended-object
@@ -927,12 +1022,12 @@ def _classify_source_sync(
         # repository alone. The notes field states explicitly that the
         # classification came from the light curve rather than from a
         # catalog, so the distinction survives for an operator.
-        scatter = _history_mag_scatter(same_filter_history)
+        scatter = _history_mag_scatter(star_history)
         # Epochs that actually carry a magnitude, not rows: an epoch whose
         # photometry never calibrated contributes nothing to `scatter`, so
         # counting it here would let VARIABILITY_MIN_EPOCHS be satisfied by a
         # baseline shorter than the one the scatter was measured over.
-        n_same_filter = _history_mag_epochs(same_filter_history)
+        n_same_filter = _history_mag_epochs(star_history)
 
         # An extended object is not a candidate here: a galaxy's or cluster's
         # aperture magnitude moves with seeing, focus and the aperture radius
@@ -945,6 +1040,18 @@ def _classify_source_sync(
                 "No light-curve variability check for extended object_type=%s "
                 "at ra=%.4f dec=%.4f",
                 object_type, ra, dec,
+                extra=extra,
+            )
+            return None
+
+        # Nor any measurement too poor to carry the claim — see
+        # _light_curve_unmeasurable().
+        reason = _light_curve_unmeasurable(source, frame_psf_arcsec)
+        if reason is not None:
+            logger.debug(
+                "No light-curve variability check at ra=%.4f dec=%.4f "
+                "delta_mag=%.3f: %s",
+                ra, dec, delta_mag, reason,
                 extra=extra,
             )
             return None

@@ -37,6 +37,26 @@ _GALAXY_OTYPES: frozenset[str] = frozenset({
     "Compact_Gr_G", "InteractingG", "PairG", "PartofG",
 })
 
+# Simbad OTYPEs that are not one star: star clusters and associations, and the
+# interstellar medium (clouds, nebulae, HII and star-forming regions) — matched
+# exactly, short code or long label. Inside a nearby galaxy Simbad names such
+# knots by the hundred (M51: Cl*, MoC, HII, SFR); their aperture magnitude
+# depends on seeing and plate scale, not on the object, and on the 2026-10-22
+# M51 run they made 142 of the 287 light-curve VARIABLE_STARs. Several of the
+# cluster codes end in "*", so this cannot be told from the code's shape.
+_NON_STELLAR_OTYPES: frozenset[str] = frozenset({
+    # short codes
+    "Cl*", "C?*", "GlC", "Gl?", "OpC", "As*", "St*", "MGr",
+    "ISM", "SFR", "HII", "Cld", "GNe", "RNe", "MoC", "DNe", "glb", "CGb",
+    "HVC", "cor", "bub", "SNR", "SR?", "sh", "flt",
+    # long labels
+    "Cluster*", "Cluster*_Candidate", "GlobCluster", "GlobCluster_Candidate",
+    "OpenCluster", "Association", "Stream*", "MouvGroup", "ISM",
+    "StarFormingReg", "HIIReg", "Cloud", "GalNeb", "RefNeb", "MolCld",
+    "DarkNeb", "Globule", "ComGlob", "HVCld", "denseCore", "Bubble",
+    "SNRemnant", "SNRemnant_Candidate", "outflow", "Filament",
+})
+
 
 # ---------------------------------------------------------------------------
 # Object-type classifiers
@@ -74,3 +94,10 @@ def _is_galaxy(object_type: str | None) -> bool:
     if object_type is None:
         return False
     return object_type.strip() in _GALAXY_OTYPES
+
+
+def _is_non_stellar(object_type: str | None) -> bool:
+    """Return True if the Simbad OTYPE is a cluster or interstellar matter — see `_NON_STELLAR_OTYPES`."""
+    if object_type is None:
+        return False
+    return object_type.strip() in _NON_STELLAR_OTYPES

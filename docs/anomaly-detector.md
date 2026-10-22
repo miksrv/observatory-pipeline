@@ -96,7 +96,7 @@ flowchart TD
     Loop --> P1{"catalog_name\n== 'MPC'?"}
     P1 -- yes --> Asteroid["ASTEROID / COMET\n(by object_type)\n⚑ _needs_ephemeris=True"]
 
-    P1 -- no --> Residual{"subtraction candidate beside a\ncatalogued star of the same mag?\n(_is_residual_of_catalogued_star)"}
+    P1 -- no --> Residual{"subtraction candidate beside a\ncatalogued star, at most 1 mag brighter\nor 2 mag fainter?\n(_is_residual_of_catalogued_star)"}
     Residual -- yes --> Suppressed
     Residual -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
     Sat -- yes --> NewBright{"_could_be_a_new_bright_object()?\n(round, not near_edge, area covered,\nno history at all here)"}
@@ -135,11 +135,12 @@ flowchart TD
     Changed -- no --> NoAnomaly(["no anomaly"])
     Changed -- yes --> Bright{"delta_mag < 0\n(got brighter)\nAND near a galaxy?"}
     Bright -- yes --> SNbright["🔔 SUPERNOVA_CANDIDATE\n(already-known host\nbrightened)"]
-    Bright -- no --> Binary{"Simbad object_type\nindicates a\ndouble/eclipsing binary?"}
+    Bright -- no --> Optics["re-judge the change against\n_same_optics_history()\n(epochs from other optics dropped)"]
+    Optics --> Binary{"Simbad object_type\nindicates a\ndouble/eclipsing binary?"}
     Binary -- yes --> BinaryStar["BINARY_STAR"]
     Binary -- no --> Variable{"Simbad object_type\nindicates a\nvariable star?"}
     Variable -- yes --> VarStar["VARIABLE_STAR\n(catalog-classified)"]
-    Variable -- no --> LightCurve{"own same-filter light curve:\n>= VARIABILITY_MIN_EPOCHS epochs\nAND abs(delta_mag) >\nVARIABILITY_SIGMA x scatter?"}
+    Variable -- no --> LightCurve{"well-measured point source\n(_light_curve_unmeasurable() is None)\nAND own light curve:\n>= VARIABILITY_MIN_EPOCHS epochs\nAND abs(delta_mag) >\nVARIABILITY_SIGMA x scatter?"}
     LightCurve -- yes --> VarStarLC["VARIABLE_STAR\n(light-curve based —\nno catalog label needed)"]
     LightCurve -- no --> NoAnomaly
 
@@ -298,6 +299,14 @@ one condition matches, the function returns and no further checks run:
      - a change near a galaxy only counts when the source **brightened**, i.e.
        `delta_mag < 0` → `SUPERNOVA_CANDIDATE` (checked first — takes priority over
        binary/variable stars);
+     - the branches below re-judge the change against `_same_optics_history()`: epochs
+       whose frame was taken with another camera or a plate scale more than
+       `SUBTRACTION_REF_MAX_SCALE_DIFF` off this frame's are dropped (`detect()` marks each
+       history row `_same_optics` from the stored frame records, `_frames.py`; an unknown
+       frame is kept). On the 2026-10-22 run the 2025 M51 frames (1.53″/px) read the
+       galaxy's knots up to a magnitude brighter than the 2022 history (0.50″/px). The
+       brightening `SUPERNOVA_CANDIDATE` above keeps the whole same-filter history, so no
+       alert depends on which telescope took the earlier epochs;
      - otherwise, if Simbad classifies the object as a double/eclipsing binary
        (`**`, `EB`, `SB`) → `BINARY_STAR`;
      - otherwise, if Simbad classifies the object as a variable
@@ -310,7 +319,13 @@ one condition matches, the function returns and no further checks run:
        Not applied to an extended object (`_is_galaxy(object_type)`): a galaxy's or
        cluster's aperture magnitude moves with seeing and aperture size, not with the
        object — NGC 4370/4341 were reported this way on the 2026-09-22 test run. A galaxy
-       brightening is the `SUPERNOVA_CANDIDATE` branch above; a "fading" one is nothing;
+       brightening is the `SUPERNOVA_CANDIDATE` branch above; a "fading" one is nothing.
+       Nor to a measurement too poor to carry the claim (`_light_curve_unmeasurable()`):
+       a Simbad cluster or interstellar-matter type (`_is_non_stellar()`: `Cl*`, `MoC`,
+       `HII`, ...), a FWHM over `VARIABILITY_MAX_FWHM_RATIO` × the frame's PSF, a `mag_err`
+       over `VARIABILITY_MAX_MAG_ERR` (forced photometry at the detection limit keeps only
+       the epochs noise pushed up) or `near_edge`. On the 2026-10-22 M51/M63/M82 run these
+       were nearly all of the 287 VARIABLE_STARs;
      - otherwise — no anomaly.
 
    The last of those exists because only `_simbad.py` ever writes a real OTYPE:
@@ -345,13 +360,94 @@ Simbad OTYPE tests used by the classifiers:
 | `ASTEROID` | Matched in MPC/SkyBot, type "asteroid" | No (logged + ephemeris) |
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |
 | `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening by a significant Δmag (as above) | **Yes** |
-| `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold | **Yes** |
+| `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold; not withdrawn by the alert confirmation (track moving with the pointing, or absent from every frame that should show it) | **Yes** |
 | `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | No (recorded so a fast mover's track is never erased and does not pollute `UNKNOWN`; an operator need not act on a satellite pass — decided 2026-09-22). The API mirrors this in its own `AnomalyModel::ALERT_TYPES` |
-| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()` | **Yes** |
+| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()`; not withdrawn by the alert confirmation (absent from a later same-filter frame of its position) | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match
 `AnomalyModel::ALLOWED_TYPES`/the `ENUM` constraint on the `observatory-api` side — the
 two lists are kept in sync by hand (see `CLAUDE.md`, `modules/anomaly_detector/` section).
+
+---
+
+## Alert confirmation (`_confirm.py`)
+
+After every source is classified, `_confirm_alerts()` checks the alerts against the other
+frames of the same field taken within `ALERT_CONFIRM_WINDOW_MIN` (default 180, before and
+after; 0 disables). It fetches, for the whole frame, the uncatalogued detections around
+each candidate up to the end of the window (`POST /sources/near/batch` with
+`uncatalogued_only` and `before_time` = obs_time + window), the frames covering it
+(`POST /frames/covering/batch`, same `before_time`), and those frames' stored records
+(`_frames.py`: one `GET /frames?object=` listing per field, `GET /frames/{id}` for the
+rest, cached for an hour; a failed lookup is not cached).
+
+**`MOVING_UNKNOWN`.** Every detection in the window that could be the object at another
+time — more than `MATCH_CONE_ARCSEC` away, within a mover's reach over that gap
+(`_wide_cone_radius_arcsec()`), at a position nothing in this frame occupies — gives a
+pairing and a velocity:
+
+- a pairing whose displacement equals the shift of the telescope pointing between the two
+  frames (within `MATCH_CONE_ARCSEC`; both plate-solved, the same optics) is fixed on the
+  sensor — a hot pixel, which a dithered
+  sequence moves across the sky exactly as the pointing;
+- a pairing that moved no more than 2 × `MATCH_CONE_ARCSEC` is left untested: motion and
+  centroid scatter look alike there (a 13.9 mag "mover" on M63 moved 6″ in 15 min, and no
+  known small body was within 0.25°);
+- any other pairing is **confirmed** by a third detection on its straight line (tolerance
+  `MATCH_CONE_ARCSEC` × the extrapolation factor, at most 3 cones), **refuted** by a frame
+  that should show the object and does not — QC `OK`, plate-solved, the same filter, its
+  predicted position inside the frame (`_covers()`: the inscribed circle less the edge
+  margin) — and **untested** otherwise.
+
+A refutation is then checked once more: a detection of any kind (`POST
+/sources/near/batch` without `uncatalogued_only`) at a predicted position in the refuting
+frame leaves the track untested — the mover may have been matched to a star it passed.
+
+Confirmed → kept, the track in `notes`. Any pairing untested, or no pairing in the window
+→ kept, "not confirmed yet" in `notes`. Only sensor-fixed pairings, or every pairing
+refuted → withdrawn: the anomaly becomes what `_classify_source_sync(allow_moving=False)`
+made of the same source (`_fallback`, a callable from `detect()`, run only now; usually
+`UNKNOWN`), with the reason in `notes`, and is checked as that below. A sensor-fixed pairing
+outweighs a pairing too short to mean anything. A request that fails withdraws nothing.
+On the 2026-10-22 M51/M63/M82 run most of the 120 `MOVING_UNKNOWN`s were hot pixels or
+cosmic rays paired with each other.
+
+**`UNKNOWN`** must still be there: a nova stays for days, a cosmic ray, a hot pixel
+(dithered away) or a subtraction residual does not. (`SUPERNOVA_CANDIDATE` is not checked:
+a new one is a subtraction candidate matched to its host galaxy, which every later frame
+detects at the same place, and nothing on the wire tells the two apart.)
+
+- An uncatalogued detection within `MATCH_CONE_ARCSEC` in a later frame of the window → kept,
+  confirmed. A catalogued one there → kept, untested: it says nothing either way.
+- Otherwise, a straight track through it in the later frames (the `MOVING_UNKNOWN` test
+  above) → it is a mover first seen here: reclassified `MOVING_UNKNOWN`. A possible track
+  nothing can test → kept.
+- Otherwise, a **later** frame that covers the position through the same filter, QC `OK`
+  and plate-solved → withdrawn. Earlier frames never withdraw it: they showing nothing
+  here is why it is new.
+- Otherwise (no such frame yet) → kept, "not confirmed yet" in `notes`.
+
+**Suspect frame.** `detect()` first counts the frame's ghost sources (`_ghost_sources()`):
+uncatalogued, round (`STAR_ELONGATION_MAX`), PSF-sized (≤ 1.5 × the frame's PSF),
+unsaturated, not from subtraction, brighter than `SUSPECT_FRAME_MAG` (15). Gaia is complete
+far below that, so `SUSPECT_FRAME_MIN_SOURCES` (3) or more of them are copies of real stars
+— a mount jump, a double exposure, a drifting frame. In such a frame (logged at WARNING)
+every alert the check above leaves "not confirmed yet" is withdrawn instead; a confirmed one
+stands. On the 2026-10-22 run three frames had 4–23 ghost sources and the other 519 at most
+one (M82 G 2020-08-21T22-34-31 alone posted 32 alerts).
+
+**Diffuse subtraction candidate.** A subtraction candidate wider than
+`SUBTRACTION_DIFFUSE_FWHM_RATIO` (2.5) × the frame's PSF is held to the same rule: it stands
+only when confirmed (`_needs_confirmation()`). On the 2026-10-22 run 60 alerts were such
+blobs, 3–20 × the PSF, over pure noise in the frame itself. A new comet is diffuse too, but
+still there in the next frames; a known one is matched through MPC first. For the same
+reason a diffuse candidate is never taken for a star's residual
+(`_is_residual_of_catalogued_star()`): its FWHM would stretch the residual radius over
+any star within a minute of arc.
+
+So an alert from a sequence's last frame, or from detection run before the next frames
+were ingested, stands as before (unless its frame is suspect or it is diffuse); running `DETECT_ANOMALIES` once a night's frames are all
+in gives the check its evidence.
 
 ---
 
