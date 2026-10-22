@@ -2329,3 +2329,143 @@ class TestSameOpticsHistory:
             await ad._frames._frame_records(["same-0", "elsewhere"], "M51")
         mock_frames.assert_awaited_once()
         mock_frame.assert_awaited_once_with("elsewhere")
+
+
+# ===========================================================================
+# MOVING_UNKNOWN checked against the frames around it (_confirm.py)
+# ===========================================================================
+
+def _shift(ra: float, dec: float, east: float, north: float = 0.0) -> tuple[float, float]:
+    return ra + east / 3600.0 / math.cos(math.radians(dec)), dec + north / 3600.0
+
+
+def _at(minutes: float) -> str:
+    import datetime as _dt
+    t0 = _dt.datetime(2024, 3, 15, 22, 1, 34)
+    return (t0 + _dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestMovingUnknownTrackConfirmation:
+    """
+    2026-10-22 run: most of the 120 MOVING_UNKNOWNs were a hot pixel or a
+    cosmic ray paired with another — a dithered sequence puts a hot pixel at
+    a new sky position in every frame. A real mover is on a straight track
+    in the neighbouring frames; a hot pixel moves exactly as the pointing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    async def _run(self, earlier, pool, frames, records, pool_fails=False, filter_name="L"):
+        """
+        earlier: the phase-1 wide-cone history (the vacated detection);
+        pool: uncatalogued detections in the window; frames: covering frames
+        in the window; records: stored frame records.
+        """
+        source = _make_source(mag=16.0, catalog_name=None, filter=filter_name)
+        current = _frame_record(_FRAME_ID)
+
+        async def near(positions, radius, before_time, uncatalogued_only=False):
+            if before_time == _OBS_TIME:
+                return {"0": earlier} if uncatalogued_only else {"0": []}
+            if pool_fails:
+                return None
+            return {"0": pool}
+
+        async def covering(positions, before_time):
+            if before_time == _OBS_TIME:
+                return {"0": [_make_coverage_frame()]}
+            return {"0": frames}
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", side_effect=covering),
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = [current, *records]
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, [source], [source], {**_FRAME_META, "frame": current})
+
+    @staticmethod
+    def _det(minutes, east, frame_id):
+        ra, dec = _shift(_RA, _DEC, east)
+        return {"ra": ra, "dec": dec, "mag": 16.0, "filter": "L", "obs_time": _at(minutes), "frame_id": frame_id}
+
+    @staticmethod
+    def _frame(frame_id, minutes, east=0.0, **extra):
+        ra, dec = _shift(_RA, _DEC, east)
+        return _frame_record(frame_id, ra_center=ra, dec_center=dec, obs_time=_at(minutes), **extra)
+
+    async def test_a_third_detection_on_the_track_confirms_it(self):
+        before = self._det(-5, 30.0, "f-5")
+        after = self._det(+5, -30.0, "f+5")
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        result = await self._run([before], [before, after], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "Track confirmed" in result[0]["notes"]
+
+    async def test_a_track_shorter_than_two_cones_confirms_nothing(self):
+        """M63 2020-05-08: a 13.9 mag "mover" at 0.4"/min — 6" in 15 min, centroid scatter."""
+        before = self._det(-5, 8.0, "f-5")
+        after = self._det(+5, -8.0, "f+5")
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        result = await self._run([before], [before, after], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "too little to tell motion from centroid scatter" in result[0]["notes"]
+
+    async def test_a_detection_that_moves_with_the_pointing_is_a_hot_pixel(self):
+        """The earlier frame pointed 30" east: so did the 'object'."""
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5, east=30.0)]
+        result = await self._run([before], [before], [], records)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "withdrawn" in result[0]["notes"]
+        assert "telescope pointing" in result[0]["notes"]
+
+    async def test_a_frame_that_should_show_the_track_and_does_not_withdraws_it(self):
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        result = await self._run([before], [before], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "no detection on its track" in result[0]["notes"]
+
+    @pytest.mark.parametrize("change", [
+        {"filter": "Ha"},               # shallower, another band
+        {"quality_flag": "BLUR"},       # QC failed: no sources
+        {"position_angle_deg": None},   # QC passed but never plate-solved
+        {"ra_center": _RA + 1.0},       # does not image the predicted position
+    ])
+    async def test_only_a_usable_frame_can_withdraw_it(self, change):
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5), {**self._frame("f+5", +5), **change}]
+        result = await self._run([before], [before], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "not confirmed yet" in result[0]["notes"]
+
+    async def test_with_no_frame_after_it_the_alert_stands(self):
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [before], [], [self._frame("f-5", -5)])
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "not confirmed yet" in result[0]["notes"]
+
+    async def test_a_failed_request_never_withdraws_an_alert(self):
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [], [], [], pool_fails=True)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+
+    async def test_disabled_check_makes_no_requests(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 0.0)
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [], [], [], pool_fails=True)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "Track" not in result[0]["notes"]
+
+    async def test_internal_keys_never_reach_the_wire(self):
+        before = self._det(-5, 30.0, "f-5")
+        result = await self._run([before], [before], [], [self._frame("f-5", -5)])
+        assert not [k for a in result for k in a if k.startswith("_")]

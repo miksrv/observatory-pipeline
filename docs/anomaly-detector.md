@@ -360,13 +360,51 @@ Simbad OTYPE tests used by the classifiers:
 | `ASTEROID` | Matched in MPC/SkyBot, type "asteroid" | No (logged + ephemeris) |
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |
 | `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening by a significant Δmag (as above) | **Yes** |
-| `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold | **Yes** |
+| `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold; not withdrawn by the alert confirmation (track moving with the pointing, or absent from every frame that should show it) | **Yes** |
 | `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | No (recorded so a fast mover's track is never erased and does not pollute `UNKNOWN`; an operator need not act on a satellite pass — decided 2026-09-22). The API mirrors this in its own `AnomalyModel::ALERT_TYPES` |
 | `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()` | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match
 `AnomalyModel::ALLOWED_TYPES`/the `ENUM` constraint on the `observatory-api` side — the
 two lists are kept in sync by hand (see `CLAUDE.md`, `modules/anomaly_detector/` section).
+
+---
+
+## Alert confirmation (`_confirm.py`)
+
+After every source is classified, `_confirm_alerts()` checks the alerts against the other
+frames of the same field taken within `ALERT_CONFIRM_WINDOW_MIN` (default 180, before and
+after; 0 disables). It fetches, for the whole frame, the uncatalogued detections around
+each candidate up to the end of the window (`POST /sources/near/batch` with
+`uncatalogued_only` and `before_time` = obs_time + window), the frames covering it
+(`POST /frames/covering/batch`, same `before_time`), and those frames' stored records
+(`_frames.py`: one `GET /frames?object=` listing per field, `GET /frames/{id}` for the
+rest, cached for the process).
+
+**`MOVING_UNKNOWN`.** Every detection in the window that could be the object at another
+time — more than `MATCH_CONE_ARCSEC` away, within a mover's reach over that gap
+(`_wide_cone_radius_arcsec()`), at a position nothing in this frame occupies — gives a
+pairing and a velocity:
+
+- a pairing whose displacement equals the shift of the telescope pointing between the two
+  frames (within `MATCH_CONE_ARCSEC`) is fixed on the sensor — a hot pixel, which a dithered
+  sequence moves across the sky exactly as the pointing;
+- a pairing that moved no more than 2 × `MATCH_CONE_ARCSEC` is left untested: motion and
+  centroid scatter look alike there (a 13.9 mag "mover" on M63 moved 6″ in 15 min, and no
+  known small body was within 0.25°);
+- any other pairing is **confirmed** by a third detection on its straight line (tolerance
+  `MATCH_CONE_ARCSEC` × the extrapolation factor, at most 3 cones), **refuted** by a frame
+  that should show the object and does not — QC `OK`, plate-solved, the same filter, its
+  predicted position inside the frame (`_covers()`: the inscribed circle less the edge
+  margin) — and **untested** otherwise.
+
+Confirmed → kept, the track in `notes`. Any pairing untested, or no pairing in the window
+→ kept, "not confirmed yet" in `notes`. Only sensor-fixed pairings, or every pairing
+refuted → withdrawn: the anomaly becomes what `_classify_source_sync(allow_moving=False)`
+made of the same source (`_fallback`, computed in `detect()`; usually `UNKNOWN`), with the
+reason in `notes`. A request that fails withdraws nothing. On the 2026-10-22 M51/M63/M82
+run most of the 120 `MOVING_UNKNOWN`s were hot pixels or cosmic rays paired with each
+other.
 
 ---
 

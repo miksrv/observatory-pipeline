@@ -4,6 +4,7 @@
 
 ### Minor Changes
 
+- Anomalies: a `MOVING_UNKNOWN` is checked against the field's frames within `ALERT_CONFIRM_WINDOW_MIN` (180 min, before and after): kept when a third detection lies on its straight track or no frame can test it, withdrawn when it moves exactly as the telescope pointing (a hot pixel in a dithered sequence) or every same-filter frame that should show it does not — most of the 120 `MOVING_UNKNOWN`s on the M51/M63/M82 run were hot pixels and cosmic rays paired with each other; run `DETECT_ANOMALIES` after a night's frames are all ingested to get the check
 - Anomalies: a light-curve `VARIABLE_STAR` (no catalog says the source varies) needs a well-measured point source — not a Simbad cluster or nebula (`Cl*`, `MoC`, `HII`, …), FWHM at most `VARIABILITY_MAX_FWHM_RATIO` (2.0) × the frame's PSF, `mag_err` at most `VARIABILITY_MAX_MAG_ERR` (0.1), not near the edge — and binary/variable-star changes are judged only against epochs from the same camera and plate scale; on the M51/M63/M82 run 287 `VARIABLE_STAR`s were knots in M51's disc measured through two telescopes, faint forced-photometry stars and edge stars
 
 ## 1.5.0

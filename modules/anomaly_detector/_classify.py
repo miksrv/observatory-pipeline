@@ -406,6 +406,7 @@ def _classify_source_sync(
     obs_time: str = "",
     catalogued_frame_sources: list[tuple] | None = None,
     frame_psf_arcsec: float | None = None,
+    allow_moving: bool = True,
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).
@@ -415,7 +416,9 @@ def _classify_source_sync(
     source's own narrow-cone history, ``wide_pool`` its uncatalogued
     wide-cone candidates (empty for a catalogued source, which never uses
     them). ``frame_psf_arcsec`` is the frame's own seeing (QC's median
-    FWHM), or None when unknown.
+    FWHM), or None when unknown. ``allow_moving=False`` skips the
+    MOVING_UNKNOWN branch — what the source is without the motion evidence,
+    which detect() keeps as the fallback should `_confirm` withdraw it.
 
     Returns an anomaly dict, or None if no reportable anomaly is found.
     """
@@ -635,7 +638,7 @@ def _classify_source_sync(
                 ),
             }
 
-        if _is_position_shifted(history, wide_history, current_frame_positions):
+        if allow_moving and _is_position_shifted(history, wide_history, current_frame_positions):
             # Near-edge sources get their centroid shifted by coma between
             # frames (rotation, guiding) — this looks like "position shifted"
             # but is purely optical. All 7 MOVING_UNKNOWN near_edge=1 in the

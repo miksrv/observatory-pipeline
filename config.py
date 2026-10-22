@@ -329,6 +329,17 @@ MOVING_CONE_MAX_ARCSEC: float = float(_get("MOVING_CONE_MAX_ARCSEC", "600.0"))
 # "something left A" with "something appeared at B" carries little weight.
 MOVING_EXTEND_MAX_GAP_MIN: float = float(_get("MOVING_EXTEND_MAX_GAP_MIN", "30.0"))
 
+# --- Confirming an alert with the frames around it -------------------------
+# An alert is checked against the other frames of the same field taken within
+# this many minutes of it, before and after (modules/anomaly_detector/
+# _confirm.py). A MOVING_UNKNOWN must line up with detections in them on a
+# straight track and must not move with the telescope (a hot pixel follows
+# the dither); it is dropped only when a frame that should show the track
+# shows nothing there. With no such frame — a sequence's last frame, or
+# detection run as soon as a frame arrives — the alert stands as before.
+# 0 disables the check.
+ALERT_CONFIRM_WINDOW_MIN: float = float(_get("ALERT_CONFIRM_WINDOW_MIN", "180.0"))
+
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
 
 # --- Statistical variability detection (modules/anomaly_detector/) ---------
@@ -970,6 +981,7 @@ _OVERRIDABLE: dict[str, type] = {
     "MOVING_RATE_ARCSEC_PER_MIN": float,
     "MOVING_CONE_MAX_ARCSEC": float,
     "MOVING_EXTEND_MAX_GAP_MIN": float,
+    "ALERT_CONFIRM_WINDOW_MIN": float,
     "DELTA_MAG_ALERT": float,
     "VARIABILITY_MIN_EPOCHS": int,
     "VARIABILITY_SIGMA": float,

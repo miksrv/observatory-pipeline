@@ -555,6 +555,12 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
   a historical detection in the wide cone whose position is now empty. The wide radius is
   per-candidate: `MOVING_CONE_ARCSEC` floor, extended to `MOVING_RATE_ARCSEC_PER_MIN × gap` for
   gaps ≤ `MOVING_EXTEND_MAX_GAP_MIN`, capped at `MOVING_CONE_MAX_ARCSEC`.
+- **Alert confirmation** (`_confirm.py`, after classification): a `MOVING_UNKNOWN` is checked
+  against the field's frames within `ALERT_CONFIRM_WINDOW_MIN`. Kept when a third detection lies
+  on its straight track, or when no frame can test the track; withdrawn (to what the source is
+  without the motion, usually `UNKNOWN`) when it moves exactly as the telescope pointing (a hot
+  pixel under dithering) or every frame that should show it — QC `OK`, plate-solved, same filter,
+  covering the predicted position — does not. A failed request withdraws nothing.
 - **Significant Δmag** = above `DELTA_MAG_ALERT` **and** above `VARIABILITY_SIGMA` × (`mag_err` ⊕
   historical scatter), **and confirmed** by the previous `VARIABILITY_CONFIRM_EPOCHS − 1`
   same-filter epochs (one deviant epoch is usually a cosmic ray). Uses the calibrated `mag` only.

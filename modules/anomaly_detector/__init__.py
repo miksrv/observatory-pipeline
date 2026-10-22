@@ -25,9 +25,11 @@ Split into files by concern — see docs/anomaly-detector.md for the full mechan
   _history.py               historical-magnitude extraction and same-filter restriction
   _movement.py              "has this source actually moved?" evidence
   _prefetch.py              the two-batch-request history/coverage prefetch
+  _frames.py                stored records of other frames (optics, pointing, coverage)
   _classify.py              the priority-ordered per-source classification
+  _confirm.py               checking an alert against the frames around it
   _ephemeris_resolution.py  concurrent JPL Horizons lookup for ASTEROID/COMET anomalies
-  _detect.py                detect() itself — orchestrates the four files above
+  _detect.py                detect() itself — orchestrates the files above
 
 `__init__.py` re-exports `detect`/`AnomalyType` for normal use, plus the handful of
 private helpers tests/test_anomaly_detector.py exercises directly

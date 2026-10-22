@@ -10,10 +10,11 @@ import logging
 import math
 
 from ._classify import _classify_source_sync
+from ._confirm import _confirm_alerts
 from ._ephemeris_resolution import _resolve_ephemerides
 from ._frames import _frame_records, _same_optics
 from ._prefetch import _prefetch_history_data
-from .types import _ALERT_TYPES
+from .types import _ALERT_TYPES, AnomalyType
 
 logger = logging.getLogger(__name__)
 
@@ -180,8 +181,7 @@ async def detect(
 
     for i, source in enumerate(sources):
         try:
-            result = _classify_source_sync(
-                source,
+            classify_args = dict(
                 frame_id=frame_id,
                 log_filename=log_filename,
                 narrow_history=narrow_by_source[i],
@@ -192,7 +192,15 @@ async def detect(
                 catalogued_frame_sources=catalogued_frame_sources,
                 frame_psf_arcsec=frame_psf_arcsec,
             )
+            result = _classify_source_sync(source, **classify_args)
             if result is not None:
+                # For the alert confirmation below; stripped before returning.
+                result["_source"] = source
+                if result["anomaly_type"] == AnomalyType.MOVING_UNKNOWN:
+                    fallback = _classify_source_sync(source, allow_moving=False, **classify_args)
+                    if fallback is not None:
+                        fallback["_source"] = source
+                    result["_fallback"] = fallback
                 anomalies.append(result)
         except Exception as exc:
             logger.error(
@@ -200,6 +208,14 @@ async def detect(
                 source.get("ra", "?"), source.get("dec", "?"), exc,
                 extra=extra,
             )
+
+    # Check the alerts against the frames around this one — see _confirm.py.
+    anomalies = await _confirm_alerts(
+        anomalies, frame_id, obs_time, frame_meta, current_frame_positions, extra
+    )
+    for anomaly in anomalies:
+        anomaly.pop("_source", None)
+        anomaly.pop("_fallback", None)
 
     # Resolve ephemerides concurrently for all MPC-matched objects
     await _resolve_ephemerides(anomalies, obs_time_mid, frame_id, log_filename)
