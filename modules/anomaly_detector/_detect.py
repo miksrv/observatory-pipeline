@@ -11,6 +11,7 @@ import math
 
 from ._classify import _classify_source_sync
 from ._ephemeris_resolution import _resolve_ephemerides
+from ._frames import _frame_records, _same_optics
 from ._prefetch import _prefetch_history_data
 from .types import _ALERT_TYPES
 
@@ -23,6 +24,37 @@ def _finite_or_none(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+async def _mark_history_optics(
+    narrow_by_source: list[list[dict]],
+    frame_record: dict,
+    extra: dict,
+) -> None:
+    """
+    Mark every narrow-cone history row `_same_optics` — True/False when the
+    stored record of the frame behind it says whether that frame was taken
+    through this frame's optics (`_frames._same_optics()`), None when it
+    cannot say. A lookup failure leaves every row unmarked, which the
+    classifier treats exactly like None.
+    """
+    frame_ids = {row.get("frame_id") for rows in narrow_by_source for row in rows}
+    frame_ids.discard(None)
+    if not frame_ids:
+        return
+    try:
+        records = await _frame_records(frame_ids, frame_record.get("object"))
+    except Exception as exc:
+        logger.warning(
+            "Could not look up the frames behind this frame's history (%s) — "
+            "magnitudes are compared across optics", exc,
+            extra=extra,
+        )
+        return
+    verdicts = {fid: _same_optics(frame_record, rec) for fid, rec in records.items()}
+    for rows in narrow_by_source:
+        for row in rows:
+            row["_same_optics"] = verdicts.get(str(row.get("frame_id")))
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +92,10 @@ async def detect(
         parameter exists for API compatibility with the pipeline orchestrator.
     frame_meta:
         Dict with keys: frame_id, obs_time (ISO 8601), filename,
-        ra_center, dec_center, fov_deg.
+        ra_center, dec_center, fov_deg. Optionally "frame": the frame's
+        stored record (GET /frames/{id}) — its camera, plate scale and QC
+        seeing; without it magnitudes are compared across optics and the
+        light-curve branch has no PSF to judge extended sources by.
 
     Returns
     -------
@@ -94,6 +129,16 @@ async def detect(
     narrow_by_source, wide_by_source, coverage_by_tile = await _prefetch_history_data(
         sources, obs_time, frame_id, log_filename
     )
+
+    # This frame's stored record (GET /frames/{id}) — present on the
+    # standalone DETECT_ANOMALIES path. It tells which optics took the frame,
+    # so the star branches can compare a source only with epochs from the
+    # same optics, and gives the frame's own seeing for the light-curve
+    # branch's extended-source test. Without it both stay as before.
+    frame_record = frame_meta.get("frame") or None
+    frame_psf_arcsec = _finite_or_none((frame_record or {}).get("qc_fwhm_median"))
+    if frame_record:
+        await _mark_history_optics(narrow_by_source, frame_record, extra)
 
     # ------------------------------------------------------------------
     # Classify all sources using prefetched data (no additional API calls)
@@ -145,6 +190,7 @@ async def detect(
                 current_frame_positions=current_frame_positions,
                 obs_time=obs_time,
                 catalogued_frame_sources=catalogued_frame_sources,
+                frame_psf_arcsec=frame_psf_arcsec,
             )
             if result is not None:
                 anomalies.append(result)

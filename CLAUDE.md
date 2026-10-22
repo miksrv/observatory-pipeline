@@ -549,7 +549,7 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | History, subtraction candidate | nothing — no Δmag against a neighbour's light curve |
 | History, significant brightening, near galaxy | `SUPERNOVA_CANDIDATE` → alert |
 | History, significant Δmag, Simbad binary / variable | `BINARY_STAR` / `VARIABLE_STAR` |
-| History, significant Δmag beyond `VARIABILITY_SIGMA` × own same-filter scatter over ≥ `VARIABILITY_MIN_EPOCHS`, not a galaxy/cluster | `VARIABLE_STAR` (light-curve based; stated in `notes`) |
+| History, significant Δmag beyond `VARIABILITY_SIGMA` × own same-filter, same-optics scatter over ≥ `VARIABILITY_MIN_EPOCHS`; a well-measured point source (not a galaxy/cluster/nebula, FWHM ≤ `VARIABILITY_MAX_FWHM_RATIO` × PSF, `mag_err` ≤ `VARIABILITY_MAX_MAG_ERR`, not near the edge) | `VARIABLE_STAR` (light-curve based; stated in `notes`) |
 
 - **"Shifted"** needs both: no history within `MATCH_CONE_ARCSEC` of the current position, **and**
   a historical detection in the wide cone whose position is now empty. The wide radius is
@@ -560,6 +560,10 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
   same-filter epochs (one deviant epoch is usually a cosmic ray). Uses the calibrated `mag` only.
 - Δmag history is restricted to the **same filter** (`_same_filter_history()`, current filter in
   `_filter`, historical `filter` joined by the API). The existence check stays filter-agnostic.
+  The star branches (binary/variable) also drop epochs from **other optics**
+  (`_same_optics_history()`: another camera, or plate scale off by more than
+  `SUBTRACTION_REF_MAX_SCALE_DIFF`, read from the stored frame records — `_frames.py`); the
+  brightening `SUPERNOVA_CANDIDATE` keeps every same-filter epoch.
 - `object_type` comes only from Simbad; Gaia/2MASS/Pan-STARRS set a generic `"STAR"`.
 - Ephemerides: `ephemeris.py` per designation, gathered with `return_exceptions=True` so one
   failure costs only that anomaly its ephemeris.

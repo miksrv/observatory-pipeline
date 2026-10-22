@@ -371,6 +371,18 @@ def test_from_wire_source_defaults_filter_to_none():
     assert result["_filter"] is None
 
 
+def test_from_wire_source_carries_fwhm_and_flux():
+    """
+    The residual check sizes its radius from the FWHM and falls back to the
+    flux without calibrated magnitudes; the light-curve test compares the
+    FWHM with the frame's PSF. A standalone re-run used to lose both.
+    """
+    api_source = {"ra": 202.47, "dec": 47.20, "mag": None, "fwhm": 3.4, "flux": 1234.5}
+    result = pipeline._from_wire_source(api_source)
+    assert result["fwhm"] == 3.4
+    assert result["flux"] == 1234.5
+
+
 def test_from_wire_source_reconstructs_near_edge():
     """
     Regression for the 2026-08-07 T_CrB coma fix: "near_edge" must round-trip

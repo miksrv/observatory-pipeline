@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.0
+
+### Minor Changes
+
+- Anomalies: a light-curve `VARIABLE_STAR` (no catalog says the source varies) needs a well-measured point source — not a Simbad cluster or nebula (`Cl*`, `MoC`, `HII`, …), FWHM at most `VARIABILITY_MAX_FWHM_RATIO` (2.0) × the frame's PSF, `mag_err` at most `VARIABILITY_MAX_MAG_ERR` (0.1), not near the edge — and binary/variable-star changes are judged only against epochs from the same camera and plate scale; on the M51/M63/M82 run 287 `VARIABLE_STAR`s were knots in M51's disc measured through two telescopes, faint forced-photometry stars and edge stars
+
 ## 1.5.0
 
 ### Minor Changes

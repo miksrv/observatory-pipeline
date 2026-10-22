@@ -2173,3 +2173,159 @@ class TestResidualCheckWithoutMagnitudes:
 
         assert _is_residual_of_catalogued_star(cand, star_same) is True
         assert _is_residual_of_catalogued_star(cand, star_much_brighter) is False
+
+
+# ===========================================================================
+# Light-curve VARIABLE_STAR: only a well-measured point source, judged
+# against epochs from the same optics (2026-10-22 M51/M63/M82 run)
+# ===========================================================================
+
+def _frame_record(frame_id: str, camera: str = "ZWO ASI1600MM", fov_deg: float = 0.5,
+                  width_px: int = 3600, height_px: int = 2700, fwhm: float = 3.0, **extra) -> dict:
+    record = {
+        "id": frame_id, "object": "M51", "camera": camera, "fov_deg": fov_deg,
+        "width_px": width_px, "height_px": height_px, "qc_fwhm_median": fwhm,
+        "quality_flag": "OK", "position_angle_deg": 10.0, "filter": "L",
+        "ra_center": _RA, "dec_center": _DEC, "obs_time": _OBS_TIME,
+    }
+    record.update(extra)
+    return record
+
+
+class TestLightCurveMeasurementQuality:
+    """
+    On the 2026-10-22 run 287 VARIABLE_STARs were posted and practically none
+    was real: 210 were knots inside M51's disc (Simbad Cl*/MoC/HII, FWHM up to
+    11 × the PSF), about 60 were faint Gaia stars measured by forced
+    photometry with mag_err 0.2-0.3, the rest edge stars. The light-curve
+    branch now asks for a measurement worth judging.
+    """
+
+    _HIST = [{"ra": _RA, "dec": _DEC, "mag": m, "filter": "L"} for m in (14.50, 14.52, 14.48, 14.51)]
+
+    async def _run(self, source: dict, frame_meta: dict | None = None) -> list[dict]:
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": [dict(h) for h in self._HIST]}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            return await ad.detect(_FRAME_ID, [source], [source], frame_meta or _FRAME_META)
+
+    async def test_a_well_measured_star_is_still_reported(self):
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        source["mag_err"] = 0.02
+        meta = {**_FRAME_META, "frame": _frame_record(_FRAME_ID)}
+        assert [a["anomaly_type"] for a in await self._run(source, meta)] == ["VARIABLE_STAR"]
+
+    @pytest.mark.parametrize("otype", ["Cl*", "MoC", "HII", "SFR", "GlC"])
+    async def test_a_cluster_or_nebula_is_not_a_light_curve_variable(self, otype):
+        source = _make_source(mag=13.5, catalog_name="Simbad", object_type=otype)
+        assert await self._run(source) == []
+
+    async def test_an_extended_source_is_not_judged(self):
+        meta = {**_FRAME_META, "frame": _frame_record(_FRAME_ID, fwhm=3.0)}
+        extended = _make_source(mag=13.5, catalog_name="Simbad", object_type="*", fwhm=12.0)
+        assert await self._run(extended, meta) == []
+        compact = _make_source(mag=13.5, catalog_name="Simbad", object_type="*", fwhm=4.0)
+        assert [a["anomaly_type"] for a in await self._run(compact, meta)] == ["VARIABLE_STAR"]
+
+    async def test_without_the_frame_psf_the_fwhm_decides_nothing(self):
+        extended = _make_source(mag=13.5, catalog_name="Simbad", object_type="*", fwhm=12.0)
+        assert [a["anomaly_type"] for a in await self._run(extended)] == ["VARIABLE_STAR"]
+
+    async def test_a_noisy_measurement_is_not_judged(self):
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        source["mag_err"] = 0.25
+        assert await self._run(source) == []
+
+    async def test_a_near_edge_source_is_not_judged(self):
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR", near_edge=True)
+        assert await self._run(source) == []
+
+    async def test_a_catalogued_variable_is_not_gated(self):
+        """Simbad already says it varies — a noisy epoch of it is still a change."""
+        source = _make_source(mag=13.5, catalog_name="Simbad", object_type="V*", near_edge=True)
+        source["mag_err"] = 0.25
+        assert [a["anomaly_type"] for a in await self._run(source)] == ["VARIABLE_STAR"]
+
+
+class TestSameOpticsHistory:
+    """
+    M51 L 2025-04 (BK2001P, 1.53″/px) against the 2022 history (TAL250K,
+    0.50″/px): 115 knots read brighter. The star branches compare a source
+    with epochs from the same optics only; the brightening SUPERNOVA branch
+    keeps the whole same-filter history, so no alert is lost to it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self):
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    async def _run(self, source, hist, records):
+        current = _frame_record(_FRAME_ID, fov_deg=0.5, width_px=3600)  # 0.50″/px
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            mock_frames.return_value = records
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, [source], [source], {**_FRAME_META, "frame": current})
+
+    @staticmethod
+    def _epochs(mags, frame_ids):
+        return [{"ra": _RA, "dec": _DEC, "mag": m, "filter": "L", "frame_id": f} for m, f in zip(mags, frame_ids)]
+
+    async def test_a_change_seen_only_against_other_optics_is_not_a_variable(self):
+        records = [_frame_record(f"old-{i}", fov_deg=1.53, width_px=3600) for i in range(4)]  # 1.53″/px
+        records += [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"old-{i}" for i in range(4)])
+        hist += self._epochs((13.50, 13.52, 13.48, 13.51), [f"same-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert await self._run(source, hist, records) == []
+
+    async def test_another_camera_is_other_optics(self):
+        records = [_frame_record(f"old-{i}", camera="QHY268M") for i in range(4)]
+        records += [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"old-{i}" for i in range(4)])
+        hist += self._epochs((13.50, 13.52, 13.48, 13.51), [f"same-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert await self._run(source, hist, records) == []
+
+    async def test_a_change_within_the_same_optics_is_still_reported(self):
+        records = [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"same-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert [a["anomaly_type"] for a in await self._run(source, hist, records)] == ["VARIABLE_STAR"]
+
+    async def test_an_epoch_of_unknown_optics_is_kept(self):
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), ["gone-1", "gone-2", "gone-3", "gone-4"])
+        source = _make_source(mag=13.5, catalog_name="Gaia DR3", object_type="STAR")
+        assert [a["anomaly_type"] for a in await self._run(source, hist, [])] == ["VARIABLE_STAR"]
+
+    async def test_galaxy_brightening_is_judged_across_optics(self):
+        records = [_frame_record(f"old-{i}", fov_deg=1.53, width_px=3600) for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"old-{i}" for i in range(4)])
+        source = _make_source(mag=13.5, catalog_name="Simbad", object_type="Sy2")
+        assert [a["anomaly_type"] for a in await self._run(source, hist, records)] == ["SUPERNOVA_CANDIDATE"]
+
+    async def test_frame_records_come_from_one_listing_per_object(self):
+        records = [_frame_record(f"same-{i}") for i in range(4)]
+        hist = self._epochs((14.5, 14.52, 14.48, 14.51), [f"same-{i}" for i in range(4)])
+        with (
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = records
+            mock_frame.return_value = None
+            got = await ad._frames._frame_records([f"same-{i}" for i in range(4)] + ["elsewhere"], "M51")
+            assert set(got) == {f"same-{i}" for i in range(4)}
+            await ad._frames._frame_records(["same-0", "elsewhere"], "M51")
+        mock_frames.assert_awaited_once()
+        mock_frame.assert_awaited_once_with("elsewhere")

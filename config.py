@@ -369,6 +369,17 @@ VARIABILITY_SIGMA: float = float(_get("VARIABILITY_SIGMA", "3.0"))
 # brighter, and back to normal on the next (2026-09-23). A real change that
 # persists fires one epoch later. 1 disables the confirmation.
 VARIABILITY_CONFIRM_EPOCHS: int = int(_get("VARIABILITY_CONFIRM_EPOCHS", "2"))
+# The light-curve VARIABLE_STAR (no catalog says the source varies) is judged
+# only on a measurement worth judging: a magnitude error at most
+# VARIABILITY_MAX_MAG_ERR, and a FWHM at most VARIABILITY_MAX_FWHM_RATIO times
+# the frame's own PSF. A source at the detection limit — forced photometry
+# keeps only the epochs that noise pushed above its SNR threshold — reads
+# about 1 mag "brighter" with mag_err 0.2-0.3; an extended knot's aperture
+# magnitude follows the seeing. Together they were 220 of the 287
+# VARIABLE_STARs on the 2026-10-22 M51/M63/M82 run. Catalogued variables
+# (Simbad V*, RR, ...) are not gated.
+VARIABILITY_MAX_MAG_ERR: float = float(_get("VARIABILITY_MAX_MAG_ERR", "0.1"))
+VARIABILITY_MAX_FWHM_RATIO: float = float(_get("VARIABILITY_MAX_FWHM_RATIO", "2.0"))
 
 # Faintest predicted visual magnitude (V) for an MPC/SkyBot object to be
 # eligible for source matching. Objects fainter than this are almost certainly
@@ -963,6 +974,8 @@ _OVERRIDABLE: dict[str, type] = {
     "VARIABILITY_MIN_EPOCHS": int,
     "VARIABILITY_SIGMA": float,
     "VARIABILITY_CONFIRM_EPOCHS": int,
+    "VARIABILITY_MAX_MAG_ERR": float,
+    "VARIABILITY_MAX_FWHM_RATIO": float,
     "MPC_MAG_LIMIT": float,
     # Edge geometry
     "EDGE_MARGIN_FRAC": float,

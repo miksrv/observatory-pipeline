@@ -135,11 +135,12 @@ flowchart TD
     Changed -- no --> NoAnomaly(["no anomaly"])
     Changed -- yes --> Bright{"delta_mag < 0\n(got brighter)\nAND near a galaxy?"}
     Bright -- yes --> SNbright["🔔 SUPERNOVA_CANDIDATE\n(already-known host\nbrightened)"]
-    Bright -- no --> Binary{"Simbad object_type\nindicates a\ndouble/eclipsing binary?"}
+    Bright -- no --> Optics["re-judge the change against\n_same_optics_history()\n(epochs from other optics dropped)"]
+    Optics --> Binary{"Simbad object_type\nindicates a\ndouble/eclipsing binary?"}
     Binary -- yes --> BinaryStar["BINARY_STAR"]
     Binary -- no --> Variable{"Simbad object_type\nindicates a\nvariable star?"}
     Variable -- yes --> VarStar["VARIABLE_STAR\n(catalog-classified)"]
-    Variable -- no --> LightCurve{"own same-filter light curve:\n>= VARIABILITY_MIN_EPOCHS epochs\nAND abs(delta_mag) >\nVARIABILITY_SIGMA x scatter?"}
+    Variable -- no --> LightCurve{"well-measured point source\n(_light_curve_unmeasurable() is None)\nAND own light curve:\n>= VARIABILITY_MIN_EPOCHS epochs\nAND abs(delta_mag) >\nVARIABILITY_SIGMA x scatter?"}
     LightCurve -- yes --> VarStarLC["VARIABLE_STAR\n(light-curve based —\nno catalog label needed)"]
     LightCurve -- no --> NoAnomaly
 
@@ -298,6 +299,14 @@ one condition matches, the function returns and no further checks run:
      - a change near a galaxy only counts when the source **brightened**, i.e.
        `delta_mag < 0` → `SUPERNOVA_CANDIDATE` (checked first — takes priority over
        binary/variable stars);
+     - the branches below re-judge the change against `_same_optics_history()`: epochs
+       whose frame was taken with another camera or a plate scale more than
+       `SUBTRACTION_REF_MAX_SCALE_DIFF` off this frame's are dropped (`detect()` marks each
+       history row `_same_optics` from the stored frame records, `_frames.py`; an unknown
+       frame is kept). On the 2026-10-22 run the 2025 M51 frames (1.53″/px) read the
+       galaxy's knots up to a magnitude brighter than the 2022 history (0.50″/px). The
+       brightening `SUPERNOVA_CANDIDATE` above keeps the whole same-filter history, so no
+       alert depends on which telescope took the earlier epochs;
      - otherwise, if Simbad classifies the object as a double/eclipsing binary
        (`**`, `EB`, `SB`) → `BINARY_STAR`;
      - otherwise, if Simbad classifies the object as a variable
@@ -310,7 +319,13 @@ one condition matches, the function returns and no further checks run:
        Not applied to an extended object (`_is_galaxy(object_type)`): a galaxy's or
        cluster's aperture magnitude moves with seeing and aperture size, not with the
        object — NGC 4370/4341 were reported this way on the 2026-09-22 test run. A galaxy
-       brightening is the `SUPERNOVA_CANDIDATE` branch above; a "fading" one is nothing;
+       brightening is the `SUPERNOVA_CANDIDATE` branch above; a "fading" one is nothing.
+       Nor to a measurement too poor to carry the claim (`_light_curve_unmeasurable()`):
+       a Simbad cluster or interstellar-matter type (`_is_non_stellar()`: `Cl*`, `MoC`,
+       `HII`, ...), a FWHM over `VARIABILITY_MAX_FWHM_RATIO` × the frame's PSF, a `mag_err`
+       over `VARIABILITY_MAX_MAG_ERR` (forced photometry at the detection limit keeps only
+       the epochs noise pushed up) or `near_edge`. On the 2026-10-22 M51/M63/M82 run these
+       were nearly all of the 287 VARIABLE_STARs;
      - otherwise — no anomaly.
 
    The last of those exists because only `_simbad.py` ever writes a real OTYPE:
