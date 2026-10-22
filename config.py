@@ -547,6 +547,13 @@ SUBTRACTION_EDGE_SNR_MIN: float = float(_get("SUBTRACTION_EDGE_SNR_MIN", "10.0")
 # measured magnitude is the star's). 0 disables the check.
 SUBTRACTION_RESIDUAL_RADIUS_FWHM: float = float(_get("SUBTRACTION_RESIDUAL_RADIUS_FWHM", "2.5"))
 SUBTRACTION_RESIDUAL_MAX_DMAG: float = float(_get("SUBTRACTION_RESIDUAL_MAX_DMAG", "1.0"))
+# How much FAINTER than the star a residual may measure. A residual is part
+# of the star's light, so it is never much brighter than the star but often
+# fainter: on the 2026-10-22 M51 run (1.53″/px, 2° field) 65 UNKNOWN /
+# MOVING_UNKNOWN alerts were candidates 5-7″ from a star and 1.0-1.9 mag
+# fainter than it. SUBTRACTION_RESIDUAL_MAX_DMAG stays the bound on the
+# brighter side, so a transient outshining its neighbour is never suppressed.
+SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG: float = float(_get("SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG", "2.0"))
 
 # --- Correlated noise in the difference image ------------------------------
 # A candidate's significance was computed as flux / (rms * sqrt(npix)), which
@@ -1023,6 +1030,7 @@ _OVERRIDABLE: dict[str, type] = {
     "SUBTRACTION_EDGE_SNR_MIN": float,
     "SUBTRACTION_RESIDUAL_RADIUS_FWHM": float,
     "SUBTRACTION_RESIDUAL_MAX_DMAG": float,
+    "SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG": float,
     "SUBTRACTION_NOISE_CORR_MAX": float,
     # Forced photometry
     "FORCED_PHOTOMETRY_ENABLED": None,  # special: bool from string

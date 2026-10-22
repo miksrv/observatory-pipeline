@@ -255,11 +255,14 @@ def _is_residual_of_catalogued_star(
     the same positions across sessions.
 
     The magnitude condition is what keeps the finding-C6 case alive — a
-    transient flaring beside a star of clearly different brightness. A
-    transient much FAINTER than a neighbour this close is lost, since its
-    measured magnitude is then essentially the star's; that is the accepted
-    cost. No magnitude on the candidate, or the check disabled, decides
-    nothing.
+    transient flaring beside a star of clearly different brightness. It is
+    asymmetric: a residual is part of the star's light, so it may measure up
+    to SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG fainter than the star (M51
+    2025-04: 65 alerts 5-7" from a star and 1.0-1.9 mag fainter) but only
+    SUBTRACTION_RESIDUAL_MAX_DMAG brighter — a transient outshining its
+    neighbour is never taken for its residual. A transient up to 2 mag
+    FAINTER than a neighbour this close is lost; that is the accepted cost.
+    No magnitude on the candidate, or the check disabled, decides nothing.
 
     On a frame without calibrated magnitudes (narrowband, 8-bit) the
     brightness comparison falls back to the flux ratio, as a magnitude
@@ -293,13 +296,18 @@ def _is_residual_of_catalogued_star(
         c_flux = entry[3] if len(entry) > 3 else None
         if abs(c_dec - dec) * 3600.0 > radius:
             continue
+        # Positive when the candidate is fainter than the star.
         if mag is not None and c_mag is not None:
-            dmag = abs(c_mag - mag)
+            fainter_by = mag - c_mag
         elif flux is not None and flux > 0 and c_flux is not None and c_flux > 0:
-            dmag = abs(2.5 * math.log10(c_flux / flux))
+            fainter_by = 2.5 * math.log10(c_flux / flux)
         else:
             continue
-        if dmag <= config.SUBTRACTION_RESIDUAL_MAX_DMAG and _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius:
+        if not -config.SUBTRACTION_RESIDUAL_MAX_DMAG <= fainter_by <= max(
+            config.SUBTRACTION_RESIDUAL_MAX_DMAG, config.SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG
+        ):
+            continue
+        if _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius:
             return True
     return False
 

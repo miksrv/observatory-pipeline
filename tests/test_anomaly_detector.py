@@ -1520,6 +1520,18 @@ class TestSubtractionResidualOfCatalogedStar:
 
         assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
 
+    async def test_a_residual_up_to_two_magnitudes_fainter_than_its_star_is_suppressed(self):
+        """M51 L 2025-04: 65 alerts 5-7" from a star and 1.0-1.9 mag fainter than it."""
+        result = await self._detect([self._candidate(mag=15.5), self._star(mag=14.0)])
+
+        assert [a for a in result if a["source_id"] == "src-resid-001"] == []
+
+    async def test_a_transient_brighter_than_its_neighbour_survives(self):
+        """A residual is part of the star's light — it cannot outshine it."""
+        result = await self._detect([self._candidate(mag=14.0), self._star(mag=15.5)])
+
+        assert [a["anomaly_type"] for a in result if a["source_id"] == "src-resid-001"] == ["UNKNOWN"]
+
     async def test_a_candidate_far_from_any_star_survives(self):
         far = _make_source(
             dec=_DEC + 60.0 / 3600.0, mag=15.5, catalog_name="Gaia DR3",

@@ -96,7 +96,7 @@ flowchart TD
     Loop --> P1{"catalog_name\n== 'MPC'?"}
     P1 -- yes --> Asteroid["ASTEROID / COMET\n(by object_type)\n⚑ _needs_ephemeris=True"]
 
-    P1 -- no --> Residual{"subtraction candidate beside a\ncatalogued star of the same mag?\n(_is_residual_of_catalogued_star)"}
+    P1 -- no --> Residual{"subtraction candidate beside a\ncatalogued star, at most 1 mag brighter\nor 2 mag fainter?\n(_is_residual_of_catalogued_star)"}
     Residual -- yes --> Suppressed
     Residual -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
     Sat -- yes --> NewBright{"_could_be_a_new_bright_object()?\n(round, not near_edge, area covered,\nno history at all here)"}

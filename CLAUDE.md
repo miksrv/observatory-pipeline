@@ -539,7 +539,7 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Unmatched + `near_edge` | suppressed, unless a subtraction candidate passing `_survives_edge_zone()` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC`, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (`…_EDGE_…` near the edge) | `SPACE_DEBRIS` — recorded, not an alert; no "vacated position" proof needed |
 | Unmatched, shifted (see below), not near edge | `MOVING_UNKNOWN` → alert |
-| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star within `SUBTRACTION_RESIDUAL_MAX_DMAG` | suppressed (that star's residual) — checked before every branch below |
+| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star at most `SUBTRACTION_RESIDUAL_MAX_DMAG` brighter or `SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG` fainter | suppressed (that star's residual) — checked before every branch below |
 | No coverage, normal detection | `FIRST_OBSERVATION` — logged only, not posted |
 | No coverage, subtraction candidate, catalogued | suppressed (registration residual) |
 | No coverage, subtraction candidate, uncatalogued | `UNKNOWN` → alert |
