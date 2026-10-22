@@ -235,6 +235,7 @@ def _survives_edge_zone(source: dict) -> bool:
 def _is_residual_of_catalogued_star(
     source: dict,
     catalogued_frame_sources: list[tuple],
+    frame_psf_arcsec: float | None = None,
 ) -> bool:
     """
     Whether an uncatalogued subtraction candidate is a catalogued star's own
@@ -267,6 +268,12 @@ def _is_residual_of_catalogued_star(
     On a frame without calibrated magnitudes (narrowband, 8-bit) the
     brightness comparison falls back to the flux ratio, as a magnitude
     difference; entries are ``(ra, dec, mag, flux)`` (a 3-tuple is mag-only).
+
+    Not for a diffuse candidate — wider than SUBTRACTION_DIFFUSE_FWHM_RATIO ×
+    the frame's PSF (`frame_psf_arcsec`): its FWHM would stretch the radius
+    over any star within a minute of arc, and a new comet beside one would be
+    dropped. Such a candidate is held to the alert confirmation instead
+    (`_confirm._needs_confirmation()`).
     """
     factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
     if factor <= 0 or not catalogued_frame_sources:
@@ -288,6 +295,9 @@ def _is_residual_of_catalogued_star(
         fwhm = float(source.get("fwhm") or 0.0)
     except (TypeError, ValueError):
         fwhm = 0.0
+    diffuse_ratio = config.SUBTRACTION_DIFFUSE_FWHM_RATIO
+    if frame_psf_arcsec and diffuse_ratio > 0 and fwhm > diffuse_ratio * frame_psf_arcsec:
+        return False
     radius = factor * fwhm if fwhm > 0 else 2.0 * config.MATCH_CONE_ARCSEC
     radius = max(radius, config.MATCH_CONE_ARCSEC)
 
@@ -512,7 +522,9 @@ def _classify_source_sync(
     # MOVING_UNKNOWN and, through the star's own history, VARIABLE_STAR
     # (M51 L 2025-04: every one of the 47-49 VARIABLE_STARs per frame).
     # ------------------------------------------------------------------
-    if from_subtraction and _is_residual_of_catalogued_star(source, catalogued_frame_sources or []):
+    if from_subtraction and _is_residual_of_catalogued_star(
+        source, catalogued_frame_sources or [], frame_psf_arcsec
+    ):
         logger.debug(
             "Suppressed: subtraction candidate ra=%.4f dec=%.4f mag=%s sits beside "
             "a catalogued star of the same brightness — its residual, not a change",

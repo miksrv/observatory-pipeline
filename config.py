@@ -335,8 +335,8 @@ MOVING_EXTEND_MAX_GAP_MIN: float = float(_get("MOVING_EXTEND_MAX_GAP_MIN", "30.0
 # _confirm.py). A MOVING_UNKNOWN must line up with detections in them on a
 # straight track and must not move with the telescope (a hot pixel follows
 # the dither); it is dropped only when a frame that should show the track
-# shows nothing there. An UNKNOWN or a new-source SUPERNOVA_CANDIDATE must be
-# detected again in a later frame of its position through the same filter.
+# shows nothing there. An UNKNOWN must be detected again in a later frame of
+# its position through the same filter.
 # With no such frame — a sequence's last frame, or detection run as soon as a
 # frame arrives — the alert stands as before. 0 disables the check.
 ALERT_CONFIRM_WINDOW_MIN: float = float(_get("ALERT_CONFIRM_WINDOW_MIN", "180.0"))
@@ -348,6 +348,7 @@ ALERT_CONFIRM_WINDOW_MIN: float = float(_get("ALERT_CONFIRM_WINDOW_MIN", "180.0"
 # 2020-08-21, 23 of them). On the 2026-10-22 run three frames had 4-23 such
 # sources and the other 519 at most one. In such a frame an alert stands
 # only when the frames around it confirm it (ALERT_CONFIRM_WINDOW_MIN).
+# SUSPECT_FRAME_MIN_SOURCES = 0 disables the check.
 SUSPECT_FRAME_MAG: float = float(_get("SUSPECT_FRAME_MAG", "15.0"))
 SUSPECT_FRAME_MIN_SOURCES: int = int(_get("SUSPECT_FRAME_MIN_SOURCES", "3"))
 # A subtraction candidate wider than this many times the frame's PSF stands

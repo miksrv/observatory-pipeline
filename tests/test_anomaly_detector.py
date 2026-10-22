@@ -2340,7 +2340,8 @@ class TestSameOpticsHistory:
             assert set(got) == {f"same-{i}" for i in range(4)}
             await ad._frames._frame_records(["same-0", "elsewhere"], "M51")
         mock_frames.assert_awaited_once()
-        mock_frame.assert_awaited_once_with("elsewhere")
+        # A failed lookup is not cached: the next detection asks again.
+        assert mock_frame.await_count == 2
 
 
 # ===========================================================================
@@ -2355,6 +2356,42 @@ def _at(minutes: float) -> str:
     import datetime as _dt
     t0 = _dt.datetime(2024, 3, 15, 22, 1, 34)
     return (t0 + _dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fake_api(rows: list[dict], frames: list[dict], fail_after_obs: bool = False):
+    """
+    A small stand-in for the two batch endpoints: answers by position, cone,
+    `before_time` and `uncatalogued_only` from `rows` (detections; a row with
+    "catalogued": True is left out of an uncatalogued_only answer) and
+    `frames` (covering frames, plus the phase-1 coverage frame).
+    """
+    from modules.anomaly_detector._movement import _parse_obs_time
+
+    def before(value, limit):
+        return _parse_obs_time(value) < _parse_obs_time(limit)
+
+    async def near(positions, radius, before_time, uncatalogued_only=False):
+        if fail_after_obs and before_time != _OBS_TIME:
+            return None
+        return {
+            str(i): [
+                r for r in rows
+                if before(r["obs_time"], before_time)
+                and ad._haversine_arcsec(p["ra"], p["dec"], r["ra"], r["dec"]) <= radius
+                and not (uncatalogued_only and r.get("catalogued"))
+            ]
+            for i, p in enumerate(positions)
+        }
+
+    async def covering(positions, before_time):
+        if fail_after_obs and before_time != _OBS_TIME:
+            return None
+        found = [f for f in frames if before(f["obs_time"], before_time)]
+        if before_time == _OBS_TIME:
+            found = [_make_coverage_frame(), *found]
+        return {str(i): found for i in range(len(positions))}
+
+    return near, covering
 
 
 class TestMovingUnknownTrackConfirmation:
@@ -2380,18 +2417,8 @@ class TestMovingUnknownTrackConfirmation:
         """
         source = _make_source(mag=16.0, catalog_name=None, filter=filter_name)
         current = _frame_record(_FRAME_ID)
-
-        async def near(positions, radius, before_time, uncatalogued_only=False):
-            if before_time == _OBS_TIME:
-                return {"0": earlier} if uncatalogued_only else {"0": []}
-            if pool_fails:
-                return None
-            return {"0": pool}
-
-        async def covering(positions, before_time):
-            if before_time == _OBS_TIME:
-                return {"0": [_make_coverage_frame()]}
-            return {"0": frames}
+        rows = list({id(r): r for r in [*earlier, *pool]}.values())
+        near, covering = _fake_api(rows, frames, fail_after_obs=pool_fails)
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
@@ -2404,9 +2431,10 @@ class TestMovingUnknownTrackConfirmation:
             return await ad.detect(_FRAME_ID, [source], [source], {**_FRAME_META, "frame": current})
 
     @staticmethod
-    def _det(minutes, east, frame_id):
+    def _det(minutes, east, frame_id, catalogued=False):
         ra, dec = _shift(_RA, _DEC, east)
-        return {"ra": ra, "dec": dec, "mag": 16.0, "filter": "L", "obs_time": _at(minutes), "frame_id": frame_id}
+        return {"ra": ra, "dec": dec, "mag": 16.0, "filter": "L", "obs_time": _at(minutes),
+                "frame_id": frame_id, "catalogued": catalogued}
 
     @staticmethod
     def _frame(frame_id, minutes, east=0.0, **extra):
@@ -2462,6 +2490,44 @@ class TestMovingUnknownTrackConfirmation:
         assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
         assert "not confirmed yet" in result[0]["notes"]
 
+    async def test_a_mover_matched_to_a_star_on_its_track_is_not_withdrawn(self):
+        """It passed a star in the next frame and took the star's catalog id."""
+        before = self._det(-5, 30.0, "f-5")
+        on_star = self._det(+5, -30.0, "f+5", catalogued=True)
+        records = [self._frame("f-5", -5), self._frame("f+5", +5)]
+        result = await self._run([before], [before, on_star], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "a catalogued source lies on its predicted track" in result[0]["notes"]
+
+    async def test_the_pointing_of_an_unsolved_frame_is_not_compared(self):
+        """Its centre is the mount's guess, so a 'move with the pointing' proves nothing."""
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5, east=30.0, position_angle_deg=None)]
+        result = await self._run([before], [before], [], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+
+    async def test_a_short_noise_pairing_does_not_save_a_hot_pixel(self):
+        before = self._det(-5, 30.0, "f-5")
+        noise = self._det(-10, 8.0, "f-10")
+        records = [self._frame("f-5", -5, east=30.0), self._frame("f-10", -10)]
+        result = await self._run([before, noise], [before, noise], [], records)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "telescope pointing" in result[0]["notes"]
+
+    async def test_a_failing_fallback_keeps_the_mover(self):
+        before = self._det(-5, 30.0, "f-5")
+        records = [self._frame("f-5", -5, east=30.0)]
+        real = ad._detect._classify_source_sync
+
+        def flaky(source, allow_moving=True, **kwargs):
+            if not allow_moving:
+                raise ValueError("boom")
+            return real(source, allow_moving=allow_moving, **kwargs)
+
+        with patch("modules.anomaly_detector._detect._classify_source_sync", side_effect=flaky):
+            result = await self._run([before], [before], [], records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+
     async def test_with_no_frame_after_it_the_alert_stands(self):
         before = self._det(-5, 30.0, "f-5")
         result = await self._run([before], [before], [], [self._frame("f-5", -5)])
@@ -2504,16 +2570,7 @@ class TestStationaryAlertConfirmation:
 
     async def _run(self, source, here, pool, frames, records):
         current = _frame_record(_FRAME_ID)
-
-        async def near(positions, radius, before_time, uncatalogued_only=False):
-            if before_time == _OBS_TIME:
-                return {"0": []}
-            return {"0": pool if uncatalogued_only else here}
-
-        async def covering(positions, before_time):
-            if before_time == _OBS_TIME:
-                return {"0": [_make_coverage_frame()]}
-            return {"0": frames}
+        near, covering = _fake_api([*here, *pool], frames)
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
@@ -2576,12 +2633,23 @@ class TestStationaryAlertConfirmation:
         assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
         assert "Not confirmed yet" in result[0]["notes"]
 
-    async def test_a_supernova_candidate_must_still_be_there(self):
+    async def test_a_supernova_candidate_is_not_checked(self):
+        """
+        A new one is a subtraction candidate matched to its host: every later
+        frame detects the galaxy there, and nothing on the wire tells the two
+        apart. It stands as before, absent from the later frame or not.
+        """
         source = _make_source(mag=16.0, catalog_name="Simbad", object_type="Sy2", from_subtraction=True)
         frames, records = [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)]
-        assert await self._run(source, [], [], frames, records) == []
-        kept = await self._run(source, [self._det(5, 0.0, "f+5")], [], frames, records)
-        assert [a["anomaly_type"] for a in kept] == ["SUPERNOVA_CANDIDATE"]
+        result = await self._run(source, [], [], frames, records)
+        assert [a["anomaly_type"] for a in result] == ["SUPERNOVA_CANDIDATE"]
+
+    async def test_a_catalogued_detection_there_later_neither_confirms_nor_withdraws(self):
+        frames, records = [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)]
+        star = self._det(5, 0.0, "f+5", catalogued=True)
+        result = await self._run(self._unknown(), [star], [], frames, records)
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "a catalogued source is detected here" in result[0]["notes"]
 
 
 class TestSuspectFrame:
@@ -2608,14 +2676,7 @@ class TestSuspectFrame:
 
     async def _run(self, sources, here=None):
         current = _frame_record(_FRAME_ID, fwhm=3.0)
-
-        async def near(positions, radius, before_time, uncatalogued_only=False):
-            if before_time == _OBS_TIME or uncatalogued_only:
-                return {}
-            return {"0": here or []}
-
-        async def covering(positions, before_time):
-            return {str(i): [_make_coverage_frame()] for i in range(len(positions))} if before_time == _OBS_TIME else {}
+        near, covering = _fake_api(here or [], [])
 
         with (
             patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
@@ -2637,6 +2698,11 @@ class TestSuspectFrame:
         result = await self._run(self._sources(3), here=seen)
         assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]  # only the first is seen again
         assert "Seen again" in result[0]["notes"]
+
+    async def test_zero_disables_the_check(self, monkeypatch):
+        monkeypatch.setattr(config, "SUSPECT_FRAME_MIN_SOURCES", 0)
+        result = await self._run(self._sources(3))
+        assert len(result) == 3
 
     async def test_two_bright_uncatalogued_sources_do_not_make_a_frame_suspect(self):
         result = await self._run(self._sources(2))
@@ -2684,3 +2750,12 @@ class TestDiffuseSubtractionCandidate:
         result = await self._run(self._blob(fwhm=4.0), [], [], [], [])
         assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
         assert "Not confirmed yet" in result[0]["notes"]
+
+    async def test_a_diffuse_candidate_is_not_taken_for_a_stars_residual(self):
+        """A new comet beside a star: its 30" FWHM must not stretch the residual radius over the star."""
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        comet = self._blob(fwhm=30.0)
+        star = [(_RA, _DEC + 40.0 / 3600.0, 14.0)]
+        assert _is_residual_of_catalogued_star(comet, star, frame_psf_arcsec=3.0) is False
+        assert _is_residual_of_catalogued_star(comet, star) is True  # no PSF: as before

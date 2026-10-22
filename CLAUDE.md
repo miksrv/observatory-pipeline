@@ -560,10 +560,12 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
   on its straight track, or when no frame can test the track; withdrawn (to what the source is
   without the motion, usually `UNKNOWN`) when it moves exactly as the telescope pointing (a hot
   pixel under dithering) or every frame that should show it — QC `OK`, plate-solved, same filter,
-  covering the predicted position — does not. An `UNKNOWN` or new-source `SUPERNOVA_CANDIDATE`
-  must be detected again in a later frame: absent from every later same-filter frame that
-  covers it → withdrawn, on a track through the later frames → `MOVING_UNKNOWN`, no later frame
-  → kept. Earlier frames never withdraw an alert. A failed request withdraws nothing. In a
+  covering the predicted position — does not (a catalogued detection on the predicted track
+  leaves it untested: the mover may have been matched to a star it passed). An `UNKNOWN` must be
+  detected again in a later frame: absent from every later same-filter frame that covers it →
+  withdrawn, on a track through the later frames → `MOVING_UNKNOWN`, a catalogued detection there
+  or no later frame → kept. `SUPERNOVA_CANDIDATE` is not checked (the host galaxy is detected in
+  every later frame). Earlier frames never withdraw an alert. A failed request withdraws nothing. In a
   **suspect frame** — `SUSPECT_FRAME_MIN_SOURCES`+ uncatalogued star-like sources brighter than
   `SUSPECT_FRAME_MAG`, i.e. ghost copies of stars (mount jump, double exposure) — only a
   confirmed alert stands; likewise for a subtraction candidate wider than

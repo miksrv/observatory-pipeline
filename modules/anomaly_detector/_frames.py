@@ -6,9 +6,8 @@ whether a frame of the same night really imaged a position.
 History and coverage rows carry only a frame id, a time and a position, so
 anything about the frame behind them — its camera, plate scale, pointing,
 filter, QC flag, whether it was plate-solved at all — comes from here. Records are
-cached for the life of the process: a frame's stored record does not change
-once registered, and one DETECT_ANOMALIES task walks the same field's
-history frame after frame.
+cached for an hour: one DETECT_ANOMALIES task walks the same field's history
+frame after frame, while a re-analysis or deletion is seen soon enough.
 
 Internal helpers only — not part of this package's public surface.
 """
@@ -18,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 
 import api_client
 import config
@@ -26,10 +26,14 @@ from ._geometry import _haversine_arcsec
 
 logger = logging.getLogger(__name__)
 
-# frame_id -> stored record (GET /frames/{id}), or None when the API had none.
-_RECORDS: dict[str, dict | None] = {}
-# Objects whose whole frame list has already been loaded into _RECORDS.
-_LOADED_OBJECTS: set[str] = set()
+# frame_id -> (time cached, stored record from GET /frames/{id}). A failed
+# lookup is never cached, so the next detection asks again.
+_RECORDS: dict[str, tuple[float, dict]] = {}
+# object -> time its whole frame list was last loaded into _RECORDS.
+_LOADED_OBJECTS: dict[str, float] = {}
+# A re-analysis can change a frame's QC flag or solve, and DELETE_FRAME
+# removes it: records are re-read after this long.
+_TTL_SEC = 3600.0
 # GET /frames pages through at most this many frames per request.
 _PAGE = 500
 # Concurrent single-frame lookups for ids the object listing did not return.
@@ -42,27 +46,33 @@ def _clear_cache() -> None:
     _LOADED_OBJECTS.clear()
 
 
+def _fresh(cached_at: float | None) -> bool:
+    return cached_at is not None and time.monotonic() - cached_at < _TTL_SEC
+
+
 async def _load_object(object_name: str) -> None:
     """One listing for the whole field instead of one request per frame."""
-    if object_name in _LOADED_OBJECTS:
+    if _fresh(_LOADED_OBJECTS.get(object_name)):
         return
     offset = 0
+    now = time.monotonic()
     while True:
         page = await api_client.get_frames(object_name=object_name, limit=_PAGE, offset=offset)
         for frame in page or []:
             frame_id = frame.get("id")
             if frame_id:
-                _RECORDS[str(frame_id)] = frame
+                _RECORDS[str(frame_id)] = (now, frame)
         if not page or len(page) < _PAGE:
             break
         offset += _PAGE
-    _LOADED_OBJECTS.add(object_name)
+    if offset or page:
+        _LOADED_OBJECTS[object_name] = now
 
 
 async def _frame_records(frame_ids, object_name: str | None = None) -> dict[str, dict]:
     """
     Stored records of `frame_ids`, keyed by id. A frame the API cannot
-    return is simply absent — every caller treats a missing record as "this
+    return (deleted, or a failed request — not cached) is simply absent — every caller treats a missing record as "this
     frame tells us nothing", never as evidence.
 
     The field's own listing (`object_name`) is loaded first; a frame filed
@@ -72,23 +82,31 @@ async def _frame_records(frame_ids, object_name: str | None = None) -> dict[str,
     wanted = {str(f) for f in frame_ids if f}
     if not wanted:
         return {}
-    if object_name and wanted - _RECORDS.keys():
+
+    def _missing() -> list[str]:
+        return sorted(f for f in wanted if not _fresh(_RECORDS.get(f, (None,))[0]))
+
+    if object_name and _missing():
         try:
             await _load_object(object_name)
         except Exception as exc:  # a listing failure only costs the batch shortcut
             logger.warning("Listing frames of object=%s failed: %s", object_name, exc)
 
-    missing = sorted(wanted - _RECORDS.keys())
+    missing = _missing()
     if missing:
         semaphore = asyncio.Semaphore(_CONCURRENCY)
 
         async def _fetch(frame_id: str) -> None:
             async with semaphore:
-                _RECORDS[frame_id] = await api_client.get_frame(frame_id)
+                record = await api_client.get_frame(frame_id)
+            if record:
+                _RECORDS[frame_id] = (time.monotonic(), record)
+            else:
+                _RECORDS.pop(frame_id, None)
 
         await asyncio.gather(*(_fetch(f) for f in missing))
 
-    return {f: _RECORDS[f] for f in wanted if _RECORDS.get(f)}
+    return {f: _RECORDS[f][1] for f in wanted if f in _RECORDS and _fresh(_RECORDS[f][0])}
 
 
 def _finite(value) -> float | None:

@@ -379,7 +379,7 @@ each candidate up to the end of the window (`POST /sources/near/batch` with
 `uncatalogued_only` and `before_time` = obs_time + window), the frames covering it
 (`POST /frames/covering/batch`, same `before_time`), and those frames' stored records
 (`_frames.py`: one `GET /frames?object=` listing per field, `GET /frames/{id}` for the
-rest, cached for the process).
+rest, cached for an hour; a failed lookup is not cached).
 
 **`MOVING_UNKNOWN`.** Every detection in the window that could be the object at another
 time — more than `MATCH_CONE_ARCSEC` away, within a mover's reach over that gap
@@ -387,7 +387,8 @@ time — more than `MATCH_CONE_ARCSEC` away, within a mover's reach over that ga
 pairing and a velocity:
 
 - a pairing whose displacement equals the shift of the telescope pointing between the two
-  frames (within `MATCH_CONE_ARCSEC`) is fixed on the sensor — a hot pixel, which a dithered
+  frames (within `MATCH_CONE_ARCSEC`; both plate-solved, the same optics) is fixed on the
+  sensor — a hot pixel, which a dithered
   sequence moves across the sky exactly as the pointing;
 - a pairing that moved no more than 2 × `MATCH_CONE_ARCSEC` is left untested: motion and
   centroid scatter look alike there (a 13.9 mag "mover" on M63 moved 6″ in 15 min, and no
@@ -398,19 +399,26 @@ pairing and a velocity:
   predicted position inside the frame (`_covers()`: the inscribed circle less the edge
   margin) — and **untested** otherwise.
 
+A refutation is then checked once more: a detection of any kind (`POST
+/sources/near/batch` without `uncatalogued_only`) at a predicted position in the refuting
+frame leaves the track untested — the mover may have been matched to a star it passed.
+
 Confirmed → kept, the track in `notes`. Any pairing untested, or no pairing in the window
 → kept, "not confirmed yet" in `notes`. Only sensor-fixed pairings, or every pairing
 refuted → withdrawn: the anomaly becomes what `_classify_source_sync(allow_moving=False)`
-made of the same source (`_fallback`, computed in `detect()`; usually `UNKNOWN`), with the
-reason in `notes`, and is checked as that below. A request that fails withdraws nothing.
+made of the same source (`_fallback`, a callable from `detect()`, run only now; usually
+`UNKNOWN`), with the reason in `notes`, and is checked as that below. A sensor-fixed pairing
+outweighs a pairing too short to mean anything. A request that fails withdraws nothing.
 On the 2026-10-22 M51/M63/M82 run most of the 120 `MOVING_UNKNOWN`s were hot pixels or
 cosmic rays paired with each other.
 
-**`UNKNOWN` and a new-source `SUPERNOVA_CANDIDATE`** (no `delta_mag`) must still be there:
-a supernova or nova stays for days, a cosmic ray, a hot pixel (dithered away) or a
-subtraction residual does not.
+**`UNKNOWN`** must still be there: a nova stays for days, a cosmic ray, a hot pixel
+(dithered away) or a subtraction residual does not. (`SUPERNOVA_CANDIDATE` is not checked:
+a new one is a subtraction candidate matched to its host galaxy, which every later frame
+detects at the same place, and nothing on the wire tells the two apart.)
 
-- A detection within `MATCH_CONE_ARCSEC` in a later frame of the window → kept, confirmed.
+- An uncatalogued detection within `MATCH_CONE_ARCSEC` in a later frame of the window → kept,
+  confirmed. A catalogued one there → kept, untested: it says nothing either way.
 - Otherwise, a straight track through it in the later frames (the `MOVING_UNKNOWN` test
   above) → it is a mover first seen here: reclassified `MOVING_UNKNOWN`. A possible track
   nothing can test → kept.
@@ -432,7 +440,10 @@ one (M82 G 2020-08-21T22-34-31 alone posted 32 alerts).
 `SUBTRACTION_DIFFUSE_FWHM_RATIO` (2.5) × the frame's PSF is held to the same rule: it stands
 only when confirmed (`_needs_confirmation()`). On the 2026-10-22 run 60 alerts were such
 blobs, 3–20 × the PSF, over pure noise in the frame itself. A new comet is diffuse too, but
-still there in the next frames; a known one is matched through MPC first.
+still there in the next frames; a known one is matched through MPC first. For the same
+reason a diffuse candidate is never taken for a star's residual
+(`_is_residual_of_catalogued_star()`): its FWHM would stretch the residual radius over
+any star within a minute of arc.
 
 So an alert from a sequence's last frame, or from detection run before the next frames
 were ingested, stands as before (unless its frame is suspect or it is diffuse); running `DETECT_ANOMALIES` once a night's frames are all

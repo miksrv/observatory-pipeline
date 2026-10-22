@@ -226,10 +226,12 @@ async def detect(
                 # For the alert confirmation below; stripped before returning.
                 result["_source"] = source
                 if result["anomaly_type"] == AnomalyType.MOVING_UNKNOWN:
-                    fallback = _classify_source_sync(source, allow_moving=False, **classify_args)
-                    if fallback is not None:
-                        fallback["_source"] = source
-                    result["_fallback"] = fallback
+                    # What the source is without the motion evidence, classified
+                    # only if _confirm withdraws the motion.
+                    result["_fallback"] = (
+                        lambda source=source, args=classify_args:
+                        _classify_source_sync(source, allow_moving=False, **args)
+                    )
                 anomalies.append(result)
         except Exception as exc:
             logger.error(
@@ -243,7 +245,7 @@ async def detect(
     # real ones; there only a confirmed alert stands.
     ghosts = _ghost_sources(sources, frame_psf_arcsec)
     suspect = None
-    if len(ghosts) >= max(1, config.SUSPECT_FRAME_MIN_SOURCES):
+    if config.SUSPECT_FRAME_MIN_SOURCES > 0 and len(ghosts) >= config.SUSPECT_FRAME_MIN_SOURCES:
         suspect = (
             f"{len(ghosts)} uncatalogued star-like sources brighter than "
             f"{config.SUSPECT_FRAME_MAG:g} mag in a suspect frame — ghost images "
