@@ -560,7 +560,10 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
   on its straight track, or when no frame can test the track; withdrawn (to what the source is
   without the motion, usually `UNKNOWN`) when it moves exactly as the telescope pointing (a hot
   pixel under dithering) or every frame that should show it — QC `OK`, plate-solved, same filter,
-  covering the predicted position — does not. A failed request withdraws nothing.
+  covering the predicted position — does not. An `UNKNOWN` or new-source `SUPERNOVA_CANDIDATE`
+  must be detected again in a later frame: absent from every later same-filter frame that
+  covers it → withdrawn, on a track through the later frames → `MOVING_UNKNOWN`, no later frame
+  → kept. Earlier frames never withdraw an alert. A failed request withdraws nothing.
 - **Significant Δmag** = above `DELTA_MAG_ALERT` **and** above `VARIABILITY_SIGMA` × (`mag_err` ⊕
   historical scatter), **and confirmed** by the previous `VARIABILITY_CONFIRM_EPOCHS − 1`
   same-filter epochs (one deviant epoch is usually a cosmic ray). Uses the calibrated `mag` only.

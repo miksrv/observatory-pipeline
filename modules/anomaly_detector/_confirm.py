@@ -19,6 +19,15 @@ that should show it — QC passed, plate-solved, the same filter, covering the
 predicted position — shows nothing there. A withdrawn mover falls back to
 what the source is without the motion evidence (usually UNKNOWN).
 
+An UNKNOWN (and a SUPERNOVA_CANDIDATE for a new source) is the other way
+round: it should still be there. Most UNKNOWN alerts on that run were in one
+frame only — cosmic rays, hot pixels, subtraction residuals. It is kept when
+a later frame detects it again or when no later frame images it yet,
+reclassified MOVING_UNKNOWN when it lies on a track through the later frames
+(a mover seen first here), and withdrawn when every later same-filter frame
+covering it shows nothing. Earlier frames never withdraw an alert: that they
+show nothing here is why it is new.
+
 Internal helpers only — not part of this package's public surface.
 """
 
@@ -89,8 +98,9 @@ def _track_verdict(
     current_centre: tuple[float, float] | None,
 ) -> tuple[str, str]:
     """
-    ("confirmed" | "untested" | "refuted", explanation) for a candidate mover
-    at (ra, dec). `pool` holds the uncatalogued detections around it within
+    ("confirmed" | "untested" | "refuted" | "unpaired", explanation) for a
+    candidate mover at (ra, dec) — "unpaired" when no detection in the window
+    could be it at another time. `pool` holds the uncatalogued detections around it within
     the window, `frames` the frames of the window (id → (minutes, record)).
 
     Every detection in `pool` that could be this object's position at
@@ -149,7 +159,7 @@ def _track_verdict(
                 f"moves with the telescope pointing in {n_sensor_fixed} pairing(s) — "
                 f"fixed on the sensor (hot pixel), not on the sky"
             )
-        return "untested", "no detection within the window to pair it with"
+        return "unpaired", "no detection within the window to pair it with"
 
     untested = False
     refuted_by: set[str] = set()
@@ -206,59 +216,62 @@ async def _confirm_alerts(
     extra: dict,
 ) -> list[dict]:
     """
-    Check every MOVING_UNKNOWN in `anomalies` against the frames around it
-    (see the module docstring) and return the anomaly list with the refuted
-    ones replaced by their fallback classification (`_fallback`, set by
-    detect(); None drops it). Needs each anomaly's `_source`.
+    Check the alerts in `anomalies` against the frames around this one and
+    return the list with the outcome applied (see the module docstring).
+    Needs each anomaly's `_source`, and a MOVING_UNKNOWN's `_fallback`.
 
-    Two batch requests for the whole frame — the uncatalogued detections and
-    the covering frames up to `ALERT_CONFIRM_WINDOW_MIN` after this frame —
-    plus the stored records of the frames involved. If any of it cannot be
-    fetched the anomalies are returned untouched: a check that cannot run
-    never withdraws an alert.
+    Three batch requests for the whole frame — detections at each alert's own
+    position, the uncatalogued detections around it, and the covering frames,
+    all up to `ALERT_CONFIRM_WINDOW_MIN` after this frame — plus the stored
+    records of the frames involved. If any of it cannot be fetched the
+    anomalies are returned untouched: a check that cannot run never
+    withdraws an alert.
     """
     window = config.ALERT_CONFIRM_WINDOW_MIN
-    movers = [a for a in anomalies if a.get("anomaly_type") == AnomalyType.MOVING_UNKNOWN]
+    alerts = [a for a in anomalies if _is_checked(a)]
     t0 = _parse_obs_time(obs_time)
-    if window <= 0 or not movers or t0 is None:
+    if window <= 0 or not alerts or t0 is None:
         return anomalies
 
     until = (t0 + datetime.timedelta(minutes=window)).isoformat() + "Z"
-    positions = [{"ra": float(a["ra"]), "dec": float(a["dec"])} for a in movers]
+    positions = [{"ra": float(a["ra"]), "dec": float(a["dec"])} for a in alerts]
     pool_radius = max(config.MOVING_CONE_ARCSEC, config.MOVING_CONE_MAX_ARCSEC)
 
     try:
-        pool_result, coverage_result = await asyncio.gather(
+        here_result, pool_result, coverage_result = await asyncio.gather(
+            api_client.get_sources_near_batch(positions, config.MATCH_CONE_ARCSEC, until),
             api_client.get_sources_near_batch(positions, pool_radius, until, uncatalogued_only=True),
             api_client.get_frames_covering_batch(positions, until),
         )
     except Exception as exc:
-        pool_result = coverage_result = None
+        here_result = pool_result = coverage_result = None
         logger.warning("Alert confirmation: request failed (%s)", exc, extra=extra)
-    if not isinstance(pool_result, dict) or not isinstance(coverage_result, dict):
+    if not all(isinstance(r, dict) for r in (here_result, pool_result, coverage_result)):
         logger.warning(
             "Alert confirmation skipped: the frames around this one could not be "
-            "fetched — %d MOVING_UNKNOWN kept unchecked", len(movers),
+            "fetched — %d alert(s) kept unchecked", len(alerts),
             extra=extra,
         )
         return anomalies
 
-    pools: list[list[_Detection]] = []
-    window_frames: list[dict[str, float]] = []
-    frame_ids: set[str] = set()
-    for k in range(len(movers)):
-        pool: list[_Detection] = []
-        for row in pool_result.get(str(k), []) or []:
+    def _rows(result: dict, k: int) -> list[_Detection]:
+        detections = []
+        for row in result.get(str(k), []) or []:
             minutes = _minutes_from(t0, row.get("obs_time"))
             if minutes is None or abs(minutes) > window or not row.get("frame_id"):
                 continue
+            if str(row["frame_id"]) == frame_id:
+                continue
             try:
-                pool.append(_Detection(float(row["ra"]), float(row["dec"]), minutes, str(row["frame_id"])))
+                detections.append(_Detection(float(row["ra"]), float(row["dec"]), minutes, str(row["frame_id"])))
             except (KeyError, TypeError, ValueError):
                 continue
-            frame_ids.add(str(row["frame_id"]))
-        pools.append(pool)
+        return detections
 
+    here = [_rows(here_result, k) for k in range(len(alerts))]
+    pools = [_rows(pool_result, k) for k in range(len(alerts))]
+    window_frames: list[dict[str, float]] = []
+    for k in range(len(alerts)):
         frames: dict[str, float] = {}
         for frame in coverage_result.get(str(k), []) or []:
             minutes = _minutes_from(t0, frame.get("obs_time"))
@@ -266,9 +279,10 @@ async def _confirm_alerts(
             if minutes is None or abs(minutes) > window or not fid or str(fid) == frame_id:
                 continue
             frames[str(fid)] = minutes
-            frame_ids.add(str(fid))
         window_frames.append(frames)
 
+    frame_ids = {d.frame_id for pool in pools for d in pool}
+    frame_ids.update(fid for frames in window_frames for fid in frames)
     records: dict[str, dict] = {}
     if frame_ids:
         object_name = (frame_meta.get("frame") or {}).get("object")
@@ -277,57 +291,133 @@ async def _confirm_alerts(
         except Exception as exc:
             logger.warning("Alert confirmation: frame lookup failed (%s)", exc, extra=extra)
 
-    current_record = frame_meta.get("frame") or frame_meta
-    current_centre = _centre(current_record)
+    current_centre = _centre(frame_meta.get("frame") or frame_meta)
+    index = {id(a): k for k, a in enumerate(alerts)}
 
-    verdicts: dict[int, tuple[str, str]] = {}
-    for k, anomaly in enumerate(movers):
-        source = anomaly.get("_source") or {}
-        frames = {
-            fid: (minutes, records[fid])
-            for fid, minutes in window_frames[k].items() if fid in records
-        }
+    def _frames_for(k: int) -> dict[str, tuple[float, dict]]:
+        frames = {fid: (m, records[fid]) for fid, m in window_frames[k].items() if fid in records}
         # Pool detections need their frame's pointing for the sensor-fixed test.
         for det in pools[k]:
             if det.frame_id in records and det.frame_id not in frames:
                 frames[det.frame_id] = (det.minutes, records[det.frame_id])
-        verdicts[id(anomaly)] = _track_verdict(
+        return frames
+
+    def _track(anomaly: dict, k: int) -> tuple[str, str]:
+        return _track_verdict(
             float(anomaly["ra"]), float(anomaly["dec"]), obs_time, frame_id,
-            source.get("_filter"), pools[k], frames, current_frame_positions, current_centre,
+            (anomaly.get("_source") or {}).get("_filter"), pools[k], _frames_for(k),
+            current_frame_positions, current_centre,
         )
 
+    def _stationary(anomaly: dict, k: int) -> tuple[str, str]:
+        """
+        ("confirmed" | "moving" | "untested" | "refuted", explanation) for an
+        alert that should still be there in the next frames: a supernova or a
+        nova stays for days, a cosmic ray or a hot pixel is gone (dithered).
+        """
+        later = sorted({d.frame_id for d in here[k] if d.minutes > 0.0})
+        if later:
+            return "confirmed", f"Seen again in {len(later)} later frame(s) within {window:g} min."
+
+        # Gone from here — but a mover first seen in this frame is somewhere
+        # else in the next ones: a track through it is a MOVING_UNKNOWN.
+        track_state, track_note = _track(anomaly, k)
+        if track_state == "confirmed":
+            return "moving", track_note
+        if track_state == "untested":
+            return "untested", f"absent from later frames here, but {track_note}"
+
+        filter_name = (anomaly.get("_source") or {}).get("_filter")
+        ra, dec = float(anomaly["ra"]), float(anomaly["dec"])
+        refuting = [
+            fid for fid, (minutes, record) in _frames_for(k).items()
+            if minutes > 0.0 and _is_solved_ok(record)
+            and record.get("filter") == filter_name and _covers(record, ra, dec)
+        ]
+        if refuting:
+            return "refuted", (
+                f"absent from {len(refuting)} later frame(s) that cover it through the "
+                f"same filter — a cosmic ray, hot pixel or residual, not an object"
+            )
+        return "untested", "no later frame of this position through the same filter"
+
+    counts: dict[str, int] = {}
     result: list[dict] = []
-    counts = {"confirmed": 0, "untested": 0, "refuted": 0}
     for anomaly in anomalies:
-        verdict = verdicts.get(id(anomaly))
-        if verdict is None:
+        if id(anomaly) not in index:
             result.append(anomaly)
             continue
-        state, note = verdict
-        counts[state] += 1
-        if state == "refuted":
-            fallback = anomaly.get("_fallback")
-            logger.info(
-                "MOVING_UNKNOWN withdrawn at ra=%.4f dec=%.4f: %s — now %s",
-                anomaly["ra"], anomaly["dec"], note,
-                fallback["anomaly_type"] if fallback else "no anomaly",
-                extra=extra,
-            )
-            if fallback is not None:
+        k = index[id(anomaly)]
+        if anomaly.get("anomaly_type") == AnomalyType.MOVING_UNKNOWN:
+            state, note = _track(anomaly, k)
+            if state == "unpaired":
+                state = "untested"
+            counts[f"MOVING_UNKNOWN {state}"] = counts.get(f"MOVING_UNKNOWN {state}", 0) + 1
+            if state == "refuted":
+                fallback = anomaly.get("_fallback")
+                logger.info(
+                    "MOVING_UNKNOWN withdrawn at ra=%.4f dec=%.4f: %s — now %s",
+                    anomaly["ra"], anomaly["dec"], note,
+                    fallback["anomaly_type"] if fallback else "no anomaly",
+                    extra=extra,
+                )
+                if fallback is None:
+                    continue
                 fallback["notes"] = (
                     f"{fallback.get('notes') or ''} Classified MOVING_UNKNOWN first, "
                     f"withdrawn: {note}."
                 ).strip()
-                result.append(fallback)
+                if not _is_checked(fallback):
+                    result.append(fallback)
+                    continue
+                anomaly = fallback  # checked as what it fell back to, below
+            else:
+                if state == "untested":
+                    note = f"Track not confirmed yet: {note} ({window:g} min)."
+                anomaly["notes"] = f"{anomaly.get('notes') or ''} {note}".strip()
+                result.append(anomaly)
+                continue
+
+        state, note = _stationary(anomaly, k)
+        label = str(getattr(anomaly["anomaly_type"], "value", anomaly["anomaly_type"]))
+        counts[f"{label} {state}"] = counts.get(f"{label} {state}", 0) + 1
+        if state == "refuted":
+            logger.info(
+                "%s withdrawn at ra=%.4f dec=%.4f: %s",
+                label, anomaly["ra"], anomaly["dec"], note,
+                extra=extra,
+            )
             continue
-        if state == "untested":
-            note = f"Track not confirmed yet: {note} ({window:g} min)."
+        if state == "moving":
+            logger.warning(
+                "ALERT — MOVING_UNKNOWN: %s at ra=%.4f dec=%.4f is on a track through "
+                "the next frames — %s",
+                label, anomaly["ra"], anomaly["dec"], note,
+                extra=extra,
+            )
+            anomaly["anomaly_type"] = AnomalyType.MOVING_UNKNOWN
+            note = f"First seen in this frame, then moved: {note}"
+        elif state == "untested":
+            note = f"Not confirmed yet: {note} ({window:g} min)."
         anomaly["notes"] = f"{anomaly.get('notes') or ''} {note}".strip()
         result.append(anomaly)
 
     logger.info(
-        "Alert confirmation: MOVING_UNKNOWN %d confirmed, %d untested, %d withdrawn",
-        counts["confirmed"], counts["untested"], counts["refuted"],
+        "Alert confirmation: %s",
+        ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "nothing to check",
         extra=extra,
     )
     return result
+
+
+def _is_checked(anomaly: dict) -> bool:
+    """
+    The alerts this module checks: MOVING_UNKNOWN, UNKNOWN, and the
+    SUPERNOVA_CANDIDATE for a new source (no delta_mag). A galaxy that
+    brightened against its own light curve has already been confirmed over
+    `VARIABILITY_CONFIRM_EPOCHS`.
+    """
+    anomaly_type = anomaly.get("anomaly_type")
+    if anomaly_type in (AnomalyType.MOVING_UNKNOWN, AnomalyType.UNKNOWN):
+        return True
+    return anomaly_type == AnomalyType.SUPERNOVA_CANDIDATE and anomaly.get("delta_mag") is None

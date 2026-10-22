@@ -2427,12 +2427,15 @@ class TestMovingUnknownTrackConfirmation:
         assert "withdrawn" in result[0]["notes"]
         assert "telescope pointing" in result[0]["notes"]
 
-    async def test_a_frame_that_should_show_the_track_and_does_not_withdraws_it(self):
+    async def test_a_frame_that_should_show_the_track_and_does_not_withdraws_it(self, caplog):
+        """Withdrawn to UNKNOWN — which the same later frame then refutes too."""
         before = self._det(-5, 30.0, "f-5")
         records = [self._frame("f-5", -5), self._frame("f+5", +5)]
-        result = await self._run([before], [before], [{"id": "f+5", "obs_time": _at(5)}], records)
-        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
-        assert "no detection on its track" in result[0]["notes"]
+        with caplog.at_level("INFO", logger="modules.anomaly_detector._confirm"):
+            result = await self._run([before], [before], [{"id": "f+5", "obs_time": _at(5)}], records)
+        assert result == []
+        assert "no detection on its track" in caplog.text
+        assert "UNKNOWN withdrawn" in caplog.text
 
     @pytest.mark.parametrize("change", [
         {"filter": "Ha"},               # shallower, another band
@@ -2469,3 +2472,101 @@ class TestMovingUnknownTrackConfirmation:
         before = self._det(-5, 30.0, "f-5")
         result = await self._run([before], [before], [], [self._frame("f-5", -5)])
         assert not [k for a in result for k in a if k.startswith("_")]
+
+
+class TestStationaryAlertConfirmation:
+    """
+    2026-10-22 run: most UNKNOWN alerts were cosmic rays, hot pixels and
+    subtraction residuals present in one frame only. A supernova or nova is
+    still there five minutes later; an alert absent from every later frame
+    that images its position through the same filter is withdrawn. A mover
+    first seen in this frame becomes MOVING_UNKNOWN instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch):
+        monkeypatch.setattr(config, "ALERT_CONFIRM_WINDOW_MIN", 180.0)
+        ad._frames._clear_cache()
+        yield
+        ad._frames._clear_cache()
+
+    async def _run(self, source, here, pool, frames, records):
+        current = _frame_record(_FRAME_ID)
+
+        async def near(positions, radius, before_time, uncatalogued_only=False):
+            if before_time == _OBS_TIME:
+                return {"0": []}
+            return {"0": pool if uncatalogued_only else here}
+
+        async def covering(positions, before_time):
+            if before_time == _OBS_TIME:
+                return {"0": [_make_coverage_frame()]}
+            return {"0": frames}
+
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", side_effect=near),
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", side_effect=covering),
+            patch("modules.anomaly_detector.api_client.get_frames", new_callable=AsyncMock) as mock_frames,
+            patch("modules.anomaly_detector.api_client.get_frame", new_callable=AsyncMock) as mock_frame,
+        ):
+            mock_frames.return_value = [current, *records]
+            mock_frame.return_value = None
+            return await ad.detect(_FRAME_ID, [source], [source], {**_FRAME_META, "frame": current})
+
+    _det = staticmethod(TestMovingUnknownTrackConfirmation._det)
+    _frame = staticmethod(TestMovingUnknownTrackConfirmation._frame)
+
+    @staticmethod
+    def _unknown():
+        return _make_source(mag=16.0, catalog_name=None)
+
+    async def test_seen_again_later_is_confirmed(self):
+        result = await self._run(self._unknown(), [self._det(5, 0.0, "f+5")], [],
+                                 [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Seen again in 1 later frame" in result[0]["notes"]
+
+    async def test_absent_from_a_later_frame_that_covers_it_is_withdrawn(self):
+        result = await self._run(self._unknown(), [], [],
+                                 [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)])
+        assert result == []
+
+    async def test_an_earlier_frame_never_withdraws_it(self):
+        """Earlier frames that show nothing here are the reason it is new."""
+        result = await self._run(self._unknown(), [], [],
+                                 [{"id": "f-5", "obs_time": _at(-5)}], [self._frame("f-5", -5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Not confirmed yet" in result[0]["notes"]
+
+    @pytest.mark.parametrize("change", [
+        {"filter": "Ha"}, {"quality_flag": "LOW_STARS"}, {"position_angle_deg": None},
+        {"ra_center": _RA + 1.0},
+    ])
+    async def test_only_a_usable_later_frame_withdraws_it(self, change):
+        record = {**self._frame("f+5", 5), **change}
+        result = await self._run(self._unknown(), [], [], [{"id": "f+5", "obs_time": _at(5)}], [record])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+
+    async def test_a_new_mover_on_a_track_becomes_moving_unknown(self):
+        """First seen here: no earlier detection to pair with, but the next two frames show it moving."""
+        pool = [self._det(5, -30.0, "f+5"), self._det(10, -60.0, "f+10")]
+        frames = [{"id": "f+5", "obs_time": _at(5)}, {"id": "f+10", "obs_time": _at(10)}]
+        records = [self._frame("f+5", 5), self._frame("f+10", 10)]
+        result = await self._run(self._unknown(), [], pool, frames, records)
+        assert [a["anomaly_type"] for a in result] == ["MOVING_UNKNOWN"]
+        assert "First seen in this frame, then moved" in result[0]["notes"]
+
+    async def test_a_possible_mover_that_cannot_be_tested_is_kept(self):
+        """Gone from here, one detection nearby in the next frame, nothing to test the line with."""
+        pool = [self._det(5, -30.0, "f+5")]
+        result = await self._run(self._unknown(), [], pool, [{"id": "f+5", "obs_time": _at(5)}],
+                                 [self._frame("f+5", 5)])
+        assert [a["anomaly_type"] for a in result] == ["UNKNOWN"]
+        assert "Not confirmed yet" in result[0]["notes"]
+
+    async def test_a_supernova_candidate_must_still_be_there(self):
+        source = _make_source(mag=16.0, catalog_name="Simbad", object_type="Sy2", from_subtraction=True)
+        frames, records = [{"id": "f+5", "obs_time": _at(5)}], [self._frame("f+5", 5)]
+        assert await self._run(source, [], [], frames, records) == []
+        kept = await self._run(source, [self._det(5, 0.0, "f+5")], [], frames, records)
+        assert [a["anomaly_type"] for a in kept] == ["SUPERNOVA_CANDIDATE"]

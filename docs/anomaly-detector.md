@@ -362,7 +362,7 @@ Simbad OTYPE tests used by the classifiers:
 | `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening by a significant Δmag (as above) | **Yes** |
 | `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold; not withdrawn by the alert confirmation (track moving with the pointing, or absent from every frame that should show it) | **Yes** |
 | `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | No (recorded so a fast mover's track is never erased and does not pollute `UNKNOWN`; an operator need not act on a satellite pass — decided 2026-09-22). The API mirrors this in its own `AnomalyModel::ALERT_TYPES` |
-| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()` | **Yes** |
+| `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()`; not withdrawn by the alert confirmation (absent from a later same-filter frame of its position) | **Yes** |
 
 The list is fixed as `AnomalyType(str, Enum)` (in `types.py`) and must match
 `AnomalyModel::ALLOWED_TYPES`/the `ENUM` constraint on the `observatory-api` side — the
@@ -402,9 +402,26 @@ Confirmed → kept, the track in `notes`. Any pairing untested, or no pairing in
 → kept, "not confirmed yet" in `notes`. Only sensor-fixed pairings, or every pairing
 refuted → withdrawn: the anomaly becomes what `_classify_source_sync(allow_moving=False)`
 made of the same source (`_fallback`, computed in `detect()`; usually `UNKNOWN`), with the
-reason in `notes`. A request that fails withdraws nothing. On the 2026-10-22 M51/M63/M82
-run most of the 120 `MOVING_UNKNOWN`s were hot pixels or cosmic rays paired with each
-other.
+reason in `notes`, and is checked as that below. A request that fails withdraws nothing.
+On the 2026-10-22 M51/M63/M82 run most of the 120 `MOVING_UNKNOWN`s were hot pixels or
+cosmic rays paired with each other.
+
+**`UNKNOWN` and a new-source `SUPERNOVA_CANDIDATE`** (no `delta_mag`) must still be there:
+a supernova or nova stays for days, a cosmic ray, a hot pixel (dithered away) or a
+subtraction residual does not.
+
+- A detection within `MATCH_CONE_ARCSEC` in a later frame of the window → kept, confirmed.
+- Otherwise, a straight track through it in the later frames (the `MOVING_UNKNOWN` test
+  above) → it is a mover first seen here: reclassified `MOVING_UNKNOWN`. A possible track
+  nothing can test → kept.
+- Otherwise, a **later** frame that covers the position through the same filter, QC `OK`
+  and plate-solved → withdrawn. Earlier frames never withdraw it: they showing nothing
+  here is why it is new.
+- Otherwise (no such frame yet) → kept, "not confirmed yet" in `notes`.
+
+So an alert from a sequence's last frame, or from detection run before the next frames
+were ingested, stands as before; running `DETECT_ANOMALIES` once a night's frames are all
+in gives the check its evidence.
 
 ---
 

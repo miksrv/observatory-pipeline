@@ -335,9 +335,10 @@ MOVING_EXTEND_MAX_GAP_MIN: float = float(_get("MOVING_EXTEND_MAX_GAP_MIN", "30.0
 # _confirm.py). A MOVING_UNKNOWN must line up with detections in them on a
 # straight track and must not move with the telescope (a hot pixel follows
 # the dither); it is dropped only when a frame that should show the track
-# shows nothing there. With no such frame — a sequence's last frame, or
-# detection run as soon as a frame arrives — the alert stands as before.
-# 0 disables the check.
+# shows nothing there. An UNKNOWN or a new-source SUPERNOVA_CANDIDATE must be
+# detected again in a later frame of its position through the same filter.
+# With no such frame — a sequence's last frame, or detection run as soon as a
+# frame arrives — the alert stands as before. 0 disables the check.
 ALERT_CONFIRM_WINDOW_MIN: float = float(_get("ALERT_CONFIRM_WINDOW_MIN", "180.0"))
 
 DELTA_MAG_ALERT: float = float(_get("DELTA_MAG_ALERT", "0.5"))
