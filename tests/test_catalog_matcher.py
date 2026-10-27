@@ -32,6 +32,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import astropy.units as u
+import httpx
 import numpy as np
 import pytest
 from astropy.coordinates import SkyCoord
@@ -39,6 +40,7 @@ from astropy.table import Table
 
 import config
 import modules.catalog_matcher as cm
+from modules.catalog_matcher import _mpc, _sbident
 
 
 # ---------------------------------------------------------------------------
@@ -46,11 +48,18 @@ import modules.catalog_matcher as cm
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def clear_cache():
+def clear_cache(monkeypatch):
     """Wipe the module-level cache before every test for isolation."""
     cm._cache.clear()
+    _mpc._down_until.clear()
+    # A failed SkyBot query falls through to JPL's sb_ident: never over the
+    # network in a test. TestJplSbident patches httpx.get itself.
+    def _no_network(*args, **kwargs):
+        raise RuntimeError("network disabled in tests")
+    monkeypatch.setattr(_sbident.httpx, "get", _no_network)
     yield
     cm._cache.clear()
+    _mpc._down_until.clear()
 
 
 # Centre of a synthetic test field — chosen to keep delta_ra negligible
@@ -444,6 +453,316 @@ class TestSkybotRetry:
 
         assert len(calls) == 1
         assert self.sleeps == []
+
+
+# ===========================================================================
+# TestMpcSourceFallback — SkyBot first, JPL sb_ident when it fails
+# ===========================================================================
+
+_EPOCH = "2024-03-15T22:01:34"
+_JPL_OBJECT = {"ra": _RA, "dec": _DEC, "designation": "Krat", "object_type": "ASTEROID"}
+
+
+class TestMpcSourceFallback:
+    """
+    SkyBot answered nginx 502 for days from 2026-10-23 and every frame
+    ingested meanwhile lost its ASTEROID/COMET matching; JPL's Small-Body
+    Identification API answers the same question from other infrastructure.
+    """
+
+    @pytest.fixture(autouse=True)
+    def sources(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(config, "CATALOG_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(config, "MPC_SOURCES", ("skybot", "jpl"))
+        monkeypatch.setattr(config, "MPC_SOURCE_COOLDOWN_SEC", 900.0)
+        monkeypatch.setattr(config, "SKYBOT_MAX_ATTEMPTS", 1)
+        self.calls: list[str] = []
+        self.skybot: Any = ValueError("502 Bad Gateway")
+        self.jpl: Any = [_JPL_OBJECT]
+
+        def _answer(name, outcome):
+            self.calls.append(name)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(_mpc, "_query_skybot", lambda *a: _answer("skybot", self.skybot))
+        monkeypatch.setattr(_sbident, "_query_sbident", lambda *a: _answer("jpl", self.jpl))
+
+    def test_skybot_answers_and_jpl_is_not_asked(self):
+        self.skybot = []
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == []
+        assert self.calls == ["skybot"]
+
+    def test_a_failed_skybot_query_falls_back_to_jpl(self):
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == [_JPL_OBJECT]
+        assert self.calls == ["skybot", "jpl"]
+
+    def test_the_fallback_answer_is_cached(self):
+        cm._query_mpc(_RA, _DEC, _EPOCH, 1.0)
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == [_JPL_OBJECT]
+        assert self.calls == ["skybot", "jpl"]
+
+    def test_a_failed_source_is_asked_last_during_its_cooldown(self):
+        cm._query_mpc(_RA, _DEC, _EPOCH, 1.0)
+        self.calls.clear()
+
+        cm._query_mpc(_RA, _DEC, "2024-03-15T22:11:34", 1.0)
+
+        assert self.calls == ["jpl"]
+
+    def test_a_down_source_is_still_asked_when_the_other_fails_too(self):
+        cm._query_mpc(_RA, _DEC, _EPOCH, 1.0)
+        self.calls.clear()
+        self.skybot = [_JPL_OBJECT]
+        self.jpl = RuntimeError("HTTP 503")
+
+        assert cm._query_mpc(_RA, _DEC, "2024-03-15T22:11:34", 1.0) == [_JPL_OBJECT]
+        assert self.calls == ["jpl", "skybot"]
+
+    def test_a_source_that_answers_again_gets_its_place_back(self):
+        cm._query_mpc(_RA, _DEC, _EPOCH, 1.0)
+        self.skybot = []
+        self.jpl = RuntimeError("HTTP 503")
+        cm._query_mpc(_RA, _DEC, "2024-03-15T22:11:34", 1.0)
+        self.calls.clear()
+        self.jpl = []
+
+        cm._query_mpc(_RA, _DEC, "2024-03-15T22:21:34", 1.0)
+
+        assert self.calls == ["skybot"]
+
+    def test_zero_cooldown_keeps_the_configured_order(self, monkeypatch):
+        monkeypatch.setattr(config, "MPC_SOURCE_COOLDOWN_SEC", 0.0)
+        cm._query_mpc(_RA, _DEC, _EPOCH, 1.0)
+        self.calls.clear()
+
+        cm._query_mpc(_RA, _DEC, "2024-03-15T22:11:34", 1.0)
+
+        assert self.calls == ["skybot", "jpl"]
+
+    def test_every_source_failing_returns_empty_and_caches_nothing(self):
+        self.jpl = RuntimeError("HTTP 503")
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == []
+
+        self.jpl = [_JPL_OBJECT]
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == [_JPL_OBJECT]
+
+    def test_no_configured_source_turns_mpc_matching_off(self, monkeypatch):
+        monkeypatch.setattr(config, "MPC_SOURCES", ())
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == []
+        assert self.calls == []
+
+    def test_only_the_configured_sources_are_asked(self, monkeypatch):
+        monkeypatch.setattr(config, "MPC_SOURCES", ("jpl", "horizons"))
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == [_JPL_OBJECT]
+        assert self.calls == ["jpl"]
+
+    def test_both_sources_get_the_same_cone(self, monkeypatch):
+        seen: list[tuple] = []
+        monkeypatch.setattr(_mpc, "_query_skybot", lambda *a: seen.append(a) or (_ for _ in ()).throw(ValueError("502")))
+        monkeypatch.setattr(_sbident, "_query_sbident", lambda *a: seen.append(a) or [])
+
+        cm._query_mpc(_RA, _DEC, _EPOCH, 1.0)
+
+        assert len(seen) == 2
+        assert seen[0][:3] == seen[1][:3]
+        assert seen[0][3] == seen[1][3]
+
+
+# ===========================================================================
+# TestJplSbident — request and parsing of JPL's Small-Body Identification API
+# ===========================================================================
+
+_SBIDENT_FIELDS = [
+    "Object name", "Astrometric RA (hh:mm:ss)", "Astrometric Dec (dd mm'ss\")",
+    "Dist. from center RA (\")", "Dist. from center Dec (\")", "Dist. from center Norm (\")",
+    "Visual magnitude (V)", "RA rate (\"/h)", "Dec rate (\"/h)",
+]
+
+
+def _sbident_payload(rows: list[list[str]]) -> dict:
+    """An sb_ident 1.1 answer with `rows` as its second pass (abridged from a real one)."""
+    return {
+        "signature": {"source": "NASA/JPL Small-Body Identification API", "version": "1.1"},
+        "n_first_pass": len(rows) + 3,
+        "n_second_pass": len(rows),
+        "fields_second": _SBIDENT_FIELDS,
+        "data_second_pass": rows,
+    }
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: Any = None, text: str = ""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+class TestJplSbident:
+
+    @pytest.fixture(autouse=True)
+    def fake_http(self, monkeypatch):
+        monkeypatch.setattr(config, "SITE_LAT", 52.5)
+        monkeypatch.setattr(config, "SITE_LON", -60.25)
+        monkeypatch.setattr(config, "SITE_ELEV", 300)
+        monkeypatch.setattr(config, "MPC_MAG_LIMIT", 19.0)
+        self.requests: list[dict] = []
+        self.response = _FakeResponse(200, _sbident_payload([]))
+
+        def _get(url, params, timeout):
+            self.requests.append(params)
+            response = self.response
+            if isinstance(response, list):
+                response = response.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        monkeypatch.setattr(_sbident.httpx, "get", _get)
+        monkeypatch.setattr(config, "JPL_SBIDENT_MAX_ATTEMPTS", 2)
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(_sbident.time, "sleep", self.sleeps.append)
+
+    def _query(self, ra=30.0, dec=12.0, radius=0.8):
+        from astropy.time import Time
+        return _sbident._query_sbident(ra, dec, radius, Time("2026-10-20T22:00:00.4"))
+
+    def test_request_asks_for_the_integrated_second_pass_at_the_site(self):
+        self._query()
+        params = self.requests[0]
+        assert params["two-pass"] == "true"
+        assert (params["lat"], params["lon"], params["alt"]) == ("52.500000", "-60.250000", "0.3000")
+        assert params["obs-time"] == "2026-10-20_22:00:00"
+        assert params["fov-ra-center"] == "02-00-00.00"
+        assert params["fov-dec-center"] == "12-00-00.0"
+        assert params["vmag-lim"] == "19.0"
+
+    def test_the_rectangle_contains_the_cone(self):
+        """sb_ident counts the RA half-width in RA degrees, not degrees on the sky."""
+        self._query(dec=60.0, radius=0.8)
+        params = self.requests[0]
+        assert float(params["fov-dec-hwidth"]) == pytest.approx(0.8)
+        assert float(params["fov-ra-hwidth"]) >= 0.8 / math.cos(math.radians(60.0))
+
+    def test_near_a_pole_the_rectangle_still_contains_the_cone(self):
+        """radius/cos(dec) gives 17.2 deg here; the circle's RA extent is 17.5."""
+        self._query(dec=85.0, radius=1.5)
+        ra_hwidth = float(self.requests[0]["fov-ra-hwidth"])
+        # The point of the circle furthest in RA, 1.5 deg from the centre.
+        centre = SkyCoord(ra=30.0 * u.deg, dec=85.0 * u.deg)
+        widest = max(
+            abs(centre.directional_offset_by(pa * u.deg, 1.5 * u.deg).ra.wrap_at(210 * u.deg).deg - 30.0)
+            for pa in np.linspace(0.0, 180.0, 3601)
+        )
+        assert widest > 17.4
+        assert ra_hwidth >= widest - 1e-6
+
+    def test_a_cone_over_the_pole_takes_every_ra(self):
+        self._query(dec=89.5, radius=0.8)
+        assert float(self.requests[0]["fov-ra-hwidth"]) == 180.0
+
+    def test_a_negative_declination_is_written_with_m(self):
+        self._query(ra=83.82083, dec=-5.38968)
+        params = self.requests[0]
+        assert params["fov-dec-center"] == "M05-23-22.8"
+        assert params["fov-ra-center"] == "05-35-17.00"
+
+    def test_ra_just_below_24h_wraps_to_zero(self):
+        self._query(ra=359.99999999)
+        assert self.requests[0]["fov-ra-center"] == "00-00-00.00"
+
+    def test_rows_are_parsed_and_named_as_skybot_names_them(self):
+        self.response = _FakeResponse(200, _sbident_payload([
+            ["10252 Heidigraf (4164 T-1)", "01:59:35.88", "+11 48'12.0\"", "", "", "", "17.2", "", ""],
+            ["C/2020 R4 (ATLAS)", "02:00:10.00", "+12 05'00.0\"", "", "", "", "15.0", "", ""],
+        ]))
+
+        objects = self._query()
+
+        assert [(o["designation"], o["object_type"]) for o in objects] == [
+            ("Heidigraf", "ASTEROID"), ("C/2020 R4", "COMET"),
+        ]
+        assert objects[0]["ra"] == pytest.approx(29.899500, abs=1e-6)
+        assert objects[0]["dec"] == pytest.approx(11.803333, abs=1e-6)
+        assert set(objects[0]) == {"ra", "dec", "designation", "object_type"}
+
+    def test_a_negative_declination_is_parsed(self):
+        self.response = _FakeResponse(200, _sbident_payload([
+            ["(2014 RY1)", "05:35:17.00", "-05 23'22.8\"", "", "", "", "18.0", "", ""],
+            ["(2014 RY2)", "05:35:17.00", "-00 30'00.0\"", "", "", "", "18.0", "", ""],
+        ]))
+        objects = self._query(ra=83.82083, dec=-5.38968, radius=5.0)
+        assert objects[0]["dec"] == pytest.approx(-5.38967, abs=1e-5)
+        assert objects[1]["dec"] == pytest.approx(-0.5)
+
+    def test_objects_in_the_rectangles_corners_are_dropped(self):
+        self.response = _FakeResponse(200, _sbident_payload([
+            # 0.75 deg off in both axes: inside the 0.8 deg half-widths, outside the cone.
+            ["(2020 AA1)", "02:03:04.00", "+12 45'00.0\"", "", "", "", "17.0", "", ""],
+        ]))
+        assert self._query() == []
+
+    def test_an_empty_field_is_an_empty_answer(self):
+        self.response = _FakeResponse(200, {
+            "signature": {"version": "1.1"}, "warning": "no matching records",
+        })
+        assert self._query() == []
+
+    def test_no_object_left_after_the_second_pass_is_an_empty_answer(self):
+        self.response = _FakeResponse(200, {
+            "signature": {"version": "1.1"}, "n_first_pass": 4, "n_second_pass": 0,
+            "fields_first": _SBIDENT_FIELDS, "data_first_pass": [],
+        })
+        assert self._query() == []
+
+    @pytest.mark.parametrize("first_failure", [
+        _FakeResponse(503, text="Service Unavailable"),
+        httpx.ReadTimeout("timed out"),
+    ])
+    def test_a_transient_failure_is_retried(self, first_failure):
+        self.response = [first_failure, _FakeResponse(200, _sbident_payload([]))]
+        assert self._query() == []
+        assert len(self.requests) == 2
+        assert len(self.sleeps) == 1
+
+    def test_a_bad_request_is_not_retried(self):
+        self.response = [_FakeResponse(400, {"message": "bad"}), _FakeResponse(200, _sbident_payload([]))]
+        with pytest.raises(RuntimeError):
+            self._query()
+        assert len(self.requests) == 1
+
+    @pytest.mark.parametrize("response", [
+        _FakeResponse(503, text="Service Unavailable"),
+        _FakeResponse(400, {"message": "invalid 'fov-dec-center' format", "code": 400}),
+        _FakeResponse(200, {"signature": {"version": "1.1"}, "n_first_pass": 4}),
+    ])
+    def test_a_failure_raises_for_the_caller_to_handle(self, response):
+        self.response = response
+        with pytest.raises(Exception):
+            self._query()
+
+
+@pytest.mark.parametrize("jpl_name, expected", [
+    ("4 Vesta (A807 FA)", ("Vesta", "ASTEROID")),
+    ("23918 (1998 SH133)", ("1998 SH133", "ASTEROID")),
+    ("(2014 RY1)", ("2014 RY1", "ASTEROID")),
+    ("10252 Heidigraf (4164 T-1)", ("Heidigraf", "ASTEROID")),
+    ("136108 Haumea (2003 EL61)", ("Haumea", "ASTEROID")),
+    ("C/2020 R4 (ATLAS)", ("C/2020 R4", "COMET")),
+    ("C/2019 Y4-B (ATLAS)", ("C/2019 Y4-B", "COMET")),
+    ("P/2010 H2 (Vales)", ("P/2010 H2", "COMET")),
+    ("29P/Schwassmann-Wachmann 1", ("29P", "COMET")),
+    ("128P/Shoemaker-Holt 1", ("128P", "COMET")),
+    ("128P/Shoemaker-Holt 1-A", ("128P-A", "COMET")),
+    ("11P/Tempel-Swift-LINEAR", ("11P", "COMET")),
+    ("73P-B/Schwassmann-Wachmann 3", ("73P-B", "COMET")),
+])
+def test_jpl_names_become_skybot_designations(jpl_name, expected):
+    assert _sbident._skybot_style_name(jpl_name) == expected
 
 
 # ===========================================================================

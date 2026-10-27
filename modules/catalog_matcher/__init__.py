@@ -50,7 +50,8 @@ docs/catalog-matcher.md or CLAUDE.md for the full mechanics:
   _simbad.py      Simbad query + match
   _2mass.py       2MASS (VizieR II/246) query + match
   _panstarrs.py   Pan-STARRS DR1 (VizieR II/349/ps1) query + match
-  _mpc.py         MPC/SkyBot query + match + get_mpc_objects()
+  _mpc.py         MPC query (SkyBot, then the sources below) + match + get_mpc_objects()
+  _sbident.py     JPL Small-Body Identification query — _mpc.py's second source
   _match.py       match() itself — orchestrates the five catalog stages above
 
 `__init__.py` re-exports `match`/`get_gaia_stars`/`get_mpc_objects` for normal use,

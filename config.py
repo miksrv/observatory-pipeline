@@ -429,6 +429,27 @@ MPC_MAG_LIMIT: float = float(_get("MPC_MAG_LIMIT", "19.0"))
 SKYBOT_MAX_ATTEMPTS: int = int(_get("SKYBOT_MAX_ATTEMPTS", "3"))
 SKYBOT_RETRY_DELAY_SEC: float = float(_get("SKYBOT_RETRY_DELAY_SEC", "3.0"))
 
+# Where known asteroids and comets in a field come from, in order of
+# preference: "skybot" (IMCCE) and "jpl" (JPL Small-Body Identification API,
+# modules/catalog_matcher/_sbident.py). The first source that answers decides
+# the frame; the next is asked only when one fails. SkyBot answered 502 for
+# days from 2026-10-23, and every frame ingested meanwhile lost its
+# ASTEROID/COMET matching. JPL needs the observer's site (SITE_LAT/SITE_LON/
+# SITE_ELEV below) — it accepts no geocentric observer.
+MPC_SOURCES: tuple[str, ...] = tuple(
+    name.strip().lower() for name in _get("MPC_SOURCES", "skybot,jpl").split(",") if name.strip()
+)
+# A source that failed is asked last for this long, so a frame does not spend
+# a down service's whole retry budget before reaching the one that works.
+# 0 always keeps the MPC_SOURCES order.
+MPC_SOURCE_COOLDOWN_SEC: float = float(_get("MPC_SOURCE_COOLDOWN_SEC", "900"))
+# One JPL sb_ident request (it integrates every candidate orbit — ~25 s for a
+# 1-2 deg field).
+JPL_SBIDENT_TIMEOUT_SEC: float = float(_get("JPL_SBIDENT_TIMEOUT_SEC", "120"))
+# Total attempts for one JPL request, on a transport error or a 5xx; the wait
+# before each retry is SKYBOT_RETRY_DELAY_SEC, doubled after each.
+JPL_SBIDENT_MAX_ATTEMPTS: int = int(_get("JPL_SBIDENT_MAX_ATTEMPTS", "2"))
+
 # ---------------------------------------------------------------------------
 # Edge-of-frame geometry (astrometry + subtraction + anomaly_detector modules)
 # ---------------------------------------------------------------------------

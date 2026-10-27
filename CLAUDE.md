@@ -469,9 +469,9 @@ the finder chart crops. Coma residuals fixed to the sensor cannot be removed by 
 they're handled by the edge/saturation/streak/FWHM filters.
 
 ### `modules/catalog_matcher/`
-Package: one file per catalog (`_simbad.py`, `_gaia.py`, `_2mass.py`, `_panstarrs.py`, `_mpc.py`),
-plus `_cache.py`, `_wcs_offset.py`, `_match.py`. `_match.py` calls catalogs through qualified
-submodule references (`_gaia._query_gaia(...)`) so tests can patch them.
+Package: one file per catalog (`_simbad.py`, `_gaia.py`, `_2mass.py`, `_panstarrs.py`, `_mpc.py`,
+`_sbident.py`), plus `_cache.py`, `_wcs_offset.py`, `_match.py`. `_match.py` calls catalogs through
+qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch them.
 
 - **Order (sequential exclusive):** Simbad → Gaia DR3 → 2MASS → Pan-STARRS DR1 → MPC/SkyBot, cone
   `MATCH_CONE_ARCSEC`. Simbad first for real object types.
@@ -479,6 +479,10 @@ submodule references (`_gaia._query_gaia(...)`) so tests can patch them.
   **off**: IMCCE intermittently returns a non-VOTable body ("No table found"), and astroquery
   caches the raw response before parsing, so a cached bad answer would defeat every retry.
   Failures are never cached by `_cache` either.
+- **Second source: JPL Small-Body Identification** (`_sbident.py`): `_query_mpc()` asks
+  `MPC_SOURCES` in order; the first that answers decides the frame, a failed source goes last
+  for `MPC_SOURCE_COOLDOWN_SEC`. JPL names are rewritten to SkyBot's — the designation is the
+  `catalog_id`, so both must give one object the same identity.
 - **MPC is the exception:** it sees every source. It takes over a stellar-claimed source only when
   the ephemeris position is within `MATCH_CONE_ARCSEC` (a blend); otherwise it matches the nearest
   *unclaimed* source within `MOVING_CONE_ARCSEC`. Takeovers log both identities.
@@ -672,6 +676,7 @@ Position-only classifications (`ASTEROID`/`COMET`/`MOVING_UNKNOWN`/`SPACE_DEBRIS
 | 2MASS | `Vizier` `II/246` | red/cool stars |
 | Pan-STARRS DR1 | `Vizier` `II/349/ps1` | to ~23.3 mag; only for `dec_center > -30°` |
 | MPC/SkyBot | `Skybot.cone_search()` at `obs_time_mid` | radius = half-diagonal + `MOVING_CONE_ARCSEC` |
+| JPL SB Ident | `ssd-api.jpl.nasa.gov/sb_ident.api` (`httpx`) | fallback when SkyBot fails (`MPC_SOURCES`); ~25 s per query |
 | JPL Horizons | `astroquery.jplhorizons` | ephemerides (`ephemeris.py`) |
 
 All catalog queries are cached (see `catalog_matcher` above) and their errors are caught and
