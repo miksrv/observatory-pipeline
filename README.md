@@ -618,6 +618,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `MPC_SOURCES` | `skybot,jpl` | No | Sources of known asteroids and comets, in order of preference: `skybot` (IMCCE SkyBot) and `jpl` (JPL Small-Body Identification API). The first that answers decides the frame; the next is asked only when one fails, and a frame gets no MPC matching only when all fail. Both give the same designations. `jpl` uses the observer site `SITE_LAT`/`SITE_LON`/`SITE_ELEV`. |
 | `MPC_SOURCE_COOLDOWN_SEC` | `900` | No | A source that failed is asked last for this many seconds, so frames stop spending a down service's retries first. `0` keeps the `MPC_SOURCES` order fixed. |
 | `JPL_SBIDENT_TIMEOUT_SEC` | `120` | No | Timeout of one JPL Small-Body Identification request (~25 s is normal: it integrates every candidate orbit). |
+| `JPL_SBIDENT_MAX_ATTEMPTS` | `2` | No | Total attempts for one JPL request on a transport error or 5xx (waits as `SKYBOT_RETRY_DELAY_SEC`). A 4xx is not retried. |
 | **Job Queue Worker** |
 | `TASK_POLL_INTERVAL_SEC` | `10.0` | No | How often `worker.py` polls `GET /tasks?status=PENDING` when idle. |
 | `TASK_POLL_BACKOFF_MAX_SEC` | `60.0` | No | Idle polling backs off exponentially up to this ceiling, resetting the moment a task is found. |

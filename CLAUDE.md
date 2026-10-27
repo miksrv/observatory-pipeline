@@ -479,13 +479,10 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   **off**: IMCCE intermittently returns a non-VOTable body ("No table found"), and astroquery
   caches the raw response before parsing, so a cached bad answer would defeat every retry.
   Failures are never cached by `_cache` either.
-- **Second source: JPL Small-Body Identification** (`_sbident.py`). `_query_mpc()` asks
-  `MPC_SOURCES` in order (`skybot,jpl`); the first that answers decides the frame, a source
-  that failed is asked last for `MPC_SOURCE_COOLDOWN_SEC`. JPL needs `two-pass=true` (the first
-  pass is ±40″), a topocentric site (`SITE_*`; it refuses code 500) and a rectangle widened by
-  1/cos(dec) then cut back to the cone. Its names are rewritten to SkyBot's (`4 Vesta (A807 FA)`
-  → `Vesta`, `29P/…` → `29P`) — the designation is the source's `catalog_id`, so both services
-  must give one object the same identity.
+- **Second source: JPL Small-Body Identification** (`_sbident.py`): `_query_mpc()` asks
+  `MPC_SOURCES` in order; the first that answers decides the frame, a failed source goes last
+  for `MPC_SOURCE_COOLDOWN_SEC`. JPL names are rewritten to SkyBot's — the designation is the
+  `catalog_id`, so both must give one object the same identity.
 - **MPC is the exception:** it sees every source. It takes over a stellar-claimed source only when
   the ephemeris position is within `MATCH_CONE_ARCSEC` (a blend); otherwise it matches the nearest
   *unclaimed* source within `MOVING_CONE_ARCSEC`. Takeovers log both identities.

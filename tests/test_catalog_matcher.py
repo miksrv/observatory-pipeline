@@ -32,6 +32,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import astropy.units as u
+import httpx
 import numpy as np
 import pytest
 from astropy.coordinates import SkyCoord
@@ -547,6 +548,11 @@ class TestMpcSourceFallback:
         self.jpl = [_JPL_OBJECT]
         assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == [_JPL_OBJECT]
 
+    def test_no_configured_source_turns_mpc_matching_off(self, monkeypatch):
+        monkeypatch.setattr(config, "MPC_SOURCES", ())
+        assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == []
+        assert self.calls == []
+
     def test_only_the_configured_sources_are_asked(self, monkeypatch):
         monkeypatch.setattr(config, "MPC_SOURCES", ("jpl", "horizons"))
         assert cm._query_mpc(_RA, _DEC, _EPOCH, 1.0) == [_JPL_OBJECT]
@@ -609,9 +615,17 @@ class TestJplSbident:
 
         def _get(url, params, timeout):
             self.requests.append(params)
-            return self.response
+            response = self.response
+            if isinstance(response, list):
+                response = response.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
 
         monkeypatch.setattr(_sbident.httpx, "get", _get)
+        monkeypatch.setattr(config, "JPL_SBIDENT_MAX_ATTEMPTS", 2)
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(_sbident.time, "sleep", self.sleeps.append)
 
     def _query(self, ra=30.0, dec=12.0, radius=0.8):
         from astropy.time import Time
@@ -632,7 +646,20 @@ class TestJplSbident:
         self._query(dec=60.0, radius=0.8)
         params = self.requests[0]
         assert float(params["fov-dec-hwidth"]) == pytest.approx(0.8)
-        assert float(params["fov-ra-hwidth"]) == pytest.approx(1.6, rel=1e-4)
+        assert float(params["fov-ra-hwidth"]) >= 0.8 / math.cos(math.radians(60.0))
+
+    def test_near_a_pole_the_rectangle_still_contains_the_cone(self):
+        """radius/cos(dec) gives 17.2 deg here; the circle's RA extent is 17.5."""
+        self._query(dec=85.0, radius=1.5)
+        ra_hwidth = float(self.requests[0]["fov-ra-hwidth"])
+        # The point of the circle furthest in RA, 1.5 deg from the centre.
+        centre = SkyCoord(ra=30.0 * u.deg, dec=85.0 * u.deg)
+        widest = max(
+            abs(centre.directional_offset_by(pa * u.deg, 1.5 * u.deg).ra.wrap_at(210 * u.deg).deg - 30.0)
+            for pa in np.linspace(0.0, 180.0, 3601)
+        )
+        assert widest > 17.4
+        assert ra_hwidth >= widest - 1e-6
 
     def test_a_cone_over_the_pole_takes_every_ra(self):
         self._query(dec=89.5, radius=0.8)
@@ -643,6 +670,10 @@ class TestJplSbident:
         params = self.requests[0]
         assert params["fov-dec-center"] == "M05-23-22.8"
         assert params["fov-ra-center"] == "05-35-17.00"
+
+    def test_ra_just_below_24h_wraps_to_zero(self):
+        self._query(ra=359.99999999)
+        assert self.requests[0]["fov-ra-center"] == "00-00-00.00"
 
     def test_rows_are_parsed_and_named_as_skybot_names_them(self):
         self.response = _FakeResponse(200, _sbident_payload([
@@ -687,6 +718,22 @@ class TestJplSbident:
             "fields_first": _SBIDENT_FIELDS, "data_first_pass": [],
         })
         assert self._query() == []
+
+    @pytest.mark.parametrize("first_failure", [
+        _FakeResponse(503, text="Service Unavailable"),
+        httpx.ReadTimeout("timed out"),
+    ])
+    def test_a_transient_failure_is_retried(self, first_failure):
+        self.response = [first_failure, _FakeResponse(200, _sbident_payload([]))]
+        assert self._query() == []
+        assert len(self.requests) == 2
+        assert len(self.sleeps) == 1
+
+    def test_a_bad_request_is_not_retried(self):
+        self.response = [_FakeResponse(400, {"message": "bad"}), _FakeResponse(200, _sbident_payload([]))]
+        with pytest.raises(RuntimeError):
+            self._query()
+        assert len(self.requests) == 1
 
     @pytest.mark.parametrize("response", [
         _FakeResponse(503, text="Service Unavailable"),

@@ -446,6 +446,9 @@ MPC_SOURCE_COOLDOWN_SEC: float = float(_get("MPC_SOURCE_COOLDOWN_SEC", "900"))
 # One JPL sb_ident request (it integrates every candidate orbit — ~25 s for a
 # 1-2 deg field).
 JPL_SBIDENT_TIMEOUT_SEC: float = float(_get("JPL_SBIDENT_TIMEOUT_SEC", "120"))
+# Total attempts for one JPL request, on a transport error or a 5xx; the wait
+# before each retry is SKYBOT_RETRY_DELAY_SEC, doubled after each.
+JPL_SBIDENT_MAX_ATTEMPTS: int = int(_get("JPL_SBIDENT_MAX_ATTEMPTS", "2"))
 
 # ---------------------------------------------------------------------------
 # Edge-of-frame geometry (astrometry + subtraction + anomaly_detector modules)

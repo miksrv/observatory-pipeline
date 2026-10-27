@@ -43,10 +43,11 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 
 import astropy.units as u
 import httpx
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import Angle, SkyCoord
 from astropy.time import Time
 
 import config
@@ -109,15 +110,12 @@ def _skybot_style_name(jpl_name: str) -> tuple[str, str]:
 
 def _sexagesimal(value_deg: float, *, hours: bool) -> str:
     """`hh-mm-ss.ss` / `[M]dd-mm-ss.s` — the only form sb_ident accepts for a centre."""
-    sign = "M" if value_deg < 0 and not hours else ""
-    total = abs(value_deg) / 15.0 if hours else abs(value_deg)
-    decimals = 2 if hours else 1
-    seconds_total = round(total * 3600.0, decimals)
-    whole, seconds = divmod(seconds_total, 60.0)
-    first, minutes = divmod(int(whole), 60)
     if hours:
-        first %= 24
-    return f"{sign}{first:02d}-{minutes:02d}-{seconds:0{3 + decimals}.{decimals}f}"
+        # Rounded to the printed 0.01 s first, so 23:59:59.999 wraps to 00 rather than printing 24.
+        seconds = round(value_deg / 15.0 * 3600.0, 2) % 86400.0
+        return Angle(seconds / 3600.0, u.hourangle).to_string(sep="-", precision=2, pad=True)
+    text = Angle(value_deg, u.deg).to_string(unit=u.deg, sep="-", precision=1, pad=True)
+    return "M" + text[1:] if text.startswith("-") else text
 
 
 def _parse_dec(text: str) -> float:
@@ -137,6 +135,56 @@ def _column(fields: list[str], prefix: str) -> int:
     raise ValueError(f"sb_ident answer has no {prefix!r} column: {fields}")
 
 
+_site_warned = False
+
+
+def _warn_once_if_site_unset() -> None:
+    """
+    JPL computes positions for the observer's site. SITE_* left at 0/0 puts it
+    on the equator: harmless for a main-belt asteroid (a few arcsec, as
+    SkyBot's geocentre), but a near-Earth object's parallax from the wrong
+    site can exceed MOVING_CONE_ARCSEC and leave it unmatched.
+    """
+    global _site_warned
+    if not _site_warned and config.SITE_LAT == 0.0 and config.SITE_LON == 0.0:
+        _site_warned = True
+        logger.warning(
+            "JPL sb_ident: SITE_LAT/SITE_LON are 0/0 — positions are computed for a point on "
+            "the equator; set the observatory's site for near-Earth objects to match"
+        )
+
+
+def _get_with_retry(params: dict) -> dict:
+    """
+    One sb_ident request, retried up to JPL_SBIDENT_MAX_ATTEMPTS in total on a
+    transport error or a 5xx (JPL documents 503 as "likely resolved after a
+    delay") — during a SkyBot outage it is the only source left. A 4xx is a
+    bad request and raised at once.
+    """
+    attempts = max(1, config.JPL_SBIDENT_MAX_ATTEMPTS)
+    delay = config.SKYBOT_RETRY_DELAY_SEC
+    for attempt in range(1, attempts + 1):
+        try:
+            response = httpx.get(_SBIDENT_URL, params=params, timeout=config.JPL_SBIDENT_TIMEOUT_SEC)
+        except httpx.TransportError as exc:
+            error: Exception = exc
+        else:
+            if response.status_code == 200:
+                return response.json()
+            # 400 carries a JSON "message" naming the bad parameter.
+            error = RuntimeError(f"sb_ident HTTP {response.status_code}: {response.text[:300]}")
+            if response.status_code < 500:
+                raise error
+        if attempt == attempts:
+            raise error
+        logger.warning(
+            "JPL sb_ident attempt %d/%d failed (%s) — retrying in %.1fs", attempt, attempts, error, delay,
+        )
+        time.sleep(delay)
+        delay *= 2
+    raise AssertionError("unreachable")
+
+
 def _query_sbident(ra_deg: float, dec_deg: float, radius_deg: float, epoch: Time) -> list[dict]:
     """
     Known asteroids and comets within `radius_deg` of (ra, dec) at `epoch`.
@@ -146,11 +194,14 @@ def _query_sbident(ra_deg: float, dec_deg: float, radius_deg: float, epoch: Time
     error, malformed answer): the caller decides what a failure means.
     """
     dec_hwidth = min(radius_deg, 90.0)
-    cos_dec = math.cos(math.radians(dec_deg))
-    if abs(dec_deg) + radius_deg >= 90.0 or cos_dec <= 0.0:
+    if abs(dec_deg) + radius_deg >= 90.0:
         ra_hwidth = 180.0  # the circle contains a pole: every RA
     else:
-        ra_hwidth = min(radius_deg / cos_dec, 180.0)
+        # The circle's widest RA extent, which radius/cos(dec) underestimates
+        # near a pole (17.2 deg instead of 17.5 at dec 85 deg, radius 1.5 deg).
+        ra_hwidth = math.degrees(math.asin(
+            math.sin(math.radians(radius_deg)) / math.cos(math.radians(dec_deg))
+        ))
 
     params = {
         "lat": f"{config.SITE_LAT:.6f}",
@@ -165,11 +216,8 @@ def _query_sbident(ra_deg: float, dec_deg: float, radius_deg: float, epoch: Time
         "two-pass": "true",
     }
 
-    response = httpx.get(_SBIDENT_URL, params=params, timeout=config.JPL_SBIDENT_TIMEOUT_SEC)
-    if response.status_code != 200:
-        # 400 carries a JSON "message" naming the bad parameter.
-        raise RuntimeError(f"sb_ident HTTP {response.status_code}: {response.text[:300]}")
-    payload = response.json()
+    _warn_once_if_site_unset()
+    payload = _get_with_retry(params)
 
     version = str(payload.get("signature", {}).get("version", ""))
     if not version.startswith(_EXPECTED_VERSION_MAJOR + "."):

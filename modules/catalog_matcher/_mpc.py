@@ -180,6 +180,8 @@ _SOURCE_LABELS: dict[str, str] = {"skybot": "SkyBot", "jpl": "JPL sb_ident"}
 # Source name → time.monotonic() before which it counts as down. Set when a
 # source fails (after its own retries), cleared when it answers.
 _down_until: dict[str, float] = {}
+# Unknown MPC_SOURCES names already warned about (once per process, not per frame).
+_warned_unknown: set[str] = set()
 
 
 def _query_source(source: str, ra_deg: float, dec_deg: float, radius_deg: float, epoch: Time) -> list[dict]:
@@ -202,7 +204,9 @@ def _sources_in_order() -> list[str]:
     configured: list[str] = []
     for name in config.MPC_SOURCES:
         if name not in _SOURCE_LABELS:
-            logger.warning("MPC_SOURCES: unknown source %r ignored (known: %s)", name, ", ".join(_SOURCE_LABELS))
+            if name not in _warned_unknown:
+                _warned_unknown.add(name)
+                logger.warning("MPC_SOURCES: unknown source %r ignored (known: %s)", name, ", ".join(_SOURCE_LABELS))
         elif name not in configured:
             configured.append(name)
     now = time.monotonic()
@@ -270,13 +274,19 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
         )
         return []
 
+    sources = _sources_in_order()
+    if not sources:
+        # MPC_SOURCES empty (or only unknown names): MPC matching is off.
+        _cache_set(cache_key, [])
+        return []
+
     radius_deg = (
         key_fov * math.sqrt(2) / 2.0
         + config.MOVING_CONE_ARCSEC / 3600.0
         + _cache_radius_margin_deg()
     )
 
-    for source in _sources_in_order():
+    for source in sources:
         label = _SOURCE_LABELS[source]
         try:
             objects = _query_source(source, key_ra, key_dec, radius_deg, epoch)
