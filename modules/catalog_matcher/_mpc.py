@@ -1,6 +1,7 @@
 """
-modules/catalog_matcher/_mpc.py — MPC / SkyBot (Minor Planet Center / IMCCE)
-querying and matching for known solar system objects.
+modules/catalog_matcher/_mpc.py — known solar system objects: querying (IMCCE
+SkyBot, with JPL's Small-Body Identification API as the second source — see
+`_sbident.py`) and matching.
 
 Internal helpers only — not part of this package's public surface, except
 `get_mpc_objects()` which is re-exported by `__init__.py`.
@@ -14,9 +15,11 @@ import time
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
+from astropy.time import Time
 
 import config
 
+from . import _sbident
 from ._cache import (
     _cache_fov_deg,
     _cache_get,
@@ -63,12 +66,159 @@ def _cone_search_with_retry(skybot, coord: SkyCoord, radius_arcmin: float, epoch
     raise AssertionError("unreachable")
 
 
+def _query_skybot(ra_deg: float, dec_deg: float, radius_deg: float, epoch: Time) -> list[dict]:
+    """
+    IMCCE SkyBot cone search, parsed into dicts with keys ra, dec,
+    designation, object_type; objects fainter than MPC_MAG_LIMIT dropped.
+
+    Raises on any failure — every retry spent, astroquery missing, or an
+    answer without the expected columns (a malformed answer, not an empty
+    sky) — so `_query_mpc()` can ask the next source. An empty field is not a
+    failure: it returns [].
+    """
+    from astroquery.imcce import Skybot
+
+    coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
+    radius_arcmin = radius_deg * 60.0
+
+    logger.info(
+        "SkyBot query: ra=%.4f dec=%.4f radius=%.1f' epoch=%s (UTC)",
+        ra_deg, dec_deg, radius_arcmin, epoch.utc.iso,
+    )
+
+    result = _cone_search_with_retry(Skybot, coord, radius_arcmin, epoch)
+
+    if result is None or len(result) == 0:
+        logger.info(
+            "SkyBot: no solar system objects found at ra=%.4f dec=%.4f epoch=%s",
+            ra_deg, dec_deg, epoch.utc.iso,
+        )
+        return []
+
+    # Log available columns once to help diagnose column name variations
+    # across astroquery versions (Name/name, RA/ra, Class/Type etc.)
+    logger.info(
+        "SkyBot returned %d row(s), columns: %s",
+        len(result), list(result.colnames),
+    )
+
+    # Normalise column names to uppercase for version-independent access
+    col_map = {c.upper(): c for c in result.colnames}
+
+    ra_col    = col_map.get("RA")
+    dec_col   = col_map.get("DEC")
+    name_col  = col_map.get("NAME") or col_map.get("OBJECT") or col_map.get("DESIGNATION")
+    class_col = col_map.get("CLASS") or col_map.get("TYPE") or col_map.get("OBJECTTYPE")
+    mag_col   = col_map.get("V") or col_map.get("MV") or col_map.get("VMAG")
+
+    if not ra_col or not dec_col or not name_col:
+        raise ValueError(f"SkyBot result missing expected columns. Available: {list(result.colnames)}")
+
+    mag_limit = config.MPC_MAG_LIMIT
+    n_skipped_faint = 0
+
+    objects: list[dict] = []
+    for row in result:
+        try:
+            # SkyBot returns RA/DEC as astropy Quantities (with angular units).
+            # .value extracts the numeric value in the column's native unit (degrees).
+            raw_ra  = row[ra_col]
+            raw_dec = row[dec_col]
+            ra_val  = float(raw_ra.value)  if hasattr(raw_ra,  "value") else float(raw_ra)
+            dec_val = float(raw_dec.value) if hasattr(raw_dec, "value") else float(raw_dec)
+            name    = str(row[name_col]).strip()
+            obj_class = str(row[class_col]).strip() if class_col else "Asteroid"
+
+            obj_type = "COMET" if "comet" in obj_class.lower() else "ASTEROID"
+
+            # Parse predicted visual magnitude — skip objects too faint to
+            # be detectable by this telescope. Without this filter, SkyBot
+            # returns dozens of mag > 20 asteroids in any field, and the
+            # matching logic assigns each one to its nearest unmatched
+            # background star, producing spurious non-moving "ASTEROID"
+            # anomalies (real incident, 2026-08-10, Vesta field: 130+
+            # asteroids returned, only Vesta at V=6.2 was actually
+            # detectable on 60s exposures; 2014 RY1 at V=21.1 was matched
+            # to a star).
+            v_mag: float | None = None
+            if mag_col:
+                try:
+                    raw_mag = row[mag_col]
+                    v_mag = float(raw_mag.value) if hasattr(raw_mag, "value") else float(raw_mag)
+                except (TypeError, ValueError):
+                    pass
+
+            if v_mag is not None and v_mag > mag_limit:
+                n_skipped_faint += 1
+                continue
+
+            logger.info(
+                "SkyBot object: %s  type=%s  V=%.1f  ra=%.4f dec=%.4f",
+                name, obj_type, v_mag if v_mag is not None else -99.0, ra_val, dec_val,
+            )
+            objects.append({
+                "ra":          ra_val,
+                "dec":         dec_val,
+                "designation": name,
+                "object_type": obj_type,
+            })
+        except Exception as row_exc:
+            logger.warning("SkyBot: skipping malformed row: %s", row_exc)
+            continue
+
+    if n_skipped_faint:
+        logger.info(
+            "SkyBot: skipped %d object(s) fainter than MPC_MAG_LIMIT=%.1f",
+            n_skipped_faint, mag_limit,
+        )
+    return objects
+
+
+# Every source of known solar system objects: MPC_SOURCES name → log label.
+_SOURCE_LABELS: dict[str, str] = {"skybot": "SkyBot", "jpl": "JPL sb_ident"}
+
+# Source name → time.monotonic() before which it counts as down. Set when a
+# source fails (after its own retries), cleared when it answers.
+_down_until: dict[str, float] = {}
+
+
+def _query_source(source: str, ra_deg: float, dec_deg: float, radius_deg: float, epoch: Time) -> list[dict]:
+    # Through the module reference, so tests can patch _sbident._query_sbident.
+    if source == "skybot":
+        return _query_skybot(ra_deg, dec_deg, radius_deg, epoch)
+    return _sbident._query_sbident(ra_deg, dec_deg, radius_deg, epoch)
+
+
+def _sources_in_order() -> list[str]:
+    """
+    MPC_SOURCES in its configured order, except that a source which failed
+    within the last MPC_SOURCE_COOLDOWN_SEC goes to the back.
+
+    A down source is not skipped outright — it is still asked when every
+    other one fails too — but during an outage lasting days (SkyBot,
+    2026-10-23) a frame no longer spends SkyBot's whole retry budget before
+    reaching the source that works.
+    """
+    configured: list[str] = []
+    for name in config.MPC_SOURCES:
+        if name not in _SOURCE_LABELS:
+            logger.warning("MPC_SOURCES: unknown source %r ignored (known: %s)", name, ", ".join(_SOURCE_LABELS))
+        elif name not in configured:
+            configured.append(name)
+    now = time.monotonic()
+    up = [s for s in configured if _down_until.get(s, 0.0) <= now]
+    return up + [s for s in configured if s not in up]
+
+
 def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: float = 1.0) -> list[dict]:
     """
     Query for known asteroids and comets near the frame centre at observation time.
 
-    Uses IMCCE SkyBot service which provides cone search for solar system objects
-    at a specific epoch. Falls back gracefully on any error.
+    Asks the sources in MPC_SOURCES in turn (IMCCE SkyBot, then JPL's
+    Small-Body Identification API — see `_sbident`), and the first one that
+    answers decides the result, an empty field included. Both yield the same
+    designations, so it does not matter to history which one answered. If
+    every source fails, returns [] without caching it.
 
     The radius is `fov_deg × sqrt(2)/2` — the frame's half-diagonal, the same
     strategy every other catalog here uses — **plus** `MOVING_CONE_ARCSEC`.
@@ -106,134 +256,49 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
     if cached is not None:
         return cached  # type: ignore[return-value]
 
-    try:
-        from astroquery.imcce import Skybot
-        from astropy.time import Time
-
-        if not obs_time:
-            logger.warning("SkyBot skipped: obs_time is empty (check DATE-OBS header in FITS)")
-            _cache_set(cache_key, [])
-            return []
-
-        coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
-        epoch = Time(obs_time)
-        radius_deg = (
-            key_fov * math.sqrt(2) / 2.0
-            + config.MOVING_CONE_ARCSEC / 3600.0
-            + _cache_radius_margin_deg()
-        )
-        radius_arcmin = radius_deg * 60.0
-
-        logger.info(
-            "SkyBot query: ra=%.4f dec=%.4f radius=%.1f' epoch=%s (UTC)",
-            key_ra, key_dec, radius_arcmin, epoch.utc.iso,
-        )
-
-        result = _cone_search_with_retry(Skybot, coord, radius_arcmin, epoch)
-
-        if result is None or len(result) == 0:
-            logger.info(
-                "SkyBot: no solar system objects found at ra=%.4f dec=%.4f epoch=%s",
-                ra_center, dec_center, epoch.utc.iso,
-            )
-            _cache_set(cache_key, [])
-            return []
-
-        # Log available columns once to help diagnose column name variations
-        # across astroquery versions (Name/name, RA/ra, Class/Type etc.)
-        logger.info(
-            "SkyBot returned %d row(s), columns: %s",
-            len(result), list(result.colnames),
-        )
-
-        # Normalise column names to uppercase for version-independent access
-        col_map = {c.upper(): c for c in result.colnames}
-
-        ra_col    = col_map.get("RA")
-        dec_col   = col_map.get("DEC")
-        name_col  = col_map.get("NAME") or col_map.get("OBJECT") or col_map.get("DESIGNATION")
-        class_col = col_map.get("CLASS") or col_map.get("TYPE") or col_map.get("OBJECTTYPE")
-        mag_col   = col_map.get("V") or col_map.get("MV") or col_map.get("VMAG")
-
-        if not ra_col or not dec_col or not name_col:
-            # A malformed answer, not an empty sky: never cached, so the next
-            # frame of this field asks again.
-            logger.warning(
-                "SkyBot result missing expected columns. Available: %s", list(result.colnames)
-            )
-            return []
-
-        mag_limit = config.MPC_MAG_LIMIT
-        n_skipped_faint = 0
-
-        objects: list[dict] = []
-        for row in result:
-            try:
-                # SkyBot returns RA/DEC as astropy Quantities (with angular units).
-                # .value extracts the numeric value in the column's native unit (degrees).
-                raw_ra  = row[ra_col]
-                raw_dec = row[dec_col]
-                ra_val  = float(raw_ra.value)  if hasattr(raw_ra,  "value") else float(raw_ra)
-                dec_val = float(raw_dec.value) if hasattr(raw_dec, "value") else float(raw_dec)
-                name    = str(row[name_col]).strip()
-                obj_class = str(row[class_col]).strip() if class_col else "Asteroid"
-
-                obj_type = "COMET" if "comet" in obj_class.lower() else "ASTEROID"
-
-                # Parse predicted visual magnitude — skip objects too faint to
-                # be detectable by this telescope. Without this filter, SkyBot
-                # returns dozens of mag > 20 asteroids in any field, and the
-                # matching logic assigns each one to its nearest unmatched
-                # background star, producing spurious non-moving "ASTEROID"
-                # anomalies (real incident, 2026-08-10, Vesta field: 130+
-                # asteroids returned, only Vesta at V=6.2 was actually
-                # detectable on 60s exposures; 2014 RY1 at V=21.1 was matched
-                # to a star).
-                v_mag: float | None = None
-                if mag_col:
-                    try:
-                        raw_mag = row[mag_col]
-                        v_mag = float(raw_mag.value) if hasattr(raw_mag, "value") else float(raw_mag)
-                    except (TypeError, ValueError):
-                        pass
-
-                if v_mag is not None and v_mag > mag_limit:
-                    n_skipped_faint += 1
-                    continue
-
-                logger.info(
-                    "SkyBot object: %s  type=%s  V=%.1f  ra=%.4f dec=%.4f",
-                    name, obj_type, v_mag if v_mag is not None else -99.0, ra_val, dec_val,
-                )
-                objects.append({
-                    "ra":          ra_val,
-                    "dec":         dec_val,
-                    "designation": name,
-                    "object_type": obj_type,
-                })
-            except Exception as row_exc:
-                logger.warning("SkyBot: skipping malformed row: %s", row_exc)
-                continue
-
-        if n_skipped_faint:
-            logger.info(
-                "SkyBot: skipped %d object(s) fainter than MPC_MAG_LIMIT=%.1f",
-                n_skipped_faint, mag_limit,
-            )
-
-        _cache_set(cache_key, objects)
-        return objects
-
-    except ImportError:
-        logger.warning("astroquery.imcce.Skybot not available, skipping MPC matching")
+    if not obs_time:
+        logger.warning("MPC query skipped: obs_time is empty (check DATE-OBS header in FITS)")
         _cache_set(cache_key, [])
         return []
+
+    try:
+        epoch = Time(obs_time)
     except Exception as exc:
         logger.warning(
-            "SkyBot query failed: ra=%.4f dec=%.4f obs_time=%r — %s",
+            "MPC query skipped: ra=%.4f dec=%.4f obs_time=%r is not a time — %s",
             ra_center, dec_center, obs_time, exc,
         )
         return []
+
+    radius_deg = (
+        key_fov * math.sqrt(2) / 2.0
+        + config.MOVING_CONE_ARCSEC / 3600.0
+        + _cache_radius_margin_deg()
+    )
+
+    for source in _sources_in_order():
+        label = _SOURCE_LABELS[source]
+        try:
+            objects = _query_source(source, key_ra, key_dec, radius_deg, epoch)
+        except Exception as exc:
+            _down_until[source] = time.monotonic() + config.MPC_SOURCE_COOLDOWN_SEC
+            logger.warning(
+                "%s query failed: ra=%.4f dec=%.4f obs_time=%r — %s",
+                label, ra_center, dec_center, obs_time, exc,
+            )
+            continue
+        if source in _down_until:
+            logger.info("%s answers again", label)
+            del _down_until[source]
+        logger.info("MPC: %d object(s) from %s", len(objects), label)
+        _cache_set(cache_key, objects)
+        return objects
+
+    logger.warning(
+        "MPC: no source answered for ra=%.4f dec=%.4f obs_time=%r — frame gets no MPC matching",
+        ra_center, dec_center, obs_time,
+    )
+    return []
 
 
 def _match_mpc(sources: list[dict], mpc_objects: list[dict]) -> None:

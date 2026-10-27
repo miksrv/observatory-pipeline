@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.1
+
+### Patch Changes
+
+- Catalog matching: known asteroids and comets come from JPL's Small-Body Identification API when IMCCE SkyBot fails (`MPC_SOURCES`, default `skybot,jpl`) — SkyBot has answered 502 since 2026-10-23 and every frame ingested meanwhile got no `ASTEROID`/`COMET` matching; JPL names are written as SkyBot writes them (`Vesta`, `1998 SH133`, `C/2020 R4`, `29P`), so history does not split by source. A failed source is asked last for `MPC_SOURCE_COOLDOWN_SEC` (900 s). Set `SITE_LAT`/`SITE_LON`/`SITE_ELEV` — JPL computes positions for the observer's site; re-run `ANALYZE` on frames ingested during the outage
+
 ## 1.6.0
 
 ### Minor Changes
