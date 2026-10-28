@@ -96,9 +96,11 @@ flowchart TD
     Loop --> P1{"catalog_name\n== 'MPC'?"}
     P1 -- yes --> Asteroid["ASTEROID / COMET\n(by object_type)\n⚑ _needs_ephemeris=True"]
 
-    P1 -- no --> Residual{"subtraction candidate beside a\ncatalogued star, at most 1 mag brighter\nor 2 mag fainter?\n(_is_residual_of_catalogued_star)"}
+    P1 -- no --> Residual{"subtraction candidate within the MATCH_CONE\nof an MPC object, or beside a catalogued star\nat most 1 mag brighter or 2 mag fainter?\n(_is_residual_of_catalogued_star)"}
     Residual -- yes --> Suppressed
-    Residual -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
+    Residual -- no --> Halo{"uncatalogued, unsaturated, within\nSATURATED_HALO_RADIUS_FWHM x the FWHM\nof a saturated source?\n(_in_saturated_halo)"}
+    Halo -- yes --> Suppressed
+    Halo -- no --> Sat{"catalog_name is None\nAND saturated == True?"}
     Sat -- yes --> NewBright{"_could_be_a_new_bright_object()?\n(round, not near_edge, area covered,\nno history at all here)"}
     NewBright -- no --> Suppressed(["suppressed — return None\n(bright-star/subtraction artifact,\nnot a real transient)"])
     NewBright -- "yes (possible nova —\nclassified, magnitude unmeasurable)" --> NoHist
@@ -134,7 +136,9 @@ flowchart TD
     DeltaMag --> Changed{"_is_significant_delta():\nabs(delta_mag) > DELTA_MAG_ALERT\nAND > VARIABILITY_SIGMA x noise\n(mag_err ⊕ same-filter scatter)?"}
     Changed -- no --> NoAnomaly(["no anomaly"])
     Changed -- yes --> Bright{"delta_mag < 0\n(got brighter)\nAND near a galaxy?"}
-    Bright -- yes --> SNbright["🔔 SUPERNOVA_CANDIDATE\n(already-known host\nbrightened)"]
+    Bright -- yes --> Extended{"extended?\n(FWHM > VARIABILITY_MAX_FWHM_RATIO\nx frame PSF)"}
+    Extended -- no --> SNbright["🔔 SUPERNOVA_CANDIDATE\n(already-known host\nbrightened)"]
+    Extended -- yes --> NoAnomaly
     Bright -- no --> Optics["re-judge the change against\n_same_optics_history()\n(epochs from other optics dropped)"]
     Optics --> Binary{"Simbad object_type\nindicates a\ndouble/eclipsing binary?"}
     Binary -- yes --> BinaryStar["BINARY_STAR"]
@@ -176,6 +180,25 @@ one condition matches, the function returns and no further checks run:
 
 1. **MPC match** — `catalog_name == "MPC"` → `ASTEROID`/`COMET`, regardless of history
    or coverage.
+
+   Then two checks drop a detection that is part of something already accounted for:
+   - `_is_residual_of_catalogued_star()` — a subtraction candidate within
+     `MATCH_CONE_ARCSEC` of an MPC object is the mover's own image in the difference image
+     (any shape or brightness: a comet's coma makes it diffuse); one beside a catalogued
+     star of about the same brightness is that star's residual. The residual radius is
+     `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × the wider of the candidate's and the star's FWHM
+     — the star's counts only when it is a point source against the frame's PSF, so a
+     galaxy never stretches the radius over a supernova beside it. A smeared frame
+     (Haumea 2024-05-28T20-11-23, 2026-10-28) had 6.6″ stars with sharp residuals 6.8″
+     from them, which the candidate's own 2.3″ FWHM missed.
+   - `_in_saturated_halo()` — an uncatalogued, unsaturated detection within
+     `SATURATED_HALO_RADIUS_FWHM` × the FWHM of a saturated source in the same frame is a
+     fragment of its halo or diffraction spikes. Saturated trails (elongation over
+     `SPACE_DEBRIS_ELONGATION_MIN` — a streak's FWHM is its length) and galaxies (a saturated
+     nucleus beside a supernova) are not used as halo sources. The saturated source's FWHM grows with its
+     brightness, so the radius does too, whatever the optics. Such fragments wander with the
+     seeing and read as "shifted" — 43 `MOVING_UNKNOWN` around the Pleiades and 3 around
+     Vesta (V=6) on the 2026-10-28 run.
 2. **Saturated, unmatched source** — `catalog_name is None` and `saturated == True` →
    suppressed (`return None`, no anomaly record) **unless**
    `_could_be_a_new_bright_object()` holds: the source is round
@@ -298,7 +321,11 @@ one condition matches, the function returns and no further checks run:
      source. If the change is significant:
      - a change near a galaxy only counts when the source **brightened**, i.e.
        `delta_mag < 0` → `SUPERNOVA_CANDIDATE` (checked first — takes priority over
-       binary/variable stars);
+       binary/variable stars), unless the source is extended (FWHM over
+       `VARIABILITY_MAX_FWHM_RATIO` × the frame's PSF): that is the galaxy's own detection,
+       whose aperture takes in more of the galaxy as the seeing widens — M74's nucleus read
+       0.6–1.0 mag "brighter" on the 2026-10-28 run. A supernova in it is a point source of its
+       own, or a subtraction candidate;
      - the branches below re-judge the change against `_same_optics_history()`: epochs
        whose frame was taken with another camera or a plate scale more than
        `SUBTRACTION_REF_MAX_SCALE_DIFF` off this frame's are dropped (`detect()` marks each
@@ -359,7 +386,7 @@ Simbad OTYPE tests used by the classifiers:
 | `BINARY_STAR` | Has history, significant Δmag (as above), Simbad binary | No (logged) |
 | `ASTEROID` | Matched in MPC/SkyBot, type "asteroid" | No (logged + ephemeris) |
 | `COMET` | Matched in MPC/SkyBot, type "comet" | No (logged + ephemeris) |
-| `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known galaxy brightening by a significant Δmag (as above) | **Yes** |
+| `SUPERNOVA_CANDIDATE` | New point source near a galaxy with no history, **or** an already-known, compact (not extended) galaxy brightening by a significant Δmag (as above) | **Yes** |
 | `MOVING_UNKNOWN` | Position-shifted source, not in MPC, elongation at or below the trail threshold; not withdrawn by the alert confirmation (track moving with the pointing, or absent from every frame that should show it) | **Yes** |
 | `SPACE_DEBRIS` | Not in MPC, no detection at current position, elongation above the trail threshold — `SPACE_DEBRIS_ELONGATION_MIN` (3.0), or `SPACE_DEBRIS_EDGE_ELONGATION_MIN` (6.0) if `near_edge` (single-exposure trail — position-shift evidence not required) | No (recorded so a fast mover's track is never erased and does not pollute `UNKNOWN`; an operator need not act on a satellite pass — decided 2026-09-22). The API mirrors this in its own `AnomalyModel::ALERT_TYPES` |
 | `UNKNOWN` | New source outside any catalog in a covered area, or detected via image subtraction in an *uncovered* area **and** not matched to any catalog; not `near_edge` unless a round, strong subtraction candidate (`_survives_edge_zone()`); includes a saturated source exempted by `_could_be_a_new_bright_object()`; not withdrawn by the alert confirmation (absent from a later same-filter frame of its position) | **Yes** |

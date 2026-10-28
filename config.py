@@ -242,6 +242,18 @@ SATURATION_ADU: float = float(_get("SATURATION_ADU", "60000"))
 # excludes from difference-image source detection, to suppress astroalign
 # residual artifacts around bright/saturated stars (see docs/ISSUES.md #1, #2).
 SATURATION_MASK_RADIUS_ARCSEC: float = float(_get("SATURATION_MASK_RADIUS_ARCSEC", "10.0"))
+# An uncatalogued detection within this many FWHM of a saturated source in the
+# same frame — FWHM of the saturated source itself, which grows with its
+# brightness — is part of that source's halo, diffraction spikes or
+# subtraction residual, not an object of its own (modules/anomaly_detector/).
+# A fixed SATURATION_MASK_RADIUS_ARCSEC is too small for a really bright
+# star: on the 2026-10-28 M45 run 43 MOVING_UNKNOWN alerts were halo
+# fragments 23-48" from the Pleiades (Alcyone's FWHM measured 48"), and
+# three more lay 20" from Vesta at V=6. Saturated trails (a streak's FWHM is
+# its length) and galaxies are never halo sources. Trade-off: a transient that close to
+# a saturated star is lost — its magnitude would be unmeasurable anyway.
+# 0 disables the check.
+SATURATED_HALO_RADIUS_FWHM: float = float(_get("SATURATED_HALO_RADIUS_FWHM", "2.0"))
 
 # ---------------------------------------------------------------------------
 # Plate-solve plausibility
@@ -1005,6 +1017,7 @@ _OVERRIDABLE: dict[str, type] = {
     # Saturation
     "SATURATION_ADU": float,
     "SATURATION_MASK_RADIUS_ARCSEC": float,
+    "SATURATED_HALO_RADIUS_FWHM": float,
     # Cross-matching
     "PHOTOMETRY_COLOR_TERM_ENABLED": None,  # special: bool from string
     "PHOTOMETRY_COLOR_TERMS": None,  # special: "FILTER:k" pairs

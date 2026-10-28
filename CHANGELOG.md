@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.2
+
+### Patch Changes
+
+- Ephemeris: JPL Horizons is asked for a small body (a comet by designation, at its closest apparition) — a bare name like `Artemis` also matched the Artemis missions and Horizons refused it as ambiguous, so 28 Artemis `ASTEROID`s of the 2026-10-28 run got no ephemeris; periodic comets (`29P`) failed the same way
+- Anomalies: an uncatalogued detection within `SATURATED_HALO_RADIUS_FWHM` (2.0) × the FWHM of a saturated source in the same frame is a fragment of its halo or spikes, not an object — 43 `MOVING_UNKNOWN`s on the M45 frames lay 23–48″ from the Pleiades, 3 more beside Vesta (V=6)
+- Analysis, anomalies: a moving object's own subtraction candidate (within `MATCH_CONE_ARCSEC` of its MPC match) is no longer kept as a second, uncatalogued source — C/2020 R4 got a `MOVING_UNKNOWN` beside its `COMET` in 55 frames; the detector drops such candidates already stored, so re-running `DETECT_ANOMALIES` is enough
+- Anomalies: a subtraction candidate counts as a star's residual within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × the wider of its own and the star's FWHM (a point-like star's, when the frame's PSF is known) — one smeared Haumea frame, stars 6.6″ wide, posted 47 alerts for sharp residuals 6.8″ from them
+- Anomalies: an extended galaxy's own detection (FWHM over `VARIABILITY_MAX_FWHM_RATIO` × the frame's PSF) brightening is no longer a `SUPERNOVA_CANDIDATE` — its aperture follows the seeing; M74's nucleus read 0.6–1.0 mag "brighter" twice
+
 ## 1.6.1
 
 ### Patch Changes

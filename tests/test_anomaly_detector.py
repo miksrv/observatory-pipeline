@@ -2759,3 +2759,197 @@ class TestDiffuseSubtractionCandidate:
         star = [(_RA, _DEC + 40.0 / 3600.0, 14.0)]
         assert _is_residual_of_catalogued_star(comet, star, frame_psf_arcsec=3.0) is False
         assert _is_residual_of_catalogued_star(comet, star) is True  # no PSF: as before
+
+
+# ===========================================================================
+# 2026-10-28 asteroid/comet run: fragments of bright objects, a smeared
+# frame's residuals, a galaxy's own nucleus
+# ===========================================================================
+
+class TestFragmentsOfBrightObjects:
+    """
+    On the 302 asteroid/comet frames 157 alerts were posted; most were parts
+    of something already accounted for: halo fragments of the Pleiades and of
+    Vesta (V=6), a comet's own image in the difference image, and residuals
+    of every star in one smeared Haumea frame.
+    """
+
+    async def _detect(self, sources: list[dict], frame_meta: dict | None = None) -> list[dict]:
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {}
+            # Every position covered: an ordinary detection then becomes UNKNOWN.
+            mock_cov.return_value = {str(i): [_make_coverage_frame()] for i in range(len(sources))}
+            return await ad.detect(_FRAME_ID, sources, sources, frame_meta or _FRAME_META)
+
+    @staticmethod
+    def _bright_star(fwhm: float = 40.0) -> dict:
+        return _make_source(
+            mag=None, catalog_name="Simbad", catalog_id="* eta Tau", object_type="*",
+            saturated=True, fwhm=fwhm, source_id="src-alcyone",
+        )
+
+    def _fragment(self, offset_arcsec: float, **kw) -> dict:
+        return _make_source(
+            dec=_DEC + offset_arcsec / 3600.0, mag=12.0, source_id="src-fragment", **kw,
+        )
+
+    def _types(self, result: list[dict], source_id: str) -> list[str]:
+        return [a["anomaly_type"] for a in result if a["source_id"] == source_id]
+
+    async def test_a_fragment_in_a_saturated_stars_halo_is_suppressed(self):
+        """M45: fragments 23-48" from Alcyone, whose FWHM measured 48"."""
+        star = self._bright_star(fwhm=40.0)
+        inside = self._fragment(0.9 * config.SATURATED_HALO_RADIUS_FWHM * 40.0, from_subtraction=True)
+        assert self._types(await self._detect([star, inside]), "src-fragment") == []
+
+    async def test_an_ordinary_detection_in_the_halo_is_suppressed_too(self):
+        star = self._bright_star(fwhm=40.0)
+        inside = self._fragment(0.9 * config.SATURATED_HALO_RADIUS_FWHM * 40.0)
+        assert self._types(await self._detect([star, inside]), "src-fragment") == []
+        assert self._types(await self._detect([inside]), "src-fragment") == ["UNKNOWN"]
+
+    async def test_the_halo_scales_with_the_saturated_sources_own_fwhm(self):
+        """The same offset is outside the halo of a fainter, narrower saturated star."""
+        offset = 0.9 * config.SATURATED_HALO_RADIUS_FWHM * 40.0
+        star = self._bright_star(fwhm=offset / (2.0 * config.SATURATED_HALO_RADIUS_FWHM))
+        outside = self._fragment(offset, from_subtraction=True)
+        assert self._types(await self._detect([star, outside]), "src-fragment") == ["UNKNOWN"]
+
+    async def test_disabled_by_a_zero_radius(self, monkeypatch):
+        monkeypatch.setattr(config, "SATURATED_HALO_RADIUS_FWHM", 0.0)
+        star = self._bright_star(fwhm=40.0)
+        inside = self._fragment(20.0, from_subtraction=True)
+        assert self._types(await self._detect([star, inside]), "src-fragment") == ["UNKNOWN"]
+
+    async def test_a_saturated_trail_has_no_halo(self):
+        """A streak's "fwhm" is its length: a 1500" satellite flare must not blank out the frame."""
+        trail = _make_source(
+            mag=None, catalog_name=None, saturated=True, fwhm=1500.0,
+            elongation=10.0 * config.SPACE_DEBRIS_ELONGATION_MIN, source_id="src-trail",
+        )
+        transient = self._fragment(300.0, from_subtraction=True)
+        assert self._types(await self._detect([trail, transient]), "src-fragment") == ["UNKNOWN"]
+
+    async def test_a_saturated_galaxy_nucleus_has_no_halo(self):
+        """A supernova beside a saturated nucleus is not a fragment of it."""
+        nucleus = _make_source(
+            mag=None, catalog_name="Simbad", catalog_id="M 82", object_type="G",
+            saturated=True, fwhm=30.0, source_id="src-nucleus",
+        )
+        supernova = self._fragment(20.0, from_subtraction=True)
+        assert self._types(await self._detect([nucleus, supernova]), "src-fragment") != []
+
+    def test_a_catalogued_or_saturated_source_is_never_a_fragment(self):
+        from modules.anomaly_detector._classify import _in_saturated_halo
+
+        halo = [(_RA, _DEC, 40.0)]
+        catalogued = self._fragment(10.0, catalog_name="Gaia DR3")
+        saturated = self._fragment(10.0, saturated=True)
+        assert _in_saturated_halo(catalogued, halo) is False
+        assert _in_saturated_halo(saturated, halo) is False
+        assert _in_saturated_halo(self._fragment(10.0), halo) is True
+
+    async def test_a_movers_own_subtraction_image_is_not_a_second_object(self):
+        """
+        C/2020 R4: the comet's coma makes its difference-image candidate
+        diffuse and brighter than the blind detection — neither the
+        magnitude nor the shape may decide; the position beside the MPC
+        object does.
+        """
+        comet = _make_source(
+            mag=11.3, catalog_name="MPC", catalog_id="C/2020 R4", object_type="COMET",
+            fwhm=6.3, source_id="src-comet",
+        )
+        image = _make_source(
+            dec=_DEC + 0.5 * config.MATCH_CONE_ARCSEC / 3600.0, mag=10.6, fwhm=11.8,
+            catalog_name=None, from_subtraction=True, source_id="src-image",
+        )
+        meta = {**_FRAME_META, "frame": _frame_record(_FRAME_ID, fwhm=3.0)}
+        with patch("modules.anomaly_detector._ephemeris_resolution.ephemeris.query",
+                   new_callable=AsyncMock, return_value=None):
+            result = await self._detect([comet, image], meta)
+        assert self._types(result, "src-image") == []
+        assert self._types(result, "src-comet") == ["COMET"]
+
+    async def test_a_movers_image_without_magnitudes_is_still_recognised(self, monkeypatch):
+        """Uncalibrated frame (narrowband, 8-bit): no mag, no flux on either; position decides.
+        Nor does turning the residual check off bring the mover's image back."""
+        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_FWHM", 0.0)
+        comet = _make_source(
+            mag=None, flux=None, catalog_name="MPC", catalog_id="29P", object_type="COMET",
+            source_id="src-comet",
+        )
+        image = _make_source(
+            dec=_DEC + 0.5 * config.MATCH_CONE_ARCSEC / 3600.0, mag=None, flux=None,
+            catalog_name=None, from_subtraction=True, source_id="src-image",
+        )
+        with patch("modules.anomaly_detector._ephemeris_resolution.ephemeris.query",
+                   new_callable=AsyncMock, return_value=None):
+            result = await self._detect([comet, image])
+        assert self._types(result, "src-image") == []
+        assert self._types(result, "src-comet") == ["COMET"]
+
+    def test_an_mpc_object_beyond_the_match_cone_decides_nothing(self):
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        candidate = _make_source(mag=None, flux=None, from_subtraction=True)
+        mover = [(_RA, _DEC + 2.0 * config.MATCH_CONE_ARCSEC / 3600.0, None, None, 6.0, "MPC")]
+        assert _is_residual_of_catalogued_star(candidate, mover) is False
+        near = [(_RA, _DEC + 0.5 * config.MATCH_CONE_ARCSEC / 3600.0, None, None, 6.0, "MPC")]
+        assert _is_residual_of_catalogued_star(candidate, near) is True
+
+    def test_a_smeared_stars_residual_is_measured_against_the_stars_width(self, monkeypatch):
+        """
+        Haumea 2024-05-28T20-11-23: stars 6.6" wide, sharp 2.3" residuals
+        6.8" from them and 1.5-1.7 mag fainter.
+        """
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_FWHM", 2.5)
+        candidate = _make_source(mag=13.6, fwhm=2.3, from_subtraction=True)
+        offset = max(6.8, config.MATCH_CONE_ARCSEC + 1.0)
+        star = [(_RA, _DEC + offset / 3600.0, 12.0, None, 6.6, "Simbad")]
+        assert _is_residual_of_catalogued_star(candidate, star, frame_psf_arcsec=5.0) is True
+        # Without the frame's PSF a star cannot be told from a galaxy: its width is not used.
+        assert _is_residual_of_catalogued_star(candidate, star) is (offset <= 2.5 * 2.3)
+
+    def test_a_galaxys_width_never_stretches_the_radius(self, monkeypatch):
+        """A supernova beside its host must not become the host's residual."""
+        from modules.anomaly_detector._classify import _is_residual_of_catalogued_star
+
+        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_FWHM", 2.5)
+        candidate = _make_source(mag=13.0, fwhm=3.0, from_subtraction=True)
+        offset = 2.5 * 3.0 + 5.0
+        galaxy = [(_RA, _DEC + offset / 3600.0, 12.0, None, 13.0, "Simbad")]
+        assert _is_residual_of_catalogued_star(candidate, galaxy, frame_psf_arcsec=3.0) is False
+
+
+class TestSupernovaOnAnExtendedGalaxy:
+    """
+    M74, 2026-10-28: the galaxy's own detection (FWHM 11-13" on a 3.5" PSF)
+    read 0.6-1.0 mag brighter than its history — its aperture follows the
+    seeing — and was posted twice as SUPERNOVA_CANDIDATE.
+    """
+
+    async def _run(self, source: dict, meta: dict) -> list[dict]:
+        hist = [_make_hist_source(mag=13.0) for _ in range(4)]
+        with (
+            patch("modules.anomaly_detector.api_client.get_sources_near_batch", new_callable=AsyncMock) as mock_sources,
+            patch("modules.anomaly_detector.api_client.get_frames_covering_batch", new_callable=AsyncMock) as mock_cov,
+        ):
+            mock_sources.return_value = {"0": hist}
+            mock_cov.return_value = {"0": [_make_coverage_frame()]}
+            return await ad.detect(_FRAME_ID, [source], [source], meta)
+
+    async def test_an_extended_galaxys_brightening_is_not_a_supernova(self):
+        meta = {**_FRAME_META, "frame": _frame_record(_FRAME_ID, fwhm=3.5)}
+        nucleus = _make_source(mag=12.0, catalog_name="Simbad", object_type="G", fwhm=11.0)
+        assert [a["anomaly_type"] for a in await self._run(nucleus, meta)] == []
+
+    async def test_a_compact_galaxy_brightening_still_is(self):
+        meta = {**_FRAME_META, "frame": _frame_record(_FRAME_ID, fwhm=3.5)}
+        compact = _make_source(mag=12.0, catalog_name="Simbad", object_type="G", fwhm=4.0)
+        assert [a["anomaly_type"] for a in await self._run(compact, meta)] == ["SUPERNOVA_CANDIDATE"]

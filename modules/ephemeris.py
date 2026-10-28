@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 
 import numpy as np
 import numpy.ma as npma
@@ -34,6 +35,31 @@ from astroquery.jplhorizons import Horizons
 import config
 
 logger = logging.getLogger(__name__)
+
+# A comet designation as catalog_matcher writes it: "C/2020 R4", "P/2019 LD2",
+# "29P", "73P-B" — the same forms catalog_matcher/_sbident.py's
+# _NUMBERED_COMET_RE / _PROVISIONAL_COMET_RE produce. Horizons keeps one record per apparition of a periodic comet
+# (and per fragment), so a bare designation is ambiguous there.
+_COMET_DESIGNATION = re.compile(r"^(?:[PCDXI]/\d{4} |\d+[PDCXI](?:-|$))")
+
+
+def _lookup_args(designation: str) -> tuple[str, dict]:
+    """
+    How to name `designation` to Horizons: the `id_type` and the
+    ephemerides() options that make the lookup unambiguous.
+
+    Without an `id_type`, Horizons searches major bodies and spacecraft too —
+    "Artemis" then matches the Artemis missions as well as (105) Artemis and
+    the query fails as ambiguous. A comet is looked up by designation, at the
+    apparition closest to the epoch, fragments excluded unless the
+    designation names one.
+    """
+    if _COMET_DESIGNATION.match(designation):
+        return "designation", {
+            "closest_apparition": True,
+            "no_fragments": "-" not in designation,
+        }
+    return "smallbody", {}
 
 
 async def query(designation: str, obs_time: str) -> dict | None:
@@ -70,7 +96,10 @@ async def query(designation: str, obs_time: str) -> dict | None:
             "elevation": config.SITE_ELEV / 1000.0,
         }
 
-        horizons = Horizons(id=designation, location=location, epochs=jd)
+        id_type, ephemerides_options = _lookup_args(designation)
+        horizons = Horizons(
+            id=designation, id_type=id_type, location=location, epochs=jd,
+        )
 
         # The budget is enforced at the HTTP layer first: astroquery passes
         # this straight to requests as its own socket timeout, so an
@@ -88,7 +117,7 @@ async def query(designation: str, obs_time: str) -> dict | None:
         # guarantees a wall-clock ceiling. It is now a backstop for a call
         # that is already killable rather than the only line of defence.
         eph = await asyncio.wait_for(
-            asyncio.to_thread(horizons.ephemerides),
+            asyncio.to_thread(horizons.ephemerides, **ephemerides_options),
             timeout=config.EPHEMERIS_TIMEOUT_SEC,
         )
 

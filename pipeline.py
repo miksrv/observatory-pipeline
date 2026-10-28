@@ -1979,6 +1979,15 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
     (10 arcsec, wider than MATCH_CONE_ARCSEC's 5) of any saturated pixel in
     the new frame or any aligned reference, and rejects near_edge candidates
     outright, so such a residual cannot reach this function to begin with.
+
+    The exemption does not cover a candidate whose nearest matched neighbour
+    is an MPC object: that is the mover's own image in the difference image
+    (it moved, so the reference stack cannot cancel it), and the change it
+    shows is the one the MPC match already accounts for. Kept, it became a
+    second, uncatalogued source of the same object — a MOVING_UNKNOWN beside
+    every COMET of C/2020 R4 (2026-10-28, 55 frames; its coma makes the
+    candidate too diffuse for _dedupe_by_catalog_identity's partner,
+    _dedupe_uncatalogued_subtraction_pair, which needs both uncatalogued).
     """
     from astropy.coordinates import SkyCoord
     import astropy.units as u
@@ -1996,6 +2005,7 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
     kept: list = []
     n_suppressed = 0
     n_exempt_subtraction = 0
+    n_mover_images = 0
 
     for src in sources:
         if src.get("catalog_name") is not None:
@@ -2004,8 +2014,13 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
             continue
 
         src_coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg)
-        sep = src_coord.separation(matched_coords).min()
+        separations = src_coord.separation(matched_coords)
+        nearest = int(separations.argmin())
+        sep = separations[nearest]
         if sep < threshold:
+            if src.get("_from_subtraction") and matched[nearest].get("catalog_name") == "MPC":
+                n_mover_images += 1
+                continue
             # Pixel-level confirmation outweighs the deblending-artifact
             # risk this step exists to guard against — see the docstring.
             if src.get("_from_subtraction"):
@@ -2022,6 +2037,14 @@ def _dedupe_unmatched_near_matched(sources: list, extra: dict) -> list:
             "Suppressed %d unmatched source(s) within %.1f\" of a matched source "
             "(deblending artifacts) — %d sources remain",
             n_suppressed, config.MATCH_CONE_ARCSEC, len(kept),
+            extra=extra,
+        )
+
+    if n_mover_images:
+        logger.info(
+            "Dropped %d subtraction candidate(s) within %.1f\" of an MPC object "
+            "— the moving object's own image in the difference image",
+            n_mover_images, config.MATCH_CONE_ARCSEC,
             extra=extra,
         )
 

@@ -265,9 +265,25 @@ def _is_residual_of_catalogued_star(
     FAINTER than a neighbour this close is lost; that is the accepted cost.
     No magnitude on the candidate, or the check disabled, decides nothing.
 
+    The radius is taken from the wider of the candidate's and the star's
+    FWHM. A frame smeared by wind or a mount jump has stars several times the
+    width of the sharp residuals its difference image shows (Haumea
+    2024-05-28T20-11-23: stars 6.6", candidates 2.3" and 6.8" from them) —
+    measured on the candidate alone, the radius missed every one of them.
+    Only a point source's FWHM counts, judged against the frame's PSF: a
+    galaxy's would stretch the radius over a supernova beside it, and
+    without the PSF nothing tells the two apart.
+
+    A candidate within MATCH_CONE_ARCSEC of an MPC object is that object's own
+    image in the difference image — it moved, so the reference stack does not
+    cancel it — whatever its shape or brightness: a comet's coma makes the
+    candidate diffuse, and it may measure brighter than the blind detection
+    (C/2020 R4, 2026-10-28: 55 MOVING_UNKNOWN beside the COMET).
+
     On a frame without calibrated magnitudes (narrowband, 8-bit) the
     brightness comparison falls back to the flux ratio, as a magnitude
-    difference; entries are ``(ra, dec, mag, flux)`` (a 3-tuple is mag-only).
+    difference; entries are ``(ra, dec, mag, flux, fwhm, catalog_name)``
+    (shorter tuples leave the missing fields unknown; a 3-tuple is mag-only).
 
     Not for a diffuse candidate — wider than SUBTRACTION_DIFFUSE_FWHM_RATIO ×
     the frame's PSF (`frame_psf_arcsec`): its FWHM would stretch the radius
@@ -275,8 +291,7 @@ def _is_residual_of_catalogued_star(
     dropped. Such a candidate is held to the alert confirmation instead
     (`_confirm._needs_confirmation()`).
     """
-    factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
-    if factor <= 0 or not catalogued_frame_sources:
+    if not catalogued_frame_sources:
         return False
     if not source.get("_from_subtraction") or source.get("catalog_name") is not None:
         return False
@@ -286,6 +301,19 @@ def _is_residual_of_catalogued_star(
         return False
     if not (math.isfinite(ra) and math.isfinite(dec)):
         return False
+
+    # Not governed by SUBTRACTION_RESIDUAL_RADIUS_FWHM: a mover's own image is
+    # not a residual, and turning the residual check off must not bring it back.
+    for entry in catalogued_frame_sources:
+        if len(entry) > 5 and entry[5] == "MPC" and (
+            _haversine_arcsec(ra, dec, entry[0], entry[1]) <= config.MATCH_CONE_ARCSEC
+        ):
+            return True
+
+    factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
+    if factor <= 0:
+        return False
+
     mag = _finite(source.get("mag"))
     flux = _finite(source.get("flux"))
     if mag is None and (flux is None or flux <= 0):
@@ -298,12 +326,18 @@ def _is_residual_of_catalogued_star(
     diffuse_ratio = config.SUBTRACTION_DIFFUSE_FWHM_RATIO
     if frame_psf_arcsec and diffuse_ratio > 0 and fwhm > diffuse_ratio * frame_psf_arcsec:
         return False
-    radius = factor * fwhm if fwhm > 0 else 2.0 * config.MATCH_CONE_ARCSEC
-    radius = max(radius, config.MATCH_CONE_ARCSEC)
 
     for entry in catalogued_frame_sources:
         c_ra, c_dec, c_mag = entry[0], entry[1], entry[2]
         c_flux = entry[3] if len(entry) > 3 else None
+        c_fwhm = _finite(entry[4]) if len(entry) > 4 else None
+        if not frame_psf_arcsec or c_fwhm is None or (
+            c_fwhm > config.VARIABILITY_MAX_FWHM_RATIO * frame_psf_arcsec
+        ):
+            c_fwhm = None
+        width = max(fwhm, c_fwhm or 0.0)
+        radius = factor * width if width > 0 else 2.0 * config.MATCH_CONE_ARCSEC
+        radius = max(radius, config.MATCH_CONE_ARCSEC)
         if abs(c_dec - dec) * 3600.0 > radius:
             continue
         # Positive when the candidate is fainter than the star.
@@ -318,6 +352,44 @@ def _is_residual_of_catalogued_star(
         ):
             continue
         if _haversine_arcsec(ra, dec, c_ra, c_dec) <= radius:
+            return True
+    return False
+
+
+def _in_saturated_halo(
+    source: dict,
+    saturated_frame_sources: list[tuple[float, float, float]],
+) -> bool:
+    """
+    Whether an uncatalogued, unsaturated detection lies within
+    SATURATED_HALO_RADIUS_FWHM × the FWHM of a saturated source in this same
+    frame — a fragment of its halo or diffraction spikes, or a residual the
+    subtraction mask (a fixed SATURATION_MASK_RADIUS_ARCSEC) was too small
+    for. The radius scales with the saturated source's own measured FWHM,
+    which grows with its brightness, so it holds for any optics. Such
+    fragments wander from frame to frame with the seeing and the spikes'
+    orientation, so they read as "shifted" and even line up into a chance
+    track (M45, 2026-10-28: 43 MOVING_UNKNOWN 23-48" from the Pleiades).
+    `saturated_frame_sources` holds ``(ra, dec, fwhm)`` — point-like
+    saturated sources only: detect() leaves out saturated trails and
+    galaxies.
+    """
+    factor = config.SATURATED_HALO_RADIUS_FWHM
+    if factor <= 0 or not saturated_frame_sources:
+        return False
+    if source.get("catalog_name") is not None or source.get("saturated"):
+        return False
+    try:
+        ra, dec = float(source["ra"]), float(source["dec"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not (math.isfinite(ra) and math.isfinite(dec)):
+        return False
+    for s_ra, s_dec, s_fwhm in saturated_frame_sources:
+        radius = factor * s_fwhm
+        if abs(s_dec - dec) * 3600.0 > radius:
+            continue
+        if _haversine_arcsec(ra, dec, s_ra, s_dec) <= radius:
             return True
     return False
 
@@ -370,6 +442,18 @@ def _same_optics_history(history: list[dict]) -> list[dict]:
     kept, so a missing frame record never shortens a light curve.
     """
     return [src for src in history if src.get("_same_optics") is not False]
+
+
+def _is_extended(source: dict, frame_psf_arcsec: float | None) -> bool:
+    """
+    FWHM over `VARIABILITY_MAX_FWHM_RATIO` × the frame's PSF — an extended
+    source, whose aperture magnitude follows the seeing. Unknown → False.
+    """
+    fwhm = _finite(source.get("fwhm"))
+    return bool(
+        fwhm is not None and frame_psf_arcsec
+        and fwhm > config.VARIABILITY_MAX_FWHM_RATIO * frame_psf_arcsec
+    )
 
 
 def _light_curve_unmeasurable(source: dict, frame_psf_arcsec: float | None) -> str | None:
@@ -425,6 +509,7 @@ def _classify_source_sync(
     catalogued_frame_sources: list[tuple] | None = None,
     frame_psf_arcsec: float | None = None,
     allow_moving: bool = True,
+    saturated_frame_sources: list[tuple[float, float, float]] | None = None,
 ) -> dict | None:
     """
     Classify a single source using PREFETCHED batch data (synchronous).
@@ -528,6 +613,17 @@ def _classify_source_sync(
         logger.debug(
             "Suppressed: subtraction candidate ra=%.4f dec=%.4f mag=%s sits beside "
             "a catalogued star of the same brightness — its residual, not a change",
+            ra, dec, mag,
+            extra=extra,
+        )
+        return None
+
+    # Likewise for any uncatalogued detection in a saturated star's halo —
+    # see _in_saturated_halo().
+    if _in_saturated_halo(source, saturated_frame_sources or []):
+        logger.debug(
+            "Suppressed: uncatalogued detection ra=%.4f dec=%.4f mag=%s lies in "
+            "a saturated source's halo — a fragment of it, not an object",
             ra, dec, mag,
             extra=extra,
         )
@@ -909,8 +1005,16 @@ def _classify_source_sync(
     # brighter) counts here; a host galaxy's own foreground star simply
     # fading is not a supernova signature. Judged on the whole same-filter
     # history, whatever optics took it: an alert is never given up because
-    # the earlier epochs came from another telescope. ---
-    if mag_changed and delta_mag is not None and delta_mag < -config.DELTA_MAG_ALERT and _is_galaxy(object_type):
+    # the earlier epochs came from another telescope. Not for an extended
+    # source — the galaxy's own detection: its aperture is sized by the
+    # frame's seeing and takes in more of the galaxy as the seeing widens
+    # (M74's nucleus, FWHM 11-13" against a 3.5" PSF, read 0.6-1.0 mag
+    # "brighter"). A supernova in it is a point source of its own, or a
+    # subtraction candidate. ---
+    if (
+        mag_changed and delta_mag is not None and delta_mag < -config.DELTA_MAG_ALERT
+        and _is_galaxy(object_type) and not _is_extended(source, frame_psf_arcsec)
+    ):
         logger.warning(
             "ALERT — SUPERNOVA_CANDIDATE: brightening near galaxy object_type=%s "
             "ra=%.4f dec=%.4f delta_mag=%.3f",
