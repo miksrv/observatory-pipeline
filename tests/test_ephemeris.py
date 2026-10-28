@@ -186,6 +186,26 @@ class TestEphemerisQuery:
         assert location["lon"]       == config.SITE_LON
         assert location["elevation"] == pytest.approx(config.SITE_ELEV / 1000.0)
 
+    @pytest.mark.parametrize("designation, id_type, options", [
+        # Without an id_type "Artemis" also matches the Artemis missions and
+        # Horizons refuses it as ambiguous (2026-10-28, 28 frames).
+        ("Artemis", "smallbody", {}),
+        ("1999 RZ167", "smallbody", {}),
+        ("C/2020 R4", "designation", {"closest_apparition": True, "no_fragments": True}),
+        ("29P", "designation", {"closest_apparition": True, "no_fragments": True}),
+        ("73P-B", "designation", {"closest_apparition": True, "no_fragments": False}),
+    ])
+    async def test_query_names_the_target_unambiguously(self, designation, id_type, options):
+        row = _make_eph_row()
+        mock_horizons = _make_horizons_mock(row)
+
+        with patch("modules.ephemeris.Horizons", mock_horizons):
+            result = await ephemeris.query(designation, _OBS_TIME)
+
+        assert result is not None
+        assert mock_horizons.call_args.kwargs["id_type"] == id_type
+        assert mock_horizons.return_value.ephemerides.call_args.kwargs == options
+
     async def test_query_handles_masked_angular_velocity(self):
         """When RA_rate and DEC_rate are masked, angular_velocity must be None."""
         row = _make_eph_row(dra=None, ddec=None)
