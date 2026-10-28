@@ -191,20 +191,30 @@ async def detect(
 
     # Catalogued sources with a measured magnitude or flux, for telling a subtraction
     # candidate that is merely a star's own residual from a transient — see
-    # _classify._is_residual_of_catalogued_star().
-    catalogued_frame_sources: list[tuple[float, float, float | None, float | None]] = []
+    # _classify._is_residual_of_catalogued_star(). MPC objects are kept even
+    # without either: a moving object's own subtraction candidate is judged
+    # by position alone. Saturated sources, for the halo around each one —
+    # _classify._in_saturated_halo().
+    catalogued_frame_sources: list[tuple] = []
+    saturated_frame_sources: list[tuple[float, float, float]] = []
     for s in sources:
-        if s.get("catalog_name") is None:
-            continue
         try:
             ra_, dec_ = float(s["ra"]), float(s["dec"])
         except (KeyError, TypeError, ValueError):
             continue
+        fwhm_ = _finite_or_none(s.get("fwhm"))
+        if s.get("saturated") and fwhm_ is not None and fwhm_ > 0:
+            saturated_frame_sources.append((ra_, dec_, fwhm_))
+        if s.get("catalog_name") is None:
+            continue
         mag_, flux_ = _finite_or_none(s.get("mag")), _finite_or_none(s.get("flux"))
-        if mag_ is not None or flux_ is not None:
-            # (ra, dec, mag, flux) — the flux stands in for brightness on a
-            # frame without calibrated magnitudes (narrowband, 8-bit).
-            catalogued_frame_sources.append((ra_, dec_, mag_, flux_))
+        if mag_ is not None or flux_ is not None or s.get("catalog_name") == "MPC":
+            # (ra, dec, mag, flux, fwhm, catalog_name) — the flux stands in for
+            # brightness on a frame without calibrated magnitudes (narrowband,
+            # 8-bit).
+            catalogued_frame_sources.append(
+                (ra_, dec_, mag_, flux_, fwhm_, s.get("catalog_name"))
+            )
 
     anomalies: list[dict] = []
 
@@ -219,6 +229,7 @@ async def detect(
                 current_frame_positions=current_frame_positions,
                 obs_time=obs_time,
                 catalogued_frame_sources=catalogued_frame_sources,
+                saturated_frame_sources=saturated_frame_sources,
                 frame_psf_arcsec=frame_psf_arcsec,
             )
             result = _classify_source_sync(source, **classify_args)
