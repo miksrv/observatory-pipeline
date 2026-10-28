@@ -2077,6 +2077,33 @@ class TestDedupeUnmatchedNearMatched:
 
         assert result == [star, transient]
 
+    def test_a_movers_own_subtraction_candidate_is_dropped(self):
+        """
+        C/2020 R4, 2026-10-28: the comet's own image in the difference image
+        sat 0.5" from the MPC-matched blind detection and was posted as a
+        second, uncatalogued source — a MOVING_UNKNOWN beside every COMET.
+        """
+        comet = {"ra": 10.0, "dec": 20.0, "catalog_name": "MPC", "catalog_id": "C/2020 R4"}
+        image = {
+            "ra": 10.0, "dec": 20.0 + 0.5 * config.MATCH_CONE_ARCSEC / 3600.0,
+            "catalog_name": None, "_from_subtraction": True,
+        }
+
+        result = pipeline._dedupe_unmatched_near_matched([comet, image], {})
+
+        assert result == [comet]
+
+    def test_the_nearest_neighbour_decides_between_a_star_and_a_mover(self):
+        """A candidate closer to a star than to the passing mover keeps the C6 exemption."""
+        cone = config.MATCH_CONE_ARCSEC / 3600.0
+        star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
+        mover = {"ra": 10.0, "dec": 20.0 + 0.9 * cone, "catalog_name": "MPC", "catalog_id": "Vesta"}
+        transient = {"ra": 10.0, "dec": 20.0 + 0.2 * cone, "catalog_name": None, "_from_subtraction": True}
+
+        result = pipeline._dedupe_unmatched_near_matched([star, mover, transient], {})
+
+        assert result == [star, mover, transient]
+
     def test_distant_unmatched_source_is_kept_either_way(self):
         star = {"ra": 10.0, "dec": 20.0, "catalog_name": "Gaia DR3", "catalog_id": "A"}
         far = {"ra": 10.5, "dec": 20.0, "catalog_name": None}
