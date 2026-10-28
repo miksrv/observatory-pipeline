@@ -15,6 +15,7 @@ from ._classify import _classify_source_sync
 from ._confirm import _confirm_alerts
 from ._ephemeris_resolution import _resolve_ephemerides
 from ._frames import _frame_records, _same_optics
+from ._otypes import _is_galaxy
 from ._prefetch import _prefetch_history_data
 from .types import _ALERT_TYPES, AnomalyType
 
@@ -194,7 +195,10 @@ async def detect(
     # _classify._is_residual_of_catalogued_star(). MPC objects are kept even
     # without either: a moving object's own subtraction candidate is judged
     # by position alone. Saturated sources, for the halo around each one —
-    # _classify._in_saturated_halo().
+    # _classify._in_saturated_halo() — but not a saturated trail (a streak's
+    # "fwhm" is its length, and would blank out a whole region of the frame)
+    # nor a galaxy (its nucleus saturates on a long exposure, and a supernova
+    # beside it must not become a halo fragment).
     catalogued_frame_sources: list[tuple] = []
     saturated_frame_sources: list[tuple[float, float, float]] = []
     for s in sources:
@@ -203,7 +207,12 @@ async def detect(
         except (KeyError, TypeError, ValueError):
             continue
         fwhm_ = _finite_or_none(s.get("fwhm"))
-        if s.get("saturated") and fwhm_ is not None and fwhm_ > 0:
+        elongation_ = _finite_or_none(s.get("elongation"))
+        if (
+            s.get("saturated") and fwhm_ is not None and fwhm_ > 0
+            and (elongation_ is None or elongation_ <= config.SPACE_DEBRIS_ELONGATION_MIN)
+            and not _is_galaxy(s.get("object_type"))
+        ):
             saturated_frame_sources.append((ra_, dec_, fwhm_))
         if s.get("catalog_name") is None:
             continue

@@ -249,7 +249,8 @@ SATURATION_MASK_RADIUS_ARCSEC: float = float(_get("SATURATION_MASK_RADIUS_ARCSEC
 # A fixed SATURATION_MASK_RADIUS_ARCSEC is too small for a really bright
 # star: on the 2026-10-28 M45 run 43 MOVING_UNKNOWN alerts were halo
 # fragments 23-48" from the Pleiades (Alcyone's FWHM measured 48"), and
-# three more lay 20" from Vesta at V=6. Trade-off: a transient that close to
+# three more lay 20" from Vesta at V=6. Saturated trails (a streak's FWHM is
+# its length) and galaxies are never halo sources. Trade-off: a transient that close to
 # a saturated star is lost — its magnitude would be unmeasurable anyway.
 # 0 disables the check.
 SATURATED_HALO_RADIUS_FWHM: float = float(_get("SATURATED_HALO_RADIUS_FWHM", "2.0"))

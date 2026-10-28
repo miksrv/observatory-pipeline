@@ -2824,6 +2824,24 @@ class TestFragmentsOfBrightObjects:
         inside = self._fragment(20.0, from_subtraction=True)
         assert self._types(await self._detect([star, inside]), "src-fragment") == ["UNKNOWN"]
 
+    async def test_a_saturated_trail_has_no_halo(self):
+        """A streak's "fwhm" is its length: a 1500" satellite flare must not blank out the frame."""
+        trail = _make_source(
+            mag=None, catalog_name=None, saturated=True, fwhm=1500.0,
+            elongation=10.0 * config.SPACE_DEBRIS_ELONGATION_MIN, source_id="src-trail",
+        )
+        transient = self._fragment(300.0, from_subtraction=True)
+        assert self._types(await self._detect([trail, transient]), "src-fragment") == ["UNKNOWN"]
+
+    async def test_a_saturated_galaxy_nucleus_has_no_halo(self):
+        """A supernova beside a saturated nucleus is not a fragment of it."""
+        nucleus = _make_source(
+            mag=None, catalog_name="Simbad", catalog_id="M 82", object_type="G",
+            saturated=True, fwhm=30.0, source_id="src-nucleus",
+        )
+        supernova = self._fragment(20.0, from_subtraction=True)
+        assert self._types(await self._detect([nucleus, supernova]), "src-fragment") != []
+
     def test_a_catalogued_or_saturated_source_is_never_a_fragment(self):
         from modules.anomaly_detector._classify import _in_saturated_halo
 
@@ -2853,6 +2871,24 @@ class TestFragmentsOfBrightObjects:
         with patch("modules.anomaly_detector._ephemeris_resolution.ephemeris.query",
                    new_callable=AsyncMock, return_value=None):
             result = await self._detect([comet, image], meta)
+        assert self._types(result, "src-image") == []
+        assert self._types(result, "src-comet") == ["COMET"]
+
+    async def test_a_movers_image_without_magnitudes_is_still_recognised(self, monkeypatch):
+        """Uncalibrated frame (narrowband, 8-bit): no mag, no flux on either; position decides.
+        Nor does turning the residual check off bring the mover's image back."""
+        monkeypatch.setattr(config, "SUBTRACTION_RESIDUAL_RADIUS_FWHM", 0.0)
+        comet = _make_source(
+            mag=None, flux=None, catalog_name="MPC", catalog_id="29P", object_type="COMET",
+            source_id="src-comet",
+        )
+        image = _make_source(
+            dec=_DEC + 0.5 * config.MATCH_CONE_ARCSEC / 3600.0, mag=None, flux=None,
+            catalog_name=None, from_subtraction=True, source_id="src-image",
+        )
+        with patch("modules.anomaly_detector._ephemeris_resolution.ephemeris.query",
+                   new_callable=AsyncMock, return_value=None):
+            result = await self._detect([comet, image])
         assert self._types(result, "src-image") == []
         assert self._types(result, "src-comet") == ["COMET"]
 

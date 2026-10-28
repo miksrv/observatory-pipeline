@@ -291,8 +291,7 @@ def _is_residual_of_catalogued_star(
     dropped. Such a candidate is held to the alert confirmation instead
     (`_confirm._needs_confirmation()`).
     """
-    factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
-    if factor <= 0 or not catalogued_frame_sources:
+    if not catalogued_frame_sources:
         return False
     if not source.get("_from_subtraction") or source.get("catalog_name") is not None:
         return False
@@ -303,11 +302,17 @@ def _is_residual_of_catalogued_star(
     if not (math.isfinite(ra) and math.isfinite(dec)):
         return False
 
+    # Not governed by SUBTRACTION_RESIDUAL_RADIUS_FWHM: a mover's own image is
+    # not a residual, and turning the residual check off must not bring it back.
     for entry in catalogued_frame_sources:
         if len(entry) > 5 and entry[5] == "MPC" and (
             _haversine_arcsec(ra, dec, entry[0], entry[1]) <= config.MATCH_CONE_ARCSEC
         ):
             return True
+
+    factor = config.SUBTRACTION_RESIDUAL_RADIUS_FWHM
+    if factor <= 0:
+        return False
 
     mag = _finite(source.get("mag"))
     flux = _finite(source.get("flux"))
@@ -365,7 +370,9 @@ def _in_saturated_halo(
     fragments wander from frame to frame with the seeing and the spikes'
     orientation, so they read as "shifted" and even line up into a chance
     track (M45, 2026-10-28: 43 MOVING_UNKNOWN 23-48" from the Pleiades).
-    `saturated_frame_sources` holds ``(ra, dec, fwhm)``.
+    `saturated_frame_sources` holds ``(ra, dec, fwhm)`` — point-like
+    saturated sources only: detect() leaves out saturated trails and
+    galaxies.
     """
     factor = config.SATURATED_HALO_RADIUS_FWHM
     if factor <= 0 or not saturated_frame_sources:

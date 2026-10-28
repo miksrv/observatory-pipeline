@@ -540,12 +540,12 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Situation | Result |
 |---|---|
 | MPC match | `ASTEROID` / `COMET` (+ JPL Horizons ephemeris) |
+| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM (the candidate's, or a point-like star's if wider) of a catalogued star at most `SUBTRACTION_RESIDUAL_MAX_DMAG` brighter or `SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG` fainter, or within `MATCH_CONE_ARCSEC` of an MPC object | suppressed (that star's residual / the mover's own image) — checked before every row below |
+| Uncatalogued, unsaturated, within `SATURATED_HALO_RADIUS_FWHM` × the FWHM of a point-like saturated source (not a trail, not a galaxy) | suppressed (halo/spike fragment) — checked before every row below |
 | Unmatched + `saturated` | suppressed, unless `_could_be_a_new_bright_object()` (round, interior, nothing ever seen at a covered position) |
 | Unmatched + `near_edge` | suppressed, unless a subtraction candidate passing `_survives_edge_zone()` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC`, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (`…_EDGE_…` near the edge) | `SPACE_DEBRIS` — recorded, not an alert; no "vacated position" proof needed |
 | Unmatched, shifted (see below), not near edge | `MOVING_UNKNOWN` → alert |
-| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM (the candidate's, or a point-like star's if wider) of a catalogued star at most `SUBTRACTION_RESIDUAL_MAX_DMAG` brighter or `SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG` fainter, or within `MATCH_CONE_ARCSEC` of an MPC object | suppressed (that star's residual / the mover's own image) — checked before every branch below |
-| Uncatalogued, unsaturated, within `SATURATED_HALO_RADIUS_FWHM` × the FWHM of a saturated source | suppressed (halo/spike fragment) — checked before every branch below |
 | No coverage, normal detection | `FIRST_OBSERVATION` — logged only, not posted |
 | No coverage, subtraction candidate, catalogued | suppressed (registration residual) |
 | No coverage, subtraction candidate, uncatalogued | `UNKNOWN` → alert |

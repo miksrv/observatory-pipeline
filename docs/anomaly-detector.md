@@ -193,7 +193,9 @@ one condition matches, the function returns and no further checks run:
      from them, which the candidate's own 2.3″ FWHM missed.
    - `_in_saturated_halo()` — an uncatalogued, unsaturated detection within
      `SATURATED_HALO_RADIUS_FWHM` × the FWHM of a saturated source in the same frame is a
-     fragment of its halo or diffraction spikes. The saturated source's FWHM grows with its
+     fragment of its halo or diffraction spikes. Saturated trails (elongation over
+     `SPACE_DEBRIS_ELONGATION_MIN` — a streak's FWHM is its length) and galaxies (a saturated
+     nucleus beside a supernova) are not used as halo sources. The saturated source's FWHM grows with its
      brightness, so the radius does too, whatever the optics. Such fragments wander with the
      seeing and read as "shifted" — 43 `MOVING_UNKNOWN` around the Pleiades and 3 around
      Vesta (V=6) on the 2026-10-28 run.

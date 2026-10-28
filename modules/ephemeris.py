@@ -37,9 +37,10 @@ import config
 logger = logging.getLogger(__name__)
 
 # A comet designation as catalog_matcher writes it: "C/2020 R4", "P/2019 LD2",
-# "29P", "73P-B". Horizons keeps one record per apparition of a periodic comet
+# "29P", "73P-B" — the same forms catalog_matcher/_sbident.py's
+# _NUMBERED_COMET_RE / _PROVISIONAL_COMET_RE produce. Horizons keeps one record per apparition of a periodic comet
 # (and per fragment), so a bare designation is ambiguous there.
-_COMET_DESIGNATION = re.compile(r"^(?:[PCDXI]/\d{4} |\d+[PDI](?:-|$))")
+_COMET_DESIGNATION = re.compile(r"^(?:[PCDXI]/\d{4} |\d+[PDCXI](?:-|$))")
 
 
 def _lookup_args(designation: str) -> tuple[str, dict]:

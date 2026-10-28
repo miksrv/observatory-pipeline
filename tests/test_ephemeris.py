@@ -194,6 +194,7 @@ class TestEphemerisQuery:
         ("C/2020 R4", "designation", {"closest_apparition": True, "no_fragments": True}),
         ("29P", "designation", {"closest_apparition": True, "no_fragments": True}),
         ("73P-B", "designation", {"closest_apparition": True, "no_fragments": False}),
+        ("1I", "designation", {"closest_apparition": True, "no_fragments": True}),
     ])
     async def test_query_names_the_target_unambiguously(self, designation, id_type, options):
         row = _make_eph_row()
