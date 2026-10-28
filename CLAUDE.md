@@ -116,7 +116,8 @@ independently re-runnable modules.
    - `_dedupe_uncatalogued_subtraction_pair` — an uncatalogued object's normal detection and its
      own subtraction candidate within `MATCH_CONE_ARCSEC`.
    - `_dedupe_unmatched_near_matched` — an unmatched deblending fragment beside a matched star
-     (subtraction candidates exempt — they carry evidence of change).
+     (subtraction candidates exempt — they carry evidence of change — unless the nearest
+     matched source is an MPC object: then it is the mover's own difference image).
    - `_dedupe_cross_catalog_duplicates` (after step 9.5) — one star claimed under two catalogs
      because forced photometry only checks its own `catalog_id`; keeps the earlier catalog in
      `_CATALOG_PRIORITY`.
@@ -543,7 +544,8 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Unmatched + `near_edge` | suppressed, unless a subtraction candidate passing `_survives_edge_zone()` |
 | Unmatched, no detection within `MATCH_CONE_ARCSEC`, elongation > `SPACE_DEBRIS_ELONGATION_MIN` (`…_EDGE_…` near the edge) | `SPACE_DEBRIS` — recorded, not an alert; no "vacated position" proof needed |
 | Unmatched, shifted (see below), not near edge | `MOVING_UNKNOWN` → alert |
-| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM of a catalogued star at most `SUBTRACTION_RESIDUAL_MAX_DMAG` brighter or `SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG` fainter | suppressed (that star's residual) — checked before every branch below |
+| Uncatalogued subtraction candidate within `SUBTRACTION_RESIDUAL_RADIUS_FWHM` × FWHM (the candidate's, or a point-like star's if wider) of a catalogued star at most `SUBTRACTION_RESIDUAL_MAX_DMAG` brighter or `SUBTRACTION_RESIDUAL_MAX_FAINTER_DMAG` fainter, or within `MATCH_CONE_ARCSEC` of an MPC object | suppressed (that star's residual / the mover's own image) — checked before every branch below |
+| Uncatalogued, unsaturated, within `SATURATED_HALO_RADIUS_FWHM` × the FWHM of a saturated source | suppressed (halo/spike fragment) — checked before every branch below |
 | No coverage, normal detection | `FIRST_OBSERVATION` — logged only, not posted |
 | No coverage, subtraction candidate, catalogued | suppressed (registration residual) |
 | No coverage, subtraction candidate, uncatalogued | `UNKNOWN` → alert |
@@ -551,7 +553,7 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 | Covered, no history, catalogued | `KNOWN_CATALOG_NEW` — logged only, not posted |
 | Covered, no history, uncatalogued | `UNKNOWN` → alert |
 | History, subtraction candidate | nothing — no Δmag against a neighbour's light curve |
-| History, significant brightening, near galaxy | `SUPERNOVA_CANDIDATE` → alert |
+| History, significant brightening, near galaxy, not extended (FWHM ≤ `VARIABILITY_MAX_FWHM_RATIO` × PSF) | `SUPERNOVA_CANDIDATE` → alert |
 | History, significant Δmag, Simbad binary / variable | `BINARY_STAR` / `VARIABLE_STAR` |
 | History, significant Δmag beyond `VARIABILITY_SIGMA` × own same-filter, same-optics scatter over ≥ `VARIABILITY_MIN_EPOCHS`; a well-measured point source (not a galaxy/cluster/nebula, FWHM ≤ `VARIABILITY_MAX_FWHM_RATIO` × PSF, `mag_err` ≤ `VARIABILITY_MAX_MAG_ERR`, not near the edge) | `VARIABLE_STAR` (light-curve based; stated in `notes`) |
 
@@ -592,6 +594,8 @@ and **[docs/anomaly-detector.md](docs/anomaly-detector.md)** for the mechanics a
 
 ### `modules/ephemeris.py`
 JPL Horizons via `astroquery.jplhorizons` → predicted RA/Dec, mag, distance, angular velocity.
+Looked up as a small body (`id_type`), a comet by designation at its closest apparition — a
+bare name like "Artemis" also matches spacecraft and Horizons refuses it as ambiguous.
 The synchronous client runs in `asyncio.to_thread()` under `EPHEMERIS_TIMEOUT_SEC`; any failure
 returns `None`.
 
