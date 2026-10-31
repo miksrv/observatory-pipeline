@@ -272,14 +272,16 @@ are in the code; `OBJECT` drives the archive subdirectory. Non-obvious resolutio
 ### `modules/normalizer.py`
 Normalizes object names (`M 51`→`M51`, `Sh2 101`→`SH2-101`, `Abell 39`/`A39`→`Abell39` — bare
 `A<n>` only when n ≤ 2712, so `A807 FA` stays a minor-planet designation), filters (`Luminance`→`L`,
-`OSC`/`RGB`/`Color`→`OSC`, `H-Alpha`→`Ha`, `L-eNhance`→`LeNhance`, Johnson/SDSS passed through, …)
+`OSC`/`RGB`/`Color`→`OSC`, `H-Alpha`→`Ha`, `O`/`S`→`OIII`/`SII`, `L-eNhance`→`LeNhance`, Johnson/SDSS passed through, …)
 and frame types (`Light`/`Dark`/`Flat`/`Bias`). Full mapping tables are in the code.
 `is_narrowband()` uses `config.NARROWBAND_FILTERS`.
 
 A Light/Flat with no FILTER card takes the filter from its path (`extract_filter_from_path()`:
 the token after `Light`/`Flat` in the filename, a `2x2` binning token skipped, else the parent
 directory), only if `known_filter()` recognises it; it is written into the frame's `FILTER` card,
-marked as taken from the file name.
+marked as taken from the file name. Likewise a frame with no `OBJECT` (or the placeholder `Unknown`)
+takes it from the filename (`extract_object_from_filename()`: `M_33_Light_…` → `M33`), written
+back into `OBJECT`.
 
 Filenames (`NORMALIZE_ENABLED=true`):
 ```

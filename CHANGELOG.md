@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.3
+
+### Patch Changes
+
+- Analysis: a Light frame with no `OBJECT` card (or the placeholder `Unknown`) takes its object from the file name again, written back into the header — the "missing" marker was lost in normalisation, so all 59 M33 frames of 2023 were archived under `UNKNOWN/`; the file name `M_33_Light_…` now gives `M33`, not `M`. Re-run `ANALYZE` on frames archived under `UNKNOWN/`
+- Filters: the filter-wheel slot names `O` and `S` are `OIII` and `SII` (narrowband) — 19 M33 frames were treated as broadband and calibrated against Gaia
+
 ## 1.6.2
 
 ### Patch Changes
