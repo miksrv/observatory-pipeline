@@ -230,6 +230,11 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   loop's, because CPU-bound steps hold the loop for minutes. astap runs in its own session, so a
   terminal Ctrl+C does not kill it mid-solve. The watcher maps SIGTERM onto its Ctrl+C path
   (flush the pending batch) — as PID 1 it would otherwise ignore SIGTERM until Docker's SIGKILL.
+- **Catalog status:** a daemon thread (`_CatalogHealthReporter`) probes every online catalog in use
+  (`modules/catalog_health.py`: one small GET per host; any answer below 500 = up) at start and
+  every `CATALOG_HEALTH_INTERVAL_SEC`, and sends the list to `POST /pipelines/catalogs` for the
+  API dashboard. A thread, not a loop task: an ANALYZE task holds the event loop for hours. It
+  only reports — catalog_matcher still queries a dead catalog and waits out its timeouts.
 - **Lost progress reports:** an item outcome the API did not take (`post_task_items_progress()`
   → `None`) is retried once the handler returns; if it still fails, the task goes back to
   `PENDING` (its unreported items are redone) instead of sitting at `RUNNING` forever.

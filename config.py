@@ -963,6 +963,13 @@ TASK_POLL_INTERVAL_SEC: float = float(_get("TASK_POLL_INTERVAL_SEC", "10.0"))
 # an unreasonable amount of time. Resets to TASK_POLL_INTERVAL_SEC the moment
 # a task is found.
 TASK_POLL_BACKOFF_MAX_SEC: float = float(_get("TASK_POLL_BACKOFF_MAX_SEC", "60.0"))
+# How often the worker checks that every online catalog it uses answers
+# (modules/catalog_health.py) and reports it to the API's dashboard, in
+# seconds; also once right after start. 0 turns the check off.
+CATALOG_HEALTH_INTERVAL_SEC: float = float(_get("CATALOG_HEALTH_INTERVAL_SEC", "600"))
+# Per-catalog timeout of that check, in seconds (SkyBot takes ~8 s to answer
+# even a tiny cone search).
+CATALOG_HEALTH_TIMEOUT_SEC: float = float(_get("CATALOG_HEALTH_TIMEOUT_SEC", "20"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1093,6 +1100,8 @@ _OVERRIDABLE: dict[str, type] = {
     # Worker polling
     "TASK_POLL_INTERVAL_SEC": float,
     "TASK_POLL_BACKOFF_MAX_SEC": float,
+    "CATALOG_HEALTH_INTERVAL_SEC": float,
+    "CATALOG_HEALTH_TIMEOUT_SEC": float,
     # Logging
     "LOG_LEVEL": None,  # special: str.upper()
     # ASTAP
