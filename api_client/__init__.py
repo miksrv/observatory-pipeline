@@ -9,6 +9,7 @@ that document for full request/response shapes:
   anomalies.py  (docs/API.md §3)
   tasks.py      (docs/API.md §14)
   settings.py   (docs/API.md §16)
+  pipelines.py  (docs/API.md §17)
   _shared.py    internal HTTP infra (retry decorator, AsyncClient factory,
                 batch-response normalization) used by every module above
 
@@ -45,6 +46,8 @@ Full list:
 
   get_settings()                                            → dict[str, str] | None
 
+  post_catalog_status(catalogs)                             → bool
+
 `httpx` is imported here (unused directly) so that
 ``unittest.mock.patch("api_client.httpx.AsyncClient", ...)`` — the mocking
 strategy tests/test_api_client.py uses — resolves without needing to know
@@ -65,6 +68,7 @@ from .frames import (
     get_nearest_frame_before,
     post_frame,
 )
+from .pipelines import post_catalog_status
 from .settings import get_settings
 from .sources import (
     get_source_track,
@@ -105,4 +109,5 @@ __all__ = [
     "post_task_items_progress",
     "upload_task_item_chart",
     "get_settings",
+    "post_catalog_status",
 ]

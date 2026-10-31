@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.3
+
+### Patch Changes
+
+- Analysis: a Light frame with no `OBJECT` card (or the placeholder `Unknown`) takes its object from the file name again, written back into the header — the "missing" marker was lost in normalisation, so all 59 M33 frames of 2023 were archived under `UNKNOWN/`; the file name `M_33_Light_…` now gives `M33`, not `M`. Re-run `ANALYZE` on frames archived under `UNKNOWN/`
+- Worker: checks every online catalog it uses (Simbad, Gaia DR3, 2MASS and Pan-STARRS on VizieR, SkyBot / JPL SB Ident per `MPC_SOURCES`, JPL Horizons) at start and every `CATALOG_HEALTH_INTERVAL_SEC` (600 s, 0 = off; `CATALOG_HEALTH_TIMEOUT_SEC` 20 s) and reports it to the API dashboard — CDS was unreachable for the whole 2026-10-28 ingest and only the log said so (requires observatory-api 1.4.1; an older API's 404 is only logged)
+- Filters: the filter-wheel slot names `O` and `S` are `OIII` and `SII` (narrowband) — 19 M33 frames were treated as broadband and calibrated against Gaia
+
 ## 1.6.2
 
 ### Patch Changes

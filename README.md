@@ -622,6 +622,8 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | **Job Queue Worker** |
 | `TASK_POLL_INTERVAL_SEC` | `10.0` | No | How often `worker.py` polls `GET /tasks?status=PENDING` when idle. |
 | `TASK_POLL_BACKOFF_MAX_SEC` | `60.0` | No | Idle polling backs off exponentially up to this ceiling, resetting the moment a task is found. |
+| `CATALOG_HEALTH_INTERVAL_SEC` | `600` | No | How often the worker checks that each online catalog answers and reports it to the API dashboard (also once at start); `0` = off. |
+| `CATALOG_HEALTH_TIMEOUT_SEC` | `20` | No | Per-catalog timeout of that check. |
 | **Observatory Site** |
 | `SITE_LAT` | `0.0` | No | Observatory latitude in decimal degrees (positive = North). Used for topocentric ephemeris queries to JPL Horizons and the JPL Small-Body Identification fallback (`MPC_SOURCES`). |
 | `SITE_LON` | `0.0` | No | Observatory longitude in decimal degrees (positive = East). |

@@ -106,11 +106,14 @@ class TestNormalizeFilterName:
         assert normalizer.normalize_filter_name("OIII")[0] == "OIII"
         assert normalizer.normalize_filter_name("O3")[0] == "OIII"
         assert normalizer.normalize_filter_name("[OIII]")[0] == "OIII"
+        assert normalizer.normalize_filter_name("O")[0] == "OIII"
         
         # SII
         assert normalizer.normalize_filter_name("SII")[0] == "SII"
         assert normalizer.normalize_filter_name("S2")[0] == "SII"
         assert normalizer.normalize_filter_name("[SII]")[0] == "SII"
+        assert normalizer.normalize_filter_name("S")[0] == "SII"
+        assert normalizer.is_narrowband("O") and normalizer.is_narrowband("S")
 
     def test_filter_suffix_removal(self):
         """Test removal of ' Filter' suffix."""
@@ -377,6 +380,53 @@ class TestExtractObjectFromFilename:
 
     def test_no_usable_segment_yields_unknown(self):
         assert normalizer.extract_object_from_filename("Light_L_300_2024-03-15.fits") == "_UNKNOWN"
+
+    @pytest.mark.parametrize("filename,expected", [
+        ("M_33_Light_O_600_secs_2023-10-19T03-33-13_001.fits", "M33"),
+        ("NGC_6946_Light_Red_300_secs_2020-07-28T03-06-25.fits", "NGC6946"),
+        ("Sh2_101_Light_Ha_300_secs_2024-03-15.fits",           "SH2-101"),
+        ("A_39_Light_L_300_secs_2024-03-15.fits",               "Abell39"),
+    ])
+    def test_a_catalog_prefix_token_keeps_its_number(self, filename, expected):
+        """2023 M33 frames had no OBJECT card; `M_33_…` collected only "M"."""
+        assert normalizer.extract_object_from_filename(filename) == expected
+
+    @pytest.mark.parametrize("filename,expected", [
+        ("NGC_7331_300_2024-03-15T22-01-34.fits", "NGC7331"),
+        ("M_300_2024-03-15T22-01-34.fits",        "M"),
+        ("T_CrB_Light_2x2_L_60_secs_2024.fits",   "T_CrB"),
+        ("M_33_2x2_Light_L_60_secs_2024.fits",    "M33"),
+    ])
+    def test_an_exposure_time_after_a_designation_is_not_swallowed(self, filename, expected):
+        assert normalizer.extract_object_from_filename(filename) == expected
+
+
+class TestPlaceholderObject:
+    """
+    A missing OBJECT must stay recognisably missing through normalisation:
+    fits_header's "_UNKNOWN" sentinel was stripped to "UNKNOWN", so the
+    pipeline's filename fallback never ran and 59 M33 frames were archived
+    under UNKNOWN/. A capture program's "Unknown" default means the same.
+    """
+
+    @pytest.mark.parametrize("raw", ["_UNKNOWN", "Unknown", "UNKNOWN", " unknown "])
+    def test_placeholders_normalise_to_the_sentinel(self, raw):
+        assert normalizer.normalize_object_name(raw)[0] == "_UNKNOWN"
+
+    def test_missing_object_survives_normalize_headers(self):
+        headers = {"object_name": "_UNKNOWN", "observation": {"object": None, "filter": "O"}}
+        normalizer.normalize_headers(headers)
+        assert headers["object_name"] == "_UNKNOWN"
+        assert headers["observation"]["filter"] == "OIII"
+
+    def test_a_placeholder_observation_object_becomes_none(self):
+        headers = {"object_name": "Unknown", "observation": {"object": "Unknown"}}
+        normalizer.normalize_headers(headers)
+        assert headers["object_name"] == "_UNKNOWN"
+        assert headers["observation"]["object"] is None
+
+    def test_a_real_name_containing_unknown_is_kept(self):
+        assert normalizer.normalize_object_name("Unknown_Nebula")[0] == "Unknown_Nebula"
 
 
 class TestMultiBandFilters:

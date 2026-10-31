@@ -76,6 +76,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from collections.abc import Iterable, Iterator
 
 import config
@@ -702,6 +703,48 @@ async def run_forever() -> None:
             signal.signal(sig, handler)
 
 
+class _CatalogHealthReporter:
+    """
+    Checks the online catalogs (modules/catalog_health.py) every
+    CATALOG_HEALTH_INTERVAL_SEC and reports them to the API, on a daemon
+    thread of its own: an ANALYZE task holds the worker's event loop for hours
+    (CPU-bound steps run on it), and that is exactly when a dead catalog
+    matters. The thread runs each report in its own short-lived event loop.
+    """
+
+    def __init__(self, interval_sec: float) -> None:
+        self._interval = interval_sec
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="catalog-health", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        from modules import catalog_health  # noqa: PLC0415
+
+        while not self._stop.is_set():
+            try:
+                results = catalog_health.check_all()
+                if not self._stop.is_set():
+                    asyncio.run(api_client.post_catalog_status(results))
+            except Exception:
+                logger.exception("Catalog health check failed")
+            self._stop.wait(self._interval)
+
+
+def _start_catalog_health_reporter() -> _CatalogHealthReporter | None:
+    """The running reporter, or None when CATALOG_HEALTH_INTERVAL_SEC is 0."""
+    if config.CATALOG_HEALTH_INTERVAL_SEC <= 0:
+        return None
+    reporter = _CatalogHealthReporter(config.CATALOG_HEALTH_INTERVAL_SEC)
+    reporter.start()
+    return reporter
+
+
 async def _poll_until_shutdown() -> None:
     """run_forever()'s body: settings, then the poll loop."""
 
@@ -718,6 +761,17 @@ async def _poll_until_shutdown() -> None:
     else:
         logger.info("No remote settings fetched — using local defaults only")
 
+    # After the remote settings: they may change the interval.
+    reporter = _start_catalog_health_reporter()
+    try:
+        await _poll_tasks()
+    finally:
+        if reporter is not None:
+            reporter.stop()
+
+
+async def _poll_tasks() -> None:
+    """The poll loop, until a shutdown is requested."""
     base_interval = config.TASK_POLL_INTERVAL_SEC
     max_interval = config.TASK_POLL_BACKOFF_MAX_SEC
     interval = base_interval

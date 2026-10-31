@@ -163,6 +163,12 @@ stops the retry loop first. HTTP 4xx errors are logged immediately and never ret
 
 ---
 
+### 17. Online Catalog Status
+
+**[POST /pipelines/catalogs](#17-online-catalog-status)**
+
+---
+
 ---
 
 ## 1. Register a Frame
@@ -1479,7 +1485,7 @@ is silently ignored):
 | Normalization | `NORMALIZE_ENABLED` |
 | Catalog cache | `CACHE_TTL_HOURS` |
 | Watcher batching | `WATCHER_DEBOUNCE_SEC`, `WATCHER_MAX_BATCH_SIZE` |
-| Worker polling | `TASK_POLL_INTERVAL_SEC`, `TASK_POLL_BACKOFF_MAX_SEC` |
+| Worker polling | `TASK_POLL_INTERVAL_SEC`, `TASK_POLL_BACKOFF_MAX_SEC`, `CATALOG_HEALTH_INTERVAL_SEC`, `CATALOG_HEALTH_TIMEOUT_SEC` |
 | Logging | `LOG_LEVEL` |
 | ASTAP | `ASTAP_FOV_HINT` |
 | Narrowband | `NARROWBAND_FILTERS` |
@@ -1490,3 +1496,43 @@ is silently ignored):
 |--------|------|
 | `401` | Invalid or missing `X-API-Key` |
 
+---
+
+## 17. Online Catalog Status
+
+`POST /pipelines/catalogs` — the worker's check of every online catalog it uses
+(`modules/catalog_health.py`), sent once at start and then every `CATALOG_HEALTH_INTERVAL_SEC`
+(600 s; 0 = off) from a thread of its own. The API stores it per pipeline (replacing the previous
+report, timestamped with its own receive time) and shows it on the dashboard. Requires
+observatory-api 1.4.1; an older API answers `404`, which the worker only logs.
+
+### Request
+
+```json
+{
+  "catalogs": [
+    {"name": "Simbad",       "ok": false, "latency_ms": null, "error": "ConnectTimeout: timed out"},
+    {"name": "Gaia DR3",     "ok": true,  "latency_ms": 412,  "error": null},
+    {"name": "SkyBot",       "ok": false, "latency_ms": 3020, "error": "HTTP 502"},
+    {"name": "JPL Horizons", "ok": true,  "latency_ms": 270,  "error": null}
+  ]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `catalogs` | list | 1–20 entries |
+| `name` | string | 1–40 characters, `A-Z a-z 0-9 space . _ / ( ) -` |
+| `ok` | bool | The service answered with a status below 500 |
+| `latency_ms` | int \| null | Response time; `null` when nothing came back |
+| `error` | string \| null | Why it is down (exception or `HTTP 5xx`); the API keeps 300 characters |
+
+### Response
+
+`200 {"data": {"stored": 4, "checked_at": "2026-10-31 20:00:00"}}`
+
+| Status | When |
+|--------|------|
+| `400` | Malformed body |
+| `401` | Invalid or missing `X-API-Key` |
+| `503` | The API's migration for this has not been run yet |

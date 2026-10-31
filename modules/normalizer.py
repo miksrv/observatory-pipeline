@@ -55,6 +55,35 @@ _CATALOG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# OBJECT values that only say "no target was set" — capture software writes
+# them as defaults (2 M33 frames of 2020-08-25 carry `OBJECT = 'Unknown'`).
+# They are treated as a missing OBJECT, so pipeline.py's filename fallback
+# runs. `_unknown` is fits_header.sanitize_object_name()'s own "missing"
+# sentinel: stripped of its underscore below, it became `UNKNOWN`, which the
+# pipeline no longer recognised as missing — all 59 M33 frames of 2023 (no
+# OBJECT card) were archived under `UNKNOWN/` instead of `M33/`.
+_PLACEHOLDER_OBJECT_NAMES: frozenset[str] = frozenset({"unknown", "_unknown"})
+
+# A catalog prefix a capture program wrote as its own filename token
+# (`M_33_Light_…`, `NGC_6946_Light_…`) — see extract_object_from_filename().
+_CATALOG_PREFIX_TOKEN_RE = re.compile(r"^(?:[A-Za-z]+|SH2)$", re.IGNORECASE)
+
+
+def _is_catalog_designation(name: str) -> bool:
+    """
+    True if *name* is a catalog designation normalize_object_name() knows,
+    within the catalog's range where it is a short one (Messier 110,
+    Caldwell 109, Abell 2712) — `M_300_…` is an exposure time, not M300.
+    """
+    for pattern, max_number in (
+        (MESSIER_PATTERN, 110),
+        (CALDWELL_PATTERN, 109),
+        (ABELL_SHORTHAND_PATTERN, _ABELL_MAX_NUMBER),
+    ):
+        if (match := pattern.match(name)) is not None:
+            return int(match.group(1)) <= max_number
+    return any(pattern.match(name) for pattern in (SH2_PATTERN, ABELL_PATTERN, _CATALOG_PATTERN))
+
 
 def normalize_object_name(raw_name: Any) -> tuple[str, str]:
     """
@@ -81,6 +110,8 @@ def normalize_object_name(raw_name: Any) -> tuple[str, str]:
     raw_str = str(raw_name).strip()
     if not raw_str:
         return ("_UNKNOWN", None)
+    if raw_str.lower() in _PLACEHOLDER_OBJECT_NAMES:
+        return ("_UNKNOWN", raw_str)
 
     match = MESSIER_PATTERN.match(raw_str)
     if match:
@@ -147,6 +178,7 @@ def extract_object_from_filename(filename: str) -> str:
         "NGC1234_Dark_300_2024-...fits" → "NGC1234"
         "4_Vesta_Light_L_120_2024-...fits" → "4_Vesta"
         "61_Cygni_Light_V_60_2024-...fits" → "61_Cygni"
+        "M_33_Light_O_600_secs_2023-...fits" → "M33"
     """
     _FRAME_TYPE_KEYWORDS: frozenset[str] = frozenset({
         "light", "dark", "flat", "bias",
@@ -160,7 +192,8 @@ def extract_object_from_filename(filename: str) -> str:
 
     collected: list[str] = []
     for index, part in enumerate(parts):
-        if part.lower() in _FRAME_TYPE_KEYWORDS:
+        # A binning token ("M_33_2x2_Light_…") ends the name like a frame type.
+        if part.lower() in _FRAME_TYPE_KEYWORDS or _BINNING_TOKEN_RE.match(part):
             break
         if re.fullmatch(r"\d+", part):
             # A number in the leading position, immediately followed by a
@@ -176,7 +209,17 @@ def extract_object_from_filename(filename: str) -> str:
                 and len(parts) > 1
                 and re.match(r"[A-Za-z]", parts[1]) is not None
             )
-            if not is_designation:
+            # A catalog prefix written as a token of its own ("M_33",
+            # "NGC_6946") is followed by its number: the 2023 M33 frames
+            # arrived as `M_33_Light_O_600_secs_…` with no OBJECT card and
+            # this collected only "M". Only directly after a lone prefix —
+            # "NGC_7331_300" must still stop at the exposure time.
+            is_catalog_number = (
+                len(collected) == 1
+                and _CATALOG_PREFIX_TOKEN_RE.match(collected[0]) is not None
+                and _is_catalog_designation(f"{collected[0]}_{part}")
+            )
+            if not (is_designation or is_catalog_number):
                 break
         collected.append(part)
 
@@ -236,6 +279,7 @@ FILTER_MAP = {
 
     # Oxygen III
     "oiii": "OIII",
+    "o": "OIII",  # INDI/Ekos filter-wheel slot names (M33 2023: `FILTER = 'O'`)
     "o3": "OIII",
     "o-iii": "OIII",
     "oxygen-iii": "OIII",
@@ -244,6 +288,7 @@ FILTER_MAP = {
 
     # Sulfur II
     "sii": "SII",
+    "s": "SII",
     "s2": "SII",
     "s-ii": "SII",
     "sulfur-ii": "SII",
@@ -629,7 +674,8 @@ def normalize_headers(raw_headers: dict) -> dict:
     if observation:
         if observation.get("object"):
             obj_obs_norm, _ = normalize_object_name(observation.get("object"))
-            observation["object"] = obj_obs_norm
+            # A placeholder ("Unknown") is no object — None, as for a missing card.
+            observation["object"] = None if obj_obs_norm == "_UNKNOWN" else obj_obs_norm
 
         filt_norm, _ = normalize_filter_name(observation.get("filter"))
         observation["filter"] = filt_norm

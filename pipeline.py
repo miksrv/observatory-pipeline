@@ -363,21 +363,13 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     if config.NORMALIZE_ENABLED and normalizer is not None:
         header = normalizer.normalize_headers(header)
 
-    # Get object name for directory organization
-    object_name: str = header.get("object_name", "_UNKNOWN") or "_UNKNOWN"
+    # Get object name for directory organization (from the filename when the
+    # OBJECT header is empty)
+    object_name: str = _apply_filename_object_fallback(header, basename)
 
-    # Fallback: extract object name from filename when OBJECT header is empty
-    if (object_name == "_UNKNOWN" or not object_name) and normalizer is not None:
-        extracted = normalizer.extract_object_from_filename(basename)
-        if extracted != "_UNKNOWN":
-            object_name = extracted
-            header["object_name"] = object_name
-            observation = header.get("observation", {})
-            if isinstance(observation, dict):
-                observation["object"] = object_name
-
-    # Write normalized object name back to FITS file
-    if config.NORMALIZE_ENABLED and normalizer is not None:
+    # Write normalized object name back to FITS file — never the "missing"
+    # sentinel itself
+    if config.NORMALIZE_ENABLED and normalizer is not None and object_name != "_UNKNOWN":
         normalizer.update_fits_object_header(fits_path, object_name)
 
     # Generate filename (normalized if enabled)
@@ -1686,12 +1678,30 @@ def _resolve_bare_filename(fits_path: str) -> str:
     return archive_layout.find_archived(fits_path) or fits_path
 
 
+def _apply_filename_object_fallback(header: dict, basename: str) -> str:
+    """
+    The frame's object name; when the OBJECT header gave none ("_UNKNOWN"),
+    the one in its filename (normalizer.extract_object_from_filename()),
+    written into *header* (`object_name`, `observation.object`).
+    """
+    object_name: str = header.get("object_name") or "_UNKNOWN"
+    if object_name == "_UNKNOWN" and normalizer is not None:
+        extracted = normalizer.extract_object_from_filename(basename)
+        if extracted != "_UNKNOWN":
+            object_name = extracted
+            header["object_name"] = object_name
+            observation = header.get("observation")
+            if isinstance(observation, dict):
+                observation["object"] = object_name
+    return object_name
+
+
 def _object_dir_name(fits_path: str) -> str:
     """The per-object directory name Step 1 will file this frame under."""
     frame_header = fits_header.extract_headers(fits_path)
     if config.NORMALIZE_ENABLED and normalizer is not None:
         frame_header = normalizer.normalize_headers(frame_header)
-    return frame_header.get("object_name") or "_UNKNOWN"
+    return _apply_filename_object_fallback(frame_header, os.path.basename(fits_path))
 
 
 def _is_8bit_file(fits_path: str) -> bool:
