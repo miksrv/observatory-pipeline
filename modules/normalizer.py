@@ -192,7 +192,8 @@ def extract_object_from_filename(filename: str) -> str:
 
     collected: list[str] = []
     for index, part in enumerate(parts):
-        if part.lower() in _FRAME_TYPE_KEYWORDS:
+        # A binning token ("M_33_2x2_Light_…") ends the name like a frame type.
+        if part.lower() in _FRAME_TYPE_KEYWORDS or _BINNING_TOKEN_RE.match(part):
             break
         if re.fullmatch(r"\d+", part):
             # A number in the leading position, immediately followed by a
@@ -673,7 +674,8 @@ def normalize_headers(raw_headers: dict) -> dict:
     if observation:
         if observation.get("object"):
             obj_obs_norm, _ = normalize_object_name(observation.get("object"))
-            observation["object"] = obj_obs_norm
+            # A placeholder ("Unknown") is no object — None, as for a missing card.
+            observation["object"] = None if obj_obs_norm == "_UNKNOWN" else obj_obs_norm
 
         filt_norm, _ = normalize_filter_name(observation.get("filter"))
         observation["filter"] = filt_norm

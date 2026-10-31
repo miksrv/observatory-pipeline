@@ -395,6 +395,7 @@ class TestExtractObjectFromFilename:
         ("NGC_7331_300_2024-03-15T22-01-34.fits", "NGC7331"),
         ("M_300_2024-03-15T22-01-34.fits",        "M"),
         ("T_CrB_Light_2x2_L_60_secs_2024.fits",   "T_CrB"),
+        ("M_33_2x2_Light_L_60_secs_2024.fits",    "M33"),
     ])
     def test_an_exposure_time_after_a_designation_is_not_swallowed(self, filename, expected):
         assert normalizer.extract_object_from_filename(filename) == expected
@@ -417,6 +418,12 @@ class TestPlaceholderObject:
         normalizer.normalize_headers(headers)
         assert headers["object_name"] == "_UNKNOWN"
         assert headers["observation"]["filter"] == "OIII"
+
+    def test_a_placeholder_observation_object_becomes_none(self):
+        headers = {"object_name": "Unknown", "observation": {"object": "Unknown"}}
+        normalizer.normalize_headers(headers)
+        assert headers["object_name"] == "_UNKNOWN"
+        assert headers["observation"]["object"] is None
 
     def test_a_real_name_containing_unknown_is_kept(self):
         assert normalizer.normalize_object_name("Unknown_Nebula")[0] == "Unknown_Nebula"

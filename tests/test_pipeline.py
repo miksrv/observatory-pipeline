@@ -3320,3 +3320,46 @@ async def test_watcher_restart_does_not_resubmit_already_queued_files(monkeypatc
         assert watcher._pending_paths == [str(fresh)]
     finally:
         watcher._in_flight_realpaths.clear()
+
+
+# ---------------------------------------------------------------------------
+# Missing OBJECT → object from the filename (v1.6.3)
+# ---------------------------------------------------------------------------
+
+
+class TestObjectFromFilename:
+    """
+    59 M33 frames of 2023 had no OBJECT card and were archived under
+    UNKNOWN/; every place that names the frame's object directory must fall
+    back to the filename the same way.
+    """
+
+    def _write(self, path, **cards):
+        hdu = fits.PrimaryHDU(np.zeros((4, 4), dtype=np.uint16))
+        for key, value in cards.items():
+            hdu.header[key] = value
+        hdu.writeto(path)
+
+    @pytest.mark.parametrize("cards", [{}, {"OBJECT": "Unknown"}])
+    def test_object_dir_name_uses_the_filename(self, tmp_path, monkeypatch, cards):
+        monkeypatch.setattr(config, "NORMALIZE_ENABLED", True)
+        path = tmp_path / "M_33_Light_O_600_secs_2023-10-19T03-33-13_001.fits"
+        self._write(path, IMAGETYP="Light Frame", **cards)
+        assert pipeline._object_dir_name(str(path)) == "M33"
+
+    def test_header_keeps_its_own_object(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "NORMALIZE_ENABLED", True)
+        path = tmp_path / "M_33_Light_O_600_secs_2023-10-19T03-33-13_001.fits"
+        self._write(path, OBJECT="NGC 598")
+        assert pipeline._object_dir_name(str(path)) == "NGC598"
+
+    def test_fallback_fills_the_header(self):
+        header = {"object_name": "_UNKNOWN", "observation": {"object": None}}
+        assert pipeline._apply_filename_object_fallback(header, "NGC_6946_Light_R_300_secs_x.fits") == "NGC6946"
+        assert header["object_name"] == "NGC6946"
+        assert header["observation"]["object"] == "NGC6946"
+
+    def test_no_usable_filename_stays_unknown(self):
+        header = {"object_name": "_UNKNOWN", "observation": {"object": None}}
+        assert pipeline._apply_filename_object_fallback(header, "Light_L_300_2024.fits") == "_UNKNOWN"
+        assert header["observation"]["object"] is None
