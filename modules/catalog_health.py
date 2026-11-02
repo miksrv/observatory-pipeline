@@ -13,9 +13,16 @@ A probe is one small GET against the host the real query goes to. "ok"
 means the service answered with any status below 500 — a 4xx to a bare
 request still proves it is up (JPL sb_ident answers 400 without an observer);
 a 5xx (SkyBot's 502 of 2026-10-23), a timeout or a refused connection means
-it is down. 2MASS and Pan-STARRS are both VizieR tables, probed by one tiny
-query each; VizieR reports a broken table as HTTP 200 with
-`QUERY_STATUS = ERROR` in the VOTable, which counts as down too.
+it is down. 2MASS and Pan-STARRS are VizieR tables, probed by one tiny query
+each; VizieR reports a broken or missing table as HTTP 200 with
+`QUERY_STATUS = ERROR` in the VOTable, which counts as down too (that is how
+a mirror says it does not carry the table).
+
+A catalog with several configured sources (SIMBAD_SERVERS, TWOMASS_SOURCES,
+PANSTARRS_SOURCES — see catalog_matcher._sources) gets one probe per source
+and one line in the report: up while any source answers, with the log
+saying which one serves it while a preferred one is down; the `error` of a
+catalog that is down names every source's failure.
 httpx's timeout is per phase (connect, read, ...), so a server trickling bytes
 can hold one probe past CATALOG_HEALTH_TIMEOUT_SEC — the report is then late,
 nothing else waits for it.
@@ -41,23 +48,41 @@ class Probe:
     url: str
     # Text in a 2xx-4xx body that still means "broken" (VizieR's error VOTable).
     error_marker: str | None = None
+    # Which of the catalog's configured sources this probes (a host name,
+    # "Gaia archive"); None for a catalog with a single, fixed source.
+    source: str | None = None
 
 
 _VIZIER_ERROR = 'name="QUERY_STATUS" value="ERROR"'
+_GAIA_ARCHIVE_URL = "https://gea.esac.esa.int/tap-server/tap/availability"
+_GAIA_ARCHIVE_LABEL = "Gaia archive"
 
 
-_SIMBAD = Probe("Simbad", "https://simbad.cds.unistra.fr/simbad/sim-tap/availability")
-_GAIA = Probe("Gaia DR3", "https://gea.esac.esa.int/tap-server/tap/availability")
-_2MASS = Probe(
-    "2MASS",
-    "https://vizier.cds.unistra.fr/viz-bin/votable?-source=II/246/out&-out.max=1&-c=0.0%2B0.0&-c.rs=60",
-    _VIZIER_ERROR,
-)
-_PANSTARRS = Probe(
-    "Pan-STARRS",
-    "https://vizier.cds.unistra.fr/viz-bin/votable?-source=II/349/ps1&-out.max=1&-c=0.0%2B0.0&-c.rs=60",
-    _VIZIER_ERROR,
-)
+def _simbad_probe(host: str) -> Probe:
+    return Probe("Simbad", f"https://{host}/simbad/sim-tap/availability", source=host)
+
+
+def _vizier_probe(name: str, table: str, host: str) -> Probe:
+    return Probe(
+        name,
+        f"https://{host}/viz-bin/votable?-source={table}&-out.max=1&-c=0.0%2B0.0&-c.rs=60",
+        _VIZIER_ERROR,
+        source=host,
+    )
+
+
+def _table_probe(name: str, table: str, source: str) -> Probe:
+    """One TWOMASS_SOURCES / PANSTARRS_SOURCES entry: a VizieR host, or `gaia` for the archive copy."""
+    if source == "gaia":
+        return Probe(name, _GAIA_ARCHIVE_URL, source=_GAIA_ARCHIVE_LABEL)
+    return _vizier_probe(name, table, source)
+
+
+_GAIA = Probe("Gaia DR3", _GAIA_ARCHIVE_URL)
+# The CDS probes, kept by name for tests.
+_SIMBAD = _simbad_probe("simbad.cds.unistra.fr")
+_2MASS = _vizier_probe("2MASS", "II/246/out", "vizier.cds.unistra.fr")
+_PANSTARRS = _vizier_probe("Pan-STARRS", "II/349/ps1", "vizier.cds.unistra.fr")
 _SKYBOT = Probe(
     "SkyBot",
     "https://ssp.imcce.fr/webservices/skybot/api/conesearch.php"
@@ -70,9 +95,24 @@ _JPL_HORIZONS = Probe("JPL Horizons", "https://ssd.jpl.nasa.gov/api/horizons.api
 _MPC_SOURCE_PROBES: dict[str, Probe] = {"skybot": _SKYBOT, "jpl": _JPL_SBIDENT}
 
 
+def _unique(names) -> list[str]:
+    seen: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
 def probes() -> list[Probe]:
-    """The catalogs this configuration uses, in catalog_matcher's order, then ephemerides."""
-    selected = [_SIMBAD, _GAIA, _2MASS, _PANSTARRS]
+    """
+    One probe per configured source, in catalog_matcher's order (Simbad, Gaia,
+    2MASS, Pan-STARRS, MPC), then ephemerides. A catalog's probes share its
+    name; `check_all()` folds them into one report line.
+    """
+    selected = [_simbad_probe(host) for host in _unique(config.SIMBAD_SERVERS)]
+    selected.append(_GAIA)
+    selected += [_table_probe("2MASS", "II/246/out", s) for s in _unique(config.TWOMASS_SOURCES)]
+    selected += [_table_probe("Pan-STARRS", "II/349/ps1", s) for s in _unique(config.PANSTARRS_SOURCES)]
     selected += [_MPC_SOURCE_PROBES[name] for name in config.MPC_SOURCES if name in _MPC_SOURCE_PROBES]
     selected.append(_JPL_HORIZONS)
     return selected
@@ -99,8 +139,46 @@ def check(probe: Probe, client: httpx.Client) -> dict:
     return {"name": probe.name, "ok": True, "latency_ms": latency_ms, "error": None}
 
 
+def fold(selected: list[Probe], results: list[dict]) -> list[dict]:
+    """
+    One report line per catalog name, in first-seen order: up with the first
+    answering source's latency while any source answers (a preferred source
+    down is logged), else down with every source's failure in `error`.
+    """
+    by_name: dict[str, list[tuple[Probe, dict]]] = {}
+    for probe, result in zip(selected, results):
+        by_name.setdefault(probe.name, []).append((probe, result))
+
+    report: list[dict] = []
+    for name, entries in by_name.items():
+        answering = [(p, r) for p, r in entries if r["ok"]]
+        if answering:
+            probe, result = answering[0]
+            down = [(p, r) for p, r in entries if not r["ok"]]
+            if down:
+                logger.warning(
+                    "%s: %s — served by %s",
+                    name,
+                    "; ".join(f"{p.source} down ({r['error']})" for p, r in down),
+                    probe.source,
+                )
+            report.append({"name": name, "ok": True, "latency_ms": result["latency_ms"], "error": None})
+            continue
+        if len(entries) == 1:
+            report.append(entries[0][1])
+            continue
+        latencies = [r["latency_ms"] for _, r in entries if r["latency_ms"] is not None]
+        report.append({
+            "name": name,
+            "ok": False,
+            "latency_ms": max(latencies) if latencies else None,
+            "error": "; ".join(f"{p.source}: {r['error']}" for p, r in entries),
+        })
+    return report
+
+
 def check_all() -> list[dict]:
-    """Probe every catalog in parallel (blocking; at most about CATALOG_HEALTH_TIMEOUT_SEC)."""
+    """Probe every source in parallel (blocking; at most about CATALOG_HEALTH_TIMEOUT_SEC), one result per catalog."""
     selected = probes()
     timeout = config.CATALOG_HEALTH_TIMEOUT_SEC
     with httpx.Client(timeout=timeout, follow_redirects=True) as client, ThreadPoolExecutor(
@@ -108,9 +186,10 @@ def check_all() -> list[dict]:
     ) as pool:
         results = list(pool.map(lambda probe: check(probe, client), selected))
 
-    down = [r["name"] for r in results if not r["ok"]]
+    report = fold(selected, results)
+    down = [r["name"] for r in report if not r["ok"]]
     if down:
         logger.warning("Online catalogs not reachable: %s", ", ".join(down))
     else:
-        logger.info("All %d online catalogs reachable", len(results))
-    return results
+        logger.info("All %d online catalogs reachable", len(report))
+    return report

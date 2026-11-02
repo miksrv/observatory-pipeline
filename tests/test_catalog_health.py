@@ -50,11 +50,36 @@ class TestCheck:
         assert result == {"name": "Simbad", "ok": False, "latency_ms": None, "error": "ConnectTimeout: timed out"}
 
 
+def _single_sources(monkeypatch):
+    monkeypatch.setattr(config, "SIMBAD_SERVERS", ("simbad.cds.unistra.fr",))
+    monkeypatch.setattr(config, "TWOMASS_SOURCES", ("vizier.cds.unistra.fr",))
+    monkeypatch.setattr(config, "PANSTARRS_SOURCES", ("vizier.cds.unistra.fr",))
+
+
 class TestProbes:
     def test_only_the_configured_mpc_sources_are_probed(self, monkeypatch):
+        _single_sources(monkeypatch)
         monkeypatch.setattr(config, "MPC_SOURCES", ("jpl",))
         names = [p.name for p in catalog_health.probes()]
         assert names == ["Simbad", "Gaia DR3", "2MASS", "Pan-STARRS", "JPL SB Ident", "JPL Horizons"]
+
+    def test_every_configured_source_of_a_catalog_is_probed(self, monkeypatch):
+        monkeypatch.setattr(config, "SIMBAD_SERVERS", ("simbad.cds.unistra.fr", "simbad.harvard.edu"))
+        monkeypatch.setattr(config, "TWOMASS_SOURCES", ("vizier.cds.unistra.fr", "vizier.idia.ac.za", "gaia"))
+        monkeypatch.setattr(config, "PANSTARRS_SOURCES", ("vizier.cds.unistra.fr", "gaia", "gaia"))
+        monkeypatch.setattr(config, "MPC_SOURCES", ("skybot",))
+        probes = [(p.name, p.source) for p in catalog_health.probes()]
+        assert probes == [
+            ("Simbad", "simbad.cds.unistra.fr"), ("Simbad", "simbad.harvard.edu"),
+            ("Gaia DR3", None),
+            ("2MASS", "vizier.cds.unistra.fr"), ("2MASS", "vizier.idia.ac.za"), ("2MASS", "Gaia archive"),
+            ("Pan-STARRS", "vizier.cds.unistra.fr"), ("Pan-STARRS", "Gaia archive"),
+            ("SkyBot", None), ("JPL Horizons", None),
+        ]
+        by_source = {(p.name, p.source): p for p in catalog_health.probes()}
+        assert by_source[("Simbad", "simbad.harvard.edu")].url == "https://simbad.harvard.edu/simbad/sim-tap/availability"
+        assert by_source[("2MASS", "vizier.idia.ac.za")].url.startswith("https://vizier.idia.ac.za/viz-bin/votable?-source=II/246/out")
+        assert by_source[("Pan-STARRS", "Gaia archive")].url == catalog_health._GAIA_ARCHIVE_URL
 
     def test_names_fit_the_api_contract(self, monkeypatch):
         """observatory-api: 1-40 chars of A-Z a-z 0-9 space . _ / ( ) -"""
@@ -63,15 +88,60 @@ class TestProbes:
         for probe in catalog_health.probes():
             assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._/()-]{0,39}", probe.name)
 
-    def test_check_all_returns_one_result_per_probe(self, monkeypatch):
+    def test_check_all_returns_one_result_per_catalog(self, monkeypatch):
         monkeypatch.setattr(config, "MPC_SOURCES", ("skybot",))
         monkeypatch.setattr(
             catalog_health, "check",
-            lambda probe, client: {"name": probe.name, "ok": probe.name != "Simbad", "latency_ms": 1, "error": None},
+            lambda probe, client: {
+                "name": probe.name, "ok": probe.name != "Simbad",
+                "latency_ms": 1, "error": None if probe.name != "Simbad" else "HTTP 502",
+            },
         )
         results = catalog_health.check_all()
         assert [r["name"] for r in results][0] == "Simbad" and results[0]["ok"] is False
-        assert len(results) == len(catalog_health.probes())
+        assert [r["name"] for r in results] == list(dict.fromkeys(p.name for p in catalog_health.probes()))
+
+
+def _ok(name, latency=5):
+    return {"name": name, "ok": True, "latency_ms": latency, "error": None}
+
+
+def _down(name, error="ConnectTimeout: timed out", latency=None):
+    return {"name": name, "ok": False, "latency_ms": latency, "error": error}
+
+
+class TestFold:
+    _CDS = catalog_health._simbad_probe("simbad.cds.unistra.fr")
+    _HARVARD = catalog_health._simbad_probe("simbad.harvard.edu")
+
+    def test_a_catalog_is_up_while_any_source_answers(self, caplog):
+        with caplog.at_level("WARNING"):
+            report = catalog_health.fold([self._CDS, self._HARVARD], [_down("Simbad"), _ok("Simbad", 250)])
+        assert report == [{"name": "Simbad", "ok": True, "latency_ms": 250, "error": None}]
+        assert "Simbad: simbad.cds.unistra.fr down (ConnectTimeout: timed out) — served by simbad.harvard.edu" in caplog.text
+
+    def test_the_preferred_source_answering_is_not_worth_a_warning(self, caplog):
+        with caplog.at_level("WARNING"):
+            report = catalog_health.fold([self._CDS, self._HARVARD], [_ok("Simbad", 40), _ok("Simbad", 250)])
+        assert report[0]["latency_ms"] == 40 and caplog.text == ""
+
+    def test_every_source_down_names_each_failure(self):
+        report = catalog_health.fold(
+            [self._CDS, self._HARVARD], [_down("Simbad"), _down("Simbad", "HTTP 502", latency=3020)],
+        )
+        assert report == [{
+            "name": "Simbad", "ok": False, "latency_ms": 3020,
+            "error": "simbad.cds.unistra.fr: ConnectTimeout: timed out; simbad.harvard.edu: HTTP 502",
+        }]
+
+    def test_a_single_source_catalog_passes_through(self):
+        result = _down("SkyBot", "HTTP 502", latency=100)
+        assert catalog_health.fold([catalog_health._SKYBOT], [result]) == [result]
+
+    def test_catalogs_keep_their_order(self):
+        probes = [self._CDS, self._HARVARD, catalog_health._GAIA, catalog_health._SKYBOT]
+        results = [_down("Simbad"), _ok("Simbad"), _ok("Gaia DR3"), _ok("SkyBot")]
+        assert [r["name"] for r in catalog_health.fold(probes, results)] == ["Simbad", "Gaia DR3", "SkyBot"]
 
 
 class TestPostCatalogStatus:

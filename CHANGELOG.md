@@ -6,6 +6,7 @@
 
 - Catalog matching: Simbad, 2MASS and Pan-STARRS each come from a list of sources in order of preference, the next asked only when one fails (`SIMBAD_SERVERS`: CDS, then its Harvard mirror; `TWOMASS_SOURCES`: CDS VizieR, the IDIA mirror, then the ESA Gaia archive's copy; `PANSTARRS_SOURCES`: CDS VizieR, then the Gaia archive's copy — no VizieR mirror carries Pan-STARRS, and the archive copy answers sparse fields only). A failed source is asked last for `CATALOG_SOURCE_COOLDOWN_SEC` (900 s). CDS Strasbourg has been unreachable since 2026-10-28 and the whole 590-frame ingest of that night was matched against Gaia alone; re-run `ANALYZE` on those frames
 - Catalog matching: a 2MASS answer without a designation column gets designations in the catalog's own `hhmmssss±ddmmsss` form, not `Jhhmmss.s±ddmmss` — the same star must keep one `catalog_id` whichever source named it
+- Worker: the catalog check probes every configured source of Simbad, 2MASS and Pan-STARRS; a catalog counts as up while any source answers, and the log says which mirror is serving it
 
 ## 1.6.3
 
