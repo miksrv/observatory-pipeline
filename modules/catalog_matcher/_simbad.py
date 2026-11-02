@@ -12,6 +12,7 @@ import math
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astroquery.simbad import Simbad
+from astroquery.simbad import conf as simbad_conf
 
 import config
 
@@ -22,8 +23,77 @@ from ._cache import (
     _cache_radius_margin_deg,
     _cache_set,
 )
+from ._sources import SourceRotation, unique
 
 logger = logging.getLogger(__name__)
+
+# Which SIMBAD_SERVERS failed and until when (see _sources).
+_rotation = SourceRotation()
+# SIMBAD_SERVERS entries astroquery does not know, warned about once per process.
+_warned_unknown: set[str] = set()
+
+
+def _servers_in_order() -> list[str]:
+    """
+    SIMBAD_SERVERS in its configured order, a server that failed within the
+    last CATALOG_SOURCE_COOLDOWN_SEC moved to the back. Only the servers
+    astroquery knows (`conf.servers_list`: the CDS original and its Harvard
+    mirror) are asked — `Simbad.server` refuses any other host.
+    """
+    configured: list[str] = []
+    for host in unique(config.SIMBAD_SERVERS):
+        if host not in simbad_conf.servers_list:
+            if host not in _warned_unknown:
+                _warned_unknown.add(host)
+                logger.warning(
+                    "SIMBAD_SERVERS: unknown server %r ignored (known: %s)",
+                    host, ", ".join(simbad_conf.servers_list),
+                )
+            continue
+        configured.append(host)
+    return _rotation.order(configured)
+
+
+def _parse_simbad_table(result) -> list[dict]:
+    """Rows of a `query_region()` table → `{ra, dec, main_id, otype}` dicts; malformed rows skipped."""
+    # Column names vary across astroquery versions; normalise to upper-case
+    colnames_upper = {c.upper(): c for c in result.colnames}
+
+    ra_col    = colnames_upper.get("RA",      "RA")
+    dec_col   = colnames_upper.get("DEC",     "DEC")
+    id_col    = colnames_upper.get("MAIN_ID", "MAIN_ID")
+    otype_col = colnames_upper.get("OTYPE",   "OTYPE")
+
+    objects: list[dict] = []
+    for row in result:
+        try:
+            ra_raw  = row[ra_col]
+            dec_raw = row[dec_col]
+            str_ra  = str(ra_raw).strip()
+            str_dec = str(dec_raw).strip()
+
+            # astroquery >= 0.4.7 (new SIMBAD TAP service) returns RA/Dec as
+            # decimal degrees (float).  Older versions returned sexagesimal
+            # strings in HMS/DMS format.  Detect the format and parse accordingly.
+            try:
+                # If it parses as a plain float → decimal degrees (new API)
+                ra_deg  = float(str_ra)
+                dec_deg = float(str_dec)
+                sky = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
+            except ValueError:
+                # Sexagesimal string, e.g. "03 47 29.1" / "+24 06 18"  (old API)
+                sky = SkyCoord(ra=str_ra, dec=str_dec, unit=(u.hourangle, u.deg))
+
+            objects.append({
+                "ra":      float(sky.ra.deg),
+                "dec":     float(sky.dec.deg),
+                "main_id": str(row[id_col]),
+                "otype":   str(row[otype_col]),
+            })
+        except Exception as row_exc:
+            logger.debug("Skipping malformed Simbad row: %s", row_exc)
+            continue
+    return objects
 
 
 def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[dict]:
@@ -41,8 +111,14 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
     loses the ability to trigger VARIABLE_STAR/BINARY_STAR/SUPERNOVA_CANDIDATE,
     every one of which gates on a real Simbad OTYPE.
 
+    Asks the servers in SIMBAD_SERVERS in turn (the CDS original, then its
+    Harvard mirror); the first that answers decides the result, an empty
+    field included — both serve the same database. A failed server is asked
+    last for CATALOG_SOURCE_COOLDOWN_SEC (see `_sources`). CDS was unreachable
+    for days from 2026-10-28 and every frame lost its object types meanwhile.
+
     Returns a list of dicts with keys: ra, dec, main_id, otype.
-    Returns [] on any error or when Simbad returns None.
+    Returns [] when every server fails (nothing cached) or when Simbad returns None.
     """
     # Query around the TILE the cache key rounds to, with the tile's own
     # half-diagonal added to the radius — not around this frame's exact
@@ -62,66 +138,40 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
     if cached is not None:
         return cached  # type: ignore[return-value]
 
-    try:
-        simbad = Simbad()
-        simbad.add_votable_fields("otype")
+    servers = _servers_in_order()
+    if not servers:
+        # SIMBAD_SERVERS empty (or only unknown hosts): Simbad matching is off.
+        _cache_set(cache_key, [])
+        return []
 
-        coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
-        radius = ((key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()) * u.deg
-        result = simbad.query_region(coord, radius=radius)
+    coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
+    radius = ((key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()) * u.deg
 
-        if result is None:
-            _cache_set(cache_key, [])
-            return []
+    for host in servers:
+        try:
+            simbad = Simbad()
+            simbad.server = host
+            simbad.add_votable_fields("otype")
+            result = simbad.query_region(coord, radius=radius)
+        except Exception as exc:
+            _rotation.failed(host, config.CATALOG_SOURCE_COOLDOWN_SEC)
+            logger.warning(
+                "Simbad (%s) query failed for ra=%.3f dec=%.3f: %s", host, ra_center, dec_center, exc,
+            )
+            continue
+        if _rotation.answered(host):
+            logger.info("Simbad at %s answers again", host)
 
-        # Column names vary across astroquery versions; normalise to upper-case
-        colnames_upper = {c.upper(): c for c in result.colnames}
-
-        ra_col    = colnames_upper.get("RA",      "RA")
-        dec_col   = colnames_upper.get("DEC",     "DEC")
-        id_col    = colnames_upper.get("MAIN_ID", "MAIN_ID")
-        otype_col = colnames_upper.get("OTYPE",   "OTYPE")
-
-        objects: list[dict] = []
-        for row in result:
-            try:
-                ra_raw  = row[ra_col]
-                dec_raw = row[dec_col]
-                str_ra  = str(ra_raw).strip()
-                str_dec = str(dec_raw).strip()
-
-                # astroquery >= 0.4.7 (new SIMBAD TAP service) returns RA/Dec as
-                # decimal degrees (float).  Older versions returned sexagesimal
-                # strings in HMS/DMS format.  Detect the format and parse accordingly.
-                try:
-                    # If it parses as a plain float → decimal degrees (new API)
-                    ra_deg  = float(str_ra)
-                    dec_deg = float(str_dec)
-                    sky = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
-                except ValueError:
-                    # Sexagesimal string, e.g. "03 47 29.1" / "+24 06 18"  (old API)
-                    sky = SkyCoord(ra=str_ra, dec=str_dec, unit=(u.hourangle, u.deg))
-
-                objects.append({
-                    "ra":      float(sky.ra.deg),
-                    "dec":     float(sky.dec.deg),
-                    "main_id": str(row[id_col]),
-                    "otype":   str(row[otype_col]),
-                })
-            except Exception as row_exc:
-                logger.debug("Skipping malformed Simbad row: %s", row_exc)
-                continue
-
+        objects = [] if result is None else _parse_simbad_table(result)
         _cache_set(cache_key, objects)
-        logger.debug(
-            "Simbad query returned %d objects for ra=%.3f dec=%.3f",
-            len(objects), ra_center, dec_center,
-        )
+        logger.info("Simbad: %d object(s) from %s", len(objects), host)
         return objects
 
-    except Exception as exc:
-        logger.warning("Simbad query failed for ra=%.3f dec=%.3f: %s", ra_center, dec_center, exc)
-        return []
+    logger.warning(
+        "Simbad: no server answered for ra=%.3f dec=%.3f — frame gets no Simbad matching",
+        ra_center, dec_center,
+    )
+    return []
 
 
 def _match_simbad(sources: list[dict], simbad_objects: list[dict]) -> None:

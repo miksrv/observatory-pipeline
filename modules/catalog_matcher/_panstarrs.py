@@ -17,6 +17,7 @@ from astroquery.vizier import Vizier
 
 import config
 
+from . import _gaia_archive
 from ._cache import (
     _cache_fov_deg,
     _cache_get,
@@ -24,20 +25,77 @@ from ._cache import (
     _cache_radius_margin_deg,
     _cache_set,
 )
+from ._sources import SourceRotation, unique
 
 logger = logging.getLogger(__name__)
+
+# The PANSTARRS_SOURCES entry that means the ESA Gaia archive's copy
+# (`_gaia_archive`); every other entry is a VizieR host name.
+_GAIA_ARCHIVE = "gaia"
+_GAIA_ARCHIVE_LABEL = "Gaia archive"
+
+# Which PANSTARRS_SOURCES failed and until when (see _sources).
+_rotation = SourceRotation()
+
+
+def _sources_in_order() -> list[str]:
+    """PANSTARRS_SOURCES in its configured order, a source that failed within CATALOG_SOURCE_COOLDOWN_SEC last."""
+    return _rotation.order(unique(config.PANSTARRS_SOURCES))
+
+
+def _label(source: str) -> str:
+    return _GAIA_ARCHIVE_LABEL if source == _GAIA_ARCHIVE else source
+
+
+def _query_vizier(host: str, coord: SkyCoord, radius) -> list[dict]:
+    """Pan-STARRS DR1 rows from one VizieR host; raises on any transport or service error."""
+    viz = Vizier(
+        columns=["RAJ2000", "DEJ2000", "objID", "rmag"],
+        row_limit=-1,
+        vizier_server=host,
+    )
+    result = viz.query_region(coord, radius=radius, catalog="II/349/ps1")
+    if result is None or len(result) == 0:
+        return []
+
+    table = result[0]
+
+    sources: list[dict] = []
+    for row in table:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                rmag = float(row["rmag"])
+            if not math.isfinite(rmag):
+                continue
+            sources.append({
+                "ra":     float(row["RAJ2000"]),
+                "dec":    float(row["DEJ2000"]),
+                "obj_id": str(row["objID"]),
+                "rmag":   rmag,
+            })
+        except (TypeError, ValueError):
+            continue
+    return sources
 
 
 def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> list[dict]:
     """
-    Query Pan-STARRS DR1 (VizieR II/349/ps1) within fov_deg/2 of the frame centre.
+    Query Pan-STARRS DR1 within the frame's half-diagonal of its centre.
 
     Pan-STARRS reaches r~23.3 mag, significantly deeper than Gaia DR3 (~21 mag),
     and reduces false UNKNOWN alerts for faint sources that are simply below Gaia's
     completeness limit. Coverage is restricted to declination > -30°.
 
+    Asks the sources in PANSTARRS_SOURCES in turn — VizieR hosts or `gaia`,
+    the ESA Gaia archive's copy of DR1 (`_gaia_archive`; no VizieR mirror
+    carries this table); the first that answers decides the result, an empty
+    field included, and a failed source is asked last for
+    CATALOG_SOURCE_COOLDOWN_SEC (see `_sources`). Every source gives the same
+    `objID`, so history does not split by source.
+
     Returns a list of dicts with keys: ra, dec, obj_id, rmag.
-    Returns [] outside coverage or on any error.
+    Returns [] outside coverage, or when every source fails (nothing cached).
     """
     if dec_center < -30.0:
         logger.debug(
@@ -64,49 +122,40 @@ def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> lis
     if cached is not None:
         return cached  # type: ignore[return-value]
 
-    try:
-        coord  = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
-        radius = ((key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()) * u.deg
-
-        viz = Vizier(
-            columns=["RAJ2000", "DEJ2000", "objID", "rmag"],
-            row_limit=-1,
-        )
-        result = viz.query_region(coord, radius=radius, catalog="II/349/ps1")
-
-        if result is None or len(result) == 0:
-            _cache_set(cache_key, [])
-            return []
-
-        table = result[0]
-
-        sources: list[dict] = []
-        for row in table:
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", UserWarning)
-                    rmag = float(row["rmag"])
-                if not math.isfinite(rmag):
-                    continue
-                sources.append({
-                    "ra":     float(row["RAJ2000"]),
-                    "dec":    float(row["DEJ2000"]),
-                    "obj_id": str(row["objID"]),
-                    "rmag":   rmag,
-                })
-            except (TypeError, ValueError):
-                continue
-
-        _cache_set(cache_key, sources)
-        logger.debug(
-            "Pan-STARRS query returned %d sources for ra=%.3f dec=%.3f",
-            len(sources), ra_center, dec_center,
-        )
-        return sources
-
-    except Exception as exc:
-        logger.warning("Pan-STARRS query failed for ra=%.3f dec=%.3f: %s", ra_center, dec_center, exc)
+    sources = _sources_in_order()
+    if not sources:
+        # PANSTARRS_SOURCES empty: Pan-STARRS matching is off.
+        _cache_set(cache_key, [])
         return []
+
+    coord  = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
+    radius_deg = (key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()
+
+    for source in sources:
+        try:
+            if source == _GAIA_ARCHIVE:
+                ps_sources = _gaia_archive._query_panstarrs(key_ra, key_dec, radius_deg)
+            else:
+                ps_sources = _query_vizier(source, coord, radius_deg * u.deg)
+        except Exception as exc:
+            _rotation.failed(source, config.CATALOG_SOURCE_COOLDOWN_SEC)
+            logger.warning(
+                "Pan-STARRS (%s) query failed for ra=%.3f dec=%.3f: %s",
+                _label(source), ra_center, dec_center, exc,
+            )
+            continue
+        if _rotation.answered(source):
+            logger.info("Pan-STARRS at %s answers again", _label(source))
+
+        _cache_set(cache_key, ps_sources)
+        logger.info("Pan-STARRS: %d source(s) from %s", len(ps_sources), _label(source))
+        return ps_sources
+
+    logger.warning(
+        "Pan-STARRS: no source answered for ra=%.3f dec=%.3f — frame gets no Pan-STARRS matching",
+        ra_center, dec_center,
+    )
+    return []
 
 
 def _match_panstarrs(sources: list[dict], ps_sources: list[dict]) -> None:

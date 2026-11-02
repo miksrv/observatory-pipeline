@@ -27,6 +27,7 @@ from ._cache import (
     _cache_radius_margin_deg,
     _cache_set,
 )
+from ._sources import SourceRotation, unique
 
 logger = logging.getLogger(__name__)
 
@@ -177,9 +178,10 @@ def _query_skybot(ra_deg: float, dec_deg: float, radius_deg: float, epoch: Time)
 # Every source of known solar system objects: MPC_SOURCES name → log label.
 _SOURCE_LABELS: dict[str, str] = {"skybot": "SkyBot", "jpl": "JPL sb_ident"}
 
-# Source name → time.monotonic() before which it counts as down. Set when a
-# source fails (after its own retries), cleared when it answers.
-_down_until: dict[str, float] = {}
+# Which MPC_SOURCES failed and until when (see _sources). `_down_until` is
+# the rotation's own dict, exposed for tests to clear.
+_rotation = SourceRotation()
+_down_until: dict[str, float] = _rotation.down_until
 # Unknown MPC_SOURCES names already warned about (once per process, not per frame).
 _warned_unknown: set[str] = set()
 
@@ -202,16 +204,14 @@ def _sources_in_order() -> list[str]:
     reaching the source that works.
     """
     configured: list[str] = []
-    for name in config.MPC_SOURCES:
+    for name in unique(config.MPC_SOURCES):
         if name not in _SOURCE_LABELS:
             if name not in _warned_unknown:
                 _warned_unknown.add(name)
                 logger.warning("MPC_SOURCES: unknown source %r ignored (known: %s)", name, ", ".join(_SOURCE_LABELS))
-        elif name not in configured:
-            configured.append(name)
-    now = time.monotonic()
-    up = [s for s in configured if _down_until.get(s, 0.0) <= now]
-    return up + [s for s in configured if s not in up]
+            continue
+        configured.append(name)
+    return _rotation.order(configured)
 
 
 def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: float = 1.0) -> list[dict]:
@@ -291,15 +291,14 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
         try:
             objects = _query_source(source, key_ra, key_dec, radius_deg, epoch)
         except Exception as exc:
-            _down_until[source] = time.monotonic() + config.MPC_SOURCE_COOLDOWN_SEC
+            _rotation.failed(source, config.MPC_SOURCE_COOLDOWN_SEC)
             logger.warning(
                 "%s query failed: ra=%.4f dec=%.4f obs_time=%r — %s",
                 label, ra_center, dec_center, obs_time, exc,
             )
             continue
-        if source in _down_until:
+        if _rotation.answered(source):
             logger.info("%s answers again", label)
-            del _down_until[source]
         logger.info("MPC: %d object(s) from %s", len(objects), label)
         _cache_set(cache_key, objects)
         return objects

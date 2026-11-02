@@ -1936,3 +1936,285 @@ class TestGaiaProperMotionPropagation:
 
         assert result[0]["catalog_name"] == "Gaia DR3"
         assert result[0]["catalog_id"] == "777"
+
+
+# ===========================================================================
+# Mirrors for the stellar catalogs (SIMBAD_SERVERS, TWOMASS_SOURCES,
+# PANSTARRS_SOURCES — modules/catalog_matcher/_sources.py)
+# ===========================================================================
+
+from modules.catalog_matcher import _2mass, _gaia_archive, _panstarrs, _simbad  # noqa: E402
+
+_CDS_SIMBAD = "simbad.cds.unistra.fr"
+_HARVARD_SIMBAD = "simbad.harvard.edu"
+_CDS_VIZIER = "vizier.cds.unistra.fr"
+_IDIA_VIZIER = "vizier.idia.ac.za"
+
+
+def _simbad_degrees_table() -> Table:
+    return Table({"RA": [_RA], "DEC": [_DEC], "MAIN_ID": ["M 42"], "OTYPE": ["HII"]})
+
+
+def _simbad_class(down: set[str], table: Table | None):
+    """
+    A stand-in for astroquery's Simbad class: every instance remembers the
+    server assigned to it, fails on the hosts in `down` and returns `table`
+    from any other. `.asked` lists the hosts queried, in order.
+    """
+    asked: list[str] = []
+
+    def make(*args, **kwargs):
+        instance = MagicMock()
+
+        def query_region(coord, radius):
+            asked.append(instance.server)
+            if instance.server in down:
+                raise ConnectionError("timed out")
+            return table
+
+        instance.query_region.side_effect = query_region
+        return instance
+
+    cls = MagicMock(side_effect=make)
+    cls.asked = asked
+    return cls
+
+
+class TestSimbadServerFallback:
+    @pytest.fixture(autouse=True)
+    def _servers(self, monkeypatch):
+        monkeypatch.setattr(config, "SIMBAD_SERVERS", (_CDS_SIMBAD, _HARVARD_SIMBAD))
+        monkeypatch.setattr(config, "CATALOG_SOURCE_COOLDOWN_SEC", 900.0)
+        _simbad._rotation.down_until.clear()
+        yield
+        _simbad._rotation.down_until.clear()
+
+    def test_cds_answers_and_the_mirror_is_not_asked(self):
+        cls = _simbad_class(set(), _simbad_degrees_table())
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            objects = cm._query_simbad(_RA, _DEC, 1.0)
+        assert cls.asked == [_CDS_SIMBAD]
+        assert [o["main_id"] for o in objects] == ["M 42"] and objects[0]["otype"] == "HII"
+
+    def test_a_failed_cds_query_falls_back_to_the_mirror(self):
+        cls = _simbad_class({_CDS_SIMBAD}, _simbad_degrees_table())
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            objects = cm._query_simbad(_RA, _DEC, 1.0)
+        assert cls.asked == [_CDS_SIMBAD, _HARVARD_SIMBAD]
+        assert len(objects) == 1
+        # The mirror's answer is cached like any other.
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            cm._query_simbad(_RA, _DEC, 1.0)
+        assert cls.asked == [_CDS_SIMBAD, _HARVARD_SIMBAD]
+
+    def test_a_failed_server_is_asked_last_during_its_cooldown(self):
+        cls = _simbad_class({_CDS_SIMBAD}, None)
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            cm._query_simbad(_RA, _DEC, 1.0)
+            cm._query_simbad(_RA + 10.0, _DEC, 1.0)   # another tile → a new query
+        assert cls.asked == [_CDS_SIMBAD, _HARVARD_SIMBAD, _HARVARD_SIMBAD]
+
+    def test_a_server_that_answers_again_gets_its_place_back(self):
+        _simbad._rotation.failed(_CDS_SIMBAD, -1.0)   # a failure whose cooldown has passed
+        cls = _simbad_class(set(), None)
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            cm._query_simbad(_RA, _DEC, 1.0)
+        assert cls.asked == [_CDS_SIMBAD]
+        assert _CDS_SIMBAD not in _simbad._rotation.down_until
+
+    def test_zero_cooldown_keeps_the_configured_order(self, monkeypatch):
+        monkeypatch.setattr(config, "CATALOG_SOURCE_COOLDOWN_SEC", 0.0)
+        cls = _simbad_class({_CDS_SIMBAD}, None)
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            cm._query_simbad(_RA, _DEC, 1.0)
+            cm._query_simbad(_RA + 10.0, _DEC, 1.0)
+        assert cls.asked == [_CDS_SIMBAD, _HARVARD_SIMBAD, _CDS_SIMBAD, _HARVARD_SIMBAD]
+
+    def test_every_server_failing_returns_empty_and_caches_nothing(self):
+        cls = _simbad_class({_CDS_SIMBAD, _HARVARD_SIMBAD}, None)
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            assert cm._query_simbad(_RA, _DEC, 1.0) == []
+            assert cm._query_simbad(_RA, _DEC, 1.0) == []
+        assert len(cls.asked) == 4
+
+    def test_an_unknown_server_is_ignored(self, monkeypatch, caplog):
+        monkeypatch.setattr(config, "SIMBAD_SERVERS", ("simbad.example.org", _HARVARD_SIMBAD))
+        _simbad._warned_unknown.clear()
+        cls = _simbad_class(set(), None)
+        with patch("modules.catalog_matcher._simbad.Simbad", cls), caplog.at_level("WARNING"):
+            cm._query_simbad(_RA, _DEC, 1.0)
+        assert cls.asked == [_HARVARD_SIMBAD]
+        assert "unknown server 'simbad.example.org'" in caplog.text
+
+    def test_no_known_server_turns_simbad_matching_off(self, monkeypatch):
+        monkeypatch.setattr(config, "SIMBAD_SERVERS", ())
+        cls = _simbad_class(set(), None)
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            assert cm._query_simbad(_RA, _DEC, 1.0) == []
+        assert cls.asked == []
+
+
+def _vizier_class(down: set[str], tables: dict[str, Table | None]):
+    """
+    A stand-in for astroquery's Vizier class: `Vizier(vizier_server=host)`
+    instances fail on the hosts in `down` and answer `[tables[host]]` from
+    any other (an empty list when the table is None). `.asked` lists the
+    hosts queried, in order.
+    """
+    asked: list[str] = []
+
+    def make(*args, **kwargs):
+        host = kwargs["vizier_server"]
+        instance = MagicMock()
+
+        def query_region(coord, radius, catalog):
+            asked.append(host)
+            if host in down:
+                raise ConnectionError("timed out")
+            table = tables.get(host)
+            return [] if table is None else [table]
+
+        instance.query_region.side_effect = query_region
+        return instance
+
+    cls = MagicMock(side_effect=make)
+    cls.asked = asked
+    return cls
+
+
+def _gaia_archive_class(table: Table | None):
+    """A stand-in for astroquery's Gaia: `launch_job(query).get_results()` is `table`, or raises when None."""
+    gaia = MagicMock()
+    if table is None:
+        gaia.launch_job.side_effect = ConnectionError("Error 408: Job timeout/aborted.")
+    else:
+        gaia.launch_job.return_value.get_results.return_value = table
+    return gaia
+
+
+class TestTwomassSourceFallback:
+    @pytest.fixture(autouse=True)
+    def _sources(self, monkeypatch):
+        monkeypatch.setattr(config, "TWOMASS_SOURCES", (_CDS_VIZIER, _IDIA_VIZIER, "gaia"))
+        monkeypatch.setattr(config, "CATALOG_SOURCE_COOLDOWN_SEC", 900.0)
+        _2mass._rotation.down_until.clear()
+        yield
+        _2mass._rotation.down_until.clear()
+
+    _CDS_TABLE = Table({"RAJ2000": [23.450391], "DEJ2000": [30.618008], "_2MASS": ["01334809+3037048"], "Jmag": [16.756]})
+    # The IDIA mirror has no "_2MASS" alias, only the catalog's own column.
+    _IDIA_TABLE = Table({"RAJ2000": [23.450391], "DEJ2000": [30.618008], "2MASS": ["01334809+3037048"], "Jmag": [16.756]})
+    _ARCHIVE_TABLE = Table({"designation": ["01334809+3037048"], "ra": [23.450391], "dec": [30.618008], "j_m": [16.756]})
+
+    def test_cds_answers_and_nothing_else_is_asked(self):
+        viz = _vizier_class(set(), {_CDS_VIZIER: self._CDS_TABLE})
+        gaia = _gaia_archive_class(None)
+        with patch("modules.catalog_matcher._2mass.Vizier", viz), patch("modules.catalog_matcher._gaia_archive.Gaia", gaia):
+            stars = cm._query_2mass(23.45, 30.62, 1.0)
+        assert viz.asked == [_CDS_VIZIER]
+        assert stars == [{"ra": 23.450391, "dec": 30.618008, "designation": "01334809+3037048", "jmag": 16.756}]
+        gaia.launch_job.assert_not_called()
+
+    def test_the_mirror_answers_when_cds_fails_with_the_same_designation(self):
+        viz = _vizier_class({_CDS_VIZIER}, {_IDIA_VIZIER: self._IDIA_TABLE})
+        with patch("modules.catalog_matcher._2mass.Vizier", viz):
+            stars = cm._query_2mass(23.45, 30.62, 1.0)
+        assert viz.asked == [_CDS_VIZIER, _IDIA_VIZIER]
+        assert stars[0]["designation"] == "01334809+3037048"
+
+    def test_the_gaia_archive_answers_when_every_vizier_host_fails(self):
+        viz = _vizier_class({_CDS_VIZIER, _IDIA_VIZIER}, {})
+        gaia = _gaia_archive_class(self._ARCHIVE_TABLE)
+        with patch("modules.catalog_matcher._2mass.Vizier", viz), patch("modules.catalog_matcher._gaia_archive.Gaia", gaia):
+            stars = cm._query_2mass(23.45, 30.62, 1.0)
+        assert viz.asked == [_CDS_VIZIER, _IDIA_VIZIER]
+        assert stars == [{"ra": 23.450391, "dec": 30.618008, "designation": "01334809+3037048", "jmag": 16.756}]
+        query = gaia.launch_job.call_args.args[0]
+        assert "gaiadr1.tmass_original_valid" in query and "j_m IS NOT NULL" in query
+
+    def test_a_failed_host_is_asked_last_during_its_cooldown(self):
+        viz = _vizier_class({_CDS_VIZIER}, {_IDIA_VIZIER: None})
+        with patch("modules.catalog_matcher._2mass.Vizier", viz):
+            cm._query_2mass(23.45, 30.62, 1.0)
+            cm._query_2mass(33.45, 30.62, 1.0)
+        assert viz.asked == [_CDS_VIZIER, _IDIA_VIZIER, _IDIA_VIZIER]
+
+    def test_every_source_failing_returns_empty_and_caches_nothing(self):
+        viz = _vizier_class({_CDS_VIZIER, _IDIA_VIZIER}, {})
+        gaia = _gaia_archive_class(None)
+        with patch("modules.catalog_matcher._2mass.Vizier", viz), patch("modules.catalog_matcher._gaia_archive.Gaia", gaia):
+            assert cm._query_2mass(23.45, 30.62, 1.0) == []
+            assert cm._query_2mass(23.45, 30.62, 1.0) == []
+        assert len(viz.asked) == 4 and gaia.launch_job.call_count == 2
+
+    @pytest.mark.parametrize("ra,dec,expected", [
+        (23.450391, 30.618008, "01334809+3037048"),
+        (23.473182, 30.618048, "01335356+3037049"),   # 04.97" — truncated, not rounded
+        (23.435314, 30.631098, "01334447+3037519"),
+        (0.0, -5.0, "00000000-0500000"),
+    ])
+    def test_a_designation_built_from_the_position_is_the_catalogs_own(self, ra, dec, expected):
+        assert _2mass._designation_from_position(ra, dec) == expected
+
+
+class TestPanstarrsSourceFallback:
+    @pytest.fixture(autouse=True)
+    def _sources(self, monkeypatch):
+        monkeypatch.setattr(config, "PANSTARRS_SOURCES", (_CDS_VIZIER, "gaia"))
+        monkeypatch.setattr(config, "CATALOG_SOURCE_COOLDOWN_SEC", 900.0)
+        _panstarrs._rotation.down_until.clear()
+        yield
+        _panstarrs._rotation.down_until.clear()
+
+    _CDS_TABLE = Table({"RAJ2000": [23.482012], "DEJ2000": [30.650686], "objID": [144780234817881216], "rmag": [18.4405]})
+    _ARCHIVE_TABLE = Table({
+        "obj_id": [144780234817881216, 144780234585320963],
+        "ra": [23.482012, 23.458763],
+        "dec": [30.650686, 30.650362],
+        "r_mean_psf_mag": [18.4405, float("nan")],
+    })
+
+    def test_cds_answers_and_the_archive_is_not_asked(self):
+        viz = _vizier_class(set(), {_CDS_VIZIER: self._CDS_TABLE})
+        gaia = _gaia_archive_class(None)
+        with patch("modules.catalog_matcher._panstarrs.Vizier", viz), patch("modules.catalog_matcher._gaia_archive.Gaia", gaia):
+            sources = cm._query_panstarrs(23.45, 30.62, 1.0)
+        assert viz.asked == [_CDS_VIZIER]
+        assert sources == [{"ra": 23.482012, "dec": 30.650686, "obj_id": "144780234817881216", "rmag": 18.4405}]
+        gaia.launch_job.assert_not_called()
+
+    def test_the_gaia_archive_answers_when_cds_fails_with_the_same_obj_id(self):
+        viz = _vizier_class({_CDS_VIZIER}, {})
+        gaia = _gaia_archive_class(self._ARCHIVE_TABLE)
+        with patch("modules.catalog_matcher._panstarrs.Vizier", viz), patch("modules.catalog_matcher._gaia_archive.Gaia", gaia):
+            sources = cm._query_panstarrs(23.45, 30.62, 1.0)
+        # The row without a magnitude is dropped, as VizieR's would be.
+        assert sources == [{"ra": 23.482012, "dec": 30.650686, "obj_id": "144780234817881216", "rmag": 18.4405}]
+        query = gaia.launch_job.call_args.args[0]
+        assert "gaiadr2.panstarrs1_original_valid" in query and "r_mean_psf_mag IS NOT NULL" in query
+
+    def test_every_source_failing_returns_empty_and_caches_nothing(self):
+        viz = _vizier_class({_CDS_VIZIER}, {})
+        gaia = _gaia_archive_class(None)
+        with patch("modules.catalog_matcher._panstarrs.Vizier", viz), patch("modules.catalog_matcher._gaia_archive.Gaia", gaia):
+            assert cm._query_panstarrs(23.45, 30.62, 1.0) == []
+            assert cm._query_panstarrs(23.45, 30.62, 1.0) == []
+        assert len(viz.asked) == 2 and gaia.launch_job.call_count == 2
+
+    def test_outside_coverage_asks_no_source(self):
+        viz = _vizier_class(set(), {})
+        with patch("modules.catalog_matcher._panstarrs.Vizier", viz):
+            assert cm._query_panstarrs(23.45, -45.0, 1.0) == []
+        assert viz.asked == []
+
+
+class TestGaiaArchiveCone:
+    def test_the_query_is_a_capped_cone_over_the_archive_copy(self):
+        query = _gaia_archive._cone_query(
+            "gaiadr2.panstarrs1_original_valid", ["obj_id", "ra", "dec", "r_mean_psf_mag"], "r_mean_psf_mag",
+            23.4621, 30.6599, 0.75,
+        )
+        assert query.startswith(f"SELECT TOP {_gaia_archive._ROW_LIMIT} obj_id, ra, dec, r_mean_psf_mag FROM gaiadr2.panstarrs1_original_valid")
+        assert "CIRCLE('ICRS', 23.462100, 30.659900, 0.750000)" in query
+        # Sorting by magnitude is what makes even a sparse field time out.
+        assert "ORDER BY" not in query

@@ -462,6 +462,42 @@ JPL_SBIDENT_TIMEOUT_SEC: float = float(_get("JPL_SBIDENT_TIMEOUT_SEC", "120"))
 # before each retry is SKYBOT_RETRY_DELAY_SEC, doubled after each.
 JPL_SBIDENT_MAX_ATTEMPTS: int = int(_get("JPL_SBIDENT_MAX_ATTEMPTS", "2"))
 
+# Where the stellar catalogs come from, each a list in order of preference.
+# The first source that answers decides the frame (an empty field included —
+# every source of one catalog serves the same data and the same identifiers,
+# so history does not split by source); the next is asked only when one
+# fails. CDS Strasbourg, home of Simbad and VizieR, was unreachable for days
+# from 2026-10-28, and every frame ingested meanwhile lost its Simbad object
+# types and its 2MASS/Pan-STARRS matches.
+#
+# SIMBAD_SERVERS: host names astroquery knows — the CDS original and its
+# official mirror at Harvard (modules/catalog_matcher/_simbad.py).
+SIMBAD_SERVERS: tuple[str, ...] = tuple(
+    name.strip().lower()
+    for name in _get("SIMBAD_SERVERS", "simbad.cds.unistra.fr,simbad.harvard.edu").split(",")
+    if name.strip()
+)
+# TWOMASS_SOURCES / PANSTARRS_SOURCES: a VizieR host name (the CDS original,
+# or a mirror — vizier.idia.ac.za carries 2MASS but not Pan-STARRS), or
+# "gaia" for the ESA Gaia archive's copy of the catalog
+# (modules/catalog_matcher/_gaia_archive.py: gaiadr1.tmass_original_valid,
+# gaiadr2.panstarrs1_original_valid). The archive copy of Pan-STARRS answers
+# a sparse field in under a minute and gives up on a dense one (M33,
+# NGC 6946) — a best effort, not a full replacement of VizieR.
+TWOMASS_SOURCES: tuple[str, ...] = tuple(
+    name.strip().lower()
+    for name in _get("TWOMASS_SOURCES", "vizier.cds.unistra.fr,vizier.idia.ac.za,gaia").split(",")
+    if name.strip()
+)
+PANSTARRS_SOURCES: tuple[str, ...] = tuple(
+    name.strip().lower()
+    for name in _get("PANSTARRS_SOURCES", "vizier.cds.unistra.fr,gaia").split(",")
+    if name.strip()
+)
+# A stellar-catalog source that failed is asked last for this long (the MPC
+# sources have MPC_SOURCE_COOLDOWN_SEC). 0 always keeps the configured order.
+CATALOG_SOURCE_COOLDOWN_SEC: float = float(_get("CATALOG_SOURCE_COOLDOWN_SEC", "900"))
+
 # ---------------------------------------------------------------------------
 # Edge-of-frame geometry (astrometry + subtraction + anomaly_detector modules)
 # ---------------------------------------------------------------------------
