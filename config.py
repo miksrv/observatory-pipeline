@@ -497,6 +497,12 @@ PANSTARRS_SOURCES: tuple[str, ...] = tuple(
 # A stellar-catalog source that failed is asked last for this long (the MPC
 # sources have MPC_SOURCE_COOLDOWN_SEC). 0 always keeps the configured order.
 CATALOG_SOURCE_COOLDOWN_SEC: float = float(_get("CATALOG_SOURCE_COOLDOWN_SEC", "900"))
+# Client-side timeout of one Simbad request (connect and read, seconds).
+# astroquery's own `timeout` is the server's execution limit and applies to
+# asynchronous jobs only; without this a Simbad host that accepts the
+# connection and never answers holds the frame forever and the next server
+# is never asked. VizieR queries have astroquery's 60 s.
+SIMBAD_TIMEOUT_SEC: float = float(_get("SIMBAD_TIMEOUT_SEC", "120"))
 
 # ---------------------------------------------------------------------------
 # Edge-of-frame geometry (astrometry + subtraction + anomaly_detector modules)

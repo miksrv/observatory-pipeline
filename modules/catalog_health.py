@@ -38,6 +38,8 @@ from dataclasses import dataclass
 import httpx
 
 import config
+from modules.catalog_matcher import _simbad
+from modules.catalog_matcher._sources import GAIA_ARCHIVE, GAIA_ARCHIVE_LABEL, unique
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +56,11 @@ class Probe:
 
 
 _VIZIER_ERROR = 'name="QUERY_STATUS" value="ERROR"'
+# The Gaia DR3 probe and the `gaia` entries of TWOMASS_SOURCES/PANSTARRS_SOURCES
+# share this URL, sent once per check (`check_all()` probes each URL once). A
+# `SELECT TOP 1` from the copy tables would prove more, but takes 11 s on
+# the 2MASS table and times out on the Pan-STARRS one.
 _GAIA_ARCHIVE_URL = "https://gea.esac.esa.int/tap-server/tap/availability"
-_GAIA_ARCHIVE_LABEL = "Gaia archive"
 
 
 def _simbad_probe(host: str) -> Probe:
@@ -73,8 +78,8 @@ def _vizier_probe(name: str, table: str, host: str) -> Probe:
 
 def _table_probe(name: str, table: str, source: str) -> Probe:
     """One TWOMASS_SOURCES / PANSTARRS_SOURCES entry: a VizieR host, or `gaia` for the archive copy."""
-    if source == "gaia":
-        return Probe(name, _GAIA_ARCHIVE_URL, source=_GAIA_ARCHIVE_LABEL)
+    if source == GAIA_ARCHIVE:
+        return Probe(name, _GAIA_ARCHIVE_URL, source=GAIA_ARCHIVE_LABEL)
     return _vizier_probe(name, table, source)
 
 
@@ -95,24 +100,18 @@ _JPL_HORIZONS = Probe("JPL Horizons", "https://ssd.jpl.nasa.gov/api/horizons.api
 _MPC_SOURCE_PROBES: dict[str, Probe] = {"skybot": _SKYBOT, "jpl": _JPL_SBIDENT}
 
 
-def _unique(names) -> list[str]:
-    seen: list[str] = []
-    for name in names:
-        if name not in seen:
-            seen.append(name)
-    return seen
-
-
 def probes() -> list[Probe]:
     """
     One probe per configured source, in catalog_matcher's order (Simbad, Gaia,
     2MASS, Pan-STARRS, MPC), then ephemerides. A catalog's probes share its
-    name; `check_all()` folds them into one report line.
+    name; `check_all()` folds them into one report line. The Simbad list is
+    the matcher's own (`_simbad.configured_servers()`), so a host it ignores
+    is not reported as serving the catalog.
     """
-    selected = [_simbad_probe(host) for host in _unique(config.SIMBAD_SERVERS)]
+    selected = [_simbad_probe(host) for host in _simbad.configured_servers()]
     selected.append(_GAIA)
-    selected += [_table_probe("2MASS", "II/246/out", s) for s in _unique(config.TWOMASS_SOURCES)]
-    selected += [_table_probe("Pan-STARRS", "II/349/ps1", s) for s in _unique(config.PANSTARRS_SOURCES)]
+    selected += [_table_probe("2MASS", "II/246/out", s) for s in unique(config.TWOMASS_SOURCES)]
+    selected += [_table_probe("Pan-STARRS", "II/349/ps1", s) for s in unique(config.PANSTARRS_SOURCES)]
     selected += [_MPC_SOURCE_PROBES[name] for name in config.MPC_SOURCES if name in _MPC_SOURCE_PROBES]
     selected.append(_JPL_HORIZONS)
     return selected
@@ -178,13 +177,21 @@ def fold(selected: list[Probe], results: list[dict]) -> list[dict]:
 
 
 def check_all() -> list[dict]:
-    """Probe every source in parallel (blocking; at most about CATALOG_HEALTH_TIMEOUT_SEC), one result per catalog."""
+    """
+    Probe every source in parallel (blocking; at most about
+    CATALOG_HEALTH_TIMEOUT_SEC), one result per catalog. Probes sharing a URL
+    (the Gaia archive's) are sent once.
+    """
     selected = probes()
+    distinct = unique(p.url for p in selected)
     timeout = config.CATALOG_HEALTH_TIMEOUT_SEC
     with httpx.Client(timeout=timeout, follow_redirects=True) as client, ThreadPoolExecutor(
-        max_workers=len(selected), thread_name_prefix="catalog-probe",
+        max_workers=len(distinct), thread_name_prefix="catalog-probe",
     ) as pool:
-        results = list(pool.map(lambda probe: check(probe, client), selected))
+        by_url = dict(zip(distinct, pool.map(
+            lambda url: check(next(p for p in selected if p.url == url), client), distinct,
+        )))
+    results = [dict(by_url[p.url], name=p.name) for p in selected]
 
     report = fold(selected, results)
     down = [r["name"] for r in report if not r["ok"]]

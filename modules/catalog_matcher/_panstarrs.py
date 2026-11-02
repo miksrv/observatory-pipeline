@@ -25,26 +25,12 @@ from ._cache import (
     _cache_radius_margin_deg,
     _cache_set,
 )
-from ._sources import SourceRotation, unique
+from ._sources import GAIA_ARCHIVE, SourceRotation, source_label, unique
 
 logger = logging.getLogger(__name__)
 
-# The PANSTARRS_SOURCES entry that means the ESA Gaia archive's copy
-# (`_gaia_archive`); every other entry is a VizieR host name.
-_GAIA_ARCHIVE = "gaia"
-_GAIA_ARCHIVE_LABEL = "Gaia archive"
-
 # Which PANSTARRS_SOURCES failed and until when (see _sources).
 _rotation = SourceRotation()
-
-
-def _sources_in_order() -> list[str]:
-    """PANSTARRS_SOURCES in its configured order, a source that failed within CATALOG_SOURCE_COOLDOWN_SEC last."""
-    return _rotation.order(unique(config.PANSTARRS_SOURCES))
-
-
-def _label(source: str) -> str:
-    return _GAIA_ARCHIVE_LABEL if source == _GAIA_ARCHIVE else source
 
 
 def _query_vizier(host: str, coord: SkyCoord, radius) -> list[dict]:
@@ -122,40 +108,33 @@ def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> lis
     if cached is not None:
         return cached  # type: ignore[return-value]
 
-    sources = _sources_in_order()
+    sources = unique(config.PANSTARRS_SOURCES)
     if not sources:
-        # PANSTARRS_SOURCES empty: Pan-STARRS matching is off.
-        _cache_set(cache_key, [])
+        # PANSTARRS_SOURCES empty: Pan-STARRS matching is off. Not cached —
+        # the tile key is shared with a configuration that has sources.
         return []
 
     coord  = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
     radius_deg = (key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()
 
-    for source in sources:
-        try:
-            if source == _GAIA_ARCHIVE:
-                ps_sources = _gaia_archive._query_panstarrs(key_ra, key_dec, radius_deg)
-            else:
-                ps_sources = _query_vizier(source, coord, radius_deg * u.deg)
-        except Exception as exc:
-            _rotation.failed(source, config.CATALOG_SOURCE_COOLDOWN_SEC)
-            logger.warning(
-                "Pan-STARRS (%s) query failed for ra=%.3f dec=%.3f: %s",
-                _label(source), ra_center, dec_center, exc,
-            )
-            continue
-        if _rotation.answered(source):
-            logger.info("Pan-STARRS at %s answers again", _label(source))
+    def ask(source: str) -> list[dict]:
+        if source == GAIA_ARCHIVE:
+            return _gaia_archive._query_panstarrs(key_ra, key_dec, radius_deg)
+        return _query_vizier(source, coord, radius_deg * u.deg)
 
-        _cache_set(cache_key, ps_sources)
-        logger.info("Pan-STARRS: %d source(s) from %s", len(ps_sources), _label(source))
-        return ps_sources
-
-    logger.warning(
-        "Pan-STARRS: no source answered for ra=%.3f dec=%.3f — frame gets no Pan-STARRS matching",
-        ra_center, dec_center,
+    answer = _rotation.first_answering(
+        sources, ask,
+        cooldown_sec=config.CATALOG_SOURCE_COOLDOWN_SEC,
+        catalog="Pan-STARRS",
+        where=f"ra={ra_center:.3f} dec={dec_center:.3f}",
+        label=source_label,
     )
-    return []
+    if answer is None:
+        return []
+    source, ps_sources = answer
+    _cache_set(cache_key, ps_sources)
+    logger.info("Pan-STARRS: %d source(s) from %s", len(ps_sources), source_label(source))
+    return ps_sources
 
 
 def _match_panstarrs(sources: list[dict], ps_sources: list[dict]) -> None:

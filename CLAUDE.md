@@ -493,8 +493,10 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   for `MPC_SOURCE_COOLDOWN_SEC`. JPL names are rewritten to SkyBot's — the designation is the
   `catalog_id`, so both must give one object the same identity.
 - **Mirrors for the stellar catalogs** (`_sources.SourceRotation`, the same first-that-answers +
-  cooldown rule as `MPC_SOURCES`, with `CATALOG_SOURCE_COOLDOWN_SEC`): `SIMBAD_SERVERS` (CDS,
-  then the Harvard mirror — the two hosts astroquery's `Simbad.server` accepts),
+  cooldown rule as `MPC_SOURCES`, with `CATALOG_SOURCE_COOLDOWN_SEC`; the loop itself is
+  `SourceRotation.first_answering()`): `SIMBAD_SERVERS` (CDS, then the Harvard mirror — the two
+  hosts astroquery's `Simbad.server` accepts; each request gets a client-side `SIMBAD_TIMEOUT_SEC`,
+  astroquery's own timeout is server-side and async-only),
   `TWOMASS_SOURCES` / `PANSTARRS_SOURCES` (VizieR host names, or `gaia` = the ESA Gaia archive's
   copy, `_gaia_archive.py`: `gaiadr1.tmass_original_valid`, `gaiadr2.panstarrs1_original_valid`).
   Every source of a catalog gives the same identifiers (2MASS designation, PS1 `objID`), so

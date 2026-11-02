@@ -77,9 +77,32 @@ class TestProbes:
             ("SkyBot", None), ("JPL Horizons", None),
         ]
         by_source = {(p.name, p.source): p for p in catalog_health.probes()}
+        # The three Gaia-archive probes share one URL (sent once by check_all).
+        assert len({p.url for p in catalog_health.probes() if p.source == "Gaia archive" or p.name == "Gaia DR3"}) == 1
         assert by_source[("Simbad", "simbad.harvard.edu")].url == "https://simbad.harvard.edu/simbad/sim-tap/availability"
         assert by_source[("2MASS", "vizier.idia.ac.za")].url.startswith("https://vizier.idia.ac.za/viz-bin/votable?-source=II/246/out")
         assert by_source[("Pan-STARRS", "Gaia archive")].url == catalog_health._GAIA_ARCHIVE_URL
+
+    def test_a_simbad_server_the_matcher_ignores_is_not_probed(self, monkeypatch):
+        """Otherwise the dashboard would show Simbad up via a host no frame is matched against."""
+        monkeypatch.setattr(config, "SIMBAD_SERVERS", ("simbad.u-strasbg.fr", "simbad.harvard.edu"))
+        assert [p.source for p in catalog_health.probes() if p.name == "Simbad"] == ["simbad.harvard.edu"]
+
+    def test_probes_sharing_a_url_are_sent_once(self, monkeypatch):
+        monkeypatch.setattr(config, "TWOMASS_SOURCES", ("gaia",))
+        monkeypatch.setattr(config, "PANSTARRS_SOURCES", ("gaia",))
+        monkeypatch.setattr(config, "MPC_SOURCES", ())
+        urls = []
+
+        def check(probe, client):
+            urls.append(probe.url)
+            return {"name": probe.name, "ok": True, "latency_ms": 1, "error": None}
+
+        monkeypatch.setattr(catalog_health, "check", check)
+        report = catalog_health.check_all()
+        assert urls.count(catalog_health._GAIA_ARCHIVE_URL) == 1
+        assert [r["name"] for r in report] == ["Simbad", "Gaia DR3", "2MASS", "Pan-STARRS", "JPL Horizons"]
+        assert all(r["ok"] for r in report)
 
     def test_names_fit_the_api_contract(self, monkeypatch):
         """observatory-api: 1-40 chars of A-Z a-z 0-9 space . _ / ( ) -"""

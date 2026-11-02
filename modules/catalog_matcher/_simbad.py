@@ -10,6 +10,7 @@ import logging
 import math
 
 import astropy.units as u
+import requests.adapters
 from astropy.coordinates import SkyCoord
 from astroquery.simbad import Simbad
 from astroquery.simbad import conf as simbad_conf
@@ -33,12 +34,12 @@ _rotation = SourceRotation()
 _warned_unknown: set[str] = set()
 
 
-def _servers_in_order() -> list[str]:
+def configured_servers() -> list[str]:
     """
-    SIMBAD_SERVERS in its configured order, a server that failed within the
-    last CATALOG_SOURCE_COOLDOWN_SEC moved to the back. Only the servers
-    astroquery knows (`conf.servers_list`: the CDS original and its Harvard
-    mirror) are asked — `Simbad.server` refuses any other host.
+    SIMBAD_SERVERS in its configured order, each once, keeping only the
+    servers astroquery knows (`conf.servers_list`: the CDS original and its
+    Harvard mirror) — `Simbad.server` refuses any other host. The catalog
+    health check probes this same list.
     """
     configured: list[str] = []
     for host in unique(config.SIMBAD_SERVERS):
@@ -51,7 +52,34 @@ def _servers_in_order() -> list[str]:
                 )
             continue
         configured.append(host)
-    return _rotation.order(configured)
+    return configured
+
+
+class _TimeoutAdapter(requests.adapters.HTTPAdapter):
+    """
+    An HTTP adapter that gives every request a timeout. astroquery's Simbad
+    runs a synchronous TAP query through pyvo on the instance's own
+    `requests.Session`, with no client-side timeout (its `timeout` is the
+    server-side execution limit, applied to asynchronous jobs only): a host
+    that accepts the connection and never answers would hold the frame
+    forever, and the fallback to the next server, which needs an exception,
+    would never happen.
+    """
+
+    def __init__(self, timeout_sec: float) -> None:
+        super().__init__()
+        self.timeout_sec = timeout_sec
+
+    def send(self, request, *, timeout=None, **kwargs):  # type: ignore[override]
+        return super().send(request, timeout=timeout if timeout is not None else self.timeout_sec, **kwargs)
+
+
+def _client(host: str) -> Simbad:
+    simbad = Simbad()
+    simbad.server = host
+    simbad._session.mount("https://", _TimeoutAdapter(config.SIMBAD_TIMEOUT_SEC))
+    simbad.add_votable_fields("otype")
+    return simbad
 
 
 def _parse_simbad_table(result) -> list[dict]:
@@ -138,40 +166,30 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
     if cached is not None:
         return cached  # type: ignore[return-value]
 
-    servers = _servers_in_order()
+    servers = configured_servers()
     if not servers:
-        # SIMBAD_SERVERS empty (or only unknown hosts): Simbad matching is off.
-        _cache_set(cache_key, [])
+        # SIMBAD_SERVERS empty (or only unknown hosts): Simbad matching is
+        # off. Not cached — the tile key is shared with a configuration that
+        # has servers, and an empty answer would outlive the setting.
         return []
 
     coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
     radius = ((key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()) * u.deg
 
-    for host in servers:
-        try:
-            simbad = Simbad()
-            simbad.server = host
-            simbad.add_votable_fields("otype")
-            result = simbad.query_region(coord, radius=radius)
-        except Exception as exc:
-            _rotation.failed(host, config.CATALOG_SOURCE_COOLDOWN_SEC)
-            logger.warning(
-                "Simbad (%s) query failed for ra=%.3f dec=%.3f: %s", host, ra_center, dec_center, exc,
-            )
-            continue
-        if _rotation.answered(host):
-            logger.info("Simbad at %s answers again", host)
-
-        objects = [] if result is None else _parse_simbad_table(result)
-        _cache_set(cache_key, objects)
-        logger.info("Simbad: %d object(s) from %s", len(objects), host)
-        return objects
-
-    logger.warning(
-        "Simbad: no server answered for ra=%.3f dec=%.3f — frame gets no Simbad matching",
-        ra_center, dec_center,
+    answer = _rotation.first_answering(
+        servers,
+        lambda host: _client(host).query_region(coord, radius=radius),
+        cooldown_sec=config.CATALOG_SOURCE_COOLDOWN_SEC,
+        catalog="Simbad",
+        where=f"ra={ra_center:.3f} dec={dec_center:.3f}",
     )
-    return []
+    if answer is None:
+        return []
+    host, result = answer
+    objects = [] if result is None else _parse_simbad_table(result)
+    _cache_set(cache_key, objects)
+    logger.info("Simbad: %d object(s) from %s", len(objects), host)
+    return objects
 
 
 def _match_simbad(sources: list[dict], simbad_objects: list[dict]) -> None:

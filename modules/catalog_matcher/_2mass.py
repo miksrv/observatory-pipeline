@@ -24,26 +24,12 @@ from ._cache import (
     _cache_radius_margin_deg,
     _cache_set,
 )
-from ._sources import SourceRotation, unique
+from ._sources import GAIA_ARCHIVE, SourceRotation, source_label, unique
 
 logger = logging.getLogger(__name__)
 
-# The TWOMASS_SOURCES entry that means the ESA Gaia archive's copy
-# (`_gaia_archive`); every other entry is a VizieR host name.
-_GAIA_ARCHIVE = "gaia"
-_GAIA_ARCHIVE_LABEL = "Gaia archive"
-
 # Which TWOMASS_SOURCES failed and until when (see _sources).
 _rotation = SourceRotation()
-
-
-def _sources_in_order() -> list[str]:
-    """TWOMASS_SOURCES in its configured order, a source that failed within CATALOG_SOURCE_COOLDOWN_SEC last."""
-    return _rotation.order(unique(config.TWOMASS_SOURCES))
-
-
-def _label(source: str) -> str:
-    return _GAIA_ARCHIVE_LABEL if source == _GAIA_ARCHIVE else source
 
 
 def _designation_from_position(ra_deg: float, dec_deg: float) -> str:
@@ -159,40 +145,34 @@ def _query_2mass(ra_center: float, dec_center: float, fov_deg: float) -> list[di
     if cached is not None:
         return cached  # type: ignore[return-value]
 
-    sources = _sources_in_order()
+    sources = unique(config.TWOMASS_SOURCES)
     if not sources:
-        # TWOMASS_SOURCES empty: 2MASS matching is off.
-        _cache_set(cache_key, [])
+        # TWOMASS_SOURCES empty: 2MASS matching is off. Not cached — the tile
+        # key is shared with a configuration that has sources.
         return []
 
     coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
     # Same radius strategy as Gaia: half-diagonal to cover all frame corners
     radius_deg = (key_fov * math.sqrt(2) / 2.0) + _cache_radius_margin_deg()
 
-    for source in sources:
-        try:
-            if source == _GAIA_ARCHIVE:
-                stars = _gaia_archive._query_2mass(key_ra, key_dec, radius_deg)
-            else:
-                stars = _query_vizier(source, coord, radius_deg * u.deg)
-        except Exception as exc:
-            _rotation.failed(source, config.CATALOG_SOURCE_COOLDOWN_SEC)
-            logger.warning(
-                "2MASS (%s) query failed for ra=%.3f dec=%.3f: %s", _label(source), ra_center, dec_center, exc,
-            )
-            continue
-        if _rotation.answered(source):
-            logger.info("2MASS at %s answers again", _label(source))
+    def ask(source: str) -> list[dict]:
+        if source == GAIA_ARCHIVE:
+            return _gaia_archive._query_2mass(key_ra, key_dec, radius_deg)
+        return _query_vizier(source, coord, radius_deg * u.deg)
 
-        _cache_set(cache_key, stars)
-        logger.info("2MASS: %d star(s) from %s", len(stars), _label(source))
-        return stars
-
-    logger.warning(
-        "2MASS: no source answered for ra=%.3f dec=%.3f — frame gets no 2MASS matching",
-        ra_center, dec_center,
+    answer = _rotation.first_answering(
+        sources, ask,
+        cooldown_sec=config.CATALOG_SOURCE_COOLDOWN_SEC,
+        catalog="2MASS",
+        where=f"ra={ra_center:.3f} dec={dec_center:.3f}",
+        label=source_label,
     )
-    return []
+    if answer is None:
+        return []
+    source, stars = answer
+    _cache_set(cache_key, stars)
+    logger.info("2MASS: %d star(s) from %s", len(stars), source_label(source))
+    return stars
 
 
 def _match_2mass(sources: list[dict], twomass_stars: list[dict]) -> None:

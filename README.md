@@ -623,6 +623,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `TWOMASS_SOURCES` | `vizier.cds.unistra.fr,vizier.idia.ac.za,gaia` | No | Sources of the 2MASS Point Source Catalog in order of preference: VizieR host names (CDS, a mirror) or `gaia`, the ESA Gaia archive's copy (`gaiadr1.tmass_original_valid`). Every source gives the same designations. |
 | `PANSTARRS_SOURCES` | `vizier.cds.unistra.fr,gaia` | No | Sources of Pan-STARRS DR1: VizieR host names or `gaia`, the ESA Gaia archive's copy (`gaiadr2.panstarrs1_original_valid`, same `objID`). No VizieR mirror carries this table; the archive copy answers a sparse field in under a minute and gives up on a dense one (M33, NGC 6946). |
 | `CATALOG_SOURCE_COOLDOWN_SEC` | `900` | No | A Simbad/2MASS/Pan-STARRS source that failed is asked last for this many seconds. `0` keeps the configured order fixed. |
+| `SIMBAD_TIMEOUT_SEC` | `120` | No | Client-side timeout of one Simbad request (connect and read). astroquery's own limit is server-side and applies to asynchronous jobs only; without this a stalled host would hold the frame forever and the next server would never be asked. VizieR queries have astroquery's 60 s. |
 | **Job Queue Worker** |
 | `TASK_POLL_INTERVAL_SEC` | `10.0` | No | How often `worker.py` polls `GET /tasks?status=PENDING` when idle. |
 | `TASK_POLL_BACKOFF_MAX_SEC` | `60.0` | No | Idle polling backs off exponentially up to this ceiling, resetting the moment a task is found. |

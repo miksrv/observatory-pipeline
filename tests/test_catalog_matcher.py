@@ -1962,9 +1962,11 @@ def _simbad_class(down: set[str], table: Table | None):
     from any other. `.asked` lists the hosts queried, in order.
     """
     asked: list[str] = []
+    instances: list[MagicMock] = []
 
     def make(*args, **kwargs):
         instance = MagicMock()
+        instances.append(instance)
 
         def query_region(coord, radius):
             asked.append(instance.server)
@@ -1977,6 +1979,7 @@ def _simbad_class(down: set[str], table: Table | None):
 
     cls = MagicMock(side_effect=make)
     cls.asked = asked
+    cls.instances = instances
     return cls
 
 
@@ -2046,12 +2049,36 @@ class TestSimbadServerFallback:
         assert cls.asked == [_HARVARD_SIMBAD]
         assert "unknown server 'simbad.example.org'" in caplog.text
 
-    def test_no_known_server_turns_simbad_matching_off(self, monkeypatch):
+    def test_no_known_server_turns_simbad_matching_off_without_caching(self, monkeypatch):
         monkeypatch.setattr(config, "SIMBAD_SERVERS", ())
         cls = _simbad_class(set(), None)
         with patch("modules.catalog_matcher._simbad.Simbad", cls):
             assert cm._query_simbad(_RA, _DEC, 1.0) == []
         assert cls.asked == []
+        # The empty answer did not go into the tile cache: with servers
+        # configured again the same tile is queried.
+        monkeypatch.setattr(config, "SIMBAD_SERVERS", (_CDS_SIMBAD,))
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            cm._query_simbad(_RA, _DEC, 1.0)
+        assert cls.asked == [_CDS_SIMBAD]
+
+    def test_every_request_gets_a_client_side_timeout(self, monkeypatch):
+        monkeypatch.setattr(config, "SIMBAD_TIMEOUT_SEC", 45.0)
+        cls = _simbad_class(set(), None)
+        with patch("modules.catalog_matcher._simbad.Simbad", cls):
+            cm._query_simbad(_RA, _DEC, 1.0)
+        (instance,) = cls.instances
+        prefix, adapter = instance._session.mount.call_args.args
+        assert prefix == "https://" and isinstance(adapter, _simbad._TimeoutAdapter)
+        assert adapter.timeout_sec == 45.0
+
+    def test_the_timeout_adapter_fills_in_a_missing_timeout_only(self):
+        import requests.adapters
+        adapter = _simbad._TimeoutAdapter(7.0)
+        with patch.object(requests.adapters.HTTPAdapter, "send", return_value="sent") as send:
+            assert adapter.send("request") == "sent"
+            assert adapter.send("request", timeout=3) == "sent"
+        assert [c.kwargs["timeout"] for c in send.call_args_list] == [7.0, 3]
 
 
 def _vizier_class(down: set[str], tables: dict[str, Table | None]):
@@ -2200,6 +2227,26 @@ class TestPanstarrsSourceFallback:
             assert cm._query_panstarrs(23.45, 30.62, 1.0) == []
             assert cm._query_panstarrs(23.45, 30.62, 1.0) == []
         assert len(viz.asked) == 2 and gaia.launch_job.call_count == 2
+
+    def test_an_archive_cone_cut_at_the_row_cap_is_a_failed_source(self, monkeypatch):
+        """An unsorted partial answer must not be cached as the complete catalog."""
+        monkeypatch.setattr(_gaia_archive, "_ROW_LIMIT", 2)
+        viz = _vizier_class({_CDS_VIZIER}, {})
+        gaia = _gaia_archive_class(self._ARCHIVE_TABLE)   # exactly _ROW_LIMIT rows
+        with patch("modules.catalog_matcher._panstarrs.Vizier", viz), patch("modules.catalog_matcher._gaia_archive.Gaia", gaia):
+            assert cm._query_panstarrs(23.45, 30.62, 1.0) == []
+            assert cm._query_panstarrs(23.45, 30.62, 1.0) == []
+        assert gaia.launch_job.call_count == 2   # nothing cached
+        assert "gaia" in _panstarrs._rotation.down_until
+
+    def test_no_source_turns_panstarrs_matching_off_without_caching(self, monkeypatch):
+        monkeypatch.setattr(config, "PANSTARRS_SOURCES", ())
+        viz = _vizier_class(set(), {_CDS_VIZIER: self._CDS_TABLE})
+        with patch("modules.catalog_matcher._panstarrs.Vizier", viz):
+            assert cm._query_panstarrs(23.45, 30.62, 1.0) == []
+            monkeypatch.setattr(config, "PANSTARRS_SOURCES", (_CDS_VIZIER,))
+            assert len(cm._query_panstarrs(23.45, 30.62, 1.0)) == 1
+        assert viz.asked == [_CDS_VIZIER]
 
     def test_outside_coverage_asks_no_source(self):
         viz = _vizier_class(set(), {})

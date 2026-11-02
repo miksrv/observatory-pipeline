@@ -17,8 +17,20 @@ Internal helpers only — not part of this package's public surface.
 
 from __future__ import annotations
 
+import logging
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from typing import TypeVar
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# The TWOMASS_SOURCES / PANSTARRS_SOURCES entry that means the ESA Gaia
+# archive's copy of the catalog (`_gaia_archive`), and how the logs and the
+# catalog health report name it; every other entry is a VizieR host name.
+GAIA_ARCHIVE = "gaia"
+GAIA_ARCHIVE_LABEL = "Gaia archive"
 
 
 def unique(names: Iterable[str]) -> list[str]:
@@ -28,6 +40,11 @@ def unique(names: Iterable[str]) -> list[str]:
         if name not in seen:
             seen.append(name)
     return seen
+
+
+def source_label(source: str) -> str:
+    """A 2MASS/Pan-STARRS source as the logs name it."""
+    return GAIA_ARCHIVE_LABEL if source == GAIA_ARCHIVE else source
 
 
 class SourceRotation:
@@ -53,3 +70,34 @@ class SourceRotation:
     def answered(self, source: str) -> bool:
         """A source answered: forget its failure. True when it had been marked down."""
         return self.down_until.pop(source, None) is not None
+
+    def first_answering(
+        self,
+        configured: Sequence[str],
+        ask: Callable[[str], T],
+        *,
+        cooldown_sec: float,
+        catalog: str,
+        where: str,
+        label: Callable[[str], str] = str,
+    ) -> tuple[str, T] | None:
+        """
+        Ask the configured sources in turn (see `order()`) until one answers;
+        `(source, its answer)`, or None when every source failed — the
+        caller then returns an empty result without caching it. A source
+        whose `ask()` raises is marked down for `cooldown_sec`; one that
+        answers after being down is logged as back. `catalog` and `where`
+        (the frame's position) only shape the log lines.
+        """
+        for source in self.order(configured):
+            try:
+                result = ask(source)
+            except Exception as exc:
+                self.failed(source, cooldown_sec)
+                logger.warning("%s (%s) query failed for %s: %s", catalog, label(source), where, exc)
+                continue
+            if self.answered(source):
+                logger.info("%s at %s answers again", catalog, label(source))
+            return source, result
+        logger.warning("%s: no source answered for %s — frame gets no %s matching", catalog, where, catalog)
+        return None

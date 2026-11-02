@@ -21,7 +21,12 @@ delivers those in one request); a sparse 1.5° field (M51, 32 000 objects)
 takes ~50 s. A timeout is a failed source like any other: logged, the frame
 goes on without Pan-STARRS. An `ORDER BY` magnitude (so that the row cap
 keeps the bright end) is what makes even a sparse field time out, so the cap
-is simply high enough not to bite.
+is simply high enough not to bite, and an answer that does reach it is
+refused (`ConeOverflow`) rather than cached as complete.
+
+astroquery's Gaia client sets no socket timeout: a stalled connection is
+bounded only by the archive's own job abort (the ~60 s 408 above), not by
+this side — the same holds for the Gaia DR3 query in `_gaia`.
 
 Internal helpers only — not part of this package's public surface.
 """
@@ -53,9 +58,21 @@ def _cone_query(table: str, columns: list[str], mag_column: str, ra: float, dec:
     )
 
 
+class ConeOverflow(RuntimeError):
+    """The cone holds more rows than `_ROW_LIMIT`: the answer would be an arbitrary subset."""
+
+
 def _cone(table: str, columns: list[str], mag_column: str, ra: float, dec: float, radius_deg: float):
-    """The archive's rows for one cone; raises on any transport or server error."""
-    return Gaia.launch_job(_cone_query(table, columns, mag_column, ra, dec, radius_deg)).get_results()
+    """
+    The archive's rows for one cone; raises on any transport or server error,
+    and on an answer cut at `_ROW_LIMIT` — an unsorted partial catalog would
+    be cached as the complete one and every star it lacks would read as
+    uncatalogued (a false UNKNOWN), so a cone this dense is a failed source.
+    """
+    result = Gaia.launch_job(_cone_query(table, columns, mag_column, ra, dec, radius_deg)).get_results()
+    if len(result) >= _ROW_LIMIT:
+        raise ConeOverflow(f"{table}: more than {_ROW_LIMIT} rows within {radius_deg:.2f}° — answer would be partial")
+    return result
 
 
 def _finite(row, column: str) -> float | None:

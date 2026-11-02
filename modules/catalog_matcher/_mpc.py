@@ -276,8 +276,8 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
 
     sources = _sources_in_order()
     if not sources:
-        # MPC_SOURCES empty (or only unknown names): MPC matching is off.
-        _cache_set(cache_key, [])
+        # MPC_SOURCES empty (or only unknown names): MPC matching is off. Not
+        # cached — the key is shared with a configuration that has sources.
         return []
 
     radius_deg = (
