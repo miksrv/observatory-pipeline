@@ -619,6 +619,11 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `MPC_SOURCE_COOLDOWN_SEC` | `900` | No | A source that failed is asked last for this many seconds, so frames stop spending a down service's retries first. `0` keeps the `MPC_SOURCES` order fixed. |
 | `JPL_SBIDENT_TIMEOUT_SEC` | `120` | No | Timeout of one JPL Small-Body Identification request (~25 s is normal: it integrates every candidate orbit). |
 | `JPL_SBIDENT_MAX_ATTEMPTS` | `2` | No | Total attempts for one JPL request on a transport error or 5xx (waits as `SKYBOT_RETRY_DELAY_SEC`). A 4xx is not retried. |
+| `SIMBAD_SERVERS` | `simbad.cds.unistra.fr,simbad.harvard.edu` | No | Simbad servers in order of preference — the CDS original and its official Harvard mirror, the two astroquery knows. The first that answers decides the frame; the next is asked only when one fails. |
+| `TWOMASS_SOURCES` | `vizier.cds.unistra.fr,vizier.idia.ac.za,gaia` | No | Sources of the 2MASS Point Source Catalog in order of preference: VizieR host names (CDS, a mirror) or `gaia`, the ESA Gaia archive's copy (`gaiadr1.tmass_original_valid`). Every source gives the same designations. |
+| `PANSTARRS_SOURCES` | `vizier.cds.unistra.fr,gaia` | No | Sources of Pan-STARRS DR1: VizieR host names or `gaia`, the ESA Gaia archive's copy (`gaiadr2.panstarrs1_original_valid`, same `objID`). No VizieR mirror carries this table; the archive copy answers a sparse field in under a minute and gives up on a dense one (M33, NGC 6946). |
+| `CATALOG_SOURCE_COOLDOWN_SEC` | `900` | No | A Simbad/2MASS/Pan-STARRS source that failed is asked last for this many seconds. `0` keeps the configured order fixed. |
+| `SIMBAD_TIMEOUT_SEC` | `120` | No | Client-side timeout of one Simbad request (connect and read). astroquery's own limit is server-side and applies to asynchronous jobs only; without this a stalled host would hold the frame forever and the next server would never be asked. VizieR queries have astroquery's 60 s. |
 | **Job Queue Worker** |
 | `TASK_POLL_INTERVAL_SEC` | `10.0` | No | How often `worker.py` polls `GET /tasks?status=PENDING` when idle. |
 | `TASK_POLL_BACKOFF_MAX_SEC` | `60.0` | No | Idle polling backs off exponentially up to this ceiling, resetting the moment a task is found. |

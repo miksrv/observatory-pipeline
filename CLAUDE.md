@@ -231,7 +231,8 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   terminal Ctrl+C does not kill it mid-solve. The watcher maps SIGTERM onto its Ctrl+C path
   (flush the pending batch) — as PID 1 it would otherwise ignore SIGTERM until Docker's SIGKILL.
 - **Catalog status:** a daemon thread (`_CatalogHealthReporter`) probes every online catalog in use
-  (`modules/catalog_health.py`: one small GET per host; any answer below 500 = up) at start and
+  (`modules/catalog_health.py`: one small GET per configured source; any answer below 500 = up,
+  a catalog is up while any of its sources answers) at start and
   every `CATALOG_HEALTH_INTERVAL_SEC`, and sends the list to `POST /pipelines/catalogs` for the
   API dashboard. A thread, not a loop task: an ANALYZE task holds the event loop for hours. It
   only reports — catalog_matcher still queries a dead catalog and waits out its timeouts.
@@ -478,7 +479,7 @@ they're handled by the edge/saturation/streak/FWHM filters.
 
 ### `modules/catalog_matcher/`
 Package: one file per catalog (`_simbad.py`, `_gaia.py`, `_2mass.py`, `_panstarrs.py`, `_mpc.py`,
-`_sbident.py`), plus `_cache.py`, `_wcs_offset.py`, `_match.py`. `_match.py` calls catalogs through
+`_sbident.py`, `_gaia_archive.py`), plus `_sources.py`, `_cache.py`, `_wcs_offset.py`, `_match.py`. `_match.py` calls catalogs through
 qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch them.
 
 - **Order (sequential exclusive):** Simbad → Gaia DR3 → 2MASS → Pan-STARRS DR1 → MPC/SkyBot, cone
@@ -491,6 +492,17 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   `MPC_SOURCES` in order; the first that answers decides the frame, a failed source goes last
   for `MPC_SOURCE_COOLDOWN_SEC`. JPL names are rewritten to SkyBot's — the designation is the
   `catalog_id`, so both must give one object the same identity.
+- **Mirrors for the stellar catalogs** (`_sources.SourceRotation`, the same first-that-answers +
+  cooldown rule as `MPC_SOURCES`, with `CATALOG_SOURCE_COOLDOWN_SEC`; the loop itself is
+  `SourceRotation.first_answering()`): `SIMBAD_SERVERS` (CDS, then the Harvard mirror — the two
+  hosts astroquery's `Simbad.server` accepts; each request gets a client-side `SIMBAD_TIMEOUT_SEC`,
+  astroquery's own timeout is server-side and async-only),
+  `TWOMASS_SOURCES` / `PANSTARRS_SOURCES` (VizieR host names, or `gaia` = the ESA Gaia archive's
+  copy, `_gaia_archive.py`: `gaiadr1.tmass_original_valid`, `gaiadr2.panstarrs1_original_valid`).
+  Every source of a catalog gives the same identifiers (2MASS designation, PS1 `objID`), so
+  history does not split by source. No VizieR mirror carries Pan-STARRS, and the archive copy of
+  it answers sparse fields only (a dense field times out) — a best effort. CDS Strasbourg was
+  down for days from 2026-10-28.
 - **MPC is the exception:** it sees every source. It takes over a stellar-claimed source only when
   the ephemeris position is within `MATCH_CONE_ARCSEC` (a blend); otherwise it matches the nearest
   *unclaimed* source within `MOVING_CONE_ARCSEC`. Takeovers log both identities.
@@ -682,10 +694,10 @@ Position-only classifications (`ASTEROID`/`COMET`/`MOVING_UNKNOWN`/`SPACE_DEBRIS
 
 | Catalog | Access | Notes |
 |---|---|---|
-| Simbad | `Simbad.query_region()` | named objects with types; CDS ~5–6 req/s |
+| Simbad | `Simbad.query_region()` | named objects with types; CDS ~5–6 req/s; Harvard mirror per `SIMBAD_SERVERS` |
 | Gaia DR3 | `Gaia.cone_search()` | ~1.8B stars, complete to ~20–21 mag; proper motions |
-| 2MASS | `Vizier` `II/246` | red/cool stars |
-| Pan-STARRS DR1 | `Vizier` `II/349/ps1` | to ~23.3 mag; only for `dec_center > -30°` |
+| 2MASS | `Vizier` `II/246` | red/cool stars; a VizieR mirror or the Gaia archive copy per `TWOMASS_SOURCES` |
+| Pan-STARRS DR1 | `Vizier` `II/349/ps1` | to ~23.3 mag; only for `dec_center > -30°`; the Gaia archive copy per `PANSTARRS_SOURCES` |
 | MPC/SkyBot | `Skybot.cone_search()` at `obs_time_mid` | radius = half-diagonal + `MOVING_CONE_ARCSEC` |
 | JPL SB Ident | `ssd-api.jpl.nasa.gov/sb_ident.api` (`httpx`) | fallback when SkyBot fails (`MPC_SOURCES`); ~25 s per query |
 | JPL Horizons | `astroquery.jplhorizons` | ephemerides (`ephemeris.py`) |
