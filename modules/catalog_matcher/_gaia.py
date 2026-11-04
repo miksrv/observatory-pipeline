@@ -37,6 +37,44 @@ logger = logging.getLogger(__name__)
 Gaia.ROW_LIMIT = 50000
 
 
+def _bound_archive_sockets(client) -> bool:
+    """
+    Give every HTTP connection the Gaia archive client opens a socket timeout
+    of `GAIA_ARCHIVE_TIMEOUT_SEC` (read when the connection is made, so a
+    remote setting applies). astroquery's TAP client builds plain
+    `http.client` connections with no timeout, so an archive that accepts a
+    query and never answers holds the frame forever — a Pan-STARRS cone over
+    M33 sat on an open socket for 30 h on 2026-11-04, and the worker's whole
+    task with it. With the timeout the stall raises, the source counts as
+    failed and the next one (or no catalog) takes over.
+
+    The hook sits on astroquery internals; if they change, the client is left
+    as it is and a warning says so (the test suite checks the installed
+    version). Returns whether the timeout was installed.
+    """
+    try:
+        handler = client._Tap__connHandler._TapConn__connectionHandler
+        plain = handler.get_connection
+        secure = handler.get_connection_secure
+    except AttributeError:
+        logger.warning(
+            "Gaia archive: astroquery's connection internals changed — queries have no client-side "
+            "timeout, a stalled archive can hold a frame indefinitely"
+        )
+        return False
+
+    def _timed(conn):
+        conn.timeout = config.GAIA_ARCHIVE_TIMEOUT_SEC
+        return conn
+
+    handler.get_connection = lambda **kwargs: _timed(plain(**kwargs))
+    handler.get_connection_secure = lambda verbose=False: _timed(secure(verbose))
+    return True
+
+
+_bound_archive_sockets(Gaia)
+
+
 def _finite_or_none(row, column: str) -> float | None:
     """
     Read one numeric column off an astropy table row, returning None when it

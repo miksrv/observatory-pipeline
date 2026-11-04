@@ -67,7 +67,8 @@ cameras** — never bake one instrument's numbers into defaults.
   `astap_amd64.tar.gz` and `astap_aarch64.tar.gz`, picked by the image's platform.
 - `.dockerignore` keeps `.env` out of the image — secrets arrive only via `env_file` at runtime.
 - `xvfb` + GTK/Pango are needed because astap requires a (virtual) display even headless;
-  `modules/astrometry/_astap.py` runs it via `xvfb-run`.
+  `modules/astrometry/_astap.py` runs it via `xvfb-run`. Each solve orphans an `Xvfb`, so both
+  services run with compose `init: true` (tini as PID 1 reaps them; Python as PID 1 did not).
 - The source tree is bind-mounted to `/app`, so code edits need only
   `docker compose restart pipeline`/`worker`; rebuild only after changing `requirements.txt` or
   the Dockerfile.
@@ -229,7 +230,7 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   long ANALYZE item. A second signal exits at once — the handler is `signal.signal()`, not the
   loop's, because CPU-bound steps hold the loop for minutes. astap runs in its own session, so a
   terminal Ctrl+C does not kill it mid-solve. The watcher maps SIGTERM onto its Ctrl+C path
-  (flush the pending batch) — as PID 1 it would otherwise ignore SIGTERM until Docker's SIGKILL.
+  (flush the pending batch) — SIGTERM's default action would otherwise drop that batch.
 - **Catalog status:** a daemon thread (`_CatalogHealthReporter`) probes every online catalog in use
   (`modules/catalog_health.py`: one small GET per configured source; any answer below 500 = up,
   a catalog is up while any of its sources answers) at start and
@@ -499,6 +500,9 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   astroquery's own timeout is server-side and async-only),
   `TWOMASS_SOURCES` / `PANSTARRS_SOURCES` (VizieR host names, or `gaia` = the ESA Gaia archive's
   copy, `_gaia_archive.py`: `gaiadr1.tmass_original_valid`, `gaiadr2.panstarrs1_original_valid`).
+  Every Gaia archive connection (DR3 and both copies) gets `GAIA_ARCHIVE_TIMEOUT_SEC`
+  (`_gaia._bound_archive_sockets()`, a hook on astroquery internals — its TAP client sets no
+  socket timeout, and a silent archive once held the worker for 30 h).
   Every source of a catalog gives the same identifiers (2MASS designation, PS1 `objID`), so
   history does not split by source. No VizieR mirror carries Pan-STARRS, and the archive copy of
   it answers sparse fields only (a dense field times out) — a best effort. CDS Strasbourg was

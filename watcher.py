@@ -366,10 +366,11 @@ def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
 if __name__ == "__main__":
     configure_logging("watcher")
 
-    # `docker compose stop` sends SIGTERM, and as PID 1 in its container this
-    # process would otherwise ignore it until Docker's SIGKILL, dropping the
-    # pending batch. Route it into the same path as Ctrl+C — installed first,
-    # so a stop during the startup scan is handled too.
+    # `docker compose stop` sends SIGTERM (forwarded by the container's init),
+    # whose default action would end this process on the spot — or, as PID 1
+    # without an init, be ignored until Docker's SIGKILL — dropping the
+    # pending batch either way. Route it into the same path as Ctrl+C —
+    # installed first, so a stop during the startup scan is handled too.
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
     observer = None

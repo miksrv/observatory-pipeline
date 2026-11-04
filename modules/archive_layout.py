@@ -32,6 +32,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import stat
 from datetime import timedelta, timezone
 from typing import Any
 
@@ -135,6 +136,26 @@ def destination_for(header: dict) -> str:
     if is_calibration(frame_type):
         return calibration_dir(frame_type, header.get("obs_time"))
     return light_dir(header.get("object_name"), observation.get("filter"))
+
+
+def make_readable(path: str) -> None:
+    """
+    Give an archived file the read bits the share needs (``a+r``), keeping
+    whatever else its mode says.
+
+    A frame keeps the permissions it arrived in incoming with — a move is a
+    rename — and that is whatever the copying tool gave it. On lookatstars
+    (2026-11-02) 66 M51 frames came from a rescued copy as ``0600`` and were
+    archived that way: present in the archive, invisible to the SFTP user
+    browsing it. Best-effort: a chmod the process may not make (a file owned
+    by another user, a read-only mount) is logged, never fatal.
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o444 != 0o444:
+            os.chmod(path, mode | 0o444)
+    except OSError as exc:
+        logger.warning("Could not make %s readable: %s", path, exc)
 
 
 def find_archived(filename: str, object_name: Any = None) -> str | None:

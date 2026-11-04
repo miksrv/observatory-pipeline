@@ -2265,3 +2265,36 @@ class TestGaiaArchiveCone:
         assert "CIRCLE('ICRS', 23.462100, 30.659900, 0.750000)" in query
         # Sorting by magnitude is what makes even a sparse field time out.
         assert "ORDER BY" not in query
+
+
+class TestGaiaArchiveSocketTimeout:
+    """
+    astroquery's TAP client opens plain `http.client` connections without a
+    timeout; `_gaia._bound_archive_sockets()` hooks them on the shared `Gaia`
+    client. These run against the installed astroquery, so a change in its
+    internals fails here rather than silently in production. No connection
+    is actually opened — `http.client` connects lazily.
+    """
+
+    @pytest.mark.parametrize("https", [True, False])
+    def test_every_archive_connection_gets_the_configured_timeout(self, monkeypatch, https):
+        from astroquery.gaia import Gaia
+        monkeypatch.setattr(config, "GAIA_ARCHIVE_TIMEOUT_SEC", 42.0)
+        handler = Gaia._Tap__connHandler._TapConn__connectionHandler
+        conn = handler.get_connection(ishttps=https, cookie=None, verbose=False)
+        assert conn.timeout == 42.0
+        # Read when the connection is made, so a remote setting applies.
+        monkeypatch.setattr(config, "GAIA_ARCHIVE_TIMEOUT_SEC", 7.0)
+        assert handler.get_connection_secure(verbose=False).timeout == 7.0
+
+    def test_the_path_queries_take_is_hooked(self, monkeypatch):
+        from astroquery.gaia import Gaia
+        monkeypatch.setattr(config, "GAIA_ARCHIVE_TIMEOUT_SEC", 42.0)
+        assert Gaia._Tap__connHandler._TapConn__get_connection().timeout == 42.0
+
+    def test_changed_internals_leave_the_client_alone_with_a_warning(self, caplog):
+        from modules.catalog_matcher import _gaia
+        client = object()
+        with caplog.at_level("WARNING"):
+            assert _gaia._bound_archive_sockets(client) is False
+        assert "no client-side timeout" in caplog.text

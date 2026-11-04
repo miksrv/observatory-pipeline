@@ -24,9 +24,12 @@ keeps the bright end) is what makes even a sparse field time out, so the cap
 is simply high enough not to bite, and an answer that does reach it is
 refused (`ConeOverflow`) rather than cached as complete.
 
-astroquery's Gaia client sets no socket timeout: a stalled connection is
-bounded only by the archive's own job abort (the ~60 s 408 above), not by
-this side — the same holds for the Gaia DR3 query in `_gaia`.
+astroquery's Gaia client sets no socket timeout, and the archive's own job
+abort is not to be relied on: on 2026-11-04 a Pan-STARRS cone over M33 sat
+on an open, silent socket for 30 h. `_gaia._bound_archive_sockets()` gives
+every connection of the shared `Gaia` client `GAIA_ARCHIVE_TIMEOUT_SEC`
+(imported below so that it is in place whoever imports this module first);
+a stall then raises like any other failed source.
 
 Internal helpers only — not part of this package's public surface.
 """
@@ -38,6 +41,8 @@ import math
 import warnings
 
 from astroquery.gaia import Gaia
+
+from . import _gaia  # noqa: F401 — installs the socket timeout on the shared Gaia client
 
 logger = logging.getLogger(__name__)
 

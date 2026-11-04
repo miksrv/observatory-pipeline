@@ -405,6 +405,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
             # named by camera — never overwrite one already there.
             dest_path = qc._unique_destination(dest_path)
             shutil.move(fits_path, dest_path)
+        archive_layout.make_readable(dest_path)
         _cleanup_astap_files(fits_path)
         _cleanup_empty_incoming_parents(fits_path)
         logger.info("Archived %s frame: %s → %s", frame_type, basename, dest_path, extra=extra)
@@ -997,6 +998,9 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
             # Re-analysis of an already-archived frame (see
             # _resolve_bare_filename()): fits_path already IS dest_path.
             logger.debug("Already at archive destination (re-analysis): %s", dest_path, extra=extra)
+        # The archive is browsed over SFTP by another account: a frame that
+        # arrived 0600 would be archived 0600 — see archive_layout.make_readable().
+        archive_layout.make_readable(dest_path)
 
         logger.info("Archived: %s → %s", original_filename, dest_path, extra=extra)
 
