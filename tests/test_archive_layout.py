@@ -118,3 +118,27 @@ class TestFindArchived:
         _touch(archive / "M51" / "L" / "a.fits")
         assert archive_layout.find_archived("a.fits") == first
         assert "more than once" in caplog.text
+
+
+class TestMakeReadable:
+    def test_adds_read_bits_to_a_private_file(self, tmp_path):
+        import stat
+
+        path = tmp_path / "frame.fits"
+        path.write_bytes(b"x")
+        os.chmod(path, 0o600)
+        archive_layout.make_readable(str(path))
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o644
+
+    def test_leaves_an_already_readable_mode_alone(self, tmp_path):
+        import stat
+
+        path = tmp_path / "frame.fits"
+        path.write_bytes(b"x")
+        os.chmod(path, 0o664)
+        archive_layout.make_readable(str(path))
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o664
+
+    def test_missing_file_is_logged_not_raised(self, tmp_path, caplog):
+        archive_layout.make_readable(str(tmp_path / "gone.fits"))
+        assert "Could not make" in caplog.text

@@ -503,6 +503,15 @@ CATALOG_SOURCE_COOLDOWN_SEC: float = float(_get("CATALOG_SOURCE_COOLDOWN_SEC", "
 # connection and never answers holds the frame forever and the next server
 # is never asked. VizieR queries have astroquery's 60 s.
 SIMBAD_TIMEOUT_SEC: float = float(_get("SIMBAD_TIMEOUT_SEC", "120"))
+# Socket timeout (seconds, per connect and per read) of every request to the
+# ESA Gaia archive: the Gaia DR3 cone and the archive copies of 2MASS and
+# Pan-STARRS (TWOMASS_SOURCES / PANSTARRS_SOURCES entry "gaia"). astroquery's
+# Gaia client sets none, and on 2026-11-04 a Pan-STARRS cone held the worker
+# on an open, silent socket for 30 h. A synchronous archive job answers only
+# when it has finished, and on 2026-11-04 a 100-row cone took ~2 min (one
+# over 3) — so this is generous: it only has to end a stall, not a slow answer.
+# Per connect / per read, not a total; 0 = no timeout.
+GAIA_ARCHIVE_TIMEOUT_SEC: float = float(_get("GAIA_ARCHIVE_TIMEOUT_SEC", "300"))
 
 # ---------------------------------------------------------------------------
 # Edge-of-frame geometry (astrometry + subtraction + anomaly_detector modules)

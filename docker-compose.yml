@@ -13,6 +13,11 @@ services:
     # On SIGTERM the watcher submits its buffered files as one ANALYZE task;
     # with the API client's retries that can outlast Docker's default 10 s.
     stop_grace_period: 1m
+    # A real init (Docker's tini) as PID 1 instead of Python: it forwards
+    # SIGTERM/SIGINT to the service and reaps orphaned grandchildren — every
+    # astap solve leaves an Xvfb behind (`xvfb-run` exits first), and with
+    # Python as PID 1 they stayed zombies for the container's life.
+    init: true
     volumes:
       # Bind-mount the source tree itself so code edits on the host are picked
       # up by a container restart (`docker compose restart pipeline`) instead
@@ -64,6 +69,8 @@ services:
     # the task stuck RUNNING. 10 min: POST /sources alone may take 3 × 180 s
     # (API_SOURCES_TIMEOUT_SEC with the client's retries).
     stop_grace_period: 10m
+    # See `pipeline` above: tini reaps the Xvfb left by each astap solve.
+    init: true
     volumes:
       - .:/app
       - ${HOST_DATA_DIR:-~/Developer/data}/fits/incoming:/fits/incoming
