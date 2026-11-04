@@ -5,7 +5,7 @@
 ### Patch Changes
 
 - Archive: an archived frame is made readable by everyone (`a+r`). A move keeps the permissions the file arrived in incoming with, and 66 M51 frames copied in as `0600` sat in the archive invisible to the SFTP user browsing it
-- Catalog matching: every request to the ESA Gaia archive (the Gaia DR3 cone and the archive copies of 2MASS and Pan-STARRS) has a socket timeout, `GAIA_ARCHIVE_TIMEOUT_SEC` (300 s). astroquery sets none, and a Pan-STARRS cone over M33 held the worker on a silent connection for 30 h, with the rest of its task and the next one waiting behind it; a stall is now a failed source and the frame goes on
+- Catalog matching: every request to the ESA Gaia archive (the Gaia DR3 cone and the archive copies of 2MASS and Pan-STARRS) has a socket timeout, `GAIA_ARCHIVE_TIMEOUT_SEC` (300 s). astroquery sets none, and a Pan-STARRS cone over M33 held the worker on a silent connection for 30 h, with the rest of its task and the next one waiting behind it; a silent connection is now a failed source and the frame goes on (the status request astroquery makes on import is bounded too, so a silent archive cannot hang the worker's start)
 - Docker: both services run under an init process (`init: true`; recreate with `docker compose up -d`) — every astap solve left an `Xvfb` zombie behind, since Python as PID 1 never reaped it
 
 ## 1.6.4

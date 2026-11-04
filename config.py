@@ -510,6 +510,7 @@ SIMBAD_TIMEOUT_SEC: float = float(_get("SIMBAD_TIMEOUT_SEC", "120"))
 # on an open, silent socket for 30 h. A synchronous archive job answers only
 # when it has finished, and on 2026-11-04 a 100-row cone took ~2 min (one
 # over 3) — so this is generous: it only has to end a stall, not a slow answer.
+# Per connect / per read, not a total; 0 = no timeout.
 GAIA_ARCHIVE_TIMEOUT_SEC: float = float(_get("GAIA_ARCHIVE_TIMEOUT_SEC", "300"))
 
 # ---------------------------------------------------------------------------

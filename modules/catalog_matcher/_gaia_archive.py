@@ -28,8 +28,9 @@ astroquery's Gaia client sets no socket timeout, and the archive's own job
 abort is not to be relied on: on 2026-11-04 a Pan-STARRS cone over M33 sat
 on an open, silent socket for 30 h. `_gaia._bound_archive_sockets()` gives
 every connection of the shared `Gaia` client `GAIA_ARCHIVE_TIMEOUT_SEC`
-(imported below so that it is in place whoever imports this module first);
-a stall then raises like any other failed source.
+(the client is imported from there, so the hook is in place whoever imports
+first); a silent connection then raises like any other failed source. It is
+a per-read bound, not a total one: an archive trickling bytes is not cut.
 
 Internal helpers only — not part of this package's public surface.
 """
@@ -40,9 +41,8 @@ import logging
 import math
 import warnings
 
-from astroquery.gaia import Gaia
-
-from . import _gaia  # noqa: F401 — installs the socket timeout on the shared Gaia client
+# The shared client, with the socket timeout `_gaia` installs on it.
+from ._gaia import Gaia
 
 logger = logging.getLogger(__name__)
 
