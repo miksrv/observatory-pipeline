@@ -400,7 +400,7 @@ async def _get_frame_with_retry(frame_id: str) -> dict | None:
     return resp_json.get("frame") if isinstance(resp_json, dict) else None
 
 
-async def get_frame(frame_id: str) -> dict | None:
+async def get_frame(frame_id: str, *, raise_on_error: bool = False) -> dict | None:
     """
     Retrieve a single previously registered frame's full stored record.
 
@@ -409,14 +409,20 @@ async def get_frame(frame_id: str) -> dict | None:
     frame_id:
         Frame ID returned by post_frame() (or from a DETECT_ANOMALIES task
         item's "frame_id").
+    raise_on_error:
+        Re-raise a failed request (5xx or transport error after the retries)
+        instead of returning None, so a caller that must tell "no such frame"
+        from "the API is down" can. Real incident (2026-11-05): a 500 burst
+        during a DETECT_ANOMALIES run made one frame look "not found", and
+        its item was reported DONE with detection never run.
 
     Returns
     -------
     dict | None
         The frame's fields (filename, obs_time, ra_center, dec_center,
-        fov_deg, object, filter, ...), or None if not found or on any
-        failure — a caller can't tell those two cases apart from the return
-        value alone (same convention as get_nearest_frame_before()).
+        fov_deg, object, filter, ...), or None if not found — and, unless
+        ``raise_on_error``, also on any failure (same convention as
+        get_nearest_frame_before()).
     """
     logger.debug(
         "GET /frames/%s",
@@ -431,6 +437,8 @@ async def get_frame(frame_id: str) -> dict | None:
             frame_id, exc,
             extra={"frame_id": frame_id, "fits_filename": None},
         )
+        if raise_on_error:
+            raise
         return None
 
 

@@ -9,12 +9,132 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
+import re
+import shutil
 import subprocess
+import tempfile
+
+import astropy.io.fits as fits
+from astropy.wcs import WCS
 
 import config
 
 logger = logging.getLogger(__name__)
+
+# Every card that describes a world coordinate system — linear part, SIP
+# distortion, projection parameters — with an optional alternate-WCS suffix.
+# Matched as whole card names: a bare prefix would also catch structural or
+# instrument keywords (`PCOUNT`, `CDS…`).
+_WCS_CARD_RE = re.compile(
+    r"^(?:CTYPE|CUNIT|CRVAL|CRPIX|CDELT|CROTA|CRDER|CSYER)\d[A-Z]?$"
+    r"|^(?:CD|PC|PV|PS)\d+_\d+[A-Z]?$"
+    r"|^(?:A|B|AP|BP)_(?:ORDER|DMAX|\d+_\d+)$"
+    r"|^(?:WCSAXES|LONPOLE|LATPOLE|WCSNAME)[A-Z]?$"
+)
+
+# Header cards astap reads its position hint from when no WCS is present.
+_RA_HINT_KEYS = ("RA", "OBJCTRA")
+_DEC_HINT_KEYS = ("DEC", "OBJCTDEC")
+# … and its plate-scale hint (focal length in mm and pixel size in µm).
+_SCALE_HINT_KEYS = ("FOCALLEN", "XPIXSZ")
+
+
+def _wcs_free_copy(fits_path: str, tmp_dir: str) -> tuple[str, float | None]:
+    """
+    Give astap a copy of ``fits_path`` whose header carries no WCS.
+
+    astap seeds its solve from a WCS it finds in the header. For a frame this
+    pipeline has already solved and archived (every re-ANALYZE), that WCS is
+    astap's own earlier TAN-SIP solution — and from that start astap
+    sometimes converges on a wrong distortion fit. Real incident (2026-11-03,
+    re-ANALYZE of the M33 2020 frames, ASI1600 at 0.78"/px): 31 of ~110
+    L/R frames came back with SIP terms three orders of magnitude too large
+    (A_0_2 = 2e-5 vs 1.8e-8 on the first solve), moving pixels up to 228"
+    from where the first solve had them; ~800 sources per frame went
+    unmatched and turned into MOVING_UNKNOWN alerts. astap's fit depends on
+    the scale it starts from: the same pixels solve correctly from the
+    header optics (FOCALLEN+XPIXSZ, ~1% off the true scale) — with the RA/DEC
+    hint anywhere from the mount position to the exact solved centre — and
+    wrongly when seeded with the previous solve's exact scale, whether as a
+    header WCS or as ``-fov`` (both tried on the frame above).
+
+    So astap always solves the frame as a first ingest would see it: pixels
+    and instrument keywords, no WCS. The hint astap then uses is RA/DEC
+    (or OBJCTRA/OBJCTDEC) and FOCALLEN+XPIXSZ; when the header lacks them,
+    they are derived from the WCS being removed — RA/DEC from its centre,
+    and a ``-fov`` (image height in degrees, astap's convention) returned
+    for the caller to pass on — so a header whose only pointing information
+    was its WCS keeps a narrow search. The header optics win over the WCS
+    scale on purpose, even though they can describe the wrong setup (audit
+    finding M16): they are what the first ingest solved from.
+
+    Returns ``(path_for_astap, fov_hint_deg)``: ``(fits_path, None)``
+    unchanged when the header has no WCS cards or cannot be read — astap
+    then sees exactly what it saw before this existed.
+    """
+    try:
+        with fits.open(fits_path) as hdul:
+            header = hdul[0].header
+            wcs_keys = [k for k in header.keys() if k and _WCS_CARD_RE.match(k.upper())]
+            if not wcs_keys:
+                return fits_path, None
+
+            naxis1 = int(header.get("NAXIS1") or 0)
+            naxis2 = int(header.get("NAXIS2") or 0)
+            centre: tuple[float, float] | None = None
+            fov_deg: float | None = None
+            try:
+                wcs = WCS(header).celestial
+                if wcs.has_celestial and naxis1 > 0 and naxis2 > 0:
+                    ra, dec = wcs.all_pix2world([[naxis1 / 2.0, naxis2 / 2.0]], 0)[0]
+                    if math.isfinite(ra) and math.isfinite(dec):
+                        centre = (float(ra) % 360.0, float(dec))
+                    scale_deg = float(abs(wcs.proj_plane_pixel_scales()[1].value))
+                    if math.isfinite(scale_deg) and scale_deg > 0:
+                        fov_deg = scale_deg * naxis2
+            except Exception:
+                pass  # an unusable WCS gives no hint; astap still gets the frame without it
+
+            has_position = (
+                any(k in header for k in _RA_HINT_KEYS) and any(k in header for k in _DEC_HINT_KEYS)
+            )
+            has_scale = all(header.get(k) for k in _SCALE_HINT_KEYS)
+    except Exception as exc:
+        logger.debug("Could not read %s's header to strip its WCS for astap: %s", fits_path, exc)
+        return fits_path, None
+
+    copy_path = os.path.join(tmp_dir, os.path.basename(fits_path))
+    try:
+        shutil.copyfile(fits_path, copy_path)
+        # output_verify="ignore": capture software writes cards astropy refuses
+        # to flush (INDI's unquoted SITELAT = *.******E+**), and astap reads them —
+        # every other card reaches astap exactly as the frame has it.
+        with fits.open(
+            copy_path, mode="update", do_not_scale_image_data=True, output_verify="ignore",
+        ) as hdul:
+            header = hdul[0].header
+            for key in wcs_keys:
+                header.remove(key, ignore_missing=True, remove_all=True)
+            if not has_position and centre is not None:
+                header["RA"] = (centre[0], "[deg] hint from the stripped WCS centre")
+                header["DEC"] = (centre[1], "[deg] hint from the stripped WCS centre")
+    except Exception as exc:
+        logger.warning(
+            "Could not prepare a WCS-free copy of %s for astap (%s) — solving the "
+            "file as it is",
+            os.path.basename(fits_path), exc,
+        )
+        return fits_path, None
+
+    logger.info(
+        "astap: solving a WCS-free copy of %s (%d WCS card(s) removed%s) — a header "
+        "WCS can steer astap into a wrong distortion fit",
+        os.path.basename(fits_path), len(set(wcs_keys)),
+        "" if has_position or centre is None else ", RA/DEC hint taken from its centre",
+    )
+    return copy_path, (None if has_scale else fov_deg)
 
 
 async def _run_astap(fits_path: str, output_base: str | None) -> bool:
@@ -24,6 +144,8 @@ async def _run_astap(fits_path: str, output_base: str | None) -> bool:
     Never passes ``-update``, so astap only ever writes into a ``.wcs`` side
     file (plus ``.ini``/``.log``) next to ``fits_path`` — or under
     ``output_base`` (``-o``) if given — never into ``fits_path`` itself.
+    A frame whose header carries a WCS is solved through a WCS-free copy
+    (``_wcs_free_copy()``), the side files still landing beside ``fits_path``.
 
     First attempt uses the narrow, header-based search window (``-r 0``, or
     ``-fov``/``-r 10`` when ``config.ASTAP_FOV_HINT`` is set) — cheap, and
@@ -51,28 +173,39 @@ async def _run_astap(fits_path: str, output_base: str | None) -> bool:
         attempts fail — every case already logged at the point of failure,
         so the caller only needs the boolean.
     """
-    outcome = await _run_astap_attempt(fits_path, output_base, wide_radius_deg=None)
-    if outcome == "solved":
-        return True
+    with tempfile.TemporaryDirectory(prefix="astap-input-") as tmp_dir:
+        input_path, fov_hint_deg = await asyncio.to_thread(_wcs_free_copy, fits_path, tmp_dir)
+        if input_path != fits_path and output_base is None:
+            # Side files belong next to the frame (where _read_wcs() and
+            # pipeline._cleanup_astap_files() look), not next to the copy.
+            output_base = os.path.splitext(fits_path)[0]
 
-    if outcome == "no_solution" and config.ASTAP_RETRY_WIDE_SEARCH:
-        logger.info(
-            "astap found no solution in the narrow header-based search window "
-            "for %s — retrying with a wide %.0f° search radius (the header's "
-            "own RA/Dec estimate, e.g. mount pointing, may be significantly off)",
-            fits_path, config.ASTAP_WIDE_SEARCH_RADIUS_DEG,
-        )
         outcome = await _run_astap_attempt(
-            fits_path, output_base,
-            wide_radius_deg=config.ASTAP_WIDE_SEARCH_RADIUS_DEG,
+            input_path, output_base, wide_radius_deg=None, fov_hint_deg=fov_hint_deg,
         )
-        return outcome == "solved"
+        if outcome == "solved":
+            return True
 
-    return False
+        if outcome == "no_solution" and config.ASTAP_RETRY_WIDE_SEARCH:
+            logger.info(
+                "astap found no solution in the narrow header-based search window "
+                "for %s — retrying with a wide %.0f° search radius (the header's "
+                "own RA/Dec estimate, e.g. mount pointing, may be significantly off)",
+                fits_path, config.ASTAP_WIDE_SEARCH_RADIUS_DEG,
+            )
+            outcome = await _run_astap_attempt(
+                input_path, output_base,
+                wide_radius_deg=config.ASTAP_WIDE_SEARCH_RADIUS_DEG,
+                fov_hint_deg=fov_hint_deg,
+            )
+            return outcome == "solved"
+
+        return False
 
 
 async def _run_astap_attempt(
     fits_path: str, output_base: str | None, wide_radius_deg: float | None,
+    fov_hint_deg: float | None = None,
 ) -> str:
     """
     Run a single astap subprocess attempt.
@@ -82,6 +215,10 @@ async def _run_astap_attempt(
     wide/blind search radius (the retry attempt — takes priority over
     ``config.ASTAP_FOV_HINT``, since the hint is exactly what a mis-pointed
     header would make unreliable).
+
+    ``fov_hint_deg`` (from ``_wcs_free_copy()``) is passed as ``-fov`` when
+    the header has no FOCALLEN/XPIXSZ for astap to compute the scale from;
+    ``config.ASTAP_FOV_HINT`` wins over it.
 
     Uses ``config.ASTAP_WIDE_SEARCH_TIMEOUT_SEC`` for the wide attempt and
     ``config.ASTAP_TIMEOUT_SEC`` for the narrow one — a SEPARATE, larger
@@ -144,6 +281,9 @@ async def _run_astap_attempt(
         logger.debug("ASTAP using explicit FOV hint: %.2f°", config.ASTAP_FOV_HINT)
     else:
         cmd.extend(["-r", "0"])   # auto-detect from FITS headers
+
+    if fov_hint_deg is not None and config.ASTAP_FOV_HINT <= 0:
+        cmd.extend(["-fov", f"{fov_hint_deg:.4f}"])
 
     # Separate, larger budget for the wide/blind retry — see this function's
     # own docstring and ASTAP_WIDE_SEARCH_TIMEOUT_SEC's config.py docstring

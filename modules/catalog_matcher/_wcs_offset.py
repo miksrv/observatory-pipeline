@@ -33,6 +33,8 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
       - Not enough sources or Gaia stars to compute reliably
       - Median separation is already within tolerance (no correction needed)
       - No statistically significant peak found (field dominated by galaxies, etc.)
+      - The offset would not improve the match against Gaia (validated by
+        re-matching the shifted sources before returning)
 
     The caller is responsible for applying the returned offset to source
     coordinates before any catalog matching.
@@ -232,10 +234,53 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
 
     offset_ra_deg  = refined_dra  / (cos_dec * 3600.0)
     offset_dec_deg = refined_ddec / 3600.0
+    total_refined = math.sqrt(refined_dra ** 2 + refined_ddec ** 2)
+
+    # Validate before applying: shift the sources by the candidate offset and
+    # re-match. A real systematic offset pulls most sources onto their stars;
+    # a peak that only collected coherent false pairs does not. Real incident
+    # (2026-11-03, 31 M33 frames): astap had returned a badly distorted SIP
+    # solve, the stars sat 6-7" off Gaia in a field-dependent pattern no
+    # uniform shift can fix, and the accumulator still found a 33-59" "peak"
+    # (subtraction residual pairs, the galaxy's dense Gaia entries). It was
+    # applied although the re-match got WORSE (median 6.71" -> 9.46", within
+    # the cone 214 -> 162) — the check only logged — and ~800 sources per
+    # frame went unmatched. Accept an offset only when neither number gets
+    # worse and at least one improves: a genuine 2-5" offset leaves the
+    # in-cone count unchanged (every star is already inside the cone) and
+    # only the median falls, while a peak of false pairs can raise the count
+    # (another of those frames: 624 -> 677) yet worsen the median.
+    cone = config.MATCH_CONE_ARCSEC
+    within_cone_pre = int(np.sum(sep_nn <= cone))
+    shifted = SkyCoord(
+        ra=[(s["ra"] + offset_ra_deg) % 360.0 for s in sources] * u.deg,
+        dec=[s["dec"] + offset_dec_deg for s in sources] * u.deg,
+    )
+    _, sep_post, _ = shifted.match_to_catalog_sky(gaia_coords)
+    sep_post_arcsec = sep_post.to(u.arcsec).value
+    median_post = float(np.median(sep_post_arcsec))
+    within_cone_post = int(np.sum(sep_post_arcsec <= cone))
+
+    logger.info(
+        "WCS offset validation: median %.2f\" -> %.2f\", within %.1f\" %d -> %d of %d",
+        median_sep, median_post, cone, within_cone_pre, within_cone_post, len(sources),
+    )
+    worse = median_post > median_sep or within_cone_post < within_cone_pre
+    better = median_post < median_sep or within_cone_post > within_cone_pre
+    if worse or not better:
+        logger.warning(
+            "WCS offset dRA=%.2f\" dDec=%.2f\" (total=%.2f\") rejected: it does not "
+            "improve the match against Gaia (median %.2f\" -> %.2f\", within %.1f\" "
+            "%d -> %d) — the residual is not a uniform shift (a distorted plate "
+            "solve?), so the positions are left as solved",
+            refined_dra, refined_ddec, total_refined,
+            median_sep, median_post, cone, within_cone_pre, within_cone_post,
+        )
+        return 0.0, 0.0
 
     logger.info(
         "WCS offset detected: dRA=%.2f\" dDec=%.2f\" (total=%.2f\") — "
         "will be applied to all source coordinates before catalog matching",
-        refined_dra, refined_ddec, math.sqrt(refined_dra ** 2 + refined_ddec ** 2),
+        refined_dra, refined_ddec, total_refined,
     )
     return offset_ra_deg, offset_dec_deg

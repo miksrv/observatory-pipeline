@@ -34,7 +34,7 @@ Full list:
   upload_source_chart(source_id, png_bytes, style, frame_count)  → bool
 
   get_frames(object_name, date_from, date_to, limit, offset) → list
-  get_frame(frame_id)                                        → dict | None
+  get_frame(frame_id, raise_on_error)                         → dict | None
   get_frame_sources(frame_id)                                → list | None
 
   create_task(task_type, items, scope, parent_task_id)       → dict | None

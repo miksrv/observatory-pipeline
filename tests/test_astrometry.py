@@ -19,6 +19,7 @@ asyncio_mode = auto is set in pytest.ini, so no @pytest.mark.asyncio required.
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -885,6 +886,122 @@ class TestAstapSip:
 
     async def test_sip_can_be_switched_off(self, monkeypatch):
         assert "-sip" not in await self._cmd(monkeypatch, False)
+
+
+class TestAstapSeesNoHeaderWcs:
+    """
+    2026-11-03: re-solving an archived frame whose header held astap's own
+    earlier TAN-SIP solve gave a wrong distortion fit on 31 M33 frames; the
+    same pixels with no WCS in the header solve correctly. astap must always
+    get a WCS-free view of the frame.
+    """
+
+    @staticmethod
+    def _write_frame(path, header_cards: dict) -> None:
+        from astropy.io import fits as afits
+        hdu = afits.PrimaryHDU(np.arange(40 * 30, dtype=np.uint16).reshape(30, 40))
+        for key, value in header_cards.items():
+            hdu.header[key] = value
+        hdu.writeto(path)
+
+    _SOLVED = {
+        "CTYPE1": "RA---TAN-SIP", "CTYPE2": "DEC--TAN-SIP",
+        "CRVAL1": 23.47, "CRVAL2": 30.66, "CRPIX1": 20.5, "CRPIX2": 15.5,
+        "PC1_1": 0.0002, "PC1_2": 0.0, "PC2_1": 0.0, "PC2_2": 0.0002,
+        "CDELT1": 1.0, "CDELT2": 1.0,
+        "A_ORDER": 2, "A_0_2": 1e-8, "B_ORDER": 2, "B_2_0": 1e-8,
+    }
+
+    def test_copy_drops_every_wcs_card_and_keeps_pixels_and_hints(self, tmp_path):
+        from astropy.io import fits as afits
+        from modules.astrometry._astap import _wcs_free_copy
+
+        src = tmp_path / "frame.fits"
+        self._write_frame(src, {**self._SOLVED, "RA": 23.5, "DEC": 30.75,
+                                "FOCALLEN": 1000.0, "XPIXSZ": 3.8, "PCOUNT_X": 1})
+        work = tmp_path / "work"
+        work.mkdir()
+
+        path, fov = _wcs_free_copy(str(src), str(work))
+
+        assert path == str(work / "frame.fits")
+        # FOCALLEN + XPIXSZ give astap the scale itself — and must win over the
+        # stripped WCS's exact scale, which reproduced the bad fit as -fov too.
+        assert fov is None
+        with afits.open(path) as copy, afits.open(src) as orig:
+            hdr = copy[0].header
+            for key in self._SOLVED:
+                assert key not in hdr
+            assert hdr["RA"] == 23.5 and hdr["DEC"] == 30.75  # the mount hint, untouched
+            assert np.array_equal(copy[0].data, orig[0].data)
+            assert "CTYPE1" in orig[0].header  # the frame itself is never modified
+
+    def test_hints_come_from_the_wcs_when_the_header_has_none(self, tmp_path):
+        from astropy.io import fits as afits
+        from modules.astrometry._astap import _wcs_free_copy
+
+        src = tmp_path / "frame.fits"
+        self._write_frame(src, self._SOLVED)
+        work = tmp_path / "work"
+        work.mkdir()
+
+        path, fov = _wcs_free_copy(str(src), str(work))
+
+        hdr = afits.getheader(path)
+        assert hdr["RA"] == pytest.approx(23.47, abs=0.01)
+        assert hdr["DEC"] == pytest.approx(30.66, abs=0.01)
+        assert fov == pytest.approx(0.0002 * 30, rel=1e-3)  # image height, astap's -fov convention
+
+    def test_a_non_standard_card_does_not_stop_the_copy(self, tmp_path):
+        """INDI writes an unquoted SITELAT = *.******E+**, which astropy refuses to flush."""
+        from astropy.io import fits as afits
+        from modules.astrometry._astap import _wcs_free_copy
+
+        src = tmp_path / "frame.fits"
+        self._write_frame(src, {**self._SOLVED, "SITELAT": 51.7})
+        good = afits.Card("SITELAT", 51.7).image.encode()
+        bad = b"SITELAT = *.******E+** / Latitude of the imaging site in degrees".ljust(80)
+        raw = src.read_bytes()
+        assert raw.count(good) == 1
+        src.write_bytes(raw.replace(good, bad))
+        work = tmp_path / "work"
+        work.mkdir()
+
+        path, _ = _wcs_free_copy(str(src), str(work))
+
+        assert path == str(work / "frame.fits")
+        assert "CTYPE1" not in afits.getheader(path)
+
+    def test_a_frame_without_wcs_is_solved_as_it_is(self, tmp_path):
+        from modules.astrometry._astap import _wcs_free_copy
+
+        src = tmp_path / "frame.fits"
+        self._write_frame(src, {"RA": 23.5, "DEC": 30.75})
+
+        assert _wcs_free_copy(str(src), str(tmp_path)) == (str(src), None)
+
+    async def test_astap_runs_on_the_copy_and_writes_beside_the_frame(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "ASTAP_FOV_HINT", 0.0)
+        src = tmp_path / "frame.fits"
+        self._write_frame(src, self._SOLVED)
+        seen: dict = {}
+
+        def _run(cmd, **kwargs):
+            input_path = cmd[cmd.index("-f") + 1]
+            from astropy.io import fits as afits
+            seen["has_wcs"] = "CTYPE1" in afits.getheader(input_path)
+            seen["cmd"] = list(cmd)
+            return MagicMock(returncode=0, stdout="Solution found", stderr="")
+
+        with patch("modules.astrometry.subprocess.run", MagicMock(side_effect=_run)):
+            assert await _run_astap(str(src), None) is True
+
+        cmd = seen["cmd"]
+        assert seen["has_wcs"] is False
+        assert cmd[cmd.index("-f") + 1] != str(src)
+        assert cmd[cmd.index("-o") + 1] == str(tmp_path / "frame")
+        assert float(cmd[cmd.index("-fov") + 1]) == pytest.approx(0.006, rel=1e-3)
+        assert not os.path.exists(cmd[cmd.index("-f") + 1])  # the copy is cleaned up
 
 
 class TestAstapTimeoutBudgets:

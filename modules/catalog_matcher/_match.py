@@ -20,12 +20,6 @@ from __future__ import annotations
 import logging
 import math
 
-import astropy.units as u
-import numpy as np
-from astropy.coordinates import SkyCoord
-
-import config
-
 from . import _2mass, _gaia, _mpc, _panstarrs, _simbad, _wcs_offset
 
 logger = logging.getLogger(__name__)
@@ -137,34 +131,6 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
                 "Applied WCS correction dRA=%.2f\" dDec=%.2f\" to %d sources  fits_filename=%s",
                 offset_ra_deg * 3600.0, offset_dec_deg * 3600.0, len(sources), fits_filename,
             )
-
-            # Post-correction validation: re-match corrected coordinates
-            # against Gaia to confirm the correction actually improved
-            # positions.  The pre-correction median_sep was already logged
-            # by _compute_wcs_offset() above ("Gaia match (raw): ..."), so
-            # the operator can compare the two numbers at a glance.
-            if gaia_stars and len(sources) >= 3:
-                try:
-                    corrected_coords = SkyCoord(
-                        ra=[s["ra"] for s in sources] * u.deg,
-                        dec=[s["dec"] for s in sources] * u.deg,
-                    )
-                    gaia_coords_val = SkyCoord(
-                        ra=[g["ra"] for g in gaia_stars] * u.deg,
-                        dec=[g["dec"] for g in gaia_stars] * u.deg,
-                    )
-                    _, sep_post, _ = corrected_coords.match_to_catalog_sky(gaia_coords_val)
-                    sep_post_arcsec = sep_post.to(u.arcsec).value
-                    median_post = float(np.median(sep_post_arcsec))
-                    within_cone = int(np.sum(sep_post_arcsec <= config.MATCH_CONE_ARCSEC))
-                    logger.info(
-                        "WCS offset validation (post-correction): median=%.2f\", "
-                        "within %.1f\"=%d/%d  fits_filename=%s",
-                        median_post, config.MATCH_CONE_ARCSEC,
-                        within_cone, len(sources), fits_filename,
-                    )
-                except Exception:
-                    pass  # validation is best-effort — never block matching
     except Exception as exc:
         logger.warning("WCS offset computation failed for fits_filename=%s: %s", fits_filename, exc)
 
