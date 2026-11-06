@@ -1702,6 +1702,28 @@ class TestComputeWcsOffset:
 
         assert (offset_ra_deg, offset_dec_deg) == (0.0, 0.0)
 
+    @pytest.mark.parametrize("shift_arcsec", [3.0, 4.0])
+    def test_small_offset_inside_the_cone_is_still_applied(self, shift_arcsec):
+        """
+        Review of 1.6.6: a 2-5" offset leaves every star inside MATCH_CONE_ARCSEC
+        both before and after, so only the median can improve — that must suffice.
+        """
+        rng = np.random.default_rng(3)
+        cos_dec = math.cos(math.radians(_DEC))
+        sources, gaia_stars = [], []
+        for i in range(60):
+            ra = _RA + rng.uniform(-0.2, 0.2)
+            dec = _DEC + rng.uniform(-0.2, 0.2)
+            gaia_stars.append({"ra": ra, "dec": dec, "source_id": f"g{i}", "phot_g_mean_mag": 14.0})
+            src = _make_source(ra=ra - shift_arcsec / (cos_dec * 3600.0), dec=dec)
+            src["catalog_name"] = None
+            sources.append(src)
+
+        offset_ra_deg, offset_dec_deg = cm._compute_wcs_offset(sources, gaia_stars)
+
+        assert offset_ra_deg * cos_dec * 3600.0 == pytest.approx(shift_arcsec, abs=0.5)
+        assert offset_dec_deg * 3600.0 == pytest.approx(0.0, abs=0.5)
+
     def test_offset_that_worsens_the_match_is_rejected(self):
         """
         2026-11-03, 31 M33 frames: a distorted plate solve left most stars a

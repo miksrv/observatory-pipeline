@@ -245,7 +245,11 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
     # (subtraction residual pairs, the galaxy's dense Gaia entries). It was
     # applied although the re-match got WORSE (median 6.71" -> 9.46", within
     # the cone 214 -> 162) — the check only logged — and ~800 sources per
-    # frame went unmatched. Accept only an offset that improves both numbers.
+    # frame went unmatched. Accept an offset only when neither number gets
+    # worse and at least one improves: a genuine 2-5" offset leaves the
+    # in-cone count unchanged (every star is already inside the cone) and
+    # only the median falls, while a peak of false pairs can raise the count
+    # (another of those frames: 624 -> 677) yet worsen the median.
     cone = config.MATCH_CONE_ARCSEC
     within_cone_pre = int(np.sum(sep_nn <= cone))
     shifted = SkyCoord(
@@ -261,7 +265,9 @@ def _compute_wcs_offset(sources: list[dict], gaia_stars: list[dict]) -> tuple[fl
         "WCS offset validation: median %.2f\" -> %.2f\", within %.1f\" %d -> %d of %d",
         median_sep, median_post, cone, within_cone_pre, within_cone_post, len(sources),
     )
-    if median_post >= median_sep or within_cone_post <= within_cone_pre:
+    worse = median_post > median_sep or within_cone_post < within_cone_pre
+    better = median_post < median_sep or within_cone_post > within_cone_pre
+    if worse or not better:
         logger.warning(
             "WCS offset dRA=%.2f\" dDec=%.2f\" (total=%.2f\") rejected: it does not "
             "improve the match against Gaia (median %.2f\" -> %.2f\", within %.1f\" "

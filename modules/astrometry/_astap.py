@@ -53,10 +53,12 @@ def _wcs_free_copy(fits_path: str, tmp_dir: str) -> tuple[str, float | None]:
     L/R frames came back with SIP terms three orders of magnitude too large
     (A_0_2 = 2e-5 vs 1.8e-8 on the first solve), moving pixels up to 228"
     from where the first solve had them; ~800 sources per frame went
-    unmatched and turned into MOVING_UNKNOWN alerts. The same file with the
-    WCS cards removed — and nothing else changed — solves identically to the
-    first ingest, even when its RA/DEC hint is the exact solved centre; the
-    trigger is the header WCS, not the hint's precision.
+    unmatched and turned into MOVING_UNKNOWN alerts. astap's fit depends on
+    the scale it starts from: the same pixels solve correctly from the
+    header optics (FOCALLEN+XPIXSZ, ~1% off the true scale) — with the RA/DEC
+    hint anywhere from the mount position to the exact solved centre — and
+    wrongly when seeded with the previous solve's exact scale, whether as a
+    header WCS or as ``-fov`` (both tried on the frame above).
 
     So astap always solves the frame as a first ingest would see it: pixels
     and instrument keywords, no WCS. The hint astap then uses is RA/DEC
@@ -64,7 +66,9 @@ def _wcs_free_copy(fits_path: str, tmp_dir: str) -> tuple[str, float | None]:
     they are derived from the WCS being removed — RA/DEC from its centre,
     and a ``-fov`` (image height in degrees, astap's convention) returned
     for the caller to pass on — so a header whose only pointing information
-    was its WCS keeps a narrow search.
+    was its WCS keeps a narrow search. The header optics win over the WCS
+    scale on purpose, even though they can describe the wrong setup (audit
+    finding M16): they are what the first ingest solved from.
 
     Returns ``(path_for_astap, fov_hint_deg)``: ``(fits_path, None)``
     unchanged when the header has no WCS cards or cannot be read — astap
@@ -127,7 +131,7 @@ def _wcs_free_copy(fits_path: str, tmp_dir: str) -> tuple[str, float | None]:
     logger.info(
         "astap: solving a WCS-free copy of %s (%d WCS card(s) removed%s) — a header "
         "WCS can steer astap into a wrong distortion fit",
-        os.path.basename(fits_path), len(wcs_keys),
+        os.path.basename(fits_path), len(set(wcs_keys)),
         "" if has_position or centre is None else ", RA/DEC hint taken from its centre",
     )
     return copy_path, (None if has_scale else fov_deg)

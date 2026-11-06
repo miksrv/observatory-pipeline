@@ -378,9 +378,9 @@ Package: `_astap.py` (runs astap), `_wcs.py` (read/validate WCS), `_frame_geomet
   software writes mount-pointing WCS that looks valid but can be arcminutes off. Header WCS is only
   a fallback.
 - **astap never sees a header WCS** (`_astap._wcs_free_copy()`): it solves a temp copy with every
-  WCS/SIP card removed, its RA/DEC + FOCALLEN/XPIXSZ hints kept (or derived from that WCS: RA/DEC
-  from its centre, `-fov` from its scale). Seeded with its own earlier SIP solve — every re-ANALYZE
-  of an archived frame — astap sometimes converged on a distortion fit 1000× too large.
+  WCS/SIP card removed and the first ingest's hints: RA/DEC and FOCALLEN/XPIXSZ (derived from that
+  WCS only when missing). Seeded with its own earlier solve's exact scale — as a header WCS or as
+  `-fov` — astap sometimes converged on a distortion fit 1000× too large (every re-ANALYZE).
 - `_is_plausible_wcs()` checks the solve (sky-valid reference, scale within
   `ASTROMETRY_PIXEL_SCALE_MIN/MAX_ARCSEC`, non-degenerate CD, finite round trip); failure →
   `solve()` returns `{}`. A confidently wrong WCS is worse than none (risk concentrates in the
@@ -524,7 +524,8 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   objects; never overwrites.
 - **WCS offset correction:** a Gaia vote accumulator estimates a systematic offset and applies it
   in place to every source's `ra`/`dec` — skipped when the median separation is already ≤ 2″, and
-  rejected unless the shifted sources match Gaia better (median and count within the cone) — a
+  rejected unless the shifted sources match Gaia better (neither the median nor the in-cone count
+  worse, one of them better — a 2–5″ offset only lowers the median) — a
   distorted solve is not a uniform shift, and its "peak" comes from coherent false pairs.
   `pipeline._apply_wcs_offset_to_solution()` then shifts the solved WCS's `CRVAL` (and the frame
   centre) by the same offset, so photometry, forced photometry and the archived header project

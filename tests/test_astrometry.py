@@ -925,7 +925,9 @@ class TestAstapSeesNoHeaderWcs:
         path, fov = _wcs_free_copy(str(src), str(work))
 
         assert path == str(work / "frame.fits")
-        assert fov is None  # FOCALLEN + XPIXSZ give astap the scale itself
+        # FOCALLEN + XPIXSZ give astap the scale itself — and must win over the
+        # stripped WCS's exact scale, which reproduced the bad fit as -fov too.
+        assert fov is None
         with afits.open(path) as copy, afits.open(src) as orig:
             hdr = copy[0].header
             for key in self._SOLVED:
