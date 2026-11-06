@@ -23,6 +23,7 @@ from api_client import anomalies as _anomalies_module
 from api_client import frames as _frames_module
 from api_client import sources as _sources_module
 from api_client import (
+    get_frame,
     get_frames_covering,
     get_nearest_frame_before,
     get_source_tracks_batch,
@@ -970,3 +971,27 @@ class TestHistoryFailuresAreDistinguishable:
         with patch.object(_frames_module, "_get_frame_sources_with_retry",
                           AsyncMock(side_effect=httpx.ConnectError("down"))):
             assert await api_client_module.get_frame_sources("frame-1") is None
+
+
+# ---------------------------------------------------------------------------
+# get_frame — "not found" vs "the API failed"
+# ---------------------------------------------------------------------------
+
+
+class TestGetFrameErrors:
+    async def test_404_is_none_either_way(self):
+        resp = _mock_response(status_code=404, json_data={"error": "Not Found"})
+        with _patch_client(get_response=resp):
+            assert await get_frame("f1") is None
+        with _patch_client(get_response=resp):
+            assert await get_frame("f1", raise_on_error=True) is None
+
+    async def test_5xx_is_none_by_default(self):
+        with patch.object(_frames_module, "_get_frame_with_retry", AsyncMock(side_effect=_make_5xx_status_error())):
+            assert await get_frame("f1") is None
+
+    async def test_5xx_raises_when_asked(self):
+        """2026-11-05: a 500 burst read as "not found" closed a DETECT item as DONE."""
+        with patch.object(_frames_module, "_get_frame_with_retry", AsyncMock(side_effect=_make_5xx_status_error())):
+            with pytest.raises(httpx.HTTPStatusError):
+                await get_frame("f1", raise_on_error=True)

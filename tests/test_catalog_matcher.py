@@ -1702,6 +1702,35 @@ class TestComputeWcsOffset:
 
         assert (offset_ra_deg, offset_dec_deg) == (0.0, 0.0)
 
+    def test_offset_that_worsens_the_match_is_rejected(self):
+        """
+        2026-11-03, 31 M33 frames: a distorted plate solve left most stars a
+        few arcsec off Gaia in no common direction, while a coherent set of
+        false pairs voted for a 40" "offset". Applying it moved the real
+        stars off their counterparts — the median got worse — so it must be
+        rejected even though the false pairs now match.
+        """
+        rng = np.random.default_rng(11)
+        cos_dec = math.cos(math.radians(_DEC))
+        sources, gaia_stars = [], []
+        for i in range(100):
+            # Sparse grid (300" spacing) so nearest neighbours are unambiguous.
+            g_ra = _RA + (i % 10) * 300.0 / (cos_dec * 3600.0)
+            g_dec = _DEC + (i // 10) * 300.0 / 3600.0
+            gaia_stars.append({"ra": g_ra, "dec": g_dec, "source_id": f"g{i}", "phot_g_mean_mag": 14.0})
+            if i < 60:
+                # Distorted: 6" off, each in its own direction.
+                angle = rng.uniform(0.0, 2.0 * math.pi)
+                d_ra, d_dec = 6.0 * math.cos(angle), 6.0 * math.sin(angle)
+            else:
+                # Coherent false pairs, all 40" off the same way.
+                d_ra, d_dec = -40.0, 0.0
+            src = _make_source(ra=g_ra + d_ra / (cos_dec * 3600.0), dec=g_dec + d_dec / 3600.0)
+            src["catalog_name"] = None
+            sources.append(src)
+
+        assert cm._compute_wcs_offset(sources, gaia_stars) == (0.0, 0.0)
+
 
 # ===========================================================================
 # TestGaiaProperMotionFields — forced-photometry support

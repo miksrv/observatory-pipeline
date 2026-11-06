@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.6
+
+### Patch Changes
+
+- Astrometry: astap solves a copy of the frame with every WCS card removed from its header (RA/DEC and the scale hint are kept, or derived from that WCS when the header has none). Re-solving an archived frame seeded astap with its own earlier SIP solve, and on 31 of the M33 2020 L/R frames it came back with a distortion fit 1000× too large — pixels up to 228″ off, ~800 unmatched sources per frame, ~2060 false `MOVING_UNKNOWN` alerts. Re-run `ANALYZE` on frames re-analyzed with 1.6.x (their archived headers carry the bad solve), then `DETECT_ANOMALIES`
+- Catalog matching: the Gaia WCS-offset correction is applied only when it improves the match (both the median separation and the count within `MATCH_CONE_ARCSEC`); on those frames a 33–59″ "offset" was applied although it made the match worse, and the check only logged it
+- Worker: a `DETECT_ANOMALIES` item whose frame record could not be fetched (an API error, not a 404) re-queues detection instead of finishing as "not found", and an item whose detection was cut short by an API outage is reported `FAILED` — not `DONE` — when the recovery task cannot be queued either
+
 ## 1.6.5
 
 ### Patch Changes

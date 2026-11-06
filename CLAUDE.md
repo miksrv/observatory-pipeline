@@ -168,7 +168,9 @@ API calls retry 3 times total on 5xx/transport errors (never 4xx). If `POST /sou
 `POST /anomalies` still fails, or the anomaly history prefetch does, `pipeline._queue_recovery_task()`
 re-queues an `ANALYZE` (archive path) or `DETECT_ANOMALIES` task; both endpoints are idempotent. The re-queue count rides in the
 item `payload`, capped by `API_RECOVERY_MAX_ATTEMPTS`; if even that fails the item is logged at
-ERROR for manual submission.
+ERROR for manual submission — and a `DETECT_ANOMALIES` item then ends `FAILED`, not `DONE`.
+`DETECT_ANOMALIES` asks `get_frame(..., raise_on_error=True)`, so an API error on the frame record is
+re-queued the same way rather than read as "frame not found".
 
 ---
 
@@ -375,6 +377,10 @@ Package: `_astap.py` (runs astap), `_wcs.py` (read/validate WCS), `_frame_geomet
 - The fresh `.wcs` side file is **preferred over any WCS already in the header** — capture
   software writes mount-pointing WCS that looks valid but can be arcminutes off. Header WCS is only
   a fallback.
+- **astap never sees a header WCS** (`_astap._wcs_free_copy()`): it solves a temp copy with every
+  WCS/SIP card removed, its RA/DEC + FOCALLEN/XPIXSZ hints kept (or derived from that WCS: RA/DEC
+  from its centre, `-fov` from its scale). Seeded with its own earlier SIP solve — every re-ANALYZE
+  of an archived frame — astap sometimes converged on a distortion fit 1000× too large.
 - `_is_plausible_wcs()` checks the solve (sky-valid reference, scale within
   `ASTROMETRY_PIXEL_SCALE_MIN/MAX_ARCSEC`, non-degenerate CD, finite round trip); failure →
   `solve()` returns `{}`. A confidently wrong WCS is worse than none (risk concentrates in the
@@ -517,7 +523,9 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   and quality flags, so calibration doesn't depend on which catalog named the star. Not for MPC
   objects; never overwrites.
 - **WCS offset correction:** a Gaia vote accumulator estimates a systematic offset and applies it
-  in place to every source's `ra`/`dec` — skipped when the median separation is already ≤ 2″.
+  in place to every source's `ra`/`dec` — skipped when the median separation is already ≤ 2″, and
+  rejected unless the shifted sources match Gaia better (median and count within the cone) — a
+  distorted solve is not a uniform shift, and its "peak" comes from coherent false pairs.
   `pipeline._apply_wcs_offset_to_solution()` then shifts the solved WCS's `CRVAL` (and the frame
   centre) by the same offset, so photometry, forced photometry and the archived header project
   sky positions onto the right pixels.

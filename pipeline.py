@@ -182,7 +182,7 @@ async def _queue_recovery_task(
     attempt: int,
     reason: str,
     extra: dict,
-) -> None:
+) -> bool:
     """
     Put a frame's unfinished work back on the task queue after its science
     payload could not be posted.
@@ -210,9 +210,14 @@ async def _queue_recovery_task(
     That case logs the exact item at ERROR so an operator can submit it by
     hand, which is the same recovery that existed before, only now with the
     frame named.
+
+    Returns whether a recovery task was queued. A DETECT_ANOMALIES caller
+    fails its item when it was not: reporting DONE for a frame whose
+    detection never ran hides it from the operator (real incident,
+    2026-11-05 — the recovery task's own POST hit the same 500 burst).
     """
     if api_client is None or config.API_RECOVERY_MAX_ATTEMPTS <= 0:
-        return
+        return False
 
     if attempt >= config.API_RECOVERY_MAX_ATTEMPTS:
         logger.error(
@@ -222,7 +227,7 @@ async def _queue_recovery_task(
             reason, attempt, task_type, item,
             extra=extra,
         )
-        return
+        return False
 
     queued_item = dict(item)
     payload = dict(queued_item.get("payload") or {})
@@ -242,7 +247,7 @@ async def _queue_recovery_task(
             reason, task_type, task_type, queued_item,
             extra=extra,
         )
-        return
+        return False
 
     logger.warning(
         "%s — queued a %s task (id=%s, attempt %d/%d) to redo it",
@@ -250,6 +255,7 @@ async def _queue_recovery_task(
         config.API_RECOVERY_MAX_ATTEMPTS,
         extra=extra,
     )
+    return True
 
 
 async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | None:
@@ -1076,6 +1082,7 @@ async def detect_anomalies_for_frame_data(
     *,
     post_filename: str,
     recovery_attempt: int = 0,
+    fail_unrecovered: bool = False,
 ) -> list[dict]:
     """
     Classify anomalies for an already-in-memory `sources` list and post the
@@ -1096,6 +1103,11 @@ async def detect_anomalies_for_frame_data(
         Dict with at least "filename" and "obs_time" — the two fields
         anomaly_detector.py actually reads (used for logging and the
         before_time bound of its history queries).
+    fail_unrecovered:
+        Raise RuntimeError when detection or the post failed on an API outage
+        and the recovery DETECT_ANOMALIES task could not be queued either —
+        the task worker's path, so the item is reported FAILED rather than
+        DONE (see `_queue_recovery_task()`).
     post_filename:
         Filename to send with `POST /frames/{id}/anomalies` — kept as a
         separate parameter from `frame_meta["filename"]` because `run()`
@@ -1126,6 +1138,7 @@ async def detect_anomalies_for_frame_data(
     # run found — turning one transient failure (a Horizons outage, a network
     # blip mid-batch) into permanent data loss (audit 2026-08-18, finding C8).
     detection_ok = False
+    unrecovered: str | None = None
     if anomaly_detector is not None:
         try:
             anomalies = await anomaly_detector.detect(frame_id, sources, sources, frame_meta)
@@ -1144,13 +1157,11 @@ async def detect_anomalies_for_frame_data(
                 exc,
                 extra=extra,
             )
-            await _queue_recovery_task(
-                "DETECT_ANOMALIES",
-                {"frame_id": frame_id},
-                recovery_attempt,
-                f"frame_id={frame_id}: history unavailable during anomaly detection",
-                extra,
-            )
+            reason = f"frame_id={frame_id}: history unavailable during anomaly detection"
+            if not await _queue_recovery_task(
+                "DETECT_ANOMALIES", {"frame_id": frame_id}, recovery_attempt, reason, extra,
+            ):
+                unrecovered = reason
         except Exception as exc:
             logger.error(
                 "Anomaly detection failed: %s — leaving this frame's stored "
@@ -1185,13 +1196,14 @@ async def detect_anomalies_for_frame_data(
         # silently missing them. DETECT_ANOMALIES reruns from stored data
         # alone — no local FITS access — so it is cheap to redo.
         if not posted:
-            await _queue_recovery_task(
-                "DETECT_ANOMALIES",
-                {"frame_id": frame_id},
-                recovery_attempt,
-                f"frame_id={frame_id}: {len(anomalies)} anomaly/anomalies could not be posted",
-                extra,
-            )
+            reason = f"frame_id={frame_id}: {len(anomalies)} anomaly/anomalies could not be posted"
+            if not await _queue_recovery_task(
+                "DETECT_ANOMALIES", {"frame_id": frame_id}, recovery_attempt, reason, extra,
+            ):
+                unrecovered = reason
+
+    if unrecovered and fail_unrecovered:
+        raise RuntimeError(f"{unrecovered}, and no recovery task could be queued")
 
     return anomalies
 
@@ -1274,7 +1286,20 @@ async def detect_anomalies_for_frame_id(frame_id: str, recovery_attempt: int = 0
         logger.warning("detect_anomalies_for_frame_id: API client not available")
         return []
 
-    frame = await api_client.get_frame(frame_id)
+    try:
+        frame = await api_client.get_frame(frame_id, raise_on_error=True)
+    except Exception as exc:
+        # The API failed, which is not "no such frame": reporting the item
+        # DONE would leave the frame silently undetected (real incident,
+        # 2026-11-05 — a 500 burst read as "not found"). Redo it later, like
+        # a history outage; fail the item if even that cannot be queued.
+        reason = f"frame_id={frame_id}: frame record unavailable ({exc})"
+        if not await _queue_recovery_task(
+            "DETECT_ANOMALIES", {"frame_id": frame_id}, recovery_attempt, reason,
+            {"fits_filename": None, "frame_id": frame_id},
+        ):
+            raise RuntimeError(f"{reason}, and no recovery task could be queued") from exc
+        return []
     if frame is None:
         logger.warning("detect_anomalies_for_frame_id: frame_id=%s not found", frame_id)
         return []
@@ -1322,6 +1347,7 @@ async def detect_anomalies_for_frame_id(frame_id: str, recovery_attempt: int = 0
         frame_meta,
         post_filename=frame.get("filename") or "<unknown>",
         recovery_attempt=recovery_attempt,
+        fail_unrecovered=True,
     )
 
     # Same "prefer mpc_designation, fall back to catalog_id via source_id"

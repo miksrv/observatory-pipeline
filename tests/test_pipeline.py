@@ -438,7 +438,7 @@ async def test_detect_anomalies_for_frame_id_propagates_frame_filter(monkeypatch
     api_mock.get_frame_sources = AsyncMock(return_value=[
         {"ra": 202.47, "dec": 47.20, "mag": 14.5, "source_id": "src-1"},
     ])
-    api_mock.post_anomalies = AsyncMock(return_value=None)
+    api_mock.post_anomalies = AsyncMock(return_value=True)
     monkeypatch.setattr("pipeline.api_client", api_mock)
 
     anom_mock = MagicMock()
@@ -3256,6 +3256,74 @@ async def test_history_outage_posts_nothing_and_requeues_detection(monkeypatch):
     api_mock.post_anomalies.assert_not_called()
     assert queued.call_args.args[0] == "DETECT_ANOMALIES"
     assert queued.call_args.args[1] == {"frame_id": "frame-123"}
+
+
+@pytest.mark.asyncio
+async def test_frame_fetch_outage_requeues_instead_of_reporting_not_found(monkeypatch):
+    """2026-11-05: a 500 on GET /frames/{id} was read as "not found" and the item closed DONE."""
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(side_effect=RuntimeError("500 Internal Server Error"))
+    api_mock.get_frame_sources = AsyncMock()
+    api_mock.post_anomalies = AsyncMock(return_value=True)
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+    queued = AsyncMock(return_value=True)
+    monkeypatch.setattr(pipeline, "_queue_recovery_task", queued)
+
+    assert await pipeline.detect_anomalies_for_frame_id("frame-123") == []
+
+    assert api_mock.get_frame.call_args.kwargs == {"raise_on_error": True}
+    assert queued.call_args.args[:2] == ("DETECT_ANOMALIES", {"frame_id": "frame-123"})
+    api_mock.get_frame_sources.assert_not_called()
+    api_mock.post_anomalies.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_frame_fetch_outage_fails_the_item_when_nothing_can_be_requeued(monkeypatch):
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(side_effect=RuntimeError("500 Internal Server Error"))
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+    monkeypatch.setattr(pipeline, "_queue_recovery_task", AsyncMock(return_value=False))
+
+    with pytest.raises(RuntimeError, match="no recovery task could be queued"):
+        await pipeline.detect_anomalies_for_frame_id("frame-123")
+
+
+@pytest.mark.asyncio
+async def test_history_outage_without_a_recovery_task_fails_the_task_item(monkeypatch):
+    """2026-11-05: the recovery POST /tasks hit the same 500s and the item still read DONE."""
+    from modules.anomaly_detector import HistoryUnavailable
+
+    api_mock = MagicMock()
+    api_mock.get_frame = AsyncMock(return_value={"filename": "f.fits", "obs_time": "2024-03-15T22:00:00"})
+    api_mock.get_frame_sources = AsyncMock(return_value=[{"ra": 1.0, "dec": 2.0}])
+    api_mock.post_anomalies = AsyncMock(return_value=True)
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+    anom_mock = MagicMock()
+    anom_mock.detect = AsyncMock(side_effect=HistoryUnavailable("narrow history"))
+    monkeypatch.setattr("pipeline.anomaly_detector", anom_mock)
+    monkeypatch.setattr(pipeline, "_queue_recovery_task", AsyncMock(return_value=False))
+
+    with pytest.raises(RuntimeError, match="history unavailable"):
+        await pipeline.detect_anomalies_for_frame_id("frame-123")
+    api_mock.post_anomalies.assert_not_called()
+
+    # The in-process path (pipeline.run()) keeps returning [] — nothing to fail there.
+    assert await pipeline.detect_anomalies_for_frame_data(
+        "frame-123", [{"ra": 1.0, "dec": 2.0}], {"filename": "f.fits"}, post_filename="f.fits",
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_queue_recovery_task_reports_whether_it_queued(monkeypatch):
+    api_mock = MagicMock()
+    monkeypatch.setattr("pipeline.api_client", api_mock)
+    monkeypatch.setattr(config, "API_RECOVERY_MAX_ATTEMPTS", 2)
+
+    api_mock.create_task = AsyncMock(return_value={"id": "t1"})
+    assert await pipeline._queue_recovery_task("DETECT_ANOMALIES", {"frame_id": "f"}, 0, "r", {}) is True
+    api_mock.create_task = AsyncMock(return_value=None)
+    assert await pipeline._queue_recovery_task("DETECT_ANOMALIES", {"frame_id": "f"}, 0, "r", {}) is False
+    assert await pipeline._queue_recovery_task("DETECT_ANOMALIES", {"frame_id": "f"}, 2, "r", {}) is False
 
 
 def test_catalog_offset_is_carried_into_the_solved_wcs():
