@@ -2994,6 +2994,17 @@ class TestProcessingReport:
         assert report["issues"] == []
         assert report["astrometry_solved"] is None
 
+    def test_too_few_references_is_reported_but_not_an_issue(self):
+        """A sparse field never calibrates; re-running ANALYZE cannot change that."""
+        report = self._report(calibration="failed", sources=[{"zero_point": None}])
+        assert report["status"] == "OK"
+        assert report["calibration"] == "failed"
+
+    def test_matching_error_and_no_sources(self):
+        report = self._report(catalog_status={"Gaia DR3": "error"}, calibration="failed", sources=[])
+        assert report["issues"] == ["no_sources", "catalog_error:Gaia DR3", "calibration_failed"]
+        assert report["status"] == "DEGRADED"
+
     def test_narrowband_left_uncalibrated_on_purpose_is_ok(self):
         report = self._report(calibration="skipped", sources=[{"zero_point": None}])
         assert report["status"] == "OK"
@@ -3039,6 +3050,48 @@ async def test_analyze_frame_reports_ok_processing(mock_modules):
     assert processing["status"] == "OK"
     assert processing["calibration"] == "calibrated"
     assert processing["zero_point"] == pytest.approx(14.5)
+
+
+@pytest.mark.asyncio
+async def test_analyze_frame_reports_a_qc_rejected_frame_as_skipped(mock_modules, monkeypatch):
+    monkeypatch.setattr("pipeline.qc.analyze", AsyncMock(return_value=dict(_GOOD_QC, quality_flag="BLUR")))
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    processing = pipeline.api_client.post_frame.call_args[0][0]["processing"]
+    assert processing["status"] == "SKIPPED"
+    assert processing["issues"] == []
+
+
+@pytest.mark.asyncio
+async def test_analyze_frame_reports_an_unsolved_frame_as_failed(mock_modules):
+    pipeline.astrometry.solve.side_effect = None
+    pipeline.astrometry.solve.return_value = {}
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    processing = pipeline.api_client.post_frame.call_args[0][0]["processing"]
+    assert processing["status"] == "FAILED"
+    assert processing["issues"] == ["astrometry_failed"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_frame_narrowband_skips_calibration_without_an_issue(mock_modules, monkeypatch):
+    monkeypatch.setattr(pipeline.normalizer, "is_narrowband", lambda f: True)
+
+    async def measure_skipped(fits_path, sources, skip_calibration=False, **kwargs):
+        assert skip_calibration is True
+        for s in sources:
+            s["calibrated"] = False
+            s["zero_point"] = None
+        return sources
+    pipeline.photometry.measure.side_effect = measure_skipped
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    processing = pipeline.api_client.post_frame.call_args[0][0]["processing"]
+    assert processing["calibration"] == "skipped"
+    assert processing["status"] == "OK"
 
 
 @pytest.mark.asyncio

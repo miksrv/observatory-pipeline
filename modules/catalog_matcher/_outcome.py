@@ -22,6 +22,7 @@ OK = "ok"                          # the catalog answered (possibly with nothing
 FAILED = "failed"                  # every configured source failed
 DISABLED = "disabled"              # no source configured (e.g. PANSTARRS_SOURCES empty)
 NOT_APPLICABLE = "not_applicable"  # the field is outside the catalog's coverage
+ERROR = "error"                    # the catalog answered, but matching against it raised
 
 _outcomes: ContextVar[dict[str, str] | None] = ContextVar("catalog_outcomes", default=None)
 

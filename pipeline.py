@@ -2643,18 +2643,23 @@ def _processing_report(
 
     `status`:
       - ``SKIPPED``  — QC rejected the frame; nothing past QC ran (by design).
-      - ``FAILED``   — QC passed but astap found no solution: no sources at all.
+      - ``FAILED``   — QC passed but astrometry gave nothing (astap found no
+        solution, or the solved frame could not be read): no sources at all.
       - ``DEGRADED`` — solved, but something on the way failed (`issues`).
       - ``OK``       — everything ran.
 
     `issues` are stable codes, in the order the steps run:
-    ``astrometry_failed``, ``catalog_failed:<catalog>`` (e.g.
-    ``catalog_failed:Gaia DR3``), ``calibration_failed`` (a broadband frame got
-    no zero point — too few Gaia references, or too much scatter), and
+    ``astrometry_failed``, ``no_sources`` (solved, but nothing extracted),
+    ``catalog_failed:<catalog>`` (the query got no answer, e.g.
+    ``catalog_failed:Gaia DR3``), ``catalog_error:<catalog>`` (it answered, but
+    matching against it raised), ``calibration_failed`` (a broadband frame got
+    no zero point BECAUSE Gaia or photometry failed — a re-run can fix it), and
     ``<step>_error`` for a step that raised (``subtraction``,
-    ``catalog_matching``, ``photometry``, ``forced_photometry``). Not issues:
-    a catalog switched off or not covering the field, a narrowband/8-bit frame
-    left uncalibrated on purpose, subtraction with too few reference frames.
+    ``catalog_matching``, ``photometry``, ``forced_photometry``). Not issues
+    (reported, but a re-run changes nothing): a catalog switched off or not
+    covering the field, a narrowband/8-bit frame left uncalibrated on purpose,
+    a field with too few usable Gaia references for a zero point, subtraction
+    with too few reference frames.
     """
     if quality_flag != "OK":
         return {
@@ -2673,10 +2678,22 @@ def _processing_report(
     issues: list[str] = []
     if not solved:
         issues.append("astrometry_failed")
+    elif not sources:
+        issues.append("no_sources")
     known = [c for c in _CATALOG_ORDER if c in catalog_status]
     known += sorted(c for c in catalog_status if c not in _CATALOG_ORDER)
-    issues += [f"catalog_failed:{c}" for c in known if catalog_status[c] == "failed"]
-    if calibration == "failed":
+    for c in known:
+        if catalog_status[c] == "failed":
+            issues.append(f"catalog_failed:{c}")
+        elif catalog_status[c] == "error":
+            issues.append(f"catalog_error:{c}")
+    # No zero point is only worth a re-run when something that a re-run can
+    # fix caused it: Gaia (the only reference catalog) or the step itself. A
+    # sparse field with too few usable references stays uncalibrated forever.
+    if calibration == "failed" and (
+        catalog_status.get("Gaia DR3") in ("failed", "error")
+        or {"catalog_matching", "photometry"} & set(step_errors)
+    ):
         issues.append("calibration_failed")
     issues += [f"{step}_error" for step in step_errors]
 

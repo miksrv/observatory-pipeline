@@ -518,7 +518,8 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   it answers sparse fields only (a dense field times out) — a best effort. CDS Strasbourg was
   down for days from 2026-10-28.
 - **Per-catalog outcome** (`_outcome.py`): a failed query returns `[]`, like an empty field, so
-  each query also records `ok`/`failed`/`disabled`/`not_applicable` into a ContextVar collector
+  each query also records `ok`/`failed`/`disabled`/`not_applicable` (and `match()` adds `error`
+  when a catalog answered but matching against it raised) into a ContextVar collector
   that only `match()` sets up; `match(..., catalog_status=dict)` hands it to the caller (step 11's
   `processing.catalogs`). A cache hit counts as `ok`; queries outside `match()` record nothing.
 - **MPC is the exception:** it sees every source. It takes over a stellar-claimed source only when

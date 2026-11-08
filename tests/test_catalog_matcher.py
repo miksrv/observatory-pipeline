@@ -2440,6 +2440,30 @@ class TestCatalogOutcome:
         assert status["Gaia DR3"] == _outcome.OK
         failing.cone_search.assert_not_called()
 
+    async def test_a_matching_error_is_not_reported_as_ok(self):
+        gaia = MagicMock()
+        gaia.cone_search.return_value = _mock_gaia_job(_gaia_table(_RA, _DEC))
+        with (
+            patch("modules.catalog_matcher._gaia._match_gaia", side_effect=RuntimeError("bug")),
+            patch("modules.catalog_matcher._simbad._match_simbad", side_effect=RuntimeError("bug")),
+        ):
+            status = await self._match(gaia, self._simbad_cls(None))
+
+        # Both answered (Simbad with an empty field): matching broke, the query did not.
+        assert status["Gaia DR3"] == _outcome.ERROR
+        assert status["Simbad"] == _outcome.ERROR
+
+    async def test_a_frame_without_date_obs_asks_mpc_for_no_epoch(self):
+        status: dict = {}
+        with (
+            patch("modules.catalog_matcher._gaia._query_gaia", return_value=[]),
+            patch("modules.catalog_matcher._simbad._query_simbad", return_value=[]),
+            patch("modules.catalog_matcher._2mass._query_2mass", return_value=[]),
+            patch("modules.catalog_matcher._panstarrs._query_panstarrs", return_value=[]),
+        ):
+            await cm.match([_make_source()], dict(_FRAME_META, obs_time=None, obs_time_mid=None), catalog_status=status)
+        assert status["MPC"] == _outcome.FAILED
+
     async def test_no_sources_queries_and_reports_nothing(self):
         status: dict = {}
         await cm.match([], _FRAME_META, catalog_status=status)
