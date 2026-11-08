@@ -135,7 +135,7 @@ def mock_modules(monkeypatch, fits_file, tmp_path):
     # collapse every source in a test frame into one, which is realistic
     # for genuine duplicate detections of the same object but wrong for
     # these fixtures, which model distinct stars.
-    async def mock_match(sources, frame_meta):
+    async def mock_match(sources, frame_meta, **_kwargs):
         for i, s in enumerate(sources):
             s.setdefault("catalog_name", "Gaia DR3")
             s.setdefault("catalog_id", f"12345-{i}")
@@ -1123,7 +1123,7 @@ async def test_finder_chart_receives_catalog_designation(mock_modules, monkeypat
     """
     fits_path = str(mock_modules)
 
-    async def mock_match(sources, frame_meta):
+    async def mock_match(sources, frame_meta, **_kwargs):
         sources[0]["catalog_name"] = "MPC"
         sources[0]["catalog_id"] = "4 Vesta"
         sources[1]["catalog_name"] = None
@@ -1175,7 +1175,7 @@ async def test_finder_chart_designation_prefers_mpc_designation_over_stale_sourc
     # sources[0] carries a Gaia DR3 identity totally unrelated to the
     # asteroid — modelling the real `sources` row having been last updated
     # by a different (star) detection sharing the same source_id.
-    async def mock_match(sources, frame_meta):
+    async def mock_match(sources, frame_meta, **_kwargs):
         sources[0]["catalog_name"] = "Gaia DR3"
         sources[0]["catalog_id"] = "3971465931154563840"
         sources[1]["catalog_name"] = None
@@ -2309,7 +2309,7 @@ async def test_pipeline_dedupes_duplicate_catalog_matches_before_posting(mock_mo
     # Force BOTH the first astrometry source and the subtraction candidate
     # to resolve to the identical MPC identity, mimicking Vesta being seen
     # twice in one frame.
-    async def mock_match_same_identity(sources, frame_meta):
+    async def mock_match_same_identity(sources, frame_meta, **_kwargs):
         for s in sources:
             if s.get("_from_subtraction") or s["ra"] == 202.47:
                 s["catalog_name"] = "MPC"
@@ -2345,7 +2345,7 @@ async def test_pipeline_dedupes_forced_photometry_cross_catalog_duplicate(mock_m
     its own eligibility check only compares against Gaia catalog_ids. Only
     the Simbad entry must reach POST /frames/{id}/sources.
     """
-    async def mock_match_first_to_simbad(sources, frame_meta):
+    async def mock_match_first_to_simbad(sources, frame_meta, **_kwargs):
         for i, s in enumerate(sources):
             if i == 0:
                 s["catalog_name"] = "Simbad"
@@ -2938,6 +2938,118 @@ class TestComputePointingError:
         assert payload["pointing_error_arcsec"] == pytest.approx(0.0, abs=1e-6)
         assert payload["pointing_error_ra_arcsec"] == pytest.approx(0.0, abs=1e-6)
         assert payload["pointing_error_dec_arcsec"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# processing — what the analysis came to beyond QC (POST /frames)
+# ---------------------------------------------------------------------------
+
+class TestProcessingReport:
+    """pipeline._processing_report(): the frame record's `processing` block."""
+
+    def _report(self, **overrides):
+        args = dict(
+            quality_flag="OK",
+            astro_result={"ra_center": 1.0},
+            catalog_status={"Simbad": "ok", "Gaia DR3": "ok", "2MASS": "ok", "Pan-STARRS": "disabled", "MPC": "ok"},
+            calibration="calibrated",
+            sources=[{"zero_point": 21.4, "zero_point_err": 0.02}],
+            subtraction_info={"performed": True, "reference_frame_count": 10},
+            step_errors=[],
+        )
+        args.update(overrides)
+        return pipeline._processing_report(**args)
+
+    def test_everything_ran(self):
+        report = self._report()
+        assert report["status"] == "OK"
+        assert report["issues"] == []
+        assert report["astrometry_solved"] is True
+        assert report["zero_point"] == pytest.approx(21.4)
+        assert report["subtraction_reference_count"] == 10
+        # A catalog switched off is reported, but is not an issue.
+        assert report["catalogs"]["Pan-STARRS"] == "disabled"
+
+    def test_failed_catalog_and_missing_zero_point_degrade_the_frame(self):
+        """The 2026-11-07 ingest: Gaia answered 503 on 7 frames, all left uncalibrated."""
+        report = self._report(
+            catalog_status={"Simbad": "ok", "Gaia DR3": "failed", "MPC": "failed"},
+            calibration="failed",
+            sources=[{"zero_point": None}],
+        )
+        assert report["status"] == "DEGRADED"
+        assert report["issues"] == ["catalog_failed:Gaia DR3", "catalog_failed:MPC", "calibration_failed"]
+        assert report["zero_point"] is None
+
+    def test_unsolved_qc_ok_frame_failed(self):
+        report = self._report(astro_result={}, catalog_status={}, calibration=None, sources=[])
+        assert report["status"] == "FAILED"
+        assert report["issues"] == ["astrometry_failed"]
+        assert report["astrometry_solved"] is False
+        assert report["subtraction_performed"] is None
+
+    def test_qc_rejected_frame_is_skipped_not_failed(self):
+        report = self._report(quality_flag="BLUR", astro_result={}, catalog_status={}, calibration=None)
+        assert report["status"] == "SKIPPED"
+        assert report["issues"] == []
+        assert report["astrometry_solved"] is None
+
+    def test_narrowband_left_uncalibrated_on_purpose_is_ok(self):
+        report = self._report(calibration="skipped", sources=[{"zero_point": None}])
+        assert report["status"] == "OK"
+
+    def test_step_errors_are_issues(self):
+        report = self._report(step_errors=["subtraction", "forced_photometry"])
+        assert report["status"] == "DEGRADED"
+        assert report["issues"] == ["subtraction_error", "forced_photometry_error"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_frame_reports_a_failed_catalog_on_the_frame_record(mock_modules):
+    """A catalog query that failed reaches POST /frames as a DEGRADED processing block."""
+    async def match_with_gaia_down(sources, frame_meta, *, catalog_status=None):
+        if catalog_status is not None:
+            catalog_status.update({"Simbad": "ok", "Gaia DR3": "failed"})
+        for i, s in enumerate(sources):
+            s.setdefault("catalog_name", None)
+        return sources
+    pipeline.catalog_matcher.match.side_effect = match_with_gaia_down
+
+    async def measure_without_zero_point(fits_path, sources, skip_calibration=False, **kwargs):
+        for s in sources:
+            s["calibrated"] = False
+            s["zero_point"] = None
+        return sources
+    pipeline.photometry.measure.side_effect = measure_without_zero_point
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    processing = pipeline.api_client.post_frame.call_args[0][0]["processing"]
+    assert processing["status"] == "DEGRADED"
+    assert processing["issues"] == ["catalog_failed:Gaia DR3", "calibration_failed"]
+    assert processing["catalogs"] == {"Simbad": "ok", "Gaia DR3": "failed"}
+    assert processing["calibration"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_analyze_frame_reports_ok_processing(mock_modules):
+    await pipeline.analyze_frame(str(mock_modules))
+
+    processing = pipeline.api_client.post_frame.call_args[0][0]["processing"]
+    assert processing["status"] == "OK"
+    assert processing["calibration"] == "calibrated"
+    assert processing["zero_point"] == pytest.approx(14.5)
+
+
+@pytest.mark.asyncio
+async def test_analyze_frame_reports_a_raising_step(mock_modules):
+    pipeline.catalog_matcher.match.side_effect = RuntimeError("Gaia outage")
+
+    await pipeline.analyze_frame(str(mock_modules))
+
+    processing = pipeline.api_client.post_frame.call_args[0][0]["processing"]
+    assert processing["status"] == "DEGRADED"
+    assert "catalog_matching_error" in processing["issues"]
 
 
 # ---------------------------------------------------------------------------

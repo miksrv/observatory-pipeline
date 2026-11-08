@@ -128,6 +128,10 @@ independently re-runnable modules.
     magnitude (it has no zero point).
 11. `api_client.post_frame()` → `frame_id`. Payload includes `pointing_error_arcsec` (+RA/Dec
     components): mount-reported target vs plate-solved centre; all `None` if either is missing.
+    It also carries `processing` (`_processing_report()`): `OK`/`DEGRADED`/`FAILED`/`SKIPPED` plus
+    issue codes — no plate solve, a catalog that did not answer, no zero point, a step that raised.
+    Every one of these is caught and the frame goes on, so this block is the only place outside
+    the log that says a frame needs re-ANALYZE; the API's frames list filters on it.
 12. `api_client.post_sources()` → `source_ids` (positionally parallel), attached as `_source_id`.
 12.5. Archive to `FITS_ARCHIVE/{object}/{filter}/` (`archive_layout.destination_for()`), first
     writing astap's solve into the header (`_write_solved_wcs()`, clearing stale
@@ -513,6 +517,10 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   history does not split by source. No VizieR mirror carries Pan-STARRS, and the archive copy of
   it answers sparse fields only (a dense field times out) — a best effort. CDS Strasbourg was
   down for days from 2026-10-28.
+- **Per-catalog outcome** (`_outcome.py`): a failed query returns `[]`, like an empty field, so
+  each query also records `ok`/`failed`/`disabled`/`not_applicable` into a ContextVar collector
+  that only `match()` sets up; `match(..., catalog_status=dict)` hands it to the caller (step 11's
+  `processing.catalogs`). A cache hit counts as `ok`; queries outside `match()` record nothing.
 - **MPC is the exception:** it sees every source. It takes over a stellar-claimed source only when
   the ephemeris position is within `MATCH_CONE_ARCSEC` (a blend); otherwise it matches the nearest
   *unclaimed* source within `MOVING_CONE_ARCSEC`. Takeovers log both identities.

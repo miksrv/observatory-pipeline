@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.0
+
+### Minor Changes
+
+- Analysis: every frame is registered with what its analysis came to beyond QC — `processing` in `POST /frames`: `OK`, `DEGRADED` (solved, but a catalog did not answer, the broadband frame got no zero point, or a step raised), `FAILED` (QC passed, astap found no solution) or `SKIPPED` (QC rejected), with the issues and each catalog's outcome. On 2026-11-07 the ESA Gaia archive answered 503 on 7 frames, which were left uncalibrated and looked like any other frame; such a frame is now listed under «Обработка: С проблемами» in the API's frames page and logged as analysed incompletely. Re-run `ANALYZE` on frames registered before 1.7.0 to fill it in (requires observatory-api 1.6.0 to be stored and shown; an older API ignores the field)
+- Catalog matching: an empty `obs_time` counts as a failed MPC query on every frame — its empty answer is no longer cached as if SkyBot had answered
+
 ## 1.6.6
 
 ### Patch Changes

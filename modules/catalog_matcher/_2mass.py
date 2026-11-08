@@ -16,7 +16,7 @@ from astroquery.vizier import Vizier
 
 import config
 
-from . import _gaia_archive
+from . import _gaia_archive, _outcome
 from ._cache import (
     _cache_fov_deg,
     _cache_get,
@@ -143,12 +143,14 @@ def _query_2mass(ra_center: float, dec_center: float, fov_deg: float) -> list[di
     cache_key = f"2mass:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        _outcome.record("2MASS", _outcome.OK)
         return cached  # type: ignore[return-value]
 
     sources = unique(config.TWOMASS_SOURCES)
     if not sources:
         # TWOMASS_SOURCES empty: 2MASS matching is off. Not cached — the tile
         # key is shared with a configuration that has sources.
+        _outcome.record("2MASS", _outcome.DISABLED)
         return []
 
     coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
@@ -168,9 +170,11 @@ def _query_2mass(ra_center: float, dec_center: float, fov_deg: float) -> list[di
         label=source_label,
     )
     if answer is None:
+        _outcome.record("2MASS", _outcome.FAILED)
         return []
     source, stars = answer
     _cache_set(cache_key, stars)
+    _outcome.record("2MASS", _outcome.OK)
     logger.info("2MASS: %d star(s) from %s", len(stars), source_label(source))
     return stars
 

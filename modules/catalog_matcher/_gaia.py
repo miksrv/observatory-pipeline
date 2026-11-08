@@ -38,6 +38,7 @@ try:
 finally:
     socket.setdefaulttimeout(_previous_default_timeout)
 
+from . import _outcome
 from ._cache import (
     _cache_fov_deg,
     _cache_get,
@@ -147,6 +148,7 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
     cache_key = f"gaia:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        _outcome.record("Gaia DR3", _outcome.OK)
         return cached  # type: ignore[return-value]
 
     try:
@@ -251,11 +253,13 @@ def _query_gaia(ra_center: float, dec_center: float, fov_deg: float) -> list[dic
             })
 
         _cache_set(cache_key, stars)
+        _outcome.record("Gaia DR3", _outcome.OK)
         logger.debug("Gaia DR3 query returned %d stars for ra=%.3f dec=%.3f", len(stars), ra_center, dec_center)
         return stars
 
     except Exception as exc:
         logger.warning("Gaia DR3 query failed for ra=%.3f dec=%.3f: %s", ra_center, dec_center, exc)
+        _outcome.record("Gaia DR3", _outcome.FAILED)
         return []
 
 

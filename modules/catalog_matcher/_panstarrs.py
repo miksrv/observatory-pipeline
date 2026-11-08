@@ -17,7 +17,7 @@ from astroquery.vizier import Vizier
 
 import config
 
-from . import _gaia_archive
+from . import _gaia_archive, _outcome
 from ._cache import (
     _cache_fov_deg,
     _cache_get,
@@ -88,6 +88,7 @@ def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> lis
             "Pan-STARRS skipped: dec=%.3f is outside coverage (dec > -30° required)",
             dec_center,
         )
+        _outcome.record("Pan-STARRS", _outcome.NOT_APPLICABLE)
         return []
 
     # Query around the TILE the cache key rounds to, with the tile's own
@@ -106,12 +107,14 @@ def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> lis
     cache_key = f"panstarrs:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        _outcome.record("Pan-STARRS", _outcome.OK)
         return cached  # type: ignore[return-value]
 
     sources = unique(config.PANSTARRS_SOURCES)
     if not sources:
         # PANSTARRS_SOURCES empty: Pan-STARRS matching is off. Not cached —
         # the tile key is shared with a configuration that has sources.
+        _outcome.record("Pan-STARRS", _outcome.DISABLED)
         return []
 
     coord  = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
@@ -130,9 +133,11 @@ def _query_panstarrs(ra_center: float, dec_center: float, fov_deg: float) -> lis
         label=source_label,
     )
     if answer is None:
+        _outcome.record("Pan-STARRS", _outcome.FAILED)
         return []
     source, ps_sources = answer
     _cache_set(cache_key, ps_sources)
+    _outcome.record("Pan-STARRS", _outcome.OK)
     logger.info("Pan-STARRS: %d source(s) from %s", len(ps_sources), source_label(source))
     return ps_sources
 

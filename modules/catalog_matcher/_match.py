@@ -20,12 +20,17 @@ from __future__ import annotations
 import logging
 import math
 
-from . import _2mass, _gaia, _mpc, _panstarrs, _simbad, _wcs_offset
+from . import _2mass, _gaia, _mpc, _outcome, _panstarrs, _simbad, _wcs_offset
 
 logger = logging.getLogger(__name__)
 
 
-async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
+async def match(
+    sources: list[dict],
+    frame_meta: dict,
+    *,
+    catalog_status: dict[str, str] | None = None,
+) -> list[dict]:
     """
     Enrich each source in-place with catalog identification fields.
 
@@ -55,6 +60,13 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         Each dict must have at minimum: ra (float), dec (float).
     frame_meta:
         Dict with keys: ra_center, dec_center, fov_deg, obs_time (ISO 8601).
+    catalog_status:
+        Optional dict filled with each queried catalog's outcome —
+        ``{"Simbad": "ok", "Gaia DR3": "failed", ...}``, values from
+        `_outcome` (ok / failed / disabled / not_applicable). A failed query
+        returns no rows, which is otherwise indistinguishable from an empty
+        field; the caller reports this on the frame record. Left untouched
+        when there are no sources (nothing is queried).
 
     Returns
     -------
@@ -76,6 +88,19 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     if not sources:
         logger.info("Catalog matching: 0 sources — nothing to match  fits_filename=%s", fits_filename)
         return sources
+
+    token = _outcome.start()
+    try:
+        _match_catalogs(sources, frame_meta, fits_filename)
+    finally:
+        outcomes = _outcome.finish(token)
+        if catalog_status is not None:
+            catalog_status.update(outcomes)
+    return sources
+
+
+def _match_catalogs(sources: list[dict], frame_meta: dict, fits_filename: str) -> None:
+    """match()'s body: query and match every catalog in order (see match())."""
 
     ra_center  = float(frame_meta.get("ra_center",  0.0))
     dec_center = float(frame_meta.get("dec_center", 0.0))
@@ -116,6 +141,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
             ra_center, dec_center, fov_deg, fov_deg * math.sqrt(2) / 2.0, len(gaia_stars), fits_filename,
         )
     except Exception as exc:
+        _outcome.record("Gaia DR3", _outcome.FAILED)
         logger.warning("Gaia query failed for fits_filename=%s: %s", fits_filename, exc)
 
     # Compute WCS offset and apply to source coordinates in-place
@@ -149,6 +175,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         )
         _simbad._match_simbad(sources, simbad_objects)
     except Exception as exc:
+        _record_stage_failure("Simbad", simbad_objects)
         logger.warning("Simbad matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 2. Gaia DR3 (dense stellar catalog, WCS offset already applied) ---
@@ -170,6 +197,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         )
         _2mass._match_2mass(sources, twomass_stars)
     except Exception as exc:
+        _record_stage_failure("2MASS", twomass_stars)
         logger.warning("2MASS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 4. Pan-STARRS DR1 (deep optical catalog, dec > -30°; catches faint sources
@@ -184,6 +212,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
             )
         _panstarrs._match_panstarrs(sources, ps_sources)
     except Exception as exc:
+        _record_stage_failure("Pan-STARRS", ps_sources)
         logger.warning("Pan-STARRS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 5. MPC / SkyBot (solar system objects; wider cone) ---
@@ -198,6 +227,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         mpc_objects = _mpc._query_mpc(ra_center, dec_center, obs_time_mid, fov_deg)
         _mpc._match_mpc(sources, mpc_objects)
     except Exception as exc:
+        _record_stage_failure("MPC", mpc_objects)
         logger.warning("MPC/SkyBot matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     n_simbad     = sum(1 for s in sources if s["catalog_name"] == "Simbad")
@@ -229,4 +259,12 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
                 match_rate * 100, n_stellar, len(sources), fits_filename,
             )
 
-    return sources
+
+def _record_stage_failure(catalog: str, rows: list[dict]) -> None:
+    """
+    A matching stage raised. Before its query returned (`rows` still empty),
+    the catalog's rows never arrived — a failed query; after, only matching
+    broke and the catalog itself answered, so its recorded outcome stands.
+    """
+    if not rows:
+        _outcome.record(catalog, _outcome.FAILED)
