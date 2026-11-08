@@ -2375,3 +2375,117 @@ class TestGaiaArchiveSocketTimeout:
 def _gaia_path() -> str:
     from modules.catalog_matcher import _gaia
     return _gaia.__file__
+
+
+# ---------------------------------------------------------------------------
+# Per-catalog outcome (match(..., catalog_status=...)) — a failed query returns
+# [] like an empty field; the frame record must still say it failed.
+# ---------------------------------------------------------------------------
+
+from modules.catalog_matcher import _outcome  # noqa: E402
+
+
+class TestCatalogOutcome:
+
+    def _simbad_cls(self, table=None, error: Exception | None = None) -> MagicMock:
+        cls = MagicMock()
+        instance = MagicMock()
+        if error is not None:
+            instance.query_region.side_effect = error
+        else:
+            instance.query_region.return_value = table
+        cls.return_value = instance
+        return cls
+
+    async def _match(self, gaia: MagicMock, simbad: MagicMock) -> dict:
+        status: dict = {}
+        with (
+            patch("modules.catalog_matcher._gaia.Gaia", gaia),
+            patch("modules.catalog_matcher._simbad.Simbad", simbad),
+            patch("modules.catalog_matcher._2mass._query_2mass", return_value=[]),
+            patch("modules.catalog_matcher._panstarrs._query_panstarrs", return_value=[]),
+            patch("modules.catalog_matcher._mpc._query_mpc", return_value=[]),
+        ):
+            await cm.match([_make_source()], _FRAME_META, catalog_status=status)
+        return status
+
+    async def test_gaia_failure_is_reported(self):
+        gaia = MagicMock()
+        gaia.cone_search.side_effect = RuntimeError("Error 503: Server overloaded")
+
+        status = await self._match(gaia, self._simbad_cls(None))
+
+        assert status["Gaia DR3"] == _outcome.FAILED
+        assert status["Simbad"] == _outcome.OK
+
+    async def test_every_simbad_server_failing_is_reported(self, monkeypatch):
+        monkeypatch.setattr(config, "SIMBAD_SERVERS", ["simbad.cds.unistra.fr"])
+        gaia = MagicMock()
+        gaia.cone_search.return_value = _mock_gaia_job(_gaia_table(_RA + 10, _DEC + 10))
+
+        status = await self._match(gaia, self._simbad_cls(error=TimeoutError("timed out")))
+
+        assert status["Simbad"] == _outcome.FAILED
+        assert status["Gaia DR3"] == _outcome.OK
+
+    async def test_a_cached_answer_counts_as_answered(self):
+        gaia = MagicMock()
+        gaia.cone_search.return_value = _mock_gaia_job(_gaia_table(_RA + 10, _DEC + 10))
+        await self._match(gaia, self._simbad_cls(None))
+
+        failing = MagicMock()
+        failing.cone_search.side_effect = RuntimeError("down")
+        status = await self._match(failing, self._simbad_cls(None))
+
+        assert status["Gaia DR3"] == _outcome.OK
+        failing.cone_search.assert_not_called()
+
+    async def test_a_matching_error_is_not_reported_as_ok(self):
+        gaia = MagicMock()
+        gaia.cone_search.return_value = _mock_gaia_job(_gaia_table(_RA, _DEC))
+        with (
+            patch("modules.catalog_matcher._gaia._match_gaia", side_effect=RuntimeError("bug")),
+            patch("modules.catalog_matcher._simbad._match_simbad", side_effect=RuntimeError("bug")),
+        ):
+            status = await self._match(gaia, self._simbad_cls(None))
+
+        # Both answered (Simbad with an empty field): matching broke, the query did not.
+        assert status["Gaia DR3"] == _outcome.ERROR
+        assert status["Simbad"] == _outcome.ERROR
+
+    async def test_a_frame_without_date_obs_asks_mpc_for_no_epoch(self):
+        status: dict = {}
+        with (
+            patch("modules.catalog_matcher._gaia._query_gaia", return_value=[]),
+            patch("modules.catalog_matcher._simbad._query_simbad", return_value=[]),
+            patch("modules.catalog_matcher._2mass._query_2mass", return_value=[]),
+            patch("modules.catalog_matcher._panstarrs._query_panstarrs", return_value=[]),
+        ):
+            await cm.match([_make_source()], dict(_FRAME_META, obs_time=None, obs_time_mid=None), catalog_status=status)
+        assert status["MPC"] == _outcome.FAILED
+
+    async def test_no_sources_queries_and_reports_nothing(self):
+        status: dict = {}
+        await cm.match([], _FRAME_META, catalog_status=status)
+        assert status == {}
+
+    def test_panstarrs_outside_coverage_and_switched_off(self, monkeypatch):
+        token = _outcome.start()
+        cm._query_panstarrs(_RA, -45.0, 1.0)
+        assert _outcome.finish(token) == {"Pan-STARRS": _outcome.NOT_APPLICABLE}
+
+        monkeypatch.setattr(config, "PANSTARRS_SOURCES", [])
+        token = _outcome.start()
+        cm._query_panstarrs(_RA, _DEC, 1.0)
+        assert _outcome.finish(token) == {"Pan-STARRS": _outcome.DISABLED}
+
+    def test_mpc_without_an_epoch_failed_every_time(self):
+        for _ in range(2):  # the empty answer is not cached as if SkyBot had answered
+            token = _outcome.start()
+            assert cm._query_mpc(_RA, _DEC, "", 1.0) == []
+            assert _outcome.finish(token) == {"MPC": _outcome.FAILED}
+
+    def test_a_query_outside_match_records_nothing(self):
+        cm._query_panstarrs(_RA, -45.0, 1.0)  # no collector active: must not raise
+        token = _outcome.start()
+        assert _outcome.finish(token) == {}

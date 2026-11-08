@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.0
+
+### Minor Changes
+
+- Analysis: `POST /frames` carries `processing` — `OK` / `DEGRADED` / `FAILED` / `SKIPPED`, the issues and each catalog's outcome — so a frame analysed incompletely (a catalog that did not answer, no plate solve, a step that raised) can be found and re-analysed; on 2026-11-07 seven frames went uncalibrated during a Gaia 503 unnoticed. Re-run `ANALYZE` to fill it in for older frames (requires observatory-api 1.6.0; an older API ignores it)
+- Catalog matching: a frame without `DATE-OBS` is a failed MPC query on every run — SkyBot was asked for the epoch "None"
+
 ## 1.6.6
 
 ### Patch Changes

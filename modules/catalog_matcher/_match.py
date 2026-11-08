@@ -20,12 +20,17 @@ from __future__ import annotations
 import logging
 import math
 
-from . import _2mass, _gaia, _mpc, _panstarrs, _simbad, _wcs_offset
+from . import _2mass, _gaia, _mpc, _outcome, _panstarrs, _simbad, _wcs_offset
 
 logger = logging.getLogger(__name__)
 
 
-async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
+async def match(
+    sources: list[dict],
+    frame_meta: dict,
+    *,
+    catalog_status: dict[str, str] | None = None,
+) -> list[dict]:
     """
     Enrich each source in-place with catalog identification fields.
 
@@ -55,6 +60,13 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         Each dict must have at minimum: ra (float), dec (float).
     frame_meta:
         Dict with keys: ra_center, dec_center, fov_deg, obs_time (ISO 8601).
+    catalog_status:
+        Optional dict filled with each queried catalog's outcome —
+        ``{"Simbad": "ok", "Gaia DR3": "failed", ...}``, values from
+        `_outcome` (ok / failed / disabled / not_applicable). A failed query
+        returns no rows, which is otherwise indistinguishable from an empty
+        field; the caller reports this on the frame record. Left untouched
+        when there are no sources (nothing is queried).
 
     Returns
     -------
@@ -77,10 +89,25 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         logger.info("Catalog matching: 0 sources — nothing to match  fits_filename=%s", fits_filename)
         return sources
 
+    token = _outcome.start()
+    try:
+        _match_catalogs(sources, frame_meta, fits_filename)
+    finally:
+        outcomes = _outcome.finish(token)
+        if catalog_status is not None:
+            catalog_status.update(outcomes)
+    return sources
+
+
+def _match_catalogs(sources: list[dict], frame_meta: dict, fits_filename: str) -> None:
+    """match()'s body: query and match every catalog in order (see match())."""
+
     ra_center  = float(frame_meta.get("ra_center",  0.0))
     dec_center = float(frame_meta.get("dec_center", 0.0))
     fov_deg    = float(frame_meta.get("fov_deg",    1.0))
-    obs_time   = str(frame_meta.get("obs_time",    ""))
+    # `or ""`: the pipeline passes obs_time=None for a frame with no DATE-OBS,
+    # and str(None) would hand SkyBot the epoch "None".
+    obs_time   = str(frame_meta.get("obs_time") or "")
     # The MPC/SkyBot stage alone runs at the exposure MIDPOINT: DATE-OBS is
     # shutter-open, and a moving object is already tens of arcsec away by
     # mid-exposure on a long one (see fits_header.midpoint_time()). Every
@@ -103,6 +130,10 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     gaia_stars: list[dict] = []
     try:
         gaia_stars = _gaia._query_gaia(ra_center, dec_center, fov_deg)
+    except Exception as exc:
+        _outcome.record("Gaia DR3", _outcome.FAILED)
+        logger.warning("Gaia query failed for fits_filename=%s: %s", fits_filename, exc)
+    try:
         # Propagate every star from Gaia's own J2016.0 epoch to this frame's
         # epoch before it is used for anything. Both consumers below — the
         # WCS-offset vote accumulator and _match_gaia() itself — compare
@@ -116,7 +147,9 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
             ra_center, dec_center, fov_deg, fov_deg * math.sqrt(2) / 2.0, len(gaia_stars), fits_filename,
         )
     except Exception as exc:
-        logger.warning("Gaia query failed for fits_filename=%s: %s", fits_filename, exc)
+        # Gaia answered; its stars go on unpropagated.
+        _outcome.record("Gaia DR3", _outcome.ERROR)
+        logger.warning("Gaia proper-motion propagation failed for fits_filename=%s: %s", fits_filename, exc)
 
     # Compute WCS offset and apply to source coordinates in-place
     try:
@@ -141,14 +174,17 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
 
     # --- 1. Simbad (named objects with rich type info) ---
     simbad_objects: list[dict] = []
+    answered = False
     try:
         simbad_objects = _simbad._query_simbad(ra_center, dec_center, fov_deg)
+        answered = True
         logger.info(
             "Simbad query: ra=%.4f dec=%.4f fov=%.4f° → %d objects  fits_filename=%s",
             ra_center, dec_center, fov_deg, len(simbad_objects), fits_filename,
         )
         _simbad._match_simbad(sources, simbad_objects)
     except Exception as exc:
+        _record_stage_failure("Simbad", answered)
         logger.warning("Simbad matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 2. Gaia DR3 (dense stellar catalog, WCS offset already applied) ---
@@ -158,25 +194,31 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
         # calibrates it the same way as on a night when Gaia claimed it.
         _gaia._attach_gaia_color(sources, gaia_stars)
     except Exception as exc:
+        _outcome.record("Gaia DR3", _outcome.ERROR)
         logger.warning("Gaia matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 3. 2MASS (fallback for red/cool stars absent in Gaia) ---
     twomass_stars: list[dict] = []
+    answered = False
     try:
         twomass_stars = _2mass._query_2mass(ra_center, dec_center, fov_deg)
+        answered = True
         logger.info(
             "2MASS query: ra=%.4f dec=%.4f fov=%.4f° → %d catalog stars  fits_filename=%s",
             ra_center, dec_center, fov_deg, len(twomass_stars), fits_filename,
         )
         _2mass._match_2mass(sources, twomass_stars)
     except Exception as exc:
+        _record_stage_failure("2MASS", answered)
         logger.warning("2MASS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 4. Pan-STARRS DR1 (deep optical catalog, dec > -30°; catches faint sources
     #        below Gaia completeness limit ~21 mag, reduces false UNKNOWN alerts) ---
     ps_sources: list[dict] = []
+    answered = False
     try:
         ps_sources = _panstarrs._query_panstarrs(ra_center, dec_center, fov_deg)
+        answered = True
         if ps_sources:
             logger.info(
                 "Pan-STARRS query: ra=%.4f dec=%.4f fov=%.4f° → %d sources  fits_filename=%s",
@@ -184,6 +226,7 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
             )
         _panstarrs._match_panstarrs(sources, ps_sources)
     except Exception as exc:
+        _record_stage_failure("Pan-STARRS", answered)
         logger.warning("Pan-STARRS matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     # --- 5. MPC / SkyBot (solar system objects; wider cone) ---
@@ -194,10 +237,13 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
     #        first (audit 2026-08-18, C3). _match_mpc() resolves the conflict
     #        positionally — see its docstring.
     mpc_objects: list[dict] = []
+    answered = False
     try:
         mpc_objects = _mpc._query_mpc(ra_center, dec_center, obs_time_mid, fov_deg)
+        answered = True
         _mpc._match_mpc(sources, mpc_objects)
     except Exception as exc:
+        _record_stage_failure("MPC", answered)
         logger.warning("MPC/SkyBot matching stage failed for fits_filename=%s: %s", fits_filename, exc)
 
     n_simbad     = sum(1 for s in sources if s["catalog_name"] == "Simbad")
@@ -229,4 +275,12 @@ async def match(sources: list[dict], frame_meta: dict) -> list[dict]:
                 match_rate * 100, n_stellar, len(sources), fits_filename,
             )
 
-    return sources
+
+def _record_stage_failure(catalog: str, answered: bool) -> None:
+    """
+    A matching stage raised. Before its query returned, the catalog's rows
+    never arrived — a failed query; after, the catalog answered and matching
+    against it broke — an error, which a re-analysis will not fix by itself
+    but which must not read as `ok` either.
+    """
+    _outcome.record(catalog, _outcome.ERROR if answered else _outcome.FAILED)

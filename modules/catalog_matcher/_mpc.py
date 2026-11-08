@@ -19,7 +19,7 @@ from astropy.time import Time
 
 import config
 
-from . import _sbident
+from . import _outcome, _sbident
 from ._cache import (
     _cache_fov_deg,
     _cache_get,
@@ -256,14 +256,17 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
     key_ra, key_dec = _cache_position(ra_center, dec_center)
     key_fov = _cache_fov_deg(fov_deg)
     cache_key = f"mpc:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}:{obs_time}"
+    if not obs_time:
+        # Before the cache lookup: an empty epoch must read as a failed
+        # query every time, not as the cached empty answer of an earlier one.
+        logger.warning("MPC query skipped: obs_time is empty (check DATE-OBS header in FITS)")
+        _outcome.record("MPC", _outcome.FAILED)
+        return []
+
     cached = _cache_get(cache_key)
     if cached is not None:
+        _outcome.record("MPC", _outcome.OK)
         return cached  # type: ignore[return-value]
-
-    if not obs_time:
-        logger.warning("MPC query skipped: obs_time is empty (check DATE-OBS header in FITS)")
-        _cache_set(cache_key, [])
-        return []
 
     try:
         epoch = Time(obs_time)
@@ -272,12 +275,14 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
             "MPC query skipped: ra=%.4f dec=%.4f obs_time=%r is not a time — %s",
             ra_center, dec_center, obs_time, exc,
         )
+        _outcome.record("MPC", _outcome.FAILED)
         return []
 
     sources = _sources_in_order()
     if not sources:
         # MPC_SOURCES empty (or only unknown names): MPC matching is off. Not
         # cached — the key is shared with a configuration that has sources.
+        _outcome.record("MPC", _outcome.DISABLED)
         return []
 
     radius_deg = (
@@ -301,12 +306,14 @@ def _query_mpc(ra_center: float, dec_center: float, obs_time: str, fov_deg: floa
             logger.info("%s answers again", label)
         logger.info("MPC: %d object(s) from %s", len(objects), label)
         _cache_set(cache_key, objects)
+        _outcome.record("MPC", _outcome.OK)
         return objects
 
     logger.warning(
         "MPC: no source answered for ra=%.4f dec=%.4f obs_time=%r — frame gets no MPC matching",
         ra_center, dec_center, obs_time,
     )
+    _outcome.record("MPC", _outcome.FAILED)
     return []
 
 

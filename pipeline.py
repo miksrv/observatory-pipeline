@@ -583,6 +583,14 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     # These are merged into `sources` and flagged _from_subtraction=True
     # so the anomaly detector can treat them with higher confidence.
     # ------------------------------------------------------------------
+    # What each step below came to, for the frame record's `processing`
+    # block (_processing_report()): a step that raised is caught and the
+    # frame goes on with partial results, so without this nothing outside
+    # the log would say the frame was analysed incompletely.
+    step_errors: list[str] = []
+    catalog_status: dict[str, str] = {}
+    calibration: str | None = None
+
     subtraction_info: dict = {"performed": False, "reference_frame_count": 0, "candidates_count": 0}
     if subtraction is not None and astro_result:
         try:
@@ -615,6 +623,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                     extra=extra,
                 )
         except Exception as exc:
+            step_errors.append("subtraction")
             logger.error(
                 "Image subtraction failed: %s — continuing without subtraction",
                 exc,
@@ -645,7 +654,9 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 # fits_header.midpoint_time()).
                 "obs_time_mid": header.get("obs_time_mid"),
             }
-            sources = await catalog_matcher.match(sources, frame_meta)
+            sources = await catalog_matcher.match(
+                sources, frame_meta, catalog_status=catalog_status,
+            )
             _apply_wcs_offset_to_solution(astro_result, sources, extra)
             matched_count = sum(1 for s in sources if s.get("catalog_name") is not None)
             logger.info(
@@ -655,6 +666,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 extra=extra,
             )
         except Exception as exc:
+            step_errors.append("catalog_matching")
             logger.error(
                 "Catalog matching failed: %s — continuing without matches",
                 exc,
@@ -746,6 +758,12 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 filter_name=header.get("observation", {}).get("filter"),
             )
             calibrated_count = sum(1 for s in sources if s.get("calibrated"))
+            if skip_calibration:
+                calibration = "skipped"
+            elif any(s.get("zero_point") is not None for s in sources):
+                calibration = "calibrated"
+            else:
+                calibration = "failed"
             logger.info(
                 "Photometry complete: %d sources measured, %d calibrated",
                 len(sources),
@@ -753,6 +771,8 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                 extra=extra,
             )
         except Exception as exc:
+            step_errors.append("photometry")
+            calibration = "failed"
             logger.error(
                 "Photometry failed: %s — continuing with uncalibrated sources",
                 exc,
@@ -878,6 +898,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
                     extra=extra,
                 )
         except Exception as exc:
+            step_errors.append("forced_photometry")
             logger.error(
                 "Forced photometry failed: %s — continuing without it",
                 exc,
@@ -908,9 +929,26 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
         )
         return None
 
+    processing = _processing_report(
+        quality_flag=quality_flag,
+        astro_result=astro_result,
+        catalog_status=catalog_status,
+        calibration=calibration,
+        sources=sources,
+        subtraction_info=subtraction_info,
+        step_errors=step_errors,
+    )
+    if processing["status"] not in ("OK", "SKIPPED"):
+        logger.warning(
+            "Frame analysed incompletely (%s): %s — re-run ANALYZE once the cause is gone",
+            processing["status"], ", ".join(processing["issues"]),
+            extra=extra,
+        )
+
     frame_data: dict = _build_frame_payload(
         fits_path, header, qc_result, astro_result,
         filename=normalized_filename,
+        processing=processing,
     )
 
     try:
@@ -2582,6 +2620,103 @@ def _compute_pointing_error(header: dict, astro_result: dict) -> dict:
     }
 
 
+# Catalogs in matching order — the order a frame's catalog issues are listed in.
+_CATALOG_ORDER = ("Simbad", "Gaia DR3", "2MASS", "Pan-STARRS", "MPC")
+
+
+def _processing_report(
+    *,
+    quality_flag: str | None,
+    astro_result: dict,
+    catalog_status: dict[str, str],
+    calibration: str | None,
+    sources: list[dict],
+    subtraction_info: dict,
+    step_errors: list[str],
+) -> dict:
+    """
+    The frame record's `processing` block (POST /frames, docs/API.md): what
+    the analysis came to beyond QC, so the operator can find a frame that was
+    analysed incompletely — a catalog that did not answer, no plate solve, no
+    zero point — and re-run ANALYZE on it. Every one of these is caught and
+    logged; the frame otherwise looks like any other.
+
+    `status`:
+      - ``SKIPPED``  — QC rejected the frame; nothing past QC ran (by design).
+      - ``FAILED``   — QC passed but astrometry gave nothing (astap found no
+        solution, or the solved frame could not be read): no sources at all.
+      - ``DEGRADED`` — solved, but something on the way failed (`issues`).
+      - ``OK``       — everything ran.
+
+    `issues` are stable codes, in the order the steps run:
+    ``astrometry_failed``, ``no_sources`` (solved, but nothing extracted),
+    ``catalog_failed:<catalog>`` (the query got no answer, e.g.
+    ``catalog_failed:Gaia DR3``), ``catalog_error:<catalog>`` (it answered, but
+    matching against it raised), ``calibration_failed`` (a broadband frame got
+    no zero point BECAUSE Gaia or photometry failed — a re-run can fix it), and
+    ``<step>_error`` for a step that raised (``subtraction``,
+    ``catalog_matching``, ``photometry``, ``forced_photometry``). Not issues
+    (reported, but a re-run changes nothing): a catalog switched off or not
+    covering the field, a narrowband/8-bit frame left uncalibrated on purpose,
+    a field with too few usable Gaia references for a zero point, subtraction
+    with too few reference frames.
+    """
+    if quality_flag != "OK":
+        return {
+            "status": "SKIPPED",
+            "issues": [],
+            "astrometry_solved": None,
+            "catalogs": {},
+            "calibration": None,
+            "zero_point": None,
+            "zero_point_err": None,
+            "subtraction_performed": None,
+            "subtraction_reference_count": None,
+        }
+
+    solved = bool(astro_result)
+    issues: list[str] = []
+    if not solved:
+        issues.append("astrometry_failed")
+    elif not sources:
+        issues.append("no_sources")
+    known = [c for c in _CATALOG_ORDER if c in catalog_status]
+    known += sorted(c for c in catalog_status if c not in _CATALOG_ORDER)
+    for c in known:
+        if catalog_status[c] == "failed":
+            issues.append(f"catalog_failed:{c}")
+        elif catalog_status[c] == "error":
+            issues.append(f"catalog_error:{c}")
+    # No zero point is only worth a re-run when something that a re-run can
+    # fix caused it: Gaia (the only reference catalog) or the step itself. A
+    # sparse field with too few usable references stays uncalibrated forever.
+    if calibration == "failed" and (
+        catalog_status.get("Gaia DR3") in ("failed", "error")
+        or {"catalog_matching", "photometry"} & set(step_errors)
+    ):
+        issues.append("calibration_failed")
+    issues += [f"{step}_error" for step in step_errors]
+
+    zero_point = next((s.get("zero_point") for s in sources if s.get("zero_point") is not None), None)
+    zero_point_err = next(
+        (s.get("zero_point_err") for s in sources if s.get("zero_point_err") is not None), None,
+    )
+
+    return {
+        "status": "FAILED" if not solved else ("DEGRADED" if issues else "OK"),
+        "issues": issues,
+        "astrometry_solved": solved,
+        "catalogs": {c: catalog_status[c] for c in known},
+        "calibration": calibration,
+        "zero_point": zero_point,
+        "zero_point_err": zero_point_err,
+        "subtraction_performed": bool(subtraction_info.get("performed")) if solved else None,
+        "subtraction_reference_count": (
+            int(subtraction_info.get("reference_frame_count") or 0) if solved else None
+        ),
+    }
+
+
 def _build_frame_payload(
     fits_path: str,
     header: dict,
@@ -2589,6 +2724,7 @@ def _build_frame_payload(
     astro_result: dict,
     *,
     filename: str,
+    processing: dict | None = None,
 ) -> dict:
     """
     Assemble the POST /frames request body from module outputs.
@@ -2641,6 +2777,9 @@ def _build_frame_payload(
             "sky_background": qc_result.get("sky_background"),
             "star_count":     qc_result.get("star_count"),
         },
+        # See _processing_report(). Optional on the wire: an API older than
+        # 1.6.0 ignores it.
+        "processing": processing,
     }
 
 

@@ -258,6 +258,18 @@ Accept: application/json
     "sky_background": 850.3,
     "star_count": 287,
     "eccentricity": 0.4
+  },
+
+  "processing": {
+    "status": "DEGRADED",
+    "issues": ["catalog_failed:Gaia DR3", "calibration_failed"],
+    "astrometry_solved": true,
+    "catalogs": {"Simbad": "ok", "Gaia DR3": "failed", "2MASS": "ok", "Pan-STARRS": "disabled", "MPC": "ok"},
+    "calibration": "failed",
+    "zero_point": null,
+    "zero_point_err": null,
+    "subtraction_performed": true,
+    "subtraction_reference_count": 10
   }
 }
 ```
@@ -305,6 +317,16 @@ Accept: application/json
 | `qc.sky_background` | float | no | Median sky background level (ADU) |
 | `qc.star_count` | integer | no | Number of stars detected by QC step |
 | `qc.eccentricity` | float | no | Median PSF eccentricity (0 = circular, 1 = linear) |
+| `processing` | object | no | What the analysis came to beyond QC (pipeline 1.7.0+, `pipeline._processing_report()`). A failed catalog, a missing plate solve or zero point is caught and logged and the frame goes on — this block is how the operator finds such a frame and re-runs ANALYZE on it. The API stores it as the frame's current outcome: a re-registration replaces it, and one without the block clears it to unknown (observatory-api 1.6.0+; an older API ignores it). |
+| `processing.status` | string | yes¹ | `OK` (every step ran), `DEGRADED` (solved, but something failed — see `issues`), `FAILED` (QC passed, astrometry gave nothing — no solution or an unreadable solve: no sources), `SKIPPED` (QC rejected the frame; nothing past QC ran, by design) |
+| `processing.issues` | string[] | no | Stable codes, in step order: `astrometry_failed`, `no_sources` (solved, nothing extracted), `catalog_failed:<catalog>` (no answer, e.g. `catalog_failed:Gaia DR3`), `catalog_error:<catalog>` (answered, but matching against it raised), `calibration_failed` (no zero point because Gaia or a step failed — a re-run can fix it), `<step>_error` for a step that raised (`subtraction`, `catalog_matching`, `photometry`, `forced_photometry`). Not issues: a catalog switched off or not covering the field, a narrowband/8-bit frame left uncalibrated on purpose, a field with too few usable Gaia references (`calibration: failed` without an issue), too few subtraction references |
+| `processing.astrometry_solved` | bool \| null | no | `null` for a QC-rejected frame |
+| `processing.catalogs` | object | no | Catalog name (`catalog_name` values) → `ok` / `failed` (no source answered) / `error` (answered, matching raised) / `disabled` (no source configured) / `not_applicable` (field outside coverage, e.g. Pan-STARRS south of −30°) |
+| `processing.calibration` | string \| null | no | `calibrated`, `skipped` (narrowband or 8-bit, on purpose), `failed`; `null` when photometry never ran |
+| `processing.zero_point`, `processing.zero_point_err` | float \| null | no | The frame's photometric zero point and its scatter |
+| `processing.subtraction_performed`, `processing.subtraction_reference_count` | bool, int \| null | no | Whether image subtraction ran, and against how many archived reference frames |
+
+¹ required when `processing` is present.
 
 ### Response
 

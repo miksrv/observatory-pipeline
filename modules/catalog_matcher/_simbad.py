@@ -24,6 +24,7 @@ from ._cache import (
     _cache_radius_margin_deg,
     _cache_set,
 )
+from . import _outcome
 from ._sources import SourceRotation, unique
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,7 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
     cache_key = f"simbad:{key_ra:.1f}:{key_dec:.1f}:{key_fov:.1f}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        _outcome.record("Simbad", _outcome.OK)
         return cached  # type: ignore[return-value]
 
     servers = configured_servers()
@@ -171,6 +173,7 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
         # SIMBAD_SERVERS empty (or only unknown hosts): Simbad matching is
         # off. Not cached — the tile key is shared with a configuration that
         # has servers, and an empty answer would outlive the setting.
+        _outcome.record("Simbad", _outcome.DISABLED)
         return []
 
     coord = SkyCoord(ra=key_ra * u.deg, dec=key_dec * u.deg)
@@ -184,10 +187,12 @@ def _query_simbad(ra_center: float, dec_center: float, fov_deg: float) -> list[d
         where=f"ra={ra_center:.3f} dec={dec_center:.3f}",
     )
     if answer is None:
+        _outcome.record("Simbad", _outcome.FAILED)
         return []
     host, result = answer
     objects = [] if result is None else _parse_simbad_table(result)
     _cache_set(cache_key, objects)
+    _outcome.record("Simbad", _outcome.OK)
     logger.info("Simbad: %d object(s) from %s", len(objects), host)
     return objects
 
