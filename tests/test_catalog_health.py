@@ -176,10 +176,18 @@ class TestPostCatalogStatus:
         client.post = AsyncMock(return_value=httpx.Response(status, json={}))
         with patch("api_client.pipelines._make_client", return_value=client):
             assert await api_client.post_catalog_status([{"name": "Simbad", "ok": True}]) is expected
-        # `waiting` is always sent, so the API clears a wait that ended.
-        client.post.assert_awaited_once_with(
-            "/pipelines/catalogs", json={"catalogs": [{"name": "Simbad", "ok": True}], "waiting": None},
-        )
+        # The periodic report leaves `waiting` out: the API keeps its state.
+        client.post.assert_awaited_once_with("/pipelines/catalogs", json={"catalogs": [{"name": "Simbad", "ok": True}]})
+
+    async def test_a_wait_is_sent_and_cleared_explicitly(self):
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=httpx.Response(200, json={}))
+        with patch("api_client.pipelines._make_client", return_value=client):
+            await api_client.post_catalog_status([{"name": "Gaia DR3", "ok": False}], waiting={"reason": "catalogs"})
+            await api_client.post_catalog_status([{"name": "Gaia DR3", "ok": True}], waiting=None)
+        assert [c.kwargs["json"]["waiting"] for c in client.post.await_args_list] == [{"reason": "catalogs"}, None]
 
     async def test_a_transport_error_is_false(self):
         client = MagicMock()
@@ -216,7 +224,7 @@ class TestReporter:
         reported = threading.Event()
         results = [{"name": "Simbad", "ok": False, "latency_ms": None, "error": "x"}]
         monkeypatch.setattr(catalog_health, "check_all", lambda: results)
-        post = AsyncMock(side_effect=lambda catalogs, waiting: reported.set() or True)
+        post = AsyncMock(side_effect=lambda catalogs, **kw: reported.set() or True)
         monkeypatch.setattr(worker.api_client, "post_catalog_status", post)
         monkeypatch.setattr(config, "CATALOG_HEALTH_INTERVAL_SEC", 3600.0)
 
@@ -228,6 +236,7 @@ class TestReporter:
             reporter.stop()
         reporter._thread.join(5)
         assert not reporter._thread.is_alive()
+        # The first report after a start clears a wait left by the previous run.
         post.assert_awaited_once_with(results, waiting=None)
 
     def test_a_failing_check_does_not_kill_the_thread(self, monkeypatch):
@@ -250,23 +259,3 @@ class TestReporter:
         finally:
             reporter.stop()
         reporter._thread.join(5)
-
-    def test_no_report_from_the_thread_while_an_item_waits_for_catalogs(self, monkeypatch):
-        checked = threading.Event()
-
-        def check_all():
-            checked.set()
-            return []
-
-        monkeypatch.setattr(catalog_health, "check_all", check_all)
-        post = AsyncMock(return_value=True)
-        monkeypatch.setattr(worker.api_client, "post_catalog_status", post)
-        monkeypatch.setattr(worker, "_waiting", {"reason": "catalogs"})
-        reporter = worker._CatalogHealthReporter(3600.0)
-        reporter.start()
-        try:
-            assert checked.wait(5)
-        finally:
-            reporter.stop()
-        reporter._thread.join(5)
-        post.assert_not_awaited()

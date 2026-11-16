@@ -78,16 +78,22 @@ class TestWaitingOutAnOutage:
 
     async def test_a_shutdown_ends_the_wait(self, outage, monkeypatch):
         monkeypatch.setattr(_shared, "_api_answers", AsyncMock(return_value=False))
-        checks = {"n": 0}
-
-        def _should_stop():  # no shutdown yet when the wait starts; one during it
-            checks["n"] += 1
-            return checks["n"] > 1
-
-        _shared.wait_out_api_outages(_should_stop)
+        _shared.wait_out_api_outages(lambda: True)
         call, _ = _flaky(10)
 
         with pytest.raises(_shared.ApiWaitInterrupted):
+            await call()
+
+    async def test_during_a_shutdown_a_request_failing_while_the_api_answers_fails_as_before(
+        self, outage, monkeypatch,
+    ):
+        # Not ApiWaitInterrupted: that would skip the worker's lost-report
+        # handling for an item that did finish.
+        monkeypatch.setattr(_shared, "_api_answers", AsyncMock(return_value=True))
+        _shared.wait_out_api_outages(lambda: True)
+        call, _ = _flaky(5)
+
+        with pytest.raises(httpx.HTTPStatusError):
             await call()
 
     async def test_zero_interval_keeps_the_old_behaviour(self, outage, monkeypatch):

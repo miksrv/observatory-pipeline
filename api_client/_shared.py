@@ -128,8 +128,10 @@ async def _wait_out_outage(what: str, exc: BaseException) -> bool:
     """
     if _should_stop is None or config.API_OUTAGE_RETRY_SEC <= 0:
         return False
-    if _should_stop():
-        raise ApiWaitInterrupted()
+    # Probe before looking at a shutdown: a request failing while the API
+    # answers fails as before, shutdown or not — the item in progress is
+    # meant to finish, and its outcome report still goes through the usual
+    # lost-report handling. Only an actual wait is cut short.
     if await _api_answers():
         return False
 

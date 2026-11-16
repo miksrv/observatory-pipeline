@@ -921,15 +921,19 @@ class TestApiOutage:
         monkeypatch.setattr(worker.api_client, "get_tasks", AsyncMock(return_value=[
             {"id": "mine", "type": "ANALYZE", "pipeline_id": "p1"},
             {"id": "untargeted", "type": "ANALYZE", "pipeline_id": None},
+            {"id": "restart", "type": "RESTART", "pipeline_id": "p1"},
         ]))
-        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "mine"}))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "x"}))
 
         await worker._reclaim_own_running_tasks()
 
         worker.api_client.get_tasks.assert_called_once_with(
             status="RUNNING", limit=50, order="asc", claimable=True,
         )
-        worker.api_client.update_task.assert_called_once_with("mine", "PENDING")
+        # A RESTART is completed, not re-queued — that would restart again, in a loop.
+        assert [c.args for c in worker.api_client.update_task.call_args_list] == [
+            ("mine", "PENDING"), ("restart", "COMPLETED"),
+        ]
 
     async def test_a_shutdown_while_waiting_for_the_api_stops_the_worker_cleanly(self, monkeypatch):
         monkeypatch.setattr(
@@ -978,7 +982,6 @@ class TestCatalogOutage:
         assert waiting[0]["catalogs"] == ["Gaia DR3"] and waiting[0]["task_id"] == "t1"
         assert waiting[0]["filename"] == "a.fits"
         assert waiting[-1] is None  # the wait is cleared on the dashboard
-        assert worker._waiting is None
 
     async def test_a_failure_while_the_catalog_answers_ends_degraded_after_the_retries(self, monkeypatch):
         self._checks(monkeypatch, True, True)

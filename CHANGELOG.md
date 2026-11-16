@@ -5,8 +5,8 @@
 ### Patch Changes
 
 - Worker: while the API does not answer at all, the frame or report in hand is retried every `API_OUTAGE_RETRY_SEC` (300 s) until it does, instead of moving on — on 2026-11-05 an outage reported frames the API never took as done and left them in incoming. A failed `POST /frames` now fails its item instead of reporting it `DONE`
-- Worker: when Simbad, Gaia DR3, 2MASS, Pan-STARRS or MPC (`CATALOG_OUTAGE_WAIT_FOR`) does not answer, an ANALYZE item registers nothing and waits, re-checking every `CATALOG_OUTAGE_RETRY_SEC` (300 s), then analyses the frame again — 209 frames went DEGRADED during the Gaia outage of 2026-11-15. The wait is reported in `POST /pipelines/catalogs` `waiting` (shown by observatory-api 1.6.1; an older one ignores it). A catalog failing for one frame while it answers otherwise is retried `CATALOG_OUTAGE_FRAME_RETRIES` (2) times, then the frame goes DEGRADED as before
-- Worker: at start, tasks of this pipeline still `RUNNING` from a previous run (stopped while the API was down, OOM, SIGKILL) go back to `PENDING` — they used to need a manual reset
+- Worker: when Simbad, Gaia DR3, 2MASS, Pan-STARRS or MPC (`CATALOG_OUTAGE_WAIT_FOR`) does not answer, an ANALYZE item registers nothing and waits, re-checking every `CATALOG_OUTAGE_RETRY_SEC` (300 s), then analyses the frame again — 209 frames went DEGRADED during the Gaia outage of 2026-11-15. The wait is reported in `POST /pipelines/catalogs` `waiting` (shown by observatory-api 1.6.1; an older one ignores it). A catalog failing for one frame while it answers otherwise is retried `CATALOG_OUTAGE_FRAME_RETRIES` (2) times, then the frame goes DEGRADED as before. The wait holds the whole worker (no other task runs meanwhile)
+- Worker: at start, tasks targeted at this pipeline and still `RUNNING` from a previous run (stopped while the API was down, OOM, SIGKILL) go back to `PENDING` — they used to need a manual reset
 
 ## 1.7.0
 

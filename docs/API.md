@@ -1548,13 +1548,14 @@ observatory-api 1.4.1; an older API answers `404`, which the worker only logs.
 | `ok` | bool | The service answered with a status below 500 |
 | `latency_ms` | int \| null | Response time; `null` when nothing came back |
 | `error` | string \| null | Why it is down (exception or `HTTP 5xx`); the API keeps 300 characters |
-| `waiting` | object \| null | Always sent; `null` unless an ANALYZE item is held until catalogs answer again (below) |
+| `waiting` | object \| null \| absent | An ANALYZE item held until catalogs answer again (below); `null` = no wait; **absent = keep the stored state** |
 
 `waiting` (pipeline 1.7.1; an API older than 1.6.1 ignores it): when a catalog of
 `CATALOG_OUTAGE_WAIT_FOR` fails while a frame is matched, the worker registers nothing and holds
 the item, re-checking every `CATALOG_OUTAGE_RETRY_SEC` (`worker._wait_for_catalogs()`). Each check is
-reported with this field, and the report after the wait carries `null`; the periodic reports skip
-while a wait is on, so they never clear it.
+reported with this field, and the report after the wait carries `null`. The periodic reports leave
+the key out (the API keeps what it has), so they cannot race a wait; the first one after a worker
+start sends `null`, clearing a wait the previous run could not.
 
 ```json
 "waiting": {

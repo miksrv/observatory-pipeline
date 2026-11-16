@@ -249,12 +249,6 @@ def _recovery_attempt(item: dict) -> int:
         return 0
 
 
-# What the worker is holding an ANALYZE item for, while it waits for catalogs
-# (_wait_for_catalogs()) — the `waiting` field of POST /pipelines/catalogs.
-# Written on the event loop, read by the catalog health thread.
-_waiting: dict | None = None
-
-
 def _utc_now_iso() -> str:
     from datetime import datetime, timezone  # noqa: PLC0415
 
@@ -281,53 +275,46 @@ async def _wait_for_catalogs(catalogs: list[str], fits_path: str, task_id: str |
     failure was this frame's own (the caller counts it), "recovered" after a
     wait, "interrupted" on a shutdown.
     """
-    global _waiting
     from modules import catalog_health  # noqa: PLC0415
 
     name = os.path.basename(fits_path)
     started = asyncio.get_running_loop().time()
     state: dict | None = None
-    try:
-        while True:
-            try:
-                report = await asyncio.to_thread(catalog_health.check_all)
-            except Exception:
-                # A check that breaks proves nothing: count them as still down.
-                logger.exception("Catalog check failed while waiting for %s", ", ".join(catalogs))
-                report = []
-            down = [c for c in catalogs if not report or not catalog_health.answers(c, report)]
-            if not down:
-                if state is None:
-                    logger.warning(
-                        "%s did not answer for %s but answers now — analysing it again",
-                        ", ".join(catalogs), name,
-                    )
-                    return "answering"
-                minutes = (asyncio.get_running_loop().time() - started) / 60.0
-                logger.info("%s answers again after %.0f min — analysing %s again", ", ".join(catalogs), minutes, name)
-                _waiting = None
-                await api_client.post_catalog_status(report, waiting=None)
-                return "recovered"
-
+    while True:
+        try:
+            report = await asyncio.to_thread(catalog_health.check_all)
+        except Exception:
+            # A check that breaks proves nothing: count them as still down.
+            logger.exception("Catalog check failed while waiting for %s", ", ".join(catalogs))
+            report = []
+        down = [c for c in catalogs if not report or not catalog_health.answers(c, report)]
+        if not down:
             if state is None:
                 logger.warning(
-                    "%s not answering — %s is not registered; waiting, checking every %.0f s",
-                    ", ".join(down), name, config.CATALOG_OUTAGE_RETRY_SEC,
+                    "%s did not answer for %s but answers now — analysing it again",
+                    ", ".join(catalogs), name,
                 )
-                state = {"reason": "catalogs", "since": _utc_now_iso(), "task_id": task_id, "filename": name}
-            state = {**state, "catalogs": down}
-            _waiting = state
-            if report:  # the API refuses an empty catalog list
-                await api_client.post_catalog_status(report, waiting=state)
+                return "answering"
+            minutes = (asyncio.get_running_loop().time() - started) / 60.0
+            logger.info("%s answers again after %.0f min — analysing %s again", ", ".join(catalogs), minutes, name)
+            await api_client.post_catalog_status(report, waiting=None)
+            return "recovered"
 
-            if await _shutdown_within(config.CATALOG_OUTAGE_RETRY_SEC):
-                logger.info("Stopped while waiting for %s — %s is analysed again after the restart", ", ".join(down), name)
-                _waiting = None
-                if report:
-                    await api_client.post_catalog_status(report, waiting=None)
-                return "interrupted"
-    finally:
-        _waiting = None
+        if state is None:
+            logger.warning(
+                "%s not answering — %s is not registered; waiting, checking every %.0f s",
+                ", ".join(down), name, config.CATALOG_OUTAGE_RETRY_SEC,
+            )
+            state = {"reason": "catalogs", "since": _utc_now_iso(), "task_id": task_id, "filename": name}
+        state = {**state, "catalogs": down}
+        if report:  # the API refuses an empty catalog list
+            await api_client.post_catalog_status(report, waiting=state)
+
+        if await _shutdown_within(config.CATALOG_OUTAGE_RETRY_SEC):
+            logger.info("Stopped while waiting for %s — %s is analysed again after the restart", ", ".join(down), name)
+            if report:
+                await api_client.post_catalog_status(report, waiting=None)
+            return "interrupted"
 
 
 async def _handle_analyze_item(item: dict, task_id: str | None = None) -> dict | None:
@@ -840,13 +827,21 @@ class _CatalogHealthReporter:
     def _run(self) -> None:
         from modules import catalog_health  # noqa: PLC0415
 
+        first = True
         while not self._stop.is_set():
             try:
                 results = catalog_health.check_all()
-                # While an item waits for catalogs, _wait_for_catalogs() reports
-                # (with its `waiting` state) — a report from here would clear it.
-                if not self._stop.is_set() and _waiting is None:
-                    asyncio.run(api_client.post_catalog_status(results, waiting=None))
+                if not self._stop.is_set():
+                    if first:
+                        # Started before any task: nothing waits yet, so clear
+                        # a wait a previous run could not (stopped mid-wait
+                        # with a broken check).
+                        asyncio.run(api_client.post_catalog_status(results, waiting=None))
+                    else:
+                        # No `waiting` key: only _wait_for_catalogs() sets and
+                        # clears that state, so this report cannot race it.
+                        asyncio.run(api_client.post_catalog_status(results))
+                    first = False
             except Exception:
                 logger.exception("Catalog health check failed")
             self._stop.wait(self._interval)
@@ -900,7 +895,8 @@ async def _reclaim_own_running_tasks() -> None:
     RUNNING forever. `claimable=True` lists the tasks targeted at this
     pipeline and untargeted ones; only the targeted ones are certainly
     ours. Their finished items stay finished — only the unfinished ones are
-    redone.
+    redone. A RESTART left RUNNING is completed instead: this start is what
+    it asked for.
     """
     try:
         running = await api_client.get_tasks(status="RUNNING", limit=50, order="asc", claimable=True)
@@ -910,6 +906,12 @@ async def _reclaim_own_running_tasks() -> None:
 
     for task in running or []:
         if not task.get("pipeline_id"):
+            continue
+        if task.get("type") in _SIGNAL_TASK_TYPES:
+            # A RESTART left RUNNING already did its job — this start is it.
+            # Re-queued, it would restart the worker again, in a loop.
+            if await api_client.update_task(task["id"], "COMPLETED") is not None:
+                logger.info("Completed task_id=%s (%s) left RUNNING by the previous run", task["id"], task["type"])
             continue
         if await api_client.update_task(task["id"], "PENDING") is None:
             logger.warning("Could not take back task_id=%s left RUNNING by the previous run", task["id"])

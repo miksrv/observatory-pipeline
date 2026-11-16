@@ -254,8 +254,10 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   of `CATALOG_OUTAGE_WAIT_FOR` whose outcome is `failed` raises `pipeline.CatalogUnavailable` right
   after matching, before anything is registered or moved. `_wait_for_catalogs()` then re-checks
   (`catalog_health.check_all()`/`answers()`) every `CATALOG_OUTAGE_RETRY_SEC`, reporting each check
-  with `POST /pipelines/catalogs` `waiting` (the thread's periodic report skips meanwhile, or it would
-  clear it), and the frame is analysed again. A failure while the check says the catalog answers is
+  with `POST /pipelines/catalogs` `waiting` (only the wait sets and clears it; the thread's periodic
+  report leaves the key out so it cannot race the wait, except its first report after a start, which
+  clears a stale one), and the frame is analysed again. The wait holds the whole worker — no other
+  task (DETECT, charts, RESTART) runs meanwhile; a SIGTERM ends it. A failure while the check says the catalog answers is
   the frame's own (a dense field on a slow mirror): after `CATALOG_OUTAGE_FRAME_RETRIES` of those the
   frame is analysed without waiting and registered DEGRADED. A shutdown during the wait leaves the
   item without an outcome (redone after the restart).
@@ -265,8 +267,9 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
 - **Tasks left `RUNNING`:** a worker that could not release its task (stopped while the API was
   down, OOM kill, SIGKILL after the grace period) leaves it `RUNNING`. At start,
   `_reclaim_own_running_tasks()` puts every `RUNNING` task targeted at this pipeline back to
-  `PENDING` — one worker runs per API key, so none can legitimately be running yet (untargeted
-  ones are left alone: they may be another pipeline's). The item it was on stays `RUNNING` (the
+  `PENDING` (a `RESTART` is completed instead — re-queued it would loop) — one worker runs per API
+  key, so none can legitimately be running yet (untargeted ones are left alone: they may be another
+  pipeline's, and stay `RUNNING` until reset by hand). The item it was on stays `RUNNING` (the
   worker's live-progress hint, `_mark_running()`); the worker treats `RUNNING` items like `PENDING`
   ones (`_UNFINISHED_ITEM_STATUSES`), so the next claim redoes it.
 
