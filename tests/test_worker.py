@@ -34,8 +34,8 @@ class TestHandleAnalyzeItem:
 
     async def test_none_result_is_still_done_without_frame_id(self, monkeypatch):
         """analyze_frame() returning None (a calibration frame, no API client
-        configured, or POST /frames itself failing) is a normal successful
-        outcome, not a failure. QC rejection is no longer one of these cases
+        configured) is a normal successful outcome, not a failure — a failed
+        POST /frames raises instead (see test_exception_reports_failed). QC rejection is no longer one of these cases
         — see test_qc_rejected_dict_result_reports_done_with_frame_id below."""
         monkeypatch.setattr(worker.pipeline, "analyze_frame", AsyncMock(return_value=None))
         item = {"id": "item-1", "filename": "/fits/incoming/a.fits"}
@@ -681,7 +681,8 @@ class TestRunForever:
         # — raising from get_tasks() instead would just be swallowed and the
         # loop would spin forever, which is what hung the first version of
         # this test.
-        get_tasks_mock = AsyncMock(side_effect=[[], [], [], [{"id": "t1"}]])
+        # The first call is the start-up look for RUNNING tasks to take back.
+        get_tasks_mock = AsyncMock(side_effect=[[], [], [], [], [{"id": "t1"}]])
         monkeypatch.setattr(worker.api_client, "get_tasks", get_tasks_mock)
         monkeypatch.setattr(worker, "_process_one_task", AsyncMock(side_effect=RuntimeError("stop test")))
         sleep_mock = AsyncMock()
@@ -711,7 +712,7 @@ class TestGracefulShutdown:
     async def test_the_item_in_progress_finishes_and_no_further_item_starts(self, monkeypatch):
         processed: list[str] = []
 
-        async def _analyze(item):
+        async def _analyze(item, task_id=None):
             processed.append(item["id"])
             worker._request_shutdown("SIGTERM")  # arrives while this item runs
             return {"item_id": item["id"], "status": "DONE"}
@@ -799,14 +800,16 @@ class TestGracefulShutdown:
         monkeypatch.setattr(worker.api_client, "get_settings", AsyncMock(return_value={}))
 
         async def _poll(**kwargs):
-            asyncio.get_running_loop().call_soon(worker._request_shutdown, "SIGTERM")
+            if kwargs.get("status") == "PENDING":
+                asyncio.get_running_loop().call_soon(worker._request_shutdown, "SIGTERM")
             return []
 
         monkeypatch.setattr(worker.api_client, "get_tasks", AsyncMock(side_effect=_poll))
 
         await asyncio.wait_for(worker.run_forever(), timeout=5)
 
-        assert worker.api_client.get_tasks.call_count == 1
+        polls = [c for c in worker.api_client.get_tasks.call_args_list if c.kwargs.get("status") == "PENDING"]
+        assert len(polls) == 1
 
     def test_a_second_signal_exits_at_once(self, monkeypatch):
         exits: list[int] = []
@@ -906,3 +909,137 @@ class TestSignalHandlers:
         finally:
             for sig, h in previous.items():
                 _signal.signal(sig, h)
+
+
+# ---------------------------------------------------------------------------
+# API outages: tasks left RUNNING, a shutdown during the wait
+# ---------------------------------------------------------------------------
+
+
+class TestApiOutage:
+    async def test_tasks_left_running_for_this_pipeline_are_taken_back_at_start(self, monkeypatch):
+        monkeypatch.setattr(worker.api_client, "get_tasks", AsyncMock(return_value=[
+            {"id": "mine", "type": "ANALYZE", "pipeline_id": "p1"},
+            {"id": "untargeted", "type": "ANALYZE", "pipeline_id": None},
+            {"id": "restart", "type": "RESTART", "pipeline_id": "p1"},
+        ]))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "x"}))
+
+        await worker._reclaim_own_running_tasks()
+
+        worker.api_client.get_tasks.assert_called_once_with(
+            status="RUNNING", limit=50, order="asc", claimable=True,
+        )
+        # A RESTART is completed, not re-queued — that would restart again, in a loop.
+        assert [c.args for c in worker.api_client.update_task.call_args_list] == [
+            ("mine", "PENDING"), ("restart", "COMPLETED"),
+        ]
+
+    async def test_a_shutdown_while_waiting_for_the_api_stops_the_worker_cleanly(self, monkeypatch):
+        monkeypatch.setattr(
+            worker, "_poll_until_shutdown", AsyncMock(side_effect=worker.api_client.ApiWaitInterrupted()),
+        )
+        seen: list = []
+        monkeypatch.setattr(worker.api_client, "wait_out_api_outages", lambda f: seen.append(f))
+
+        await worker.run_forever()
+
+        assert callable(seen[0]) and seen[-1] is None
+
+
+# ---------------------------------------------------------------------------
+# Catalog outages: an ANALYZE item waits for the catalogs it needs
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogOutage:
+    @pytest.fixture(autouse=True)
+    def setup(self, monkeypatch):
+        monkeypatch.setattr(worker, "_shutdown", asyncio.Event())
+        monkeypatch.setattr(worker.config, "CATALOG_OUTAGE_RETRY_SEC", 0.01)
+        monkeypatch.setattr(worker.config, "CATALOG_OUTAGE_FRAME_RETRIES", 2)
+        self.posts = AsyncMock(return_value=True)
+        monkeypatch.setattr(worker.api_client, "post_catalog_status", self.posts)
+
+    def _checks(self, monkeypatch, *gaia_up: bool):
+        from modules import catalog_health
+
+        answers = iter(gaia_up)
+        monkeypatch.setattr(
+            catalog_health, "check_all", lambda: [{"name": "Gaia DR3", "ok": next(answers)}],
+        )
+
+    async def test_the_item_waits_until_the_catalog_answers_then_analyses_again(self, monkeypatch):
+        self._checks(monkeypatch, False, False, True)
+        analyze = AsyncMock(side_effect=[worker.pipeline.CatalogUnavailable(["Gaia DR3"]), {"frame_id": "f1"}])
+        monkeypatch.setattr(worker.pipeline, "analyze_frame", analyze)
+
+        result = await worker._handle_analyze_item({"id": "i1", "filename": "/fits/a.fits"}, "t1")
+
+        assert result == {"item_id": "i1", "status": "DONE", "frame_id": "f1"}
+        assert [c.kwargs["wait_for_catalogs"] for c in analyze.await_args_list] == [True, True]
+        waiting = [c.kwargs["waiting"] for c in self.posts.await_args_list]
+        assert waiting[0]["catalogs"] == ["Gaia DR3"] and waiting[0]["task_id"] == "t1"
+        assert waiting[0]["filename"] == "a.fits"
+        assert waiting[-1] is None  # the wait is cleared on the dashboard
+
+    async def test_a_failure_while_the_catalog_answers_ends_degraded_after_the_retries(self, monkeypatch):
+        self._checks(monkeypatch, True, True)
+        analyze = AsyncMock(side_effect=[
+            worker.pipeline.CatalogUnavailable(["Gaia DR3"]),
+            worker.pipeline.CatalogUnavailable(["Gaia DR3"]),
+            {"frame_id": "f1"},
+        ])
+        monkeypatch.setattr(worker.pipeline, "analyze_frame", analyze)
+
+        result = await worker._handle_analyze_item({"id": "i1", "filename": "/fits/a.fits"}, "t1")
+
+        assert result["status"] == "DONE"
+        assert [c.kwargs["wait_for_catalogs"] for c in analyze.await_args_list] == [True, True, False]
+        self.posts.assert_not_awaited()  # never an outage, so no wait was reported
+
+    async def test_a_shutdown_during_the_wait_leaves_the_item_without_an_outcome(self, monkeypatch):
+        self._checks(monkeypatch, False)
+        monkeypatch.setattr(
+            worker.pipeline, "analyze_frame", AsyncMock(side_effect=worker.pipeline.CatalogUnavailable(["Gaia DR3"])),
+        )
+        # The shutdown arrives during the wait.
+        monkeypatch.setattr(worker, "_shutdown_within", AsyncMock(return_value=True))
+        progress = AsyncMock()
+        monkeypatch.setattr(worker.api_client, "post_task_items_progress", progress)
+
+        await worker._run_analyze_task({"id": "t1"}, [{"id": "i1", "filename": "/fits/a.fits"}])
+
+        # Only the RUNNING hint: no DONE/FAILED for an item that was not finished.
+        assert [c.args[1][0]["status"] for c in progress.await_args_list] == ["RUNNING"]
+        assert self.posts.await_args_list[-1].kwargs["waiting"] is None
+
+    async def test_zero_interval_never_waits(self, monkeypatch):
+        monkeypatch.setattr(worker.config, "CATALOG_OUTAGE_RETRY_SEC", 0)
+        analyze = AsyncMock(return_value={"frame_id": "f1"})
+        monkeypatch.setattr(worker.pipeline, "analyze_frame", analyze)
+
+        await worker._handle_analyze_item({"id": "i1", "filename": "/fits/a.fits"})
+
+        assert analyze.await_args.kwargs["wait_for_catalogs"] is False
+
+    async def test_a_broken_check_counts_as_still_down(self, monkeypatch):
+        from modules import catalog_health
+
+        results = iter([RuntimeError("probe crashed"), [{"name": "Gaia DR3", "ok": True}]])
+
+        def check_all():
+            r = next(results)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        monkeypatch.setattr(catalog_health, "check_all", check_all)
+        analyze = AsyncMock(side_effect=[worker.pipeline.CatalogUnavailable(["Gaia DR3"]), {"frame_id": "f1"}])
+        monkeypatch.setattr(worker.pipeline, "analyze_frame", analyze)
+
+        result = await worker._handle_analyze_item({"id": "i1", "filename": "/fits/a.fits"}, "t1")
+
+        assert result["status"] == "DONE"
+        # Waited (not counted as the frame's own failure), so the re-run still waits.
+        assert [c.kwargs["wait_for_catalogs"] for c in analyze.await_args_list] == [True, True]

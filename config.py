@@ -290,6 +290,17 @@ ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MA
 # otherwise re-queue itself forever. 0 disables recovery entirely.
 API_RECOVERY_MAX_ATTEMPTS: int = int(_get("API_RECOVERY_MAX_ATTEMPTS", "2"))
 
+# What the worker does when the API stops answering (connection refused,
+# timeouts, 5xx after the three quick retries) while a cheap probe request
+# fails too: it holds the request it has in hand — the frame's finished
+# analysis, an item's progress report — and tries again every this many
+# seconds until the API answers, instead of moving on to the next frame. On
+# 2026-11-05 a three-minute outage otherwise reported unregistered frames as
+# done. A request that fails while the probe answers is that request's own
+# error and fails as before. 0 = the old behaviour (fail after the quick
+# retries). The watcher never waits.
+API_OUTAGE_RETRY_SEC: float = float(_get("API_OUTAGE_RETRY_SEC", "300"))
+
 # Read timeout (s) for POST /frames/{id}/sources. Saving several hundred
 # sources takes the API well over the 30 s every other call gets; a client
 # timeout there retried the POST while the first one was still running on
@@ -1022,6 +1033,26 @@ CATALOG_HEALTH_INTERVAL_SEC: float = float(_get("CATALOG_HEALTH_INTERVAL_SEC", "
 # even a tiny cone search).
 CATALOG_HEALTH_TIMEOUT_SEC: float = float(_get("CATALOG_HEALTH_TIMEOUT_SEC", "20"))
 
+# A frame matched while a catalog did not answer comes out DEGRADED and has
+# to be analysed again (2026-11-15: 209 frames during a Gaia DR3 outage).
+# Instead, when one of CATALOG_OUTAGE_WAIT_FOR fails (every configured source
+# of it), an ANALYZE item registers nothing and the worker waits — checking
+# the catalogs (modules/catalog_health.py) every CATALOG_OUTAGE_RETRY_SEC and
+# reporting the wait to the API — then analyses the frame again. 0 = no wait:
+# the frame is registered DEGRADED, as before.
+CATALOG_OUTAGE_RETRY_SEC: float = float(_get("CATALOG_OUTAGE_RETRY_SEC", "300"))
+# The catalogs worth waiting for, by the names of POST /frames'
+# processing.catalogs (MPC = SkyBot/JPL, whichever MPC_SOURCES lists).
+CATALOG_OUTAGE_WAIT_FOR: tuple[str, ...] = tuple(
+    name.strip()
+    for name in _get("CATALOG_OUTAGE_WAIT_FOR", "Simbad,Gaia DR3,2MASS,Pan-STARRS,MPC").split(",")
+    if name.strip()
+)
+# A catalog that fails for one frame while its check says it answers is that
+# frame's problem (a dense field timing out on a slow mirror), not an outage:
+# the frame is tried this many more times, then registered DEGRADED.
+CATALOG_OUTAGE_FRAME_RETRIES: int = int(_get("CATALOG_OUTAGE_FRAME_RETRIES", "2"))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -1091,6 +1122,7 @@ _OVERRIDABLE: dict[str, type] = {
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
     "API_RECOVERY_MAX_ATTEMPTS": int,
+    "API_OUTAGE_RETRY_SEC": float,
     "API_SOURCES_TIMEOUT_SEC": float,
     "HISTORY_BATCH_MAX_POSITIONS": int,
     "MATCH_CONE_ARCSEC": float,
@@ -1153,6 +1185,8 @@ _OVERRIDABLE: dict[str, type] = {
     "TASK_POLL_BACKOFF_MAX_SEC": float,
     "CATALOG_HEALTH_INTERVAL_SEC": float,
     "CATALOG_HEALTH_TIMEOUT_SEC": float,
+    "CATALOG_OUTAGE_RETRY_SEC": float,
+    "CATALOG_OUTAGE_FRAME_RETRIES": int,
     # Logging
     "LOG_LEVEL": None,  # special: str.upper()
     # ASTAP

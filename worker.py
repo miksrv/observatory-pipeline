@@ -249,9 +249,85 @@ def _recovery_attempt(item: dict) -> int:
         return 0
 
 
-async def _handle_analyze_item(item: dict) -> dict:
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _shutdown_within(seconds: float) -> bool:
+    """Wait `seconds`; True as soon as a shutdown is requested."""
+    try:
+        await asyncio.wait_for(_shutdown.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def _wait_for_catalogs(catalogs: list[str], fits_path: str, task_id: str | None) -> str:
+    """
+    Hold an ANALYZE item whose frame met unanswering catalogs until they
+    answer again. Checks them (catalog_health.check_all()) at once and then
+    every CATALOG_OUTAGE_RETRY_SEC, and reports the wait to the API with
+    each check (POST /pipelines/catalogs `waiting`).
+
+    Returns "answering" when the first check already finds them up — the
+    failure was this frame's own (the caller counts it), "recovered" after a
+    wait, "interrupted" on a shutdown.
+    """
+    from modules import catalog_health  # noqa: PLC0415
+
+    name = os.path.basename(fits_path)
+    started = asyncio.get_running_loop().time()
+    state: dict | None = None
+    while True:
+        try:
+            report = await asyncio.to_thread(catalog_health.check_all)
+        except Exception:
+            # A check that breaks proves nothing: count them as still down.
+            logger.exception("Catalog check failed while waiting for %s", ", ".join(catalogs))
+            report = []
+        down = [c for c in catalogs if not report or not catalog_health.answers(c, report)]
+        if not down:
+            if state is None:
+                logger.warning(
+                    "%s did not answer for %s but answers now — analysing it again",
+                    ", ".join(catalogs), name,
+                )
+                return "answering"
+            minutes = (asyncio.get_running_loop().time() - started) / 60.0
+            logger.info("%s answers again after %.0f min — analysing %s again", ", ".join(catalogs), minutes, name)
+            await api_client.post_catalog_status(report, waiting=None)
+            return "recovered"
+
+        if state is None:
+            logger.warning(
+                "%s not answering — %s is not registered; waiting, checking every %.0f s",
+                ", ".join(down), name, config.CATALOG_OUTAGE_RETRY_SEC,
+            )
+            state = {"reason": "catalogs", "since": _utc_now_iso(), "task_id": task_id, "filename": name}
+        state = {**state, "catalogs": down}
+        if report:  # the API refuses an empty catalog list
+            await api_client.post_catalog_status(report, waiting=state)
+
+        if await _shutdown_within(config.CATALOG_OUTAGE_RETRY_SEC):
+            logger.info("Stopped while waiting for %s — %s is analysed again after the restart", ", ".join(down), name)
+            if report:
+                await api_client.post_catalog_status(report, waiting=None)
+            return "interrupted"
+
+
+async def _handle_analyze_item(item: dict, task_id: str | None = None) -> dict | None:
     """
     Run analyze_frame() for one ANALYZE task item.
+
+    A frame that met a catalog of CATALOG_OUTAGE_WAIT_FOR not answering is
+    not registered (pipeline.CatalogUnavailable): the item waits for the
+    catalog (_wait_for_catalogs()) and analyses the frame again. A catalog
+    that fails for this frame while its check says it answers is the frame's
+    own problem — after CATALOG_OUTAGE_FRAME_RETRIES such runs it is analysed
+    without waiting and registered DEGRADED. None: a shutdown came during the
+    wait — the item has no outcome and is redone after the restart.
 
     `item["filename"]` is the full path to the FITS file, as submitted at
     task-creation time — not just a basename; whatever created this task is
@@ -269,11 +345,22 @@ async def _handle_analyze_item(item: dict) -> dict:
     if not fits_path:
         return {"item_id": item["id"], "status": "FAILED", "error": "Item has no filename"}
 
-    try:
-        result = await pipeline.analyze_frame(fits_path, _recovery_attempt(item))
-    except Exception as exc:
-        logger.exception("ANALYZE item failed for %s", fits_path)
-        return {"item_id": item["id"], "status": "FAILED", "error": str(exc)}
+    frame_failures = 0
+    while True:
+        wait = config.CATALOG_OUTAGE_RETRY_SEC > 0 and frame_failures < config.CATALOG_OUTAGE_FRAME_RETRIES
+        try:
+            result = await pipeline.analyze_frame(fits_path, _recovery_attempt(item), wait_for_catalogs=wait)
+        except pipeline.CatalogUnavailable as exc:
+            outcome = await _wait_for_catalogs(exc.catalogs, fits_path, task_id)
+            if outcome == "interrupted":
+                return None
+            if outcome == "answering":
+                frame_failures += 1
+            continue
+        except Exception as exc:
+            logger.exception("ANALYZE item failed for %s", fits_path)
+            return {"item_id": item["id"], "status": "FAILED", "error": str(exc)}
+        break
 
     if result is None:
         # Not necessarily an error — a calibration frame or a QC rejection
@@ -301,7 +388,9 @@ async def _run_analyze_task(task: dict, items: list[dict]) -> None:
     for item in _until_shutdown(items):
         if item.get("filename"):
             await _mark_running(task["id"], item["id"])
-        outcome = await _handle_analyze_item(item)
+        outcome = await _handle_analyze_item(item, task["id"])
+        if outcome is None:
+            return  # stopped while waiting for catalogs: the item stays unfinished
         await _report_progress(task["id"], [outcome])
 
 
@@ -696,9 +785,21 @@ async def run_forever() -> None:
     global _shutdown
     _shutdown = asyncio.Event()
     previous_handlers = _install_signal_handlers(asyncio.get_running_loop())
+    # The worker holds the work in hand through an API outage instead of
+    # failing it (config.API_OUTAGE_RETRY_SEC); a shutdown ends the wait.
+    api_client.wait_out_api_outages(lambda: _shutdown.is_set())
     try:
         await _poll_until_shutdown()
+    except api_client.ApiWaitInterrupted:
+        # The item in hand is neither done nor failed, and with the API down
+        # its task cannot be released either: it stays RUNNING until the next
+        # start takes it back (_reclaim_own_running_tasks()).
+        logger.warning(
+            "Stopped while waiting for the API — the task in progress stays RUNNING "
+            "and is taken back at the next start"
+        )
     finally:
+        api_client.wait_out_api_outages(None)
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
 
@@ -726,11 +827,21 @@ class _CatalogHealthReporter:
     def _run(self) -> None:
         from modules import catalog_health  # noqa: PLC0415
 
+        first = True
         while not self._stop.is_set():
             try:
                 results = catalog_health.check_all()
                 if not self._stop.is_set():
-                    asyncio.run(api_client.post_catalog_status(results))
+                    if first:
+                        # Started before any task: nothing waits yet, so clear
+                        # a wait a previous run could not (stopped mid-wait
+                        # with a broken check).
+                        asyncio.run(api_client.post_catalog_status(results, waiting=None))
+                    else:
+                        # No `waiting` key: only _wait_for_catalogs() sets and
+                        # clears that state, so this report cannot race it.
+                        asyncio.run(api_client.post_catalog_status(results))
+                    first = False
             except Exception:
                 logger.exception("Catalog health check failed")
             self._stop.wait(self._interval)
@@ -761,6 +872,8 @@ async def _poll_until_shutdown() -> None:
     else:
         logger.info("No remote settings fetched — using local defaults only")
 
+    await _reclaim_own_running_tasks()
+
     # After the remote settings: they may change the interval.
     reporter = _start_catalog_health_reporter()
     try:
@@ -768,6 +881,42 @@ async def _poll_until_shutdown() -> None:
     finally:
         if reporter is not None:
             reporter.stop()
+
+
+async def _reclaim_own_running_tasks() -> None:
+    """
+    Put back to PENDING every task still RUNNING for this pipeline from its
+    previous run.
+
+    One worker runs per pipeline (per API key), so at start none of this
+    pipeline's tasks can legitimately be RUNNING: one that is was left by a
+    run that could not release it — stopped while the API was down, killed
+    by OOM, SIGKILLed after the grace period. It would otherwise stay
+    RUNNING forever. `claimable=True` lists the tasks targeted at this
+    pipeline and untargeted ones; only the targeted ones are certainly
+    ours. Their finished items stay finished — only the unfinished ones are
+    redone. A RESTART left RUNNING is completed instead: this start is what
+    it asked for.
+    """
+    try:
+        running = await api_client.get_tasks(status="RUNNING", limit=50, order="asc", claimable=True)
+    except Exception:
+        logger.exception("Could not list RUNNING tasks to take back")
+        return
+
+    for task in running or []:
+        if not task.get("pipeline_id"):
+            continue
+        if task.get("type") in _SIGNAL_TASK_TYPES:
+            # A RESTART left RUNNING already did its job — this start is it.
+            # Re-queued, it would restart the worker again, in a loop.
+            if await api_client.update_task(task["id"], "COMPLETED") is not None:
+                logger.info("Completed task_id=%s (%s) left RUNNING by the previous run", task["id"], task["type"])
+            continue
+        if await api_client.update_task(task["id"], "PENDING") is None:
+            logger.warning("Could not take back task_id=%s left RUNNING by the previous run", task["id"])
+            continue
+        logger.info("Took back task_id=%s (%s) left RUNNING by the previous run", task["id"], task.get("type"))
 
 
 async def _poll_tasks() -> None:

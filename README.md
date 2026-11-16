@@ -514,6 +514,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `API_BASE_URL` | — | Yes | Base URL of the observatory-api (e.g., `https://your-cloud-host.com/api/v1`) |
 | `API_KEY` | — | Yes | Secret API key for authentication |
 | `API_RECOVERY_MAX_ATTEMPTS` | `2` | No | How many times a frame whose `POST /sources` or `POST /anomalies` exhausted its retries may re-queue itself as a recovery task. A 4xx is never retried, so without a bound such a frame would re-queue forever; past it the exact item is logged at ERROR for manual submission. |
+| `API_OUTAGE_RETRY_SEC` | `300` | No | While the API does not answer at all (the request and a `GET /settings` probe both fail), the worker keeps the work in hand and retries every this many seconds instead of moving on to the next frame; `0` = fail after the quick retries. The watcher never waits. |
 | **FITS Directories** |
 | `FITS_INCOMING` | `/fits/incoming` | No | Directory to watch for new FITS files |
 | `FITS_ARCHIVE` | `/fits/archive` | No | Archive of every processed frame — layout in [File Organization](#file-organization) |
@@ -629,6 +630,9 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `TASK_POLL_INTERVAL_SEC` | `10.0` | No | How often `worker.py` polls `GET /tasks?status=PENDING` when idle. |
 | `TASK_POLL_BACKOFF_MAX_SEC` | `60.0` | No | Idle polling backs off exponentially up to this ceiling, resetting the moment a task is found. |
 | `CATALOG_HEALTH_INTERVAL_SEC` | `600` | No | How often the worker checks that each online catalog answers and reports it to the API dashboard (also once at start); `0` = off. |
+| `CATALOG_OUTAGE_RETRY_SEC` | `300` | No | When a catalog of `CATALOG_OUTAGE_WAIT_FOR` does not answer during an ANALYZE item, the frame is not registered: the worker waits, re-checking the catalogs every this many seconds and showing the wait on the API dashboard, then analyses the frame again. `0` = no wait (the frame is registered DEGRADED). |
+| `CATALOG_OUTAGE_WAIT_FOR` | `Simbad,Gaia DR3,2MASS,Pan-STARRS,MPC` | No | The catalogs worth waiting for (names as in `POST /frames` `processing.catalogs`; `MPC` = the `MPC_SOURCES`). |
+| `CATALOG_OUTAGE_FRAME_RETRIES` | `2` | No | A catalog failing for one frame while its check says it answers (a dense field timing out on a slow mirror) is that frame's problem: it is tried this many more times, then registered DEGRADED. |
 | `CATALOG_HEALTH_TIMEOUT_SEC` | `20` | No | Per-catalog timeout of that check. |
 | **Observatory Site** |
 | `SITE_LAT` | `0.0` | No | Observatory latitude in decimal degrees (positive = North). Used for topocentric ephemeris queries to JPL Horizons and the JPL Small-Body Identification fallback (`MPC_SOURCES`). |

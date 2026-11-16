@@ -176,7 +176,18 @@ class TestPostCatalogStatus:
         client.post = AsyncMock(return_value=httpx.Response(status, json={}))
         with patch("api_client.pipelines._make_client", return_value=client):
             assert await api_client.post_catalog_status([{"name": "Simbad", "ok": True}]) is expected
+        # The periodic report leaves `waiting` out: the API keeps its state.
         client.post.assert_awaited_once_with("/pipelines/catalogs", json={"catalogs": [{"name": "Simbad", "ok": True}]})
+
+    async def test_a_wait_is_sent_and_cleared_explicitly(self):
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock(return_value=httpx.Response(200, json={}))
+        with patch("api_client.pipelines._make_client", return_value=client):
+            await api_client.post_catalog_status([{"name": "Gaia DR3", "ok": False}], waiting={"reason": "catalogs"})
+            await api_client.post_catalog_status([{"name": "Gaia DR3", "ok": True}], waiting=None)
+        assert [c.kwargs["json"]["waiting"] for c in client.post.await_args_list] == [{"reason": "catalogs"}, None]
 
     async def test_a_transport_error_is_false(self):
         client = MagicMock()
@@ -184,6 +195,24 @@ class TestPostCatalogStatus:
         client.__aexit__ = AsyncMock(return_value=False)
         with patch("api_client.pipelines._make_client", return_value=client):
             assert await api_client.post_catalog_status([]) is False
+
+
+class TestAnswers:
+    REPORT = [
+        {"name": "Gaia DR3", "ok": False},
+        {"name": "SkyBot", "ok": False},
+        {"name": "JPL SB Ident", "ok": True},
+    ]
+
+    def test_a_catalog_is_its_own_report_line(self):
+        assert catalog_health.answers("Gaia DR3", self.REPORT) is False
+
+    def test_mpc_answers_while_one_of_its_sources_does(self):
+        assert catalog_health.answers("MPC", self.REPORT) is True
+        assert catalog_health.answers("MPC", self.REPORT[:2]) is False
+
+    def test_a_catalog_the_report_does_not_cover_counts_as_answering(self):
+        assert catalog_health.answers("2MASS", self.REPORT) is True
 
 
 class TestReporter:
@@ -195,7 +224,7 @@ class TestReporter:
         reported = threading.Event()
         results = [{"name": "Simbad", "ok": False, "latency_ms": None, "error": "x"}]
         monkeypatch.setattr(catalog_health, "check_all", lambda: results)
-        post = AsyncMock(side_effect=lambda catalogs: reported.set() or True)
+        post = AsyncMock(side_effect=lambda catalogs, **kw: reported.set() or True)
         monkeypatch.setattr(worker.api_client, "post_catalog_status", post)
         monkeypatch.setattr(config, "CATALOG_HEALTH_INTERVAL_SEC", 3600.0)
 
@@ -207,7 +236,8 @@ class TestReporter:
             reporter.stop()
         reporter._thread.join(5)
         assert not reporter._thread.is_alive()
-        post.assert_awaited_once_with(results)
+        # The first report after a start clears a wait left by the previous run.
+        post.assert_awaited_once_with(results, waiting=None)
 
     def test_a_failing_check_does_not_kill_the_thread(self, monkeypatch):
         calls = []

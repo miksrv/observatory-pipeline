@@ -168,7 +168,15 @@ ingestion path goes through the task queue.
 
 ### Recovery after API failures
 
-API calls retry 3 times total on 5xx/transport errors (never 4xx). If `POST /sources` or
+API calls retry 3 times total on 5xx/transport errors (never 4xx). In the worker
+(`api_client.wait_out_api_outages()`), a call that still fails then probes `GET /settings`: while
+that fails too the API is down, and the call holds the work in hand and retries every
+`API_OUTAGE_RETRY_SEC` until the API answers — the worker does not move on to the next frame (a
+shutdown ends the wait with `ApiWaitInterrupted`, a `BaseException` so the pipeline's
+`except Exception` blocks pass it through; the item is left unfinished). A request failing while
+the probe answers is its own error (a PHP error on one payload, `near/batch`'s `503` time cap) and
+goes on as below; the watcher never waits. A failed `POST /frames` raises — `None` from
+`analyze_frame()` means "nothing to register" and is reported `DONE`. If `POST /sources` or
 `POST /anomalies` still fails, or the anomaly history prefetch does, `pipeline._queue_recovery_task()`
 re-queues an `ANALYZE` (archive path) or `DETECT_ANOMALIES` task; both endpoints are idempotent. The re-queue count rides in the
 item `payload`, capped by `API_RECOVERY_MAX_ATTEMPTS`; if even that fails the item is logged at
@@ -241,16 +249,29 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   (`modules/catalog_health.py`: one small GET per configured source; any answer below 500 = up,
   a catalog is up while any of its sources answers) at start and
   every `CATALOG_HEALTH_INTERVAL_SEC`, and sends the list to `POST /pipelines/catalogs` for the
-  API dashboard. A thread, not a loop task: an ANALYZE task holds the event loop for hours. It
-  only reports — catalog_matcher still queries a dead catalog and waits out its timeouts.
+  API dashboard. A thread, not a loop task: an ANALYZE task holds the event loop for hours.
+- **Catalog outages:** an ANALYZE item runs `analyze_frame(..., wait_for_catalogs=True)`: a catalog
+  of `CATALOG_OUTAGE_WAIT_FOR` whose outcome is `failed` raises `pipeline.CatalogUnavailable` right
+  after matching, before anything is registered or moved. `_wait_for_catalogs()` then re-checks
+  (`catalog_health.check_all()`/`answers()`) every `CATALOG_OUTAGE_RETRY_SEC`, reporting each check
+  with `POST /pipelines/catalogs` `waiting` (only the wait sets and clears it; the thread's periodic
+  report leaves the key out so it cannot race the wait, except its first report after a start, which
+  clears a stale one), and the frame is analysed again. The wait holds the whole worker — no other
+  task (DETECT, charts, RESTART) runs meanwhile; a SIGTERM ends it. A failure while the check says the catalog answers is
+  the frame's own (a dense field on a slow mirror): after `CATALOG_OUTAGE_FRAME_RETRIES` of those the
+  frame is analysed without waiting and registered DEGRADED. A shutdown during the wait leaves the
+  item without an outcome (redone after the restart).
 - **Lost progress reports:** an item outcome the API did not take (`post_task_items_progress()`
   → `None`) is retried once the handler returns; if it still fails, the task goes back to
   `PENDING` (its unreported items are redone) instead of sitting at `RUNNING` forever.
-- **Known limitation:** no lease/heartbeat. A worker that dies mid-task without that chance (OOM
-  kill, SIGKILL after the grace period) leaves it `RUNNING` forever — reset by hand with
-  `PATCH /tasks/{id} {"status": "PENDING"}`. The item it was on stays `RUNNING` (the worker's
-  live-progress hint, `_mark_running()`); the worker treats `RUNNING` items like `PENDING` ones
-  (`_UNFINISHED_ITEM_STATUSES`), so the next claim redoes it.
+- **Tasks left `RUNNING`:** a worker that could not release its task (stopped while the API was
+  down, OOM kill, SIGKILL after the grace period) leaves it `RUNNING`. At start,
+  `_reclaim_own_running_tasks()` puts every `RUNNING` task targeted at this pipeline back to
+  `PENDING` (a `RESTART` is completed instead — re-queued it would loop) — one worker runs per API
+  key, so none can legitimately be running yet (untargeted ones are left alone: they may be another
+  pipeline's, and stay `RUNNING` until reset by hand). The item it was on stays `RUNNING` (the
+  worker's live-progress hint, `_mark_running()`); the worker treats `RUNNING` items like `PENDING`
+  ones (`_UNFINISHED_ITEM_STATUSES`), so the next claim redoes it.
 
 ---
 
