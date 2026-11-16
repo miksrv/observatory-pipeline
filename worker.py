@@ -249,9 +249,98 @@ def _recovery_attempt(item: dict) -> int:
         return 0
 
 
-async def _handle_analyze_item(item: dict) -> dict:
+# What the worker is holding an ANALYZE item for, while it waits for catalogs
+# (_wait_for_catalogs()) — the `waiting` field of POST /pipelines/catalogs.
+# Written on the event loop, read by the catalog health thread.
+_waiting: dict | None = None
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _shutdown_within(seconds: float) -> bool:
+    """Wait `seconds`; True as soon as a shutdown is requested."""
+    try:
+        await asyncio.wait_for(_shutdown.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def _wait_for_catalogs(catalogs: list[str], fits_path: str, task_id: str | None) -> str:
+    """
+    Hold an ANALYZE item whose frame met unanswering catalogs until they
+    answer again. Checks them (catalog_health.check_all()) at once and then
+    every CATALOG_OUTAGE_RETRY_SEC, and reports the wait to the API with
+    each check (POST /pipelines/catalogs `waiting`).
+
+    Returns "answering" when the first check already finds them up — the
+    failure was this frame's own (the caller counts it), "recovered" after a
+    wait, "interrupted" on a shutdown.
+    """
+    global _waiting
+    from modules import catalog_health  # noqa: PLC0415
+
+    name = os.path.basename(fits_path)
+    started = asyncio.get_running_loop().time()
+    state: dict | None = None
+    try:
+        while True:
+            try:
+                report = await asyncio.to_thread(catalog_health.check_all)
+            except Exception:
+                # A check that breaks proves nothing: count them as still down.
+                logger.exception("Catalog check failed while waiting for %s", ", ".join(catalogs))
+                report = []
+            down = [c for c in catalogs if not report or not catalog_health.answers(c, report)]
+            if not down:
+                if state is None:
+                    logger.warning(
+                        "%s did not answer for %s but answers now — analysing it again",
+                        ", ".join(catalogs), name,
+                    )
+                    return "answering"
+                minutes = (asyncio.get_running_loop().time() - started) / 60.0
+                logger.info("%s answers again after %.0f min — analysing %s again", ", ".join(catalogs), minutes, name)
+                _waiting = None
+                await api_client.post_catalog_status(report, waiting=None)
+                return "recovered"
+
+            if state is None:
+                logger.warning(
+                    "%s not answering — %s is not registered; waiting, checking every %.0f s",
+                    ", ".join(down), name, config.CATALOG_OUTAGE_RETRY_SEC,
+                )
+                state = {"reason": "catalogs", "since": _utc_now_iso(), "task_id": task_id, "filename": name}
+            state = {**state, "catalogs": down}
+            _waiting = state
+            if report:  # the API refuses an empty catalog list
+                await api_client.post_catalog_status(report, waiting=state)
+
+            if await _shutdown_within(config.CATALOG_OUTAGE_RETRY_SEC):
+                logger.info("Stopped while waiting for %s — %s is analysed again after the restart", ", ".join(down), name)
+                _waiting = None
+                if report:
+                    await api_client.post_catalog_status(report, waiting=None)
+                return "interrupted"
+    finally:
+        _waiting = None
+
+
+async def _handle_analyze_item(item: dict, task_id: str | None = None) -> dict | None:
     """
     Run analyze_frame() for one ANALYZE task item.
+
+    A frame that met a catalog of CATALOG_OUTAGE_WAIT_FOR not answering is
+    not registered (pipeline.CatalogUnavailable): the item waits for the
+    catalog (_wait_for_catalogs()) and analyses the frame again. A catalog
+    that fails for this frame while its check says it answers is the frame's
+    own problem — after CATALOG_OUTAGE_FRAME_RETRIES such runs it is analysed
+    without waiting and registered DEGRADED. None: a shutdown came during the
+    wait — the item has no outcome and is redone after the restart.
 
     `item["filename"]` is the full path to the FITS file, as submitted at
     task-creation time — not just a basename; whatever created this task is
@@ -269,11 +358,22 @@ async def _handle_analyze_item(item: dict) -> dict:
     if not fits_path:
         return {"item_id": item["id"], "status": "FAILED", "error": "Item has no filename"}
 
-    try:
-        result = await pipeline.analyze_frame(fits_path, _recovery_attempt(item))
-    except Exception as exc:
-        logger.exception("ANALYZE item failed for %s", fits_path)
-        return {"item_id": item["id"], "status": "FAILED", "error": str(exc)}
+    frame_failures = 0
+    while True:
+        wait = config.CATALOG_OUTAGE_RETRY_SEC > 0 and frame_failures < config.CATALOG_OUTAGE_FRAME_RETRIES
+        try:
+            result = await pipeline.analyze_frame(fits_path, _recovery_attempt(item), wait_for_catalogs=wait)
+        except pipeline.CatalogUnavailable as exc:
+            outcome = await _wait_for_catalogs(exc.catalogs, fits_path, task_id)
+            if outcome == "interrupted":
+                return None
+            if outcome == "answering":
+                frame_failures += 1
+            continue
+        except Exception as exc:
+            logger.exception("ANALYZE item failed for %s", fits_path)
+            return {"item_id": item["id"], "status": "FAILED", "error": str(exc)}
+        break
 
     if result is None:
         # Not necessarily an error — a calibration frame or a QC rejection
@@ -301,7 +401,9 @@ async def _run_analyze_task(task: dict, items: list[dict]) -> None:
     for item in _until_shutdown(items):
         if item.get("filename"):
             await _mark_running(task["id"], item["id"])
-        outcome = await _handle_analyze_item(item)
+        outcome = await _handle_analyze_item(item, task["id"])
+        if outcome is None:
+            return  # stopped while waiting for catalogs: the item stays unfinished
         await _report_progress(task["id"], [outcome])
 
 
@@ -741,8 +843,10 @@ class _CatalogHealthReporter:
         while not self._stop.is_set():
             try:
                 results = catalog_health.check_all()
-                if not self._stop.is_set():
-                    asyncio.run(api_client.post_catalog_status(results))
+                # While an item waits for catalogs, _wait_for_catalogs() reports
+                # (with its `waiting` state) — a report from here would clear it.
+                if not self._stop.is_set() and _waiting is None:
+                    asyncio.run(api_client.post_catalog_status(results, waiting=None))
             except Exception:
                 logger.exception("Catalog health check failed")
             self._stop.wait(self._interval)

@@ -249,8 +249,16 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   (`modules/catalog_health.py`: one small GET per configured source; any answer below 500 = up,
   a catalog is up while any of its sources answers) at start and
   every `CATALOG_HEALTH_INTERVAL_SEC`, and sends the list to `POST /pipelines/catalogs` for the
-  API dashboard. A thread, not a loop task: an ANALYZE task holds the event loop for hours. It
-  only reports — catalog_matcher still queries a dead catalog and waits out its timeouts.
+  API dashboard. A thread, not a loop task: an ANALYZE task holds the event loop for hours.
+- **Catalog outages:** an ANALYZE item runs `analyze_frame(..., wait_for_catalogs=True)`: a catalog
+  of `CATALOG_OUTAGE_WAIT_FOR` whose outcome is `failed` raises `pipeline.CatalogUnavailable` right
+  after matching, before anything is registered or moved. `_wait_for_catalogs()` then re-checks
+  (`catalog_health.check_all()`/`answers()`) every `CATALOG_OUTAGE_RETRY_SEC`, reporting each check
+  with `POST /pipelines/catalogs` `waiting` (the thread's periodic report skips meanwhile, or it would
+  clear it), and the frame is analysed again. A failure while the check says the catalog answers is
+  the frame's own (a dense field on a slow mirror): after `CATALOG_OUTAGE_FRAME_RETRIES` of those the
+  frame is analysed without waiting and registered DEGRADED. A shutdown during the wait leaves the
+  item without an outcome (redone after the restart).
 - **Lost progress reports:** an item outcome the API did not take (`post_task_items_progress()`
   → `None`) is retried once the handler returns; if it still fails, the task goes back to
   `PENDING` (its unreported items are redone) instead of sitting at `RUNNING` forever.

@@ -200,3 +200,21 @@ def check_all() -> list[dict]:
     else:
         logger.info("All %d online catalogs reachable", len(report))
     return report
+
+
+# processing.catalogs name → the report names that serve it. MPC is asked
+# through MPC_SOURCES (SkyBot, JPL SB Ident); every other catalog's report line
+# carries its own name.
+_REPORT_NAMES: dict[str, tuple[str, ...]] = {"MPC": (_SKYBOT.name, _JPL_SBIDENT.name)}
+
+
+def answers(catalog: str, report: list[dict]) -> bool:
+    """
+    Whether `catalog` (a name from POST /frames' processing.catalogs) answers
+    according to a `check_all()` report: any of its report lines up. A catalog
+    the report does not cover counts as answering — there is nothing to wait
+    for, and the worker's frame retries bound what happens next.
+    """
+    names = _REPORT_NAMES.get(catalog, (catalog,))
+    lines = [r for r in report if r.get("name") in names]
+    return not lines or any(r.get("ok") for r in lines)

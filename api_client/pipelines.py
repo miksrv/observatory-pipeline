@@ -13,10 +13,16 @@ from ._shared import _make_client
 logger = logging.getLogger(__name__)
 
 
-async def post_catalog_status(catalogs: list[dict]) -> bool:
+async def post_catalog_status(catalogs: list[dict], waiting: dict | None = None) -> bool:
     """
     Report the online catalog check (`modules.catalog_health.check_all()`) with
     ``POST /pipelines/catalogs``. Returns True on 200.
+
+    `waiting` says the worker holds an ANALYZE item until catalogs answer
+    again (`worker._wait_for_catalogs()`): ``{"reason": "catalogs",
+    "catalogs": [...], "since": ISO time, "task_id", "filename"}``, or None —
+    sent every time, so the API clears the state when the wait ends. An API
+    older than 1.6.1 ignores the field.
 
     One attempt, no ``@_retry``: the next check follows in
     CATALOG_HEALTH_INTERVAL_SEC anyway, and a status report must never hold
@@ -25,7 +31,7 @@ async def post_catalog_status(catalogs: list[dict]) -> bool:
     """
     try:
         async with _make_client(timeout=15.0) as client:
-            resp = await client.post("/pipelines/catalogs", json={"catalogs": catalogs})
+            resp = await client.post("/pipelines/catalogs", json={"catalogs": catalogs, "waiting": waiting})
     except Exception as exc:
         logger.warning("POST /pipelines/catalogs failed: %s", exc)
         return False

@@ -1507,7 +1507,7 @@ is silently ignored):
 | Normalization | `NORMALIZE_ENABLED` |
 | Catalog cache | `CACHE_TTL_HOURS` |
 | Watcher batching | `WATCHER_DEBOUNCE_SEC`, `WATCHER_MAX_BATCH_SIZE` |
-| Worker polling | `TASK_POLL_INTERVAL_SEC`, `TASK_POLL_BACKOFF_MAX_SEC`, `CATALOG_HEALTH_INTERVAL_SEC`, `CATALOG_HEALTH_TIMEOUT_SEC`, `API_OUTAGE_RETRY_SEC` |
+| Worker polling | `TASK_POLL_INTERVAL_SEC`, `TASK_POLL_BACKOFF_MAX_SEC`, `CATALOG_HEALTH_INTERVAL_SEC`, `CATALOG_HEALTH_TIMEOUT_SEC`, `API_OUTAGE_RETRY_SEC`, `CATALOG_OUTAGE_RETRY_SEC`, `CATALOG_OUTAGE_FRAME_RETRIES` |
 | Logging | `LOG_LEVEL` |
 | ASTAP | `ASTAP_FOV_HINT` |
 | Narrowband | `NARROWBAND_FILTERS` |
@@ -1548,6 +1548,23 @@ observatory-api 1.4.1; an older API answers `404`, which the worker only logs.
 | `ok` | bool | The service answered with a status below 500 |
 | `latency_ms` | int \| null | Response time; `null` when nothing came back |
 | `error` | string \| null | Why it is down (exception or `HTTP 5xx`); the API keeps 300 characters |
+| `waiting` | object \| null | Always sent; `null` unless an ANALYZE item is held until catalogs answer again (below) |
+
+`waiting` (pipeline 1.7.1; an API older than 1.6.1 ignores it): when a catalog of
+`CATALOG_OUTAGE_WAIT_FOR` fails while a frame is matched, the worker registers nothing and holds
+the item, re-checking every `CATALOG_OUTAGE_RETRY_SEC` (`worker._wait_for_catalogs()`). Each check is
+reported with this field, and the report after the wait carries `null`; the periodic reports skip
+while a wait is on, so they never clear it.
+
+```json
+"waiting": {
+  "reason": "catalogs",
+  "catalogs": ["Gaia DR3"],
+  "since": "2026-11-15T06:31:30Z",
+  "task_id": "6af0f7e69f9579.63231956",
+  "filename": "IC_5070_Light_OIII_300_secs_2020-06-24T01-37-47_006.fits"
+}
+```
 
 ### Response
 

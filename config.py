@@ -1033,6 +1033,26 @@ CATALOG_HEALTH_INTERVAL_SEC: float = float(_get("CATALOG_HEALTH_INTERVAL_SEC", "
 # even a tiny cone search).
 CATALOG_HEALTH_TIMEOUT_SEC: float = float(_get("CATALOG_HEALTH_TIMEOUT_SEC", "20"))
 
+# A frame matched while a catalog did not answer comes out DEGRADED and has
+# to be analysed again (2026-11-15: 209 frames during a Gaia DR3 outage).
+# Instead, when one of CATALOG_OUTAGE_WAIT_FOR fails (every configured source
+# of it), an ANALYZE item registers nothing and the worker waits — checking
+# the catalogs (modules/catalog_health.py) every CATALOG_OUTAGE_RETRY_SEC and
+# reporting the wait to the API — then analyses the frame again. 0 = no wait:
+# the frame is registered DEGRADED, as before.
+CATALOG_OUTAGE_RETRY_SEC: float = float(_get("CATALOG_OUTAGE_RETRY_SEC", "300"))
+# The catalogs worth waiting for, by the names of POST /frames'
+# processing.catalogs (MPC = SkyBot/JPL, whichever MPC_SOURCES lists).
+CATALOG_OUTAGE_WAIT_FOR: tuple[str, ...] = tuple(
+    name.strip()
+    for name in _get("CATALOG_OUTAGE_WAIT_FOR", "Simbad,Gaia DR3,2MASS,Pan-STARRS,MPC").split(",")
+    if name.strip()
+)
+# A catalog that fails for one frame while its check says it answers is that
+# frame's problem (a dense field timing out on a slow mirror), not an outage:
+# the frame is tried this many more times, then registered DEGRADED.
+CATALOG_OUTAGE_FRAME_RETRIES: int = int(_get("CATALOG_OUTAGE_FRAME_RETRIES", "2"))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -1165,6 +1185,8 @@ _OVERRIDABLE: dict[str, type] = {
     "TASK_POLL_BACKOFF_MAX_SEC": float,
     "CATALOG_HEALTH_INTERVAL_SEC": float,
     "CATALOG_HEALTH_TIMEOUT_SEC": float,
+    "CATALOG_OUTAGE_RETRY_SEC": float,
+    "CATALOG_OUTAGE_FRAME_RETRIES": int,
     # Logging
     "LOG_LEVEL": None,  # special: str.upper()
     # ASTAP

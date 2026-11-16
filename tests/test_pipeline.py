@@ -3045,6 +3045,40 @@ async def test_analyze_frame_reports_a_failed_catalog_on_the_frame_record(mock_m
 
 
 @pytest.mark.asyncio
+async def test_a_frame_waiting_for_catalogs_registers_and_moves_nothing(mock_modules):
+    """wait_for_catalogs: a failed catalog the worker waits for stops the frame
+    before POST /frames and the archive move — it is analysed again later."""
+    async def match_with_gaia_down(sources, frame_meta, *, catalog_status=None):
+        if catalog_status is not None:
+            catalog_status.update({"Simbad": "ok", "Gaia DR3": "failed"})
+        return sources
+    pipeline.catalog_matcher.match.side_effect = match_with_gaia_down
+
+    with pytest.raises(pipeline.CatalogUnavailable) as raised:
+        await pipeline.analyze_frame(str(mock_modules), wait_for_catalogs=True)
+
+    assert raised.value.catalogs == ["Gaia DR3"]
+    pipeline.api_client.post_frame.assert_not_called()
+    assert os.path.exists(str(mock_modules))
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_not_waited_for_does_not_stop_the_frame(mock_modules, monkeypatch):
+    monkeypatch.setattr(config, "CATALOG_OUTAGE_WAIT_FOR", ("Gaia DR3",))
+
+    async def match_with_simbad_down(sources, frame_meta, *, catalog_status=None):
+        if catalog_status is not None:
+            catalog_status.update({"Simbad": "failed", "Gaia DR3": "ok"})
+        return sources
+    pipeline.catalog_matcher.match.side_effect = match_with_simbad_down
+
+    await pipeline.analyze_frame(str(mock_modules), wait_for_catalogs=True)
+
+    processing = pipeline.api_client.post_frame.call_args[0][0]["processing"]
+    assert processing["issues"] == ["catalog_failed:Simbad"]
+
+
+@pytest.mark.asyncio
 async def test_analyze_frame_reports_ok_processing(mock_modules):
     await pipeline.analyze_frame(str(mock_modules))
 

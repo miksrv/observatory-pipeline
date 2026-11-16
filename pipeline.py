@@ -258,7 +258,25 @@ async def _queue_recovery_task(
     return True
 
 
-async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | None:
+class CatalogUnavailable(Exception):
+    """
+    A catalog the worker waits for (config.CATALOG_OUTAGE_WAIT_FOR) did not
+    answer while this frame was matched. Raised by analyze_frame() with
+    `wait_for_catalogs=True` before anything is registered, archived or
+    moved — the frame is analysed again once the catalog answers.
+    """
+
+    def __init__(self, catalogs: list[str]) -> None:
+        self.catalogs = list(catalogs)
+        super().__init__(f"catalog(s) not answering: {', '.join(self.catalogs)}")
+
+
+async def analyze_frame(
+    fits_path: str,
+    recovery_attempt: int = 0,
+    *,
+    wait_for_catalogs: bool = False,
+) -> dict | None:
     """
     Process a single FITS file through header extraction, QC, astrometry,
     subtraction, catalog matching, photometry, forced photometry, and
@@ -294,6 +312,10 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
         `POST /sources` — carried in the task item's own payload and read back
         by `worker.py`. Bounds the re-queue loop; see
         `_queue_recovery_task()`.
+    wait_for_catalogs:
+        Raise CatalogUnavailable instead of going on DEGRADED when a catalog of
+        config.CATALOG_OUTAGE_WAIT_FOR did not answer — the worker's ANALYZE
+        items, which wait for it. Off by default (pipeline.run(), tests).
 
     Returns
     -------
@@ -677,6 +699,15 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
     else:
         if catalog_matcher is None:
             logger.debug("Catalog matcher not available — skipping", extra=extra)
+
+    # A catalog worth waiting for did not answer: stop before anything is
+    # registered or moved (CFA conversion and the OBJECT/FILTER header fixes
+    # above are idempotent), so the frame can simply be analysed again.
+    if wait_for_catalogs:
+        unavailable = [c for c in config.CATALOG_OUTAGE_WAIT_FOR if catalog_status.get(c) == "failed"]
+        if unavailable:
+            _cleanup_astap_files(fits_path)
+            raise CatalogUnavailable(unavailable)
 
     # ------------------------------------------------------------------
     # Step 4.5 — Deduplicate sources sharing a catalog identity.
