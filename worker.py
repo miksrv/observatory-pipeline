@@ -696,9 +696,21 @@ async def run_forever() -> None:
     global _shutdown
     _shutdown = asyncio.Event()
     previous_handlers = _install_signal_handlers(asyncio.get_running_loop())
+    # The worker holds the work in hand through an API outage instead of
+    # failing it (config.API_OUTAGE_RETRY_SEC); a shutdown ends the wait.
+    api_client.wait_out_api_outages(lambda: _shutdown.is_set())
     try:
         await _poll_until_shutdown()
+    except api_client.ApiWaitInterrupted:
+        # The item in hand is neither done nor failed, and with the API down
+        # its task cannot be released either: it stays RUNNING until the next
+        # start takes it back (_reclaim_own_running_tasks()).
+        logger.warning(
+            "Stopped while waiting for the API — the task in progress stays RUNNING "
+            "and is taken back at the next start"
+        )
     finally:
+        api_client.wait_out_api_outages(None)
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
 
@@ -761,6 +773,8 @@ async def _poll_until_shutdown() -> None:
     else:
         logger.info("No remote settings fetched — using local defaults only")
 
+    await _reclaim_own_running_tasks()
+
     # After the remote settings: they may change the interval.
     reporter = _start_catalog_health_reporter()
     try:
@@ -768,6 +782,35 @@ async def _poll_until_shutdown() -> None:
     finally:
         if reporter is not None:
             reporter.stop()
+
+
+async def _reclaim_own_running_tasks() -> None:
+    """
+    Put back to PENDING every task still RUNNING for this pipeline from its
+    previous run.
+
+    One worker runs per pipeline (per API key), so at start none of this
+    pipeline's tasks can legitimately be RUNNING: one that is was left by a
+    run that could not release it — stopped while the API was down, killed
+    by OOM, SIGKILLed after the grace period. It would otherwise stay
+    RUNNING forever. `claimable=True` lists the tasks targeted at this
+    pipeline and untargeted ones; only the targeted ones are certainly
+    ours. Their finished items stay finished — only the unfinished ones are
+    redone.
+    """
+    try:
+        running = await api_client.get_tasks(status="RUNNING", limit=50, order="asc", claimable=True)
+    except Exception:
+        logger.exception("Could not list RUNNING tasks to take back")
+        return
+
+    for task in running or []:
+        if not task.get("pipeline_id"):
+            continue
+        if await api_client.update_task(task["id"], "PENDING") is None:
+            logger.warning("Could not take back task_id=%s left RUNNING by the previous run", task["id"])
+            continue
+        logger.info("Took back task_id=%s (%s) left RUNNING by the previous run", task["id"], task.get("type"))
 
 
 async def _poll_tasks() -> None:

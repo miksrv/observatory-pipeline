@@ -1258,7 +1258,9 @@ async def test_post_frame_failure_aborts(mock_modules):
     pipeline.api_client.post_frame.side_effect = RuntimeError("API unreachable")
 
     fits_path = str(mock_modules)
-    await pipeline.run(fits_path)
+    # Raised, not swallowed: a None result would be reported DONE.
+    with pytest.raises(RuntimeError, match="could not be registered"):
+        await pipeline.run(fits_path)
 
     pipeline.api_client.post_sources.assert_not_called()
 

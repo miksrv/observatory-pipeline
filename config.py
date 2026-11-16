@@ -290,6 +290,17 @@ ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC: float = float(_get("ASTROMETRY_PIXEL_SCALE_MA
 # otherwise re-queue itself forever. 0 disables recovery entirely.
 API_RECOVERY_MAX_ATTEMPTS: int = int(_get("API_RECOVERY_MAX_ATTEMPTS", "2"))
 
+# What the worker does when the API stops answering (connection refused,
+# timeouts, 5xx after the three quick retries) while a cheap probe request
+# fails too: it holds the request it has in hand — the frame's finished
+# analysis, an item's progress report — and tries again every this many
+# seconds until the API answers, instead of moving on to the next frame. On
+# 2026-11-05 a three-minute outage otherwise reported unregistered frames as
+# done. A request that fails while the probe answers is that request's own
+# error and fails as before. 0 = the old behaviour (fail after the quick
+# retries). The watcher never waits.
+API_OUTAGE_RETRY_SEC: float = float(_get("API_OUTAGE_RETRY_SEC", "300"))
+
 # Read timeout (s) for POST /frames/{id}/sources. Saving several hundred
 # sources takes the API well over the 30 s every other call gets; a client
 # timeout there retried the POST while the first one was still running on
@@ -1091,6 +1102,7 @@ _OVERRIDABLE: dict[str, type] = {
     "ASTROMETRY_PIXEL_SCALE_MIN_ARCSEC": float,
     "ASTROMETRY_PIXEL_SCALE_MAX_ARCSEC": float,
     "API_RECOVERY_MAX_ATTEMPTS": int,
+    "API_OUTAGE_RETRY_SEC": float,
     "API_SOURCES_TIMEOUT_SEC": float,
     "HISTORY_BATCH_MAX_POSITIONS": int,
     "MATCH_CONE_ARCSEC": float,

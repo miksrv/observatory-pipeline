@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.1
+
+### Patch Changes
+
+- Worker: while the API does not answer at all, the frame or report in hand is retried every `API_OUTAGE_RETRY_SEC` (300 s) until it does, instead of moving on — on 2026-11-05 an outage reported frames the API never took as done and left them in incoming. A failed `POST /frames` now fails its item instead of reporting it `DONE`
+- Worker: at start, tasks of this pipeline still `RUNNING` from a previous run (stopped while the API was down, OOM, SIGKILL) go back to `PENDING` — they used to need a manual reset
+
 ## 1.7.0
 
 ### Minor Changes

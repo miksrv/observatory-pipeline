@@ -278,7 +278,7 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
         5. Photometry (optional) — uses Gaia DR3 matches for zero-point calibration
         5.6. Forced photometry / reverse matching (optional) — measures flux at
              every catalog/MPC position not already caught by blind detection
-        6. POST frame to API — stop on failure
+        6. POST frame to API — raises on failure
         7. POST sources to API
         8. Move file to archive
 
@@ -301,8 +301,10 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
         `None` if processing stopped early — a file that is not a single
         exposure (a colour cube or a capture-software stack, moved to
         FITS_REJECTED unanalysed), a Dark/Flat/Bias calibration
-        frame (archived with no analysis), no `api_client` configured, or
-        `POST /frames` itself failing. A QC rejection is **not** one of
+        frame (archived with no analysis), or no `api_client` configured.
+        `POST /frames` failing raises RuntimeError instead — the frame was
+        analysed but not registered, which is not "nothing to do" (the
+        worker reports None as DONE). A QC rejection is **not** one of
         these cases anymore: the frame is still registered (with its QC
         metrics and a non-"OK" `quality_flag`) and the file is still
         archived — just with astrometry/subtraction/catalog matching/
@@ -958,7 +960,11 @@ async def analyze_frame(fits_path: str, recovery_attempt: int = 0) -> dict | Non
         logger.error("Failed to register frame %s: %s", basename, exc, extra=extra)
         # Clean up astap temp files even on failure
         _cleanup_astap_files(fits_path)
-        return None
+        # Raised, not `return None`: None means "nothing to register"
+        # (calibration, unsupported) and the worker reports it DONE — a frame
+        # the API never took was reported done and left in incoming
+        # (2026-11-05). The file stays where it is; the item fails.
+        raise RuntimeError(f"Frame {basename} could not be registered: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Step 7 — Post sources (includes catalog match info from step 4)

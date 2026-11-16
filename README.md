@@ -514,6 +514,7 @@ All settings are loaded from environment variables via `config.py`. Here is the 
 | `API_BASE_URL` | — | Yes | Base URL of the observatory-api (e.g., `https://your-cloud-host.com/api/v1`) |
 | `API_KEY` | — | Yes | Secret API key for authentication |
 | `API_RECOVERY_MAX_ATTEMPTS` | `2` | No | How many times a frame whose `POST /sources` or `POST /anomalies` exhausted its retries may re-queue itself as a recovery task. A 4xx is never retried, so without a bound such a frame would re-queue forever; past it the exact item is logged at ERROR for manual submission. |
+| `API_OUTAGE_RETRY_SEC` | `300` | No | While the API does not answer at all (the request and a `GET /settings` probe both fail), the worker keeps the work in hand and retries every this many seconds instead of moving on to the next frame; `0` = fail after the quick retries. The watcher never waits. |
 | **FITS Directories** |
 | `FITS_INCOMING` | `/fits/incoming` | No | Directory to watch for new FITS files |
 | `FITS_ARCHIVE` | `/fits/archive` | No | Archive of every processed frame — layout in [File Organization](#file-organization) |

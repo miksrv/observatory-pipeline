@@ -34,8 +34,8 @@ class TestHandleAnalyzeItem:
 
     async def test_none_result_is_still_done_without_frame_id(self, monkeypatch):
         """analyze_frame() returning None (a calibration frame, no API client
-        configured, or POST /frames itself failing) is a normal successful
-        outcome, not a failure. QC rejection is no longer one of these cases
+        configured) is a normal successful outcome, not a failure — a failed
+        POST /frames raises instead (see test_exception_reports_failed). QC rejection is no longer one of these cases
         — see test_qc_rejected_dict_result_reports_done_with_frame_id below."""
         monkeypatch.setattr(worker.pipeline, "analyze_frame", AsyncMock(return_value=None))
         item = {"id": "item-1", "filename": "/fits/incoming/a.fits"}
@@ -681,7 +681,8 @@ class TestRunForever:
         # — raising from get_tasks() instead would just be swallowed and the
         # loop would spin forever, which is what hung the first version of
         # this test.
-        get_tasks_mock = AsyncMock(side_effect=[[], [], [], [{"id": "t1"}]])
+        # The first call is the start-up look for RUNNING tasks to take back.
+        get_tasks_mock = AsyncMock(side_effect=[[], [], [], [], [{"id": "t1"}]])
         monkeypatch.setattr(worker.api_client, "get_tasks", get_tasks_mock)
         monkeypatch.setattr(worker, "_process_one_task", AsyncMock(side_effect=RuntimeError("stop test")))
         sleep_mock = AsyncMock()
@@ -799,14 +800,16 @@ class TestGracefulShutdown:
         monkeypatch.setattr(worker.api_client, "get_settings", AsyncMock(return_value={}))
 
         async def _poll(**kwargs):
-            asyncio.get_running_loop().call_soon(worker._request_shutdown, "SIGTERM")
+            if kwargs.get("status") == "PENDING":
+                asyncio.get_running_loop().call_soon(worker._request_shutdown, "SIGTERM")
             return []
 
         monkeypatch.setattr(worker.api_client, "get_tasks", AsyncMock(side_effect=_poll))
 
         await asyncio.wait_for(worker.run_forever(), timeout=5)
 
-        assert worker.api_client.get_tasks.call_count == 1
+        polls = [c for c in worker.api_client.get_tasks.call_args_list if c.kwargs.get("status") == "PENDING"]
+        assert len(polls) == 1
 
     def test_a_second_signal_exits_at_once(self, monkeypatch):
         exits: list[int] = []
@@ -906,3 +909,35 @@ class TestSignalHandlers:
         finally:
             for sig, h in previous.items():
                 _signal.signal(sig, h)
+
+
+# ---------------------------------------------------------------------------
+# API outages: tasks left RUNNING, a shutdown during the wait
+# ---------------------------------------------------------------------------
+
+
+class TestApiOutage:
+    async def test_tasks_left_running_for_this_pipeline_are_taken_back_at_start(self, monkeypatch):
+        monkeypatch.setattr(worker.api_client, "get_tasks", AsyncMock(return_value=[
+            {"id": "mine", "type": "ANALYZE", "pipeline_id": "p1"},
+            {"id": "untargeted", "type": "ANALYZE", "pipeline_id": None},
+        ]))
+        monkeypatch.setattr(worker.api_client, "update_task", AsyncMock(return_value={"id": "mine"}))
+
+        await worker._reclaim_own_running_tasks()
+
+        worker.api_client.get_tasks.assert_called_once_with(
+            status="RUNNING", limit=50, order="asc", claimable=True,
+        )
+        worker.api_client.update_task.assert_called_once_with("mine", "PENDING")
+
+    async def test_a_shutdown_while_waiting_for_the_api_stops_the_worker_cleanly(self, monkeypatch):
+        monkeypatch.setattr(
+            worker, "_poll_until_shutdown", AsyncMock(side_effect=worker.api_client.ApiWaitInterrupted()),
+        )
+        seen: list = []
+        monkeypatch.setattr(worker.api_client, "wait_out_api_outages", lambda f: seen.append(f))
+
+        await worker.run_forever()
+
+        assert callable(seen[0]) and seen[-1] is None

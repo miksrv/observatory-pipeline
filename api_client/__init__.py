@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import httpx  # noqa: F401 — see docstring above; patch() target resolution needs this attribute.
 
+from ._shared import ApiWaitInterrupted, wait_out_api_outages
 from .anomalies import post_anomalies
 from .frames import (
     get_frame,
@@ -88,6 +89,8 @@ from .tasks import (
 )
 
 __all__ = [
+    "ApiWaitInterrupted",
+    "wait_out_api_outages",
     "post_frame",
     "post_sources",
     "post_anomalies",
