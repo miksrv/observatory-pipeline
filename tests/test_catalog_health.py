@@ -33,6 +33,12 @@ class TestCheck:
         result = catalog_health.check(probe, _client(lambda request: httpx.Response(502)))
         assert result == {"name": "SkyBot", "ok": False, "latency_ms": result["latency_ms"], "error": "HTTP 502"}
 
+    def test_a_404_is_down(self):
+        # CDS answered 404 to the Simbad TAP endpoint for weeks: the service
+        # the query needs is not there, however fast the host answers.
+        result = catalog_health.check(catalog_health._SIMBAD, _client(lambda request: httpx.Response(404)))
+        assert result == {"name": "Simbad", "ok": False, "latency_ms": result["latency_ms"], "error": "HTTP 404"}
+
     def test_vizier_error_votable_is_down(self):
         body = '<VOTABLE><INFO name="QUERY_STATUS" value="ERROR">table not found</INFO></VOTABLE>'
         result = catalog_health.check(catalog_health._2MASS, _client(lambda request: httpx.Response(200, text=body)))

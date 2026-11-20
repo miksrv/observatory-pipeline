@@ -821,6 +821,71 @@ class TestGracefulShutdown:
         assert exits == [1]
 
 
+class TestReleaseFreedMemory:
+    @pytest.fixture(autouse=True)
+    def fresh_shutdown_event(self, monkeypatch):
+        monkeypatch.setattr(worker, "_shutdown", asyncio.Event())
+        monkeypatch.setattr(worker, "_rss_mb", lambda: 500.0)
+        monkeypatch.setattr(worker.config, "WORKER_MAX_RSS_MB", 8192.0)
+
+    def test_a_worker_over_the_memory_limit_stops_before_the_next_item(self, monkeypatch):
+        monkeypatch.setattr(worker, "_release_freed_memory", lambda: None)
+        rss = iter([500.0, 9000.0])
+        monkeypatch.setattr(worker, "_rss_mb", lambda: next(rss))
+        assert list(worker._until_shutdown(["a", "b", "c"])) == ["a"]
+        # The SIGTERM path: the task's unstarted items go back to PENDING.
+        assert worker._shutdown.is_set()
+
+    @pytest.mark.parametrize("limit,rss", [(0.0, 99999.0), (8192.0, None)])
+    def test_no_limit_or_no_proc_never_stops(self, monkeypatch, limit, rss):
+        monkeypatch.setattr(worker, "_release_freed_memory", lambda: None)
+        monkeypatch.setattr(worker.config, "WORKER_MAX_RSS_MB", limit)
+        monkeypatch.setattr(worker, "_rss_mb", lambda: rss)
+        assert list(worker._until_shutdown(["a", "b"])) == ["a", "b"]
+        assert not worker._shutdown.is_set()
+
+    async def test_the_task_is_released_when_the_limit_stops_it(self, monkeypatch):
+        monkeypatch.setattr(worker, "_release_freed_memory", lambda: None)
+        rss = iter([500.0, 9000.0])
+        monkeypatch.setattr(worker, "_rss_mb", lambda: next(rss))
+        analyzed: list[str] = []
+
+        async def _analyze(item, task_id=None):
+            analyzed.append(item["id"])
+            return {"id": item["id"], "status": "DONE"}
+
+        monkeypatch.setattr(worker, "_handle_analyze_item", _analyze)
+        monkeypatch.setattr(worker, "_mark_running", AsyncMock())
+        monkeypatch.setattr(worker, "_report_progress", AsyncMock())
+        items = [{"id": "i1", "filename": "a.fits"}, {"id": "i2", "filename": "b.fits"}]
+        await worker._run_analyze_task({"id": "t1"}, items)
+        assert analyzed == ["i1"] and worker._shutdown.is_set()
+
+    def test_memory_is_released_before_every_item(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(worker, "_release_freed_memory", lambda: calls.append("release"))
+        for item in worker._until_shutdown(["a", "b"]):
+            calls.append(item)
+        assert calls == ["release", "a", "release", "b"]
+
+    def test_nothing_is_released_once_a_shutdown_is_requested(self, monkeypatch):
+        release = MagicMock()
+        monkeypatch.setattr(worker, "_release_freed_memory", release)
+        worker._shutdown.set()
+        assert list(worker._until_shutdown(["a"])) == []
+        release.assert_not_called()
+
+    def test_malloc_trim_is_called_where_glibc_has_it(self, monkeypatch):
+        trim = MagicMock(return_value=1)
+        monkeypatch.setattr(worker, "_malloc_trim", trim)
+        worker._release_freed_memory()
+        trim.assert_called_once_with(0)
+
+    def test_without_glibc_only_the_collector_runs(self, monkeypatch):
+        monkeypatch.setattr(worker, "_malloc_trim", None)
+        worker._release_freed_memory()  # no error on macOS / musl
+
+
 class TestLostProgressReports:
     """
     An item whose outcome never reached the API stays PENDING there, so the

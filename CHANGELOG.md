@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.2
+
+### Patch Changes
+
+- Catalog status: a `404` from a catalog's endpoint now counts as down. CDS answers 404 to Simbad TAP, so Simbad counted as up while it failed every frame, and each frame was analysed three times (about 13 min instead of 4) before going DEGRADED anyway
+- Simbad: a host that cannot complete the connection gives up after `SIMBAD_CONNECT_TIMEOUT_SEC` (15 s) instead of `SIMBAD_TIMEOUT_SEC` per request. A Harvard mirror stuck in the TLS handshake cost every frame 4 minutes
+- Worker: memory freed by an item is returned to the OS before the next one starts, and expired catalog answers are dropped from the in-process cache. The worker grew to 28 GB (swap full) in 4.5 days
+- Worker: above `WORKER_MAX_RSS_MB` (8192) it stops between two items, its task goes back to `PENDING`, and Docker restarts it. About 20 MB per frame stays behind even after that, and only a restart gives it back
+
 ## 1.7.1
 
 ### Patch Changes

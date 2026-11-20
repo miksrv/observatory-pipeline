@@ -514,6 +514,14 @@ CATALOG_SOURCE_COOLDOWN_SEC: float = float(_get("CATALOG_SOURCE_COOLDOWN_SEC", "
 # connection and never answers holds the frame forever and the next server
 # is never asked. VizieR queries have astroquery's 60 s.
 SIMBAD_TIMEOUT_SEC: float = float(_get("SIMBAD_TIMEOUT_SEC", "120"))
+# The connect phase of that timeout (TCP and TLS handshake), seconds, capped
+# at SIMBAD_TIMEOUT_SEC. A host that does not even complete a handshake is
+# down, and one query sends several requests (pyvo first fetches the TAP
+# capabilities, trying two URLs): with the full SIMBAD_TIMEOUT_SEC on each, a
+# Harvard mirror stuck in the TLS handshake cost every frame 4 minutes in
+# November 2026 before the next server was asked. 0 = no separate connect
+# limit (the whole SIMBAD_TIMEOUT_SEC).
+SIMBAD_CONNECT_TIMEOUT_SEC: float = float(_get("SIMBAD_CONNECT_TIMEOUT_SEC", "15"))
 # Socket timeout (seconds, per connect and per read) of every request to the
 # ESA Gaia archive: the Gaia DR3 cone and the archive copies of 2MASS and
 # Pan-STARRS (TWOMASS_SOURCES / PANSTARRS_SOURCES entry "gaia"). astroquery's
@@ -1025,6 +1033,13 @@ TASK_POLL_INTERVAL_SEC: float = float(_get("TASK_POLL_INTERVAL_SEC", "10.0"))
 # an unreasonable amount of time. Resets to TASK_POLL_INTERVAL_SEC the moment
 # a task is found.
 TASK_POLL_BACKOFF_MAX_SEC: float = float(_get("TASK_POLL_BACKOFF_MAX_SEC", "60.0"))
+# The worker's resident memory (MB) above which it exits between two items,
+# the way a SIGTERM stops it (the task in progress goes back to PENDING), and
+# Docker's `restart: unless-stopped` starts it afresh. Checked after the
+# freed memory is returned to the OS; what is left still grows by ~20 MB per
+# frame (not live Python objects, not reclaimed by malloc_trim; 28 GB after
+# 1457 frames on 2026-11-20). A frame's own peak stays well below the default. 0 = never.
+WORKER_MAX_RSS_MB: float = float(_get("WORKER_MAX_RSS_MB", "8192"))
 # How often the worker checks that every online catalog it uses answers
 # (modules/catalog_health.py) and reports it to the API's dashboard, in
 # seconds; also once right after start. 0 turns the check off.

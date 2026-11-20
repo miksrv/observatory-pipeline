@@ -163,6 +163,23 @@ def _cache_get(key: str) -> Any | None:
     return data
 
 
+def _evict_expired() -> None:
+    """
+    Drop every in-process entry past its TTL.
+
+    An expired entry is never served again (`_cache_get()` re-checks the
+    age), yet it used to stay in the dict for the life of the process: the
+    worker visits a new sky tile every few frames, and after 4.5 days it held
+    every catalog answer since its start (1321 tiles, ~0.6 GB of JSON, about
+    4x that as Python objects). The disk tier keeps them; a later frame on
+    that tile reads the file back, or re-queries once it has expired too.
+    """
+    ttl = _cache_ttl()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for key in [k for k, entry in _cache.items() if now - entry["fetched_at"] >= ttl]:
+        del _cache[key]
+
+
 def _cache_set(key: str, data: Any) -> None:
     """
     Store data in the in-process dict AND on disk.
@@ -175,6 +192,7 @@ def _cache_set(key: str, data: Any) -> None:
     behind that would otherwise poison every read of this key until
     CACHE_TTL expires it.
     """
+    _evict_expired()
     _cache[key] = {"data": data, "fetched_at": datetime.datetime.now(datetime.timezone.utc)}
 
     path = _cache_file_path(key)

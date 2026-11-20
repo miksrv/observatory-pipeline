@@ -246,7 +246,7 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   terminal Ctrl+C does not kill it mid-solve. The watcher maps SIGTERM onto its Ctrl+C path
   (flush the pending batch) — SIGTERM's default action would otherwise drop that batch.
 - **Catalog status:** a daemon thread (`_CatalogHealthReporter`) probes every online catalog in use
-  (`modules/catalog_health.py`: one small GET per configured source; any answer below 500 = up,
+  (`modules/catalog_health.py`: one small GET per configured source; any answer below 500 except 404 = up,
   a catalog is up while any of its sources answers) at start and
   every `CATALOG_HEALTH_INTERVAL_SEC`, and sends the list to `POST /pipelines/catalogs` for the
   API dashboard. A thread, not a loop task: an ANALYZE task holds the event loop for hours.
@@ -261,6 +261,10 @@ Polls observatory-api's `tasks` table (docs/API.md §14) and dispatches items:
   the frame's own (a dense field on a slow mirror): after `CATALOG_OUTAGE_FRAME_RETRIES` of those the
   frame is analysed without waiting and registered DEGRADED. A shutdown during the wait leaves the
   item without an outcome (redone after the restart).
+- **Memory:** `_until_shutdown()` (every item loop; per source for GENERATE_CHARTS) runs `gc.collect()` and
+  glibc `malloc_trim(0)` before each item: freed heap fragments otherwise stayed resident (28 GB
+  after 4.5 days). About 20 MB per frame survives even that (not live Python objects), so above
+  `WORKER_MAX_RSS_MB` the worker stops there like on SIGTERM and Docker restarts it.
 - **Lost progress reports:** an item outcome the API did not take (`post_task_items_progress()`
   → `None`) is retried once the handler returns; if it still fails, the task goes back to
   `PENDING` (its unreported items are redone) instead of sitting at `RUNNING` forever.
@@ -566,7 +570,8 @@ qualified submodule references (`_gaia._query_gaia(...)`) so tests can patch the
   **tiles**: each catalog queries around the tile centre with the tile half-diagonal added to the
   radius (`_cache_position()`, `_cache_radius_margin_deg()`). Disk-write failures degrade to
   in-memory only. The TTL is read at call time (remote settings arrive after import); a disk hit
-  keeps the file's own age.
+  keeps the file's own age. Every store drops the
+  in-process entries past their TTL (they used to pile up for the life of the worker).
 
 ### `modules/forced_photometry.py`
 Reverse matching ("precovery"): for every Gaia DR3 star (≤ `FORCED_PHOTOMETRY_MAG_LIMIT`) and

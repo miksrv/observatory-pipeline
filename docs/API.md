@@ -1545,7 +1545,7 @@ observatory-api 1.4.1; an older API answers `404`, which the worker only logs.
 |-------|------|-------|
 | `catalogs` | list | 1–20 entries |
 | `name` | string | 1–40 characters, `A-Z a-z 0-9 space . _ / ( ) -` |
-| `ok` | bool | The service answered with a status below 500 |
+| `ok` | bool | The service answered with a status below 500, other than 404 |
 | `latency_ms` | int \| null | Response time; `null` when nothing came back |
 | `error` | string \| null | Why it is down (exception or `HTTP 5xx`); the API keeps 300 characters |
 | `waiting` | object \| null \| absent | An ANALYZE item held until catalogs answer again (below); `null` = no wait; **absent = keep the stored state** |

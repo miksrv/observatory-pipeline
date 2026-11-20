@@ -10,10 +10,13 @@ catalog that silently fails costs a frame its matches without stopping it
 only the log said so.
 
 A probe is one small GET against the host the real query goes to. "ok"
-means the service answered with any status below 500 — a 4xx to a bare
-request still proves it is up (JPL sb_ident answers 400 without an observer);
-a 5xx (SkyBot's 502 of 2026-10-23), a timeout or a refused connection means
-it is down. 2MASS and Pan-STARRS are VizieR tables, probed by one tiny query
+means the service answered with any status below 500 except 404 — a 4xx to a
+bare request still proves it is up (JPL sb_ident answers 400 without an
+observer); a 5xx (SkyBot's 502 of 2026-10-23), a 404 (the endpoint the query
+uses is not served there: CDS answered 404 to every Simbad TAP and VizieR
+request through November 2026 while counting as up, so every frame was
+re-analysed for nothing, CATALOG_OUTAGE_FRAME_RETRIES times), a timeout or a
+refused connection means it is down. 2MASS and Pan-STARRS are VizieR tables, probed by one tiny query
 each; VizieR reports a broken or missing table as HTTP 200 with
 `QUERY_STATUS = ERROR` in the VOTable, which counts as down too (that is how
 a mirror says it does not carry the table).
@@ -131,7 +134,7 @@ def check(probe: Probe, client: httpx.Client) -> dict:
         return {"name": probe.name, "ok": False, "latency_ms": None, "error": _error_text(exc)}
 
     latency_ms = int(round((time.monotonic() - started) * 1000))
-    if response.status_code >= 500:
+    if response.status_code >= 500 or response.status_code == 404:
         return {"name": probe.name, "ok": False, "latency_ms": latency_ms, "error": f"HTTP {response.status_code}"}
     if probe.error_marker is not None and probe.error_marker in response.text:
         return {"name": probe.name, "ok": False, "latency_ms": latency_ms, "error": "the service reported an error"}
