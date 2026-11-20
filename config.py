@@ -519,7 +519,8 @@ SIMBAD_TIMEOUT_SEC: float = float(_get("SIMBAD_TIMEOUT_SEC", "120"))
 # down, and one query sends several requests (pyvo first fetches the TAP
 # capabilities, trying two URLs): with the full SIMBAD_TIMEOUT_SEC on each, a
 # Harvard mirror stuck in the TLS handshake cost every frame 4 minutes in
-# November 2026 before the next server was asked.
+# November 2026 before the next server was asked. 0 = no separate connect
+# limit (the whole SIMBAD_TIMEOUT_SEC).
 SIMBAD_CONNECT_TIMEOUT_SEC: float = float(_get("SIMBAD_CONNECT_TIMEOUT_SEC", "15"))
 # Socket timeout (seconds, per connect and per read) of every request to the
 # ESA Gaia archive: the Gaia DR3 cone and the archive copies of 2MASS and

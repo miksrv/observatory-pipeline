@@ -73,7 +73,9 @@ class _TimeoutAdapter(requests.adapters.HTTPAdapter):
 
     def __init__(self, timeout_sec: float, connect_timeout_sec: float | None = None) -> None:
         super().__init__()
-        connect = timeout_sec if connect_timeout_sec is None else min(connect_timeout_sec, timeout_sec)
+        # None or <= 0 (urllib3 rejects a zero timeout): the connect phase gets the whole timeout.
+        use_own = connect_timeout_sec is not None and connect_timeout_sec > 0
+        connect = min(connect_timeout_sec, timeout_sec) if use_own else timeout_sec
         self.timeout_sec: tuple[float, float] = (connect, timeout_sec)
 
     def send(self, request, *, timeout=None, **kwargs):  # type: ignore[override]

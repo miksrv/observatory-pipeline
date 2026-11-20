@@ -2141,6 +2141,10 @@ class TestSimbadServerFallback:
     def test_the_connect_timeout_never_exceeds_the_whole_timeout(self):
         assert _simbad._TimeoutAdapter(5.0, 15.0).timeout_sec == (5.0, 5.0)
 
+    def test_a_zero_connect_timeout_falls_back_to_the_whole_timeout(self):
+        # urllib3 rejects 0: every Simbad request would fail.
+        assert _simbad._TimeoutAdapter(120.0, 0.0).timeout_sec == (120.0, 120.0)
+
     def test_the_timeout_adapter_fills_in_a_missing_timeout_only(self):
         import requests.adapters
         adapter = _simbad._TimeoutAdapter(7.0)
