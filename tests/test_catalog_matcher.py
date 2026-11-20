@@ -175,6 +175,19 @@ class TestCacheLogic:
         result = cm._cache_get("stale_key")
         assert result is None
 
+    def test_storing_an_entry_drops_the_expired_ones(self, tmp_path, monkeypatch):
+        """The in-process dict held every tile since the worker started (28 GB after 4.5 days)."""
+        monkeypatch.setattr(config, "CATALOG_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(config, "CACHE_TTL_HOURS", 1.0)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cm._cache["expired_tile"] = {"data": [1], "fetched_at": now - datetime.timedelta(hours=2)}
+        cm._cache["fresh_tile"] = {"data": [2], "fetched_at": now - datetime.timedelta(minutes=10)}
+
+        cm._cache_set("new_tile", [3])
+
+        assert "expired_tile" not in cm._cache
+        assert cm._cache_get("fresh_tile") == [2] and cm._cache_get("new_tile") == [3]
+
     def test_the_ttl_is_read_at_call_time(self, monkeypatch):
         """Remote settings are applied after import; a changed TTL must take effect."""
         one_hour_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
@@ -2115,13 +2128,18 @@ class TestSimbadServerFallback:
 
     def test_every_request_gets_a_client_side_timeout(self, monkeypatch):
         monkeypatch.setattr(config, "SIMBAD_TIMEOUT_SEC", 45.0)
+        monkeypatch.setattr(config, "SIMBAD_CONNECT_TIMEOUT_SEC", 10.0)
         cls = _simbad_class(set(), None)
         with patch("modules.catalog_matcher._simbad.Simbad", cls):
             cm._query_simbad(_RA, _DEC, 1.0)
         (instance,) = cls.instances
         prefix, adapter = instance._session.mount.call_args.args
         assert prefix == "https://" and isinstance(adapter, _simbad._TimeoutAdapter)
-        assert adapter.timeout_sec == 45.0
+        # A short connect phase: a host stuck in the TLS handshake is down.
+        assert adapter.timeout_sec == (10.0, 45.0)
+
+    def test_the_connect_timeout_never_exceeds_the_whole_timeout(self):
+        assert _simbad._TimeoutAdapter(5.0, 15.0).timeout_sec == (5.0, 5.0)
 
     def test_the_timeout_adapter_fills_in_a_missing_timeout_only(self):
         import requests.adapters
@@ -2129,7 +2147,7 @@ class TestSimbadServerFallback:
         with patch.object(requests.adapters.HTTPAdapter, "send", return_value="sent") as send:
             assert adapter.send("request") == "sent"
             assert adapter.send("request", timeout=3) == "sent"
-        assert [c.kwargs["timeout"] for c in send.call_args_list] == [7.0, 3]
+        assert [c.kwargs["timeout"] for c in send.call_args_list] == [(7.0, 7.0), 3]
 
 
 def _vizier_class(down: set[str], tables: dict[str, Table | None]):

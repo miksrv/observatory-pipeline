@@ -72,6 +72,8 @@ automatically. Reset it back to PENDING by hand
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import logging
 import os
 import signal
@@ -146,10 +148,83 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> dict:
     return {sig: signal.signal(sig, _handler) for sig in (signal.SIGTERM, signal.SIGINT)}
 
 
+def _load_malloc_trim():
+    """glibc's malloc_trim(), or None where there is none (macOS during development)."""
+    try:
+        trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return None
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    return trim
+
+
+_malloc_trim = _load_malloc_trim()
+
+
+def _release_freed_memory() -> None:
+    """
+    Hand the memory the previous item freed back to the OS.
+
+    glibc keeps what Python and numpy free in its heaps, and every frame
+    allocates differently sized image and catalog buffers on a pool of
+    threads (asyncio.to_thread), so the holes are rarely reused whole: the
+    worker grew to 28 GB of RSS (swap full) in 4.5 days on 2026-11-20 while
+    holding a few hundred MB of live data. Measured on that host's frames,
+    malloc_trim(0) after a frame gave back everything the frame had left
+    behind. Between items only: a trim walks every heap, cheap next to an
+    item but not free.
+    """
+    gc.collect()
+    if _malloc_trim is not None:
+        _malloc_trim(0)
+
+
+def _rss_mb() -> float | None:
+    """This process's resident memory in MB, or None without /proc (macOS)."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _over_memory_limit() -> bool:
+    """
+    True once the worker holds more than WORKER_MAX_RSS_MB after releasing
+    what the previous item freed. About 20 MB of every frame survives that
+    (not live Python objects); exiting and letting Docker restart the
+    container is what gives it back.
+    """
+    limit = config.WORKER_MAX_RSS_MB
+    if limit <= 0:
+        return False
+    rss = _rss_mb()
+    if rss is None or rss <= limit:
+        return False
+    logger.warning(
+        "Worker holds %.0f MB, over WORKER_MAX_RSS_MB=%.0f — stopping between items "
+        "so Docker restarts it with fresh memory (the task goes back to PENDING)",
+        rss, limit,
+    )
+    return True
+
+
 def _until_shutdown(items: Iterable) -> Iterator:
-    """Yield items until a shutdown is requested; the rest stay PENDING on the API."""
+    """
+    Yield items until a shutdown is requested; the rest stay PENDING on the API.
+    Memory the previous item freed is released before the next one starts, and
+    a worker over WORKER_MAX_RSS_MB stops here as if it had received SIGTERM.
+    """
     for item in items:
         if _shutdown.is_set():
+            return
+        _release_freed_memory()
+        if _over_memory_limit():
+            _shutdown.set()
             return
         yield item
 
